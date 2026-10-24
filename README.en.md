@@ -106,7 +106,7 @@ flowchart LR
 ### 3. `RSA-1024 (e = 3)` Cryptography & Custom `SWaP / FeC` (`FSC`) Certificates
 - **Built-in Pure-Python `RSA-1024 (e = 3)` Keypair Generator**: Miller–Rabin primality testing using `secrets`, exporting `.json` plus standard OpenSSL `.private.pem` (`PKCS#1`) and `.public.pem` (`SPKI`) files.
 - **Synchronized `SWaP RSA` & `FBL RSA` Public Modulus Replacement**: patches the public modulus in `CodeFlash.bin` AND simultaneously updates the mirrored `SWaP` NvM cache in `DataFlash.bin` (`NvM 0x7C @ 0xDB04`) with a fresh `IEEE CRC-32 @ 0xDCE4` while preserving the gateway's original 5-byte hardware **`VCRN`** (`DID 0x3C03 @ 0xDC0C`).
-- **Custom 171-Byte (`0xAB`) `VAG SWaP FSC` Builder & Signer (`sign-fsc`)**: computes pure-Python `RIPEMD-160` + `PKCS#1 v1.5` signatures to generate valid activation certificates (`0x10000100` Driving Profile Selection `FPA / Mode`, `0x10000300` Driver Alert `MKE`, `0x10001800` `MKB`, etc.) ready for standard OBD-II upload via `UDS 0x2E 0xDE01`.
+- **Custom 171-Byte (`0xAB`) `VAG SWaP FSC` Builder & Signer (`sign-fsc`)**: computes pure-Python `RIPEMD-160` + `PKCS#1 v1.5` signatures to generate valid activation certificates (`0x10000100` Driving Profile Selection `FPA / Mode`, `0x10000300` Driver Alert `MKE`, `0x10001800` `Snow`, etc.) ready for standard OBD-II upload via `UDS 0x2E 0x3C01` + `31 01 C0 01`.
 - **Custom `.odx` Firmware Block Signer (`sign-odx`)**: generates 128-byte `SHA-1 + PKCS#1 v1.5` (`<FW-SIGNATURE>`) signatures matching your custom `FBL RSA` key (`Sector 5 @ 0x0000A2F7`).
 
 ### 4. Full-Screen Interactive Windowing TUI + Scriptable CLI (`EN` / `RU`)
@@ -243,6 +243,400 @@ python3 conti_cp_tool.py -l en sign-fsc \
 # 5. Print the 12 CP banks reference table and step-by-step guide
 python3 conti_cp_tool.py -l en banks
 python3 conti_cp_tool.py -l en guide
+```
+
+---
+
+## Hidden Features & Engineering CAN / UDS Protocols on Gateway `J533`
+
+Below is the complete byte-level specification of all hidden, engineering, and service CAN/UDS protocols inside the **Continental `3Q0 907 530` (`RH850/F1L`)** Gateway, recovered directly from `CodeFlash.bin` and `Uflash.bin` disassembly (OBD-II diagnostic CAN on pins `6 / 14`, **`500 kbps`**, physical Gateway `19` IDs: Tester Request **`0x710`** → Gateway Response **`0x77A`**).
+
+### 1. Engineering UDS Sessions & Both `SecurityAccess` Levels (Including Stock Master Password)
+
+Even on **100% unmodified factory firmware**, the UDS session dispatch table (`0x000203B0`) natively accepts engineering diagnostic sessions:
+
+| UDS Request (`0x710`) | Reply (`0x77A`) | Session Name | Unlocked Capabilities |
+| :---: | :---: | :--- | :--- |
+| `10 03` | `50 03 ...` | `ExtendedDiagnosticSession` | Long Coding (`0x0600`), installation list (`0x04A3`), `LIN` / `BEM` / `Wake-up` service routines |
+| **`10 40`** | `50 40 ...` | **`EOLSession` (VW End-Of-Line)** | Custom `ZDC` dataset upload (`0x34/0x36`), `SWaP FSC` upload (`0x3C01` + `0xC001`), `KSCHUTZ` sync (`0x0567`) |
+| **`10 4F`** | `50 4F ...` | **`DevelopmentSession` (Engineering)** | Continental developer mode and Superuser `SecurityAccess Level 2` (`27 03 / 27 04`) |
+| `10 02` | `50 02 ...` | `ProgrammingSession` | Software reset into Flash Bootloader `Uflash.bin` (`0xFEDFFFF0 = 0xA5430911`) |
+
+#### Application `SecurityAccess` Algorithms (`0x0002714C` / `0x000817CA`)
+
+1. **`Level 1` (`27 01` → `27 02`, open VAG login `20103` = `0x00004E87`):**
+   - Unlocks adaptations, `ZDC` dataset flashing, and `SWaP FSC` activation.
+   - **Formula:** `Key = (uint32_be(Seed) + 0x00004E87) & 0xFFFFFFFF`
+   - **Worked Example (`Seed = 12 34 56 78`):** `0x12345678 + 0x00004E87 = 0x1234A4FF`
+     ```text
+     TX 0x710: 02 27 01 AA AA AA AA AA    ->  RX 0x77A: 06 67 01 12 34 56 78 AA   (Seed = 0x12345678)
+     TX 0x710: 06 27 02 12 34 A4 FF AA    ->  RX 0x77A: 02 67 02 AA AA AA AA AA   (Level 1 Unlocked!)
+     ```
+
+2. **`Level 2` (`27 03` → `27 04`, Superuser Engineering Level `0xCAFFE012`):**
+   - The `SendKey` handler (`0x0008182C`) accepts **either of two keys** even on untouched stock firmware:
+     - **Dynamic seed-based key:** `Key = (uint32_be(Seed) + 0xCAFFE012) & 0xFFFFFFFF`  
+       *(example for `Seed = 12 34 56 78`: `(0x12345678 + 0xCAFFE012) & 0xFFFFFFFF = 0xDD34368A` → `27 04 DD 34 36 8A`)*;
+     - **Hardcoded seed-independent master password `CA FF E0 12`** (works for **ANY** `Seed`!):
+       ```text
+       TX 0x710: 02 10 4F AA AA AA AA AA    ->  RX 0x77A: 06 50 4F 00 32 01 F4 AA   (DevelopmentSession)
+       TX 0x710: 02 27 03 AA AA AA AA AA    ->  RX 0x77A: 06 67 03 9A BC DE F0 AA   (any random Seed)
+       TX 0x710: 06 27 04 CA FF E0 12 AA    ->  RX 0x77A: 02 67 04 AA AA AA AA AA   (Superuser Level 2 Unlocked!)
+       ```
+
+---
+
+### 2. Live Calibration Protocol `ASAM CCP v2.1` (`29-bit CAN 0x1BFC8600 / 0x1BFC8601`)
+
+Production gateway firmware compiles in a complete **ASAM CCP v2.1** calibration server on Diagnostic CAN (`500 kbps`, **29-bit Extended CAN IDs**, `DLC = 8`, Station Address **`0x0055`** Big-Endian or broadcast `00 00`):
+- **Tester Request (`CRO`):** **`0x1BFC8600`** — `[CMD, CTR, Byte2, Byte3, Byte4, Byte5, Byte6, Byte7]` (`CTR` = arbitrary 1-byte packet counter echoed in reply).
+- **Gateway Reply (`DTO`):** **`0x1BFC8601`** — `[0xFF, ERR, CTR, D0, D1, D2, D3, D4]` (`ERR = 0x00` ACK, `0x30` unknown command, `0x32` out of range, `0x33` address locked by `CCP_CheckAddr`).
+
+> [!NOTE]
+> On stock firmware, `CONNECT` works immediately, whereas reading protected regions (`CodeFlash`, `DataFlash`, `Uflash`, `KSCHUTZ RAM`) returns dummy `0xAD` bytes and `RAM` writes return `0x33`. Applying **`patch-engineering`** in `conti_cp_tool.py` unlocks `Feature 0x81` and strips the `CCP_CheckAddr` blacklist, enabling **full live memory read access and live `RAM` writes directly over the OBD-II port on a running car**!
+
+| `CMD` | CCP Mnemonic | Request on `0x1BFC8600` (`8` bytes) | Reply on `0x1BFC8601` & Behavior |
+| :---: | :--- | :--- | :--- |
+| `0x01` | `CONNECT` | `01 <CTR> 00 55 00 00 00 00` | `FF 00 <CTR> ...` — opens CCP session with station `0x0055` |
+| `0x1B` | `GET_CCP_VERSION` | `1B <CTR> 02 01 00 00 00 00` | `FF 00 <CTR> 02 01 00 00 00` — confirms `CCP v2.1` |
+| `0x17` | `EXCHANGE_ID` | `17 <CTR> 00 00 00 00 00 00` | `FF 00 <CTR> <Len> ...` — sets `MTA0 = 0x000265F8` (ECU ID string) |
+| `0x02` | `SET_MTA` | `02 <CTR> <00\|01> 00 <Addr_BE32>` | `FF 00 <CTR> ...` — loads 32-bit Big-Endian address into `MTA0` (`00`) or `MTA1` (`01`) |
+| `0x04` | `UPLOAD` | `04 <CTR> <Size:01..05> 00 00 00 00 00` | `FF 00 <CTR> <B0..B4>` — reads `1..5` bytes from `[MTA0]` and advances `MTA0 += Size` |
+| `0x0F` | `SHORT_UP` | `0F <CTR> <Size:01..05> 00 <Addr_BE32>` | `FF 00 <CTR> <B0..B4>` — single-frame `1..5` byte read via `MTA1` |
+| `0x03` | `DNLOAD` | `03 <CTR> <Size:01..05> <D0..D4>` | `FF 00 <CTR> <Ext> <NewMTA0_BE32>` — writes `1..5` bytes to RAM at `[MTA0]`, `MTA0 += Size` |
+| `0x23` | `DNLOAD_6` | `23 <CTR> <D0 D1 D2 D3 D4 D5>` | `FF 00 <CTR> <Ext> <NewMTA0_BE32>` — writes `6` bytes to RAM at `[MTA0]`, `MTA0 += 6` |
+| `0x07` | `DISCONNECT` | `07 <CTR> <00\|01> 00 00 00 00 00` | `FF 00 <CTR> ...` — closes session (`00` temporary, `01` permanent) |
+
+#### Practical `ASAM CCP` Use-Case Examples
+
+1. **Live OBD dump of CP Bank `#7` (`5F` MIB2 @ `0xFF20C600` in internal `DataFlash`):**
+   ```text
+   TX 0x1BFC8600: 01 01 00 55 00 00 00 00   ->  RX 0x1BFC8601: FF 00 01 00 00 00 00 00  (CONNECT)
+   TX 0x1BFC8600: 02 02 00 00 FF 20 C6 00   ->  RX 0x1BFC8601: FF 00 02 00 00 00 00 00  (MTA0 = 0xFF20C600)
+   TX 0x1BFC8600: 04 03 05 00 00 00 00 00   ->  RX 0x1BFC8601: FF 00 03 55 55 55 55 K0  (header 55555555 + K0)
+   TX 0x1BFC8600: 04 04 05 00 00 00 00 00   ->  RX 0x1BFC8601: FF 00 04 K1 K2 K3 K4 K5  (key bytes K1..K5)
+   ```
+
+2. **Instant in-RAM activation of ALL 13 `SWaP / FeC` licenses on the fly (no `RSA`, no `FSC`, no reboot):**
+   The `SWaP` evaluator (`0x0007E05A`) aggregates all 13 feature flags into a 16-bit Little-Endian word at **`*(uint16_t *)0xFEDE1394`**:
+   - bit `1` (`0x0002`) — `0x10000300` (`MKE` — Driver Alert / Fatigue Detection);
+   - bit `3` (`0x0008`) — `0x10000100` (`FPA Base` — Driving Profile Selection master enable);
+   - bits `5..15` (`0xFFE0`) — 11 `FPA` driving profiles (`0x10001100` *Comfort*, `0x10001200` *Normal*, `0x10001300` *Sport*, `0x10001400` *Offroad*, `0x10001500` *Eco*, `0x10001600`, `0x10001700` *Individual*, `0x10001800` *Snow*, `0x10001900` *E-Mode*, `0x10001A00` *GTE / Race*, `0x10001B00` *Offroad Individual*); bits `0` & `2` (`0x0005`) are internal `evaluated` status bits.
+   - Writing **`0xFFFA`** (`FA FF` Little-Endian on CAN) sets all 13 license bits (`0x0002 | 0x0008 | 0xFFE0`) immediately:
+   ```text
+   TX 0x1BFC8600: 01 01 00 55 00 00 00 00   ->  RX 0x1BFC8601: FF 00 01 00 00 00 00 00  (CONNECT)
+   TX 0x1BFC8600: 02 02 00 00 FE DE 13 94   ->  RX 0x1BFC8601: FF 00 02 00 00 00 00 00  (MTA0 = 0xFEDE1394)
+   TX 0x1BFC8600: 03 03 02 FA FF 00 00 00   ->  RX 0x1BFC8601: FF 00 03 00 FE DE 13 96  (wrote 0xFFFA LE!)
+   ```
+
+3. **Timerless jump into the Factory `CAN RAM-Loader` at any uptime:**
+   Write magic word `0xA4420810` (`10 08 42 A4` LE) into retention RAM `0xFEDFFFF0` and trigger UDS `ECUReset` (`11 01`):
+   ```text
+   TX 0x1BFC8600: 02 05 00 00 FE DF FF F0   ->  RX 0x1BFC8601: FF 00 05 00 00 00 00 00  (MTA0 = 0xFEDFFFF0)
+   TX 0x1BFC8600: 03 06 04 10 08 42 A4 00   ->  RX 0x1BFC8601: FF 00 06 00 FE DF FF F4  (wrote 0xA4420810)
+   TX 0x710:      02 11 01 AA AA AA AA AA   ->  resets MCU straight into CAN RAM-Loader on 0x6F0 / 0x6F1!
+   ```
+
+---
+
+### 3. Hidden Trigger `0x07FC80FE` & Two-Stage Factory `CAN RAM-Loader` (`0x6F0 / 0x6F1` — Supervisor Code Execution Without RSA)
+
+`Uflash.bin` embeds a proprietary two-stage Continental factory loader capable of streaming native `RH850` machine code into RAM (`0xFEDF8020..0xFEDFFEFF`) and executing it in Supervisor Mode with zero `RSA` checks.
+
+#### Step 0 — Entry from Application (`29-bit CAN 0x07FC80FE`)
+On an engineering-patched unit immediately after power-on or `11 01` (vehicle speed = 0), transmit the 29-bit frame:
+```text
+TX 0x07FC80FE: 84 00 00 00 00 00 00 00   ->  RX 0x07FC80FF (writes 0xA4420810 to 0xFEDFFFF0 + SWRESA reset)
+```
+After reset, the bootloader listens on **11-bit Standard CAN IDs: `0x6F0` (Tester TX) → `0x6F1` (Gateway RX)** (`500 kbps`).
+
+#### Stage 1 — Factory `Seed / Key` on `0x6F0 / 0x6F1` (`0x01000BCC`)
+
+1. Request `Seed`: `TX 0x6F0: 30 00 00 00 00 00 00 00` → `RX 0x6F1: 30 <S0> <S1> <S2> <S3>`.
+2. **Exact 4-byte `Key` calculation (`poly = 0xA001` reflected, `init = 0x0000`):**
+
+```python
+def crc16_reflected_zero(data: bytes) -> int:
+    crc = 0x0000  # NOTE: initial value at 0x01004AF4 is 0x0000 (NOT 0xFFFF!)
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = ((crc >> 1) ^ 0xA001) if (crc & 1) else (crc >> 1)
+    return crc & 0xFFFF
+
+def conti_ramloader_key(seed4: bytes) -> bytes:
+    s0, s1, s2, s3 = seed4
+    buf = bytes([0x65, 0x96, s2, s1, 0xAC, s3, 0x53, s0])
+    c1 = crc16_reflected_zero(buf[0:8])
+    c2 = crc16_reflected_zero(buf[2:8])
+    b0, b1 = c1 & 0xFF, (c1 >> 8) & 0xFF
+    b2, b3 = c2 & 0xFF, (c2 >> 8) & 0xFF
+    rem = s3 % 3
+    if rem == 0:
+        return bytes([b1, b2, b3, b0])
+    if rem == 1:
+        return bytes([b2, b0, b1, b3])
+    return bytes([b3, b2, b0, b1])
+```
+
+- **Verified test vectors for all 3 branches of `S3 % 3`:**
+  - `Seed = 12 34 56 78` (`0x78 % 3 = 0`, `c1 = 0x5890`, `c2 = 0x46A0`) → **`Key = 58 A0 46 90`**
+  - `Seed = A1 B2 C3 01` (`0x01 % 3 = 1`, `c1 = 0xEF94`, `c2 = 0xF1A4`) → **`Key = A4 94 EF F1`**
+  - `Seed = 11 22 33 44` (`0x44 % 3 = 2`, `c1 = 0x6350`, `c2 = 0x7D60`) → **`Key = 7D 60 50 63`**
+
+3. Unlock and enter Stage 2:
+```text
+TX 0x6F0: 30 00 00 00 00 00 00 00   ->  RX 0x6F1: 30 12 34 56 78 ...  (Seed = 12 34 56 78)
+TX 0x6F0: 20 58 A0 46 90 00 00 00   ->  RX 0x6F1: 20 ...              (Key accepted; bad key returns 35)
+TX 0x6F0: 50 00 00 00 00 00 00 00   ->  RX 0x6F1: 50 ...              (Enters Stage 2 RAM-Loader!)
+```
+
+#### Stage 2 — Streaming Upload & Code Execution (`0x0100120E`)
+
+- **Sync:** `TX 0x6F0: 84 00 00 00 00` → echo `RX 0x6F1: 84 00 00 00 00`.
+- **Stream Packet Format** (packed sequentially across raw `0x6F0` frames without ISO-TP headers):
+  `[HdrHi = 0x80 | ((Len >> 8) & 0x7F)] [HdrLo = Len & 0xFF] [Body[0 .. Len-1]] [XOR_Checksum]`
+  where `XOR_Checksum` is the bytewise `XOR` of all packet bytes from `HdrHi` through `Body[Len-1]`.
+- **Gateway Reply (`0x6F1`, 4 bytes):** `[0x80, 0x01, Status, 0x81 ^ Status]` (`0x00` = OK, `0x03` = XOR error, `0x05` = wrong 8-byte password, `0x07` = write pointer `r28` updated).
+- **Execution Rule (`jarl [r28 + 8], lp`):** at write pointer `r28` (default `0xFEDF8130`, i.e., offset `0x0110` from `0xFEDF8020`), the first **8 bytes** MUST equal the Continental password **`DE 42 56 5E E5 65 24 ED`**, followed at `r28 + 8` (`0xFEDF8138`) by native `RH850` machine code ending with `7F 00` (`jmp [lp]`):
+
+```text
+# 1) Set write pointer r28 = 0xFEDF8020 + 0x0110 = 0xFEDF8130 (Body = 00 01 01 10, XOR = 80^04^00^01^01^10 = 94):
+TX 0x6F0: 80 04 00 01 01 10 94                  ->  RX 0x6F1: 80 01 07 86  (Status 0x07: pointer set)
+
+# 2) Upload 8B password + `jmp [lp]` (7F 00) stub (Len = 10 = 0x0A, XOR = 0x28), split across raw 0x6F0 frames:
+TX 0x6F0: 80 0A DE 42 56 5E E5 65               (stream frame 1)
+TX 0x6F0: 24 ED 7F 00 28                        ->  RX 0x6F1: 80 01 00 81  (Status 0x00: written to RAM)
+
+# 3) Execute `jarl [0xFEDF8138], lp` in Supervisor Mode (Body = FE, XOR = 80^01^FE = 7F):
+TX 0x6F0: 80 01 FE 7F                           ->  RX 0x6F1: 80 01 00 81  (Executed with zero RSA check!)
+
+# 4) Clean exit & MCU reset (Body = 00 FF, XOR = 80^02^00^FF = 7D):
+TX 0x6F0: 80 02 00 FF 7D                        ->  RX 0x6F1: 80 01 00 81  (MCU resets)
+```
+
+---
+
+### 4. `Uflash` Flash Bootloader `VAG SA2` Algorithm (`10 02` → `27 11 / 27 12`)
+
+In `ProgrammingSession` (`10 02`), `Uflash.bin` validates `27 11` / `27 12` using its `SA2` bytecode VM (`0x010023D8`, 124-byte script at `0x0000A377`). Exact closed-form Python implementation:
+
+```python
+def conti_j533_fbl_sa2(seed: int) -> int:
+    x = seed & 0xFFFFFFFF
+    for step in range(8):
+        msb = (x >> 31) & 1
+        x = ((x << 1) | (1 if step in (2, 7) else 0)) & 0xFFFFFFFF
+        if msb:
+            x ^= 0x1EDC6F41
+    for _ in range(11):
+        borrow = x < 0x80361423
+        x = (x - 0x80361423) & 0xFFFFFFFF
+        if borrow:
+            x ^= 0x04000200
+    return x
+```
+
+- **Verified Test Vectors (`27 11` → `27 12`):**
+  - `Seed = 0x00000001` → `Key = 0x7DAD27A0`
+  - `Seed = 0x12345678` → `Key = 0x7CA16271` (`TX 0x710: 06 27 12 7C A1 62 71 AA` → `RX 0x77A: 02 67 12`)
+  - `Seed = 0xDEADBEEF` → `Key = 0x3AEE8BB5`
+  - `Seed = 0xFFFFFFFF` → `Key = 0xEAE26413`
+
+---
+
+### 5. Stock OBD `ZDC` Dataset Upload (Zero RSA!), OBD `SWaP FSC` Activation & Service `DID` / `RoutineControl (0x31)`
+
+#### A. `ZDC` Parameterization (`Dataset Upload`) Performs ZERO `RSA` Verification!
+Unlike cameras or radars, the gateway's `RequestDownload` / `TransferData` handler (`0x0003E552` / `0x0003D558`) checks **only a standard 4-byte Little-Endian `IEEE 802.3 CRC-32` (`zlib.crc32`) appended to the end of each block**! Any custom-edited dataset (including the **`FPA Driving Profile Selection`** button/mode matrix) can be flashed over OBD onto a **100% stock unpatched gateway**:
+
+```python
+import struct, zlib
+# Pack any of the 7 ZDC blocks (e.g., FPA idx=2: UDS_Addr=0x00002880, UDS_Len=0x0800 = 2048 bytes):
+assert len(body_bytes) == uds_len - 4          # for FPA: 2044 payload bytes
+zdc_payload = body_bytes + struct.pack("<I", zlib.crc32(body_bytes))  # + 4-byte CRC-32 LE = 2048 bytes
+```
+
+| `idx` | UDS Address (`0x34`) | Size (`UDS_Len`) | Offset in `Dflash.bin` | Dataset Consumer |
+| :---: | :---: | :---: | :---: | :--- |
+| `0` | `0x00000A00` | `0x0080` (`128` B) | `0x0080 .. 0x00FF` | Base `ZDC` configuration block |
+| `1` | `0x00000A80` | `0x0100` (`256` B) | `0x0100 .. 0x01FF` | **`MKE`** — Driver Alert / Fatigue Detection parameters (`'ZM3'`) |
+| **`2`** | **`0x00002880`** | **`0x0800` (`2048` B)** | `0x0200 .. 0x09FF` | **`FPA` (`Driving Profile Selection`)** — Driving Mode & button table |
+| `3` | `0x00003080` | `0x0400` (`1024` B) | `0x0A00 .. 0x0DFF` | Auxiliary / Hybrid energy management table |
+| `4` | `0x00000B80` | `0x1100` (`4352` B) | `0x1340 .. 0x243F` | **Main Gateway network routing dataset** (`'NC00'`) |
+| `5` | `0x00003E00` | `0x012E` (`302` B) | `0x1200 .. 0x132D` | Subsystem calibration table |
+| `6` | `0x00001C80` | `0x0C00` (`3072` B) | `0x2440 .. 0x303F` | **`BEM`** — Battery, LIN alternator & `Start-Stop` recuperation curves |
+
+OBD UDS sequence to upload the `FPA` dataset (`0x710` → `0x77A`):
+`10 40` → `27 01` / `27 02 <Seed + 0x4E87>` → *(opt. `2E F1 A0 <11B ID>`, `2E F1 A1 <4B Ver>`)* → `34 00 44 00 00 28 80 00 00 08 00` → `36 01 ...` .. `36 NN ...` (`2048` bytes ending with `CRC-32 LE`) → `37` → **`31 01 02 EF`** (`CheckMemory`) → **`31 01 03 00`**.
+
+#### B. Exact 5-Step OBD `SWaP FSC` (`171`-Byte Certificate) Activation (`0x710` → `0x77A`)
+1. `10 40` — strictly `EOLSession` *(`C0 01` is rejected in `10 03`!)*.
+2. `27 01` → `27 02 <Seed + 0x4E87>` — open login `20103`.
+3. *(Optional: read the gateway's 5-byte `VCRN` via `22 3C 03` or `22 3C 0A`.)*
+4. `2E 3C 01 <171-byte FSC>` — stages the `sign-fsc` certificate into RAM buffer `0xFEDF590D`.
+5. **`31 01 C0 01`** *(strictly 4 bytes with zero inline payload — appending `FSC` bytes to `31 01` fails with `7F 31 13`!)* → poll **`31 03 C0 01`** until completion (delete an installed `FeC` via `31 01 C0 02 <4B FeC>`).
+
+#### C. Hidden Service `DIDs (0x2E)` & All 15 `RoutineControl (0x31)` RIDs
+
+| Service + ID | Session / Security | Exact Function in Continental `J533` Firmware |
+| :---: | :---: | :--- |
+| `2E 04 FC` / `2E 04 FE` | `10 40` + `SA1` | **`Production Mode` (Assembly Line Mode)**: 3-byte bitmasks disabling select sleep/power checks with auto-clear counter *(does NOT disable CP)* |
+| `2E 09 28` | `10 03` / `10 40` | **`Transport Mode`**: disables non-essential loads during vehicle shipping |
+| `2E 06 00` / `2E 04 A3` | `10 03` / `10 40` | `Long Coding` and Gateway `Verbauliste` (installed ECU list in external `95640`) |
+| `31 01 02 03` | `10 03` / `10 40` | `CheckProgrammingPreconditions` — verifies `V = 0`, etc. prior to flashing |
+| `31 01 03 06` | `10 40` / `10 4F` | Native cryptographic unlock of `Feature 0x80 / 0x81 / 0x83` via 16-byte `ICUS0` challenge-response |
+| `31 01 03 B0` / `05 C7` | `10 03` / `10 40` | Resets Battery Energy Management (`BEM`) statistics & communication fault counters |
+| `31 01 04 B5` / `04 B6` | `10 03` / `10 40` | Starts & polls `LIN` slave bus diagnostic test (alternator, `J367` battery sensor) |
+| `31 01 04 75` | `10 03` / `10 40` | Holds CAN subnetworks awake / Partial Networking test |
+| `31 01 05 67` | `10 40` + `SA1` | `KSCHUTZ` (`CP`) service status check / synchronization routine |
+| `31 01 06 65` | `10 03` / `10 40` | Physical `Wake-up line` diagnostic test |
+| `31 01 06 91` | `10 03` / `10 40` | Forced bus sleep entry for quiescent current measurement |
+| `31 01 10 27` | `10 40` + `SA1` | Factory EOL CAN/LIN transceiver self-test |
+
+*(Note: none of the 73 `WDBI` DIDs or 15 `RoutineControl` RIDs enable raw broadcast mirroring of internal CAN buses onto the OBD-II `CAN Diagn.` pins — to sniff `0x17FC01xx / 0x17FE01xx` frames, connect directly to the target internal CAN twisted pair behind the gateway).*
+
+---
+
+## Component Protection (`KSCHUTZ` / `CP`) CAN Protocol & UDS Key Adaptation Commands
+
+Below is the complete wire protocol between Master Gateway `J533 (19)` and a Slave ECU (illustrated with Infotainment `5F` MIB2 STD on `0x17FC0173 / 0x17FE0173` and diagnostic `0x773 / 0x7DD`), together with the **two-step UDS CAN key adaptation commands (`2E 00 BE` → `2E 00 BD`)** verified against `J5 M30` firmware disassembly and full-system emulation.
+
+### 1. Four-Message Runtime CAN Handshake (`80 01` → `C0 01` → `80 02` → `C0 02`)
+
+On internal vehicle CAN buses (`500 kbps`, `ISO-TP`, **29-bit Extended CAN IDs** from the 12-bank table above — e.g., `0x17FC0173` Gateway → `5F` and `0x17FE0173` `5F` → Gateway), the gateway performs mutual `AES-128-ECB` authentication at ignition-on and periodically during driving using the shared **16-byte working key `K3` (`IKA`)**:
+
+1. **Gateway Challenge Request (`11`-byte `ISO-TP` on `0x17FC0173`):**  
+   `80 01 <8-byte GW_Challenge> <1-byte Seq>`
+2. **Slave Challenge Response (`11`-byte `ISO-TP` on `0x17FE0173`):**  
+   `C0 01 <8-byte Slave_Challenge> <1-byte Seq>`
+3. **Mutual Proof Calculation (`FIPS-197 AES-128-ECB`, no IV, no byte reversal):**  
+   Both ECUs concatenate the two 8-byte nonces into a 16-byte block and encrypt it under **`K3` (`IKA`)**:
+   $$\text{AuthBlock}_{16\text{B}} = \text{AES-128-ECB\_Encrypt}_{K_3}\!\left(\text{GW\_Challenge}_{8\text{B}} \;\|\; \text{Slave\_Challenge}_{8\text{B}}\right)$$
+   - **`GW_Proof` (first 8 bytes):** `AuthBlock[0..7]`
+   - **`Slave_Proof` (last 8 bytes):** `AuthBlock[8..15]`
+4. **Gateway Proof (`11`-byte `ISO-TP` on `0x17FC0173`):**  
+   `80 02 <8-byte GW_Proof> <1-byte Seq>`
+5. **Slave Verdict & Reply (`0x17FE0173`):**
+   - **If `GW_Proof == AuthBlock[0..7]` (keys match):** the Slave ECU resets its internal CP error counter to `0` (`KS_PASSIVE` — unmuting audio / unlocking features), arms a one-shot latch to accept the vehicle `VIN` from `0x6B4`, and replies with `11` bytes:  
+     `C0 02 <8-byte Slave_Proof> <1-byte Seq>`
+   - **If keys mismatch:** the Slave ECU pushes its error counter past the lock threshold (`>= 0x1F` → `KS_ACTIVE`, DTC `U110100`) and sends a 5-byte negative response:  
+     `7F 80 02 35 <Seq>` (`0x35 = invalidKey`; other NRCs: `7F 80 01 21` busy booting, `7F 80 01 10` EEPROM read failure, `7F 80 02 22` sequence error).  
+     *(On the bench without a gateway, `5F` increments its counter by `+1` at boot check and `+1` every **`16` minutes** = `960,000` ms, locking into `CP Active` at `0x1F` after roughly **`8` hours** of continuous runtime).*
+
+#### Worked Calculation & Frame-by-Frame `ISO-TP` CAN Trace
+Given shared key `K3 = 11 22 33 44 55 66 77 88 99 AA BB CC DD EE FF 00`, `Seq = 01`, `GW_Challenge = 01 02 03 04 05 06 07 08`, and `Slave_Challenge = 3E 12 A4 16 05 96 7F 03`:
+- `AES-128-ECB` input: `01 02 03 04 05 06 07 08 3E 12 A4 16 05 96 7F 03`
+- `AuthBlock` output: `4A 7F EC 1B FF 9B 47 1F | 24 E2 91 A4 AE EC E2 DC`
+- `GW_Proof = 4A 7F EC 1B FF 9B 47 1F`, `Slave_Proof = 24 E2 91 A4 AE EC E2 DC`:
+
+```text
+# Step 1: J533 -> 5F (80 01 + GW_Challenge + Seq = 11 bytes: First Frame 10 0B + Flow Control 30 + Consecutive Frame 21)
+TX 0x17FC0173: 10 0B 80 01 01 02 03 04
+RX 0x17FE0173: 30 0F 05 AA AA AA AA AA
+TX 0x17FC0173: 21 05 06 07 08 01 AA AA
+
+# Step 2: 5F -> J533 (C0 01 + Slave_Challenge + Seq = 11 bytes)
+RX 0x17FE0173: 10 0B C0 01 3E 12 A4 16
+TX 0x17FC0173: 30 00 00 AA AA AA AA AA
+RX 0x17FE0173: 21 05 96 7F 03 01 AA AA
+
+# Step 3: J533 -> 5F (80 02 + GW_Proof + Seq = 11 bytes)
+TX 0x17FC0173: 10 0B 80 02 4A 7F EC 1B
+RX 0x17FE0173: 30 0F 05 AA AA AA AA AA
+TX 0x17FC0173: 21 FF 9B 47 1F 01 AA AA
+
+# Step 4: 5F -> J533 (C0 02 + Slave_Proof + Seq = 11 bytes -> CP cleared, KS counter = 0!)
+RX 0x17FE0173: 10 0B C0 02 24 E2 91 A4
+TX 0x17FC0173: 30 00 00 AA AA AA AA AA
+RX 0x17FE0173: 21 AE EC E2 DC 01 AA AA
+```
+
+---
+
+### 2. Broadcast Vehicle Identification Frame `0x6B4` (`VIN_01`, 11-bit CAN, `DLC = 8`)
+
+Alongside the handshake, the gateway broadcasts a 3-part multiplexed **`0x6B4` (`VIN_01`)** frame across vehicle CAN buses. Immediately after a valid `C0 02` handshake, the Slave ECU's one-shot latch stores the 4-byte Vehicle/Gateway ID and 17-character `VIN` into `EEPROM` *(whereas if `data[1..4]` in mux `0` changes to a non-zero value WITHOUT a confirmed handshake, the Slave ECU immediately triggers `CP Active`!)*:
+
+| Multiplexer (`data[0] & 3`) | `0x6B4` Payload Bytes | Example for `VIN = TMBJJ7NE0G0000480` & `VehID = 11 22 33 44` |
+| :---: | :--- | :--- |
+| **`0`** (`0x00`) | `data[1..4]` = `4B VehID`, `data[5..7]` = `VIN[0..2]` | `00 11 22 33 44 54 4D 42` (`"TMB"`) |
+| **`1`** (`0x01`) | `data[1..7]` = `VIN[3..9]` (7 ASCII chars) | `01 4A 4A 37 4E 45 30 47` (`"JJ7NE0G"`) |
+| **`2`** (`0x02`) | `data[1..7]` = `VIN[10..16]` (7 ASCII chars) | `02 30 30 30 30 34 38 30` (`"0000480"`) |
+
+---
+
+### 3. UDS CAN Key Adaptation Commands on the Slave ECU (`2E 00 BE` → `2E 00 BD`)
+
+When adapting or changing the **`K3` (`IKA`)** key inside a Slave ECU over Diagnostic CAN (for example, writing a new `K3` into `5F` MIB2 on **`0x773` → `0x7DD`** without desoldering its EEPROM, given knowledge of that unit's **current** `K3` — either the donor's old `K3` or the factory Virgin default key `/6`), Slave firmware uses a **two-step `UDS 0x2E WriteDataByIdentifier` protocol**:
+
+- **Sessions & Security:** accepted in sessions `0x01`, `0x03`, `0x40`, `0x4F` with **`sec = 0x00` (NO `SecurityAccess 0x27` required!)** and exempt from workshop fingerprint checks, because cryptographic authorization is proven by encrypting under the **currently active working key `K3_current`**!
+- **Exact 37-Byte UDS Payload (`ISO-TP`):**
+  ```text
+  2E 00 <BE or BD> <Block1: 16 bytes> <Block2: 16 bytes> 00 00
+  ```
+  *(The trailing 2 bytes `00 00` are mandatory: the UDS table strictly requires `34` data bytes after `2E 00 BE/BD`, otherwise returning `7F 2E 13`!)*.
+
+#### How `Block1` and `Block2` Are Calculated (`FUN_8041ecd8` / `FUN_803d107c`)
+Upon reception, the Slave ECU **reverses the byte order** (`[15..0]`) of `Block1` and `Block2`, decrypts both blocks with **`AES-128-ECB_Decrypt`** under **`K3_current`** into plaintexts `P1` and `P2`, and verifies that `P2` is the exact **bitwise complement (`XOR 0xFF`)** of `P1` across all 16 bytes (`P1[i] == ~P2[i]`, otherwise rejecting with `7F 2E 31 = requestOutOfRange`).
+
+Therefore, to pack any new 16-byte key `K_new` under a known `K3_current`:
+$$\text{Block1} = \text{reverse}\!\left(\text{AES-128-ECB\_Encrypt}_{K_{3,\text{current}}}\!\left(K_{\text{new}}\right)\right)$$
+$$\text{Block2} = \text{reverse}\!\left(\text{AES-128-ECB\_Encrypt}_{K_{3,\text{current}}}\!\left(K_{\text{new}} \oplus \mathtt{FF}^{16}\right)\right)$$
+
+#### Why BOTH Steps Are Mandatory Strictly in Order `0x00BE` → `0x00BD`
+1. **Step 1 — `UDS 2E 00 BE` (write new working key `K3_new` / `IKA`, encrypted under OLD `K3_current`):**
+   - Writes `K3_new` into working Slot 3 (`/3`), fills secondary Slot 1 (`/1`) with `FF..FF`, and **resets the adaptation status byte to `0`** (`decrypted(/2)[9] = 0`).
+   - *Pitfall:* stopping after `0x00BE` allows the CAN handshake to pass and unmutes audio, but leaves an active UDS fault "Control module not adapted" (`DTC 0x20`)!
+2. **Step 2 — `UDS 2E 00 BD` (write secondary key `K1_new` / `GFA` into Slot 1 `/1`, encrypted under the NEW `K3_new`!):**
+   - `0x00BD` MUST be encrypted under **the new `K3_new`** written in Step 1!
+   - Stores the 16-byte `K1_new` (`GFA` / Slot 1 key) into `/1` and — whenever `K3_new` differs from the factory Virgin default — **sets the adaptation flag `decrypted(/2)[9] = 1`**, clearing the "not adapted" fault completely!
+
+> [!WARNING]
+> **Effect on `SWaP / FeC` (`VCRN`) in `5F` MIB2:** on `5F`, the internal `SWaP` individualization key is derived through `(K3, K1)`. Changing `K3` / `K1` via `0x00BE` / `0x00BD` therefore changes the head unit's 5-byte `VCRN` (`DID 0x3C05`). To preserve the head unit's original `VCRN` and factory `SWaP` licenses untouched, do not overwrite keys inside `5F` — simply read `5F`'s existing `K3` and write it into Gateway Bank `#7` with `conti_cp_tool.py`! *(On Master Gateway `J533` itself, online `2E 00 BE` + `2E 02 C5` on `0x710` expects a 64-byte `SHE M1||M2||M3` container under hardware `ICUS0 KEY_2` rather than inverted `AES-ECB`, which is why plaintext `IKA` binding on the gateway is performed in its dump).*
+
+#### Ready-to-Use Python Calculator & Verified `ISO-TP` CAN Trace (`0x773` → `0x7DD`)
+
+```python
+import subprocess, struct
+
+def aes128_ecb_encrypt(key16: bytes, plain16: bytes) -> bytes:
+    return subprocess.run(
+        ["openssl", "enc", "-aes-128-ecb", "-nopad", "-K", key16.hex()],
+        input=plain16, capture_output=True, check=True,
+    ).stdout
+
+def build_cp_uds_write(did: int, k3_current: bytes, k_new: bytes) -> bytes:
+    """Builds the 37-byte UDS 0x2E (0x00BE or 0x00BD) CP key write payload for a VAG Slave ECU."""
+    inv_new = bytes(b ^ 0xFF for b in k_new)
+    block1 = aes128_ecb_encrypt(k3_current, k_new)[::-1]    # reverse 16 bytes [15..0]
+    block2 = aes128_ecb_encrypt(k3_current, inv_new)[::-1]  # reverse 16 bytes [15..0]
+    return struct.pack(">BH", 0x2E, did) + block1 + block2 + b"\x00\x00"
+```
+
+**Worked Example:** adapting `5F` (`0x773` → `0x7DD`) from current key `K3_old = FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF` to new working key `K3_new = 11 22 33 44 55 66 77 88 99 AA BB CC DD EE FF 00` and secondary key `K1_new = 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F`:
+
+```text
+# 0) Enter Extended Diagnostic Session (NO SecurityAccess 0x27 required!):
+TX 0x773: 02 10 03 55 55 55 55 55   ->  RX 0x7DD: 06 50 03 00 32 01 F4 AA
+
+# 1) Step A — Write new working key K3_new via DID 0x00BE (37 bytes = 0x25, encrypted under K3_old):
+#    Full UDS payload: 2E 00 BE 58DF59918BBF09D33FF952B3AC4DD745 957D7130E3DB18818E241FAF35656250 00 00
+TX 0x773: 10 25 2E 00 BE 58 DF 59   ->  RX 0x7DD: 30 0F 05 AA AA AA AA AA
+TX 0x773: 21 91 8B BF 09 D3 3F F9
+TX 0x773: 22 52 B3 AC 4D D7 45 95
+TX 0x773: 23 7D 71 30 E3 DB 18 81
+TX 0x773: 24 8E 24 1F AF 35 65 62
+TX 0x773: 25 50 00 00 55 55 55 55   ->  RX 0x7DD: 03 6E 00 BE AA AA AA AA  (K3_new stored in Slot /3!)
+
+# 2) Step B — Write K1_new & set adaptation flag via DID 0x00BD (37 bytes = 0x25, encrypted under NEW K3_new!):
+#    Full UDS payload: 2E 00 BD 2CC30C0CFAE3F1C2A496D04570ABD2A5 F84D9AA2BCF439E5113B602146D1537D 00 00
+TX 0x773: 10 25 2E 00 BD 2C C3 0C   ->  RX 0x7DD: 30 0F 05 AA AA AA AA AA
+TX 0x773: 21 0C FA E3 F1 C2 A4 96
+TX 0x773: 22 D0 45 70 AB D2 A5 F8
+TX 0x773: 23 4D 9A A2 BC F4 39 E5
+TX 0x773: 24 11 3B 60 21 46 D1 53
+TX 0x773: 25 7D 00 00 55 55 55 55   ->  RX 0x7DD: 03 6E 00 BD AA AA AA AA  (decrypted(/2)[9] = 1, fully adapted!)
 ```
 
 ---
