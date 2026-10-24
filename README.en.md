@@ -59,6 +59,25 @@
 
 ---
 
+## What You Need Before Starting (NOT a "One-Click" Magic Tool!)
+
+> [!IMPORTANT]
+> **This script is NOT a one-button "plug in an OBD cable and make everything work" solution!**  
+> It does not talk to the car over a diagnostic cable, cannot unlock read-protected silicon in software, and cannot magically guess security keys over CAN. It is a **low-level binary dump & key preparation toolkit** built for specialists who have bench hardware tools and understand `VAG MQB` / `KSCHUTZ` architecture.
+
+To actually use this script on a vehicle, **two prerequisites are strictly required**:
+
+1. **A real bench dump from your physical `J533` Gateway read via `Voltage Glitch`:**
+   - The `Renesas RH850/F1L` (`R7F7010543` / `R7F7010563`) MCU inside production Continental `3Q0 907 530` gateways is factory read-locked (`Security Lock`).
+   - Unpacking a dealer `.frf` / `.odx` update file is NOT enough: `.odx` files do not contain your car's unique `DataFlash.bin` (`64 KB` holding existing `SHE` slave keys, Master Key `GFA`, `VCRN`, and `SWaP` slots), `Uflash.bin` (`32 KB`), or the `0x00000000..0x0000C1FF` boot prefix.
+   - You must remove the gateway from the car, open it on the bench, read `CodeFlash.bin` + `DataFlash.bin` (+ `Uflash.bin`) using a hardware **`Voltage Glitch` (`Fault Injection`)** programmer (`VVDI Multi-Prog`, `CG100X`, `Orange-5 RH850 Glitch`, etc.), patch the dumps with this script, and flash them back on the bench.
+2. **The target Slave ECU's 16-byte `K3` (`IKA`) key extracted in advance from that ECU's own dump:**
+   - To bind a used or retrofitted module (`5F` MIB2, `17` Cluster, `13` ACC Radar, `47` Sound Amplifier, `A5` Camera, etc.) to the gateway offline, you must **already know that specific unit's 16-byte plaintext `K3` (`IKA` — Individual Key Application) Component Protection key** (`32` HEX characters).
+   - **Plaintext `K3` NEVER travels over UDS / CAN and NEVER appears in `ODIS` logs or bus captures!** During `ODIS Online` / `FAZIT` adaptation, keys are delivered strictly inside encrypted cryptographic containers (`SHE M1..M3` / `AES`) unwrapped inside hardware security modules, while runtime CAN handshakes exchange only random nonces and `AES-128` proofs.
+   - **The ONLY way to obtain `K3` (`IKA`) is by dumping the memory of the target Slave ECU itself** (`EEPROM` / `DataFlash` / `SPI NOR` / `eMMC` on the bench or via direct internal access on that specific module — or, if you already have full dump write access on the Slave ECU, writing the same custom 16-byte key into both the Slave ECU dump and the Gateway bank).
+
+---
+
 ## Features
 
 ### 1. Offline Component Protection (`KSCHUTZ` `#MoLaLi`) Binding
