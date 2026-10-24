@@ -1,0 +1,26 @@
+# Python bytecode & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# OS & IDE metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Never accidentally commit vehicle ECU dumps, certificates, or private RSA keys
+*.bin
+*.raw
+*.fsc
+*.sig
+*.odx
+*.frf
+*.sgo
+*.private.pem
+*keypair*.json
+dumps/
+backup/
