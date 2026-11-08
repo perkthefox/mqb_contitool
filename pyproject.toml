@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contitool"
-version = "2.0.1b"
+version = "2.0.1c"
 description = "ContiTool — Desktop GUI Studio & CLI for Continental VAG MQB Gateway J533 (Renesas RH850/F1L)"
 readme = "README.md"
 requires-python = ">=3.12"

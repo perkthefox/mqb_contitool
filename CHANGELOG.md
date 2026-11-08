@@ -1,5 +1,34 @@
 # Changelog / История изменений
 
+## 2.0.1c — 2026-11-09
+
+По отчётам на 2.0.1b: адаптеры, которые отказывают в сыром CAN.
+From the 2.0.1b reports: adapters that refuse raw CAN.
+
+### 🇷🇺 Исправлено
+- **`PDUCreateComLogicalLink: D-PDU error 0x01` сразу после удачного подключения модуля.** ContiTool выбирал модуль по тому, что тот **принял подключение**, — а это ничего не доказывает: чужой драйвер J2534 подключается спокойно и отказывает уже на сыром канале CAN. Теперь канал открывается внутри перебора, и модуль считается нужным, только когда связь реально поднялась; не поднялась — берётся следующий кандидат.
+- **Любой отказ в сыром канале объясняется словами**, с именем адаптера и кодом, вместо голого `0x01` или `0x50`. Раньше понятный текст показывался только для `0x50`.
+- Если кандидат один, показывается его собственная причина, а не обобщённая сводка: при нескольких кандидатах сводка дополнена причиной последнего.
+
+### 🇷🇺 Добавлено
+- **Запасной режим для адаптеров без RawMode.** Часть VAS 6154 / VNCI (в том числе вполне настоящих) отказывает в сыром канале CAN — отказ приходит от самого адаптера, на всех драйверах. Для них ContiTool теперь пробует связь в стиле ODIS: по одному каналу на пару идентификаторов (`0x710/0x77A` и `0x6F0/0x6F1`), с адресацией через таблицу URID. Идентификаторы объектов не захардкожены — программа спрашивает их у драйвера по имени.
+- **Запасной режим проверяет сам себя.** После открытия каналов отправляется один `10 03`, и без ответа адаптер честно объявляется неподдерживаемым. Открыться — ещё не значит работать: это защита от «наполовину работающей» сессии.
+
+### 🇷🇺 Известно
+- Запасной режим **не проверен на железе**: ни один адаптер без RawMode нам пока недоступен. На адаптерах, где сырой CAN работает, путь кода недостижим и ничего не меняет. Отчёты с результатом приветствуются.
+
+### 🇬🇧 Fixed
+- **`PDUCreateComLogicalLink: D-PDU error 0x01` right after the module connected.** ContiTool picked the module that **accepted a connection**, which proves nothing: another vendor's J2534 driver connects happily and only then refuses the raw CAN channel. The links are now opened inside the candidate loop, so a module counts as the right one only once communication is actually up; if it is not, the next candidate is tried.
+- **Any refusal of the raw channel is now explained in words**, naming the adapter and the code, instead of a bare `0x01` or `0x50`. Before, only `0x50` produced a readable message.
+- With a single candidate its own reason is shown instead of a summary; with several, the summary carries the last reason too.
+
+### 🇬🇧 Added
+- **A fallback for adapters without RawMode.** Some VAS 6154 / VNCI units — genuine ones included — refuse the raw CAN channel, and the refusal comes from the adapter itself on every driver. For those ContiTool now tries the ODIS-style link: one per identifier pair (`0x710/0x77A` and `0x6F0/0x6F1`), addressed through the URID table. Object ids are not hardcoded; they are asked from the driver by name.
+- **The fallback verifies itself.** Once the links are up it sends one `10 03`, and without an answer the adapter is honestly reported as unsupported. Opening is not the same as working, and a half-working session helps nobody.
+
+### 🇬🇧 Known
+- The fallback is **not hardware-verified**: no adapter without RawMode is available to us yet. On adapters where raw CAN works the code path is unreachable and changes nothing. Reports welcome.
+
 ## 2.0.1b — 2026-11-08
 
 Исправления по отчётам пользователей 2.0.1a: выбор модуля и драйвера D-PDU, удержание связи с VCI.

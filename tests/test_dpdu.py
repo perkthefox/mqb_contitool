@@ -21,11 +21,14 @@ from contitool.can.dpdu import (
     MAX_TX_IN_FLIGHT,
     RAWCAN_OBD6_14,
     DPduBus,
+    EcuUniqueRespData,
     EventItem,
     FlagData,
     ModuleData,
     ModuleItem,
+    ParamItem,
     ResultData,
+    UridTable,
 )
 from contitool.i18n import set_lang
 from test_identify import FakeGateway
@@ -67,6 +70,13 @@ class FakePduApi:
         self.connect_rc: dict[int, int] = {}  # per-module PDUModuleConnect result other than 0 / 0x01
         self.connected: list[int] = []
         self.create_rc = 0  # what PDUCreateComLogicalLink answers (0x50: the module has no such resource)
+        self.create_rc_for: dict[int, int] = {}  # per-module refusal, keyed by hMod
+        self.rawmode_ok = True  # False: the adapter refuses RawMode, as the VCI of issue #12 does
+        self.nonraw_ok = True  # False: it refuses the ODIS-style link as well
+        self.nonraw_silent = False  # True: the links open but carry nothing — the guess was wrong
+        self.nonraw_links: dict[int, dict[str, int]] = {}  # link -> ids written into its URID table
+        self.objects = {"ISO_11898_2_DWCAN": 0x10, "ISO_11898_RAW": 0x11, "HI": 0x20, "LOW": 0x21,
+                        "CP_CanPhysReqId": 0x1A, "CP_CanRespUUDTId": 0x1B}
 
     def PDUConstruct(self, *_a) -> int:  # noqa: N802 (D-PDU names)
         return 0
@@ -87,9 +97,49 @@ class FakePduApi:
             return self.connect_rc[hmod]
         return 0 if hmod in self.connect_ok else 0x01  # PDU_ERR_FCT_FAILED, as a driver whose service is down
 
+    # ---- the ODIS-style fallback an adapter without RawMode has to offer
+    def PDUGetObjectId(self, _kind, name, out) -> int:  # noqa: N802
+        oid = self.objects.get(name.decode(), 0)
+        out._obj.value = oid
+        return 0 if oid else 0x62  # PDU_ERR_ID_NOT_SUPPORTED
+
+    def PDUGetUniqueRespIdTable(self, _hmod, hcll, out) -> int:  # noqa: N802
+        vals = (C.c_uint32 * 2)(0, 0)
+        params = (ParamItem * 2)(  # indexing a ctypes array yields an int, so address the slots, not the values
+            ParamItem(0x1200, 0x1A, 0x105, 1, C.cast(vals, C.c_void_p)),
+            ParamItem(0x1200, 0x1B, 0x105, 1, C.cast(C.byref(vals, C.sizeof(C.c_uint32)), C.c_void_p)),
+        )
+        entry = (EcuUniqueRespData * 1)(EcuUniqueRespData(0, 2, C.cast(params, C.POINTER(ParamItem))))
+        table = UridTable(0x1700, 1, C.cast(entry, C.POINTER(EcuUniqueRespData)))
+        self.keep += [vals, params, entry, table, hcll]
+        out._obj.contents = table
+        return 0
+
+    def PDUSetUniqueRespIdTable(self, _hmod, hcll, table) -> int:  # noqa: N802
+        t = table._obj if hasattr(table, "_obj") else table.contents
+        entry = t.pUniqueData[0]
+        ids = {entry.pParams[i].ComParamId: C.cast(entry.pParams[i].pComParamData, C.POINTER(C.c_uint32)).contents.value
+               for i in range(entry.NumParamItems)}
+        self.nonraw_links[hcll] = {"phys": ids.get(0x1A, 0), "resp": ids.get(0x1B, 0)}
+        return 0
+
     def PDUCreateComLogicalLink(self, _hmod, rsc, resource, _tag, phcll, flag) -> int:  # noqa: N802
+        if _hmod in self.create_rc_for:
+            return self.create_rc_for[_hmod]
         if self.create_rc:
             return self.create_rc
+        if rsc is not None:  # RscData path: bus + protocol + pins, resource PDU_ID_UNDEF
+            if not self.nonraw_ok:
+                return 0x01
+            assert resource == 0xFFFFFFFE and rsc._obj.ProtocolId == self.objects["ISO_11898_RAW"]
+            h = 0x20010000 + len(self.links)
+            self.links[h] = tuple(flag._obj.pFlagData[i] for i in range(4))
+            self.params[h], self.events[h] = {}, []
+            self.nonraw_links[h] = {"phys": 0, "resp": 0}
+            phcll._obj.value = h
+            return 0
+        if not self.rawmode_ok:
+            return 0x01  # PDU_ERR_FCT_FAILED, exactly as the issue #12 adapter answers
         assert rsc is None and resource == RAWCAN_OBD6_14 and flag._obj.NumFlagBytes == 4
         h = 0x20010000 + len(self.links)
         self.links[h] = tuple(flag._obj.pFlagData[i] for i in range(4))
@@ -118,6 +168,20 @@ class FakePduApi:
     def _start_cop(self, _hmod, hcll, cop, size, data, ctrl, _tag, hcop) -> int:
         c = ctrl._obj
         assert c.TxFlag.NumFlagBytes == 4
+        if hcll in self.nonraw_links:  # fixed-id link: the payload travels alone, the ids come from its URID table
+            hcop._obj.value = self.next_cop
+            self.next_cop += 1
+            if cop != COPT_SENDRECV or not size:
+                return 0  # STARTCOMM/STOPCOMM and the receive-only primitive
+            self.tx_open.append(hcop._obj.value)
+            if self.nonraw_silent:
+                return 0
+            ids = self.nonraw_links[hcll]
+            self.gw.send(can.Message(arbitration_id=ids["phys"], data=bytes(data[:size]), is_extended_id=False))
+            while (m := self.gw.recv()) is not None:
+                if m.arbitration_id == ids["resp"]:
+                    self._result(bytes(m.data), b"\x00\x00\x00\x00", link=hcll)
+            return 0
         if hcll == self.monitor:
             assert cop == COPT_SENDRECV and (c.NumSendCycles, c.NumReceiveCycles) == (0, -1)
             assert c.NumPossibleExpectedResponses >= 1  # the exported API refuses an empty list
@@ -146,13 +210,13 @@ class FakePduApi:
         hcop._obj.value = 0
         return 0
 
-    def _result(self, raw: bytes, flags: bytes) -> None:
+    def _result(self, raw: bytes, flags: bytes, link: int | None = None) -> None:
         with self._lock:
             data, fl = (U8 * len(raw)).from_buffer_copy(raw), (U8 * 4).from_buffer_copy(flags)
             r = ResultData(FlagData(4, fl), 0, 1, FlagData(0, None), 0, 0, None, len(raw), C.cast(data, C.POINTER(U8)))
             ev = EventItem(IT_RESULT, 1, None, 0, C.cast(C.pointer(r), C.c_void_p))
             self.keep += [data, fl, r, ev]
-            self.events[self.monitor].append(ev)
+            self.events[self.monitor if link is None else link].append(ev)
 
     def PDUGetEventItem(self, *args) -> int:  # noqa: N802
         with self._lock:
@@ -288,7 +352,7 @@ def test_a_vci_that_drops_on_connect_is_retried_once(monkeypatch) -> None:
     bus.shutdown()
     api = FakePduApi()
     api.fail_connects = 2
-    with pytest.raises(can.CanOperationError):
+    with pytest.raises(can.CanError):  # an initialization failure now: no module produced a usable link
         DPduBus(dll=api)
     assert api.destructed
 
@@ -429,6 +493,79 @@ def test_a_module_failing_in_an_unexpected_way_does_not_hide_the_vci_behind_it()
     assert api.connected == [0x10000009, 0x10000001]
     assert bus.module_label == "VAS6154A" and not bus.spent
     bus.shutdown()
+
+
+def test_a_module_that_connects_but_gives_no_raw_can_is_not_the_one_we_keep() -> None:
+    """Issue #12: connecting proves nothing — a foreign driver accepts the connect and only then refuses the
+    raw-CAN resource, which reached users as a bare `PDUCreateComLogicalLink: D-PDU error 0x01`."""
+    set_lang("en")
+    api = FakePduApi()
+    api.modules = [(14, 0x10000009, b"VendorName='Volkswagen AG' ModuleName='VAS6154A-STALE'"), VAS6154]
+    api.connect_ok = {0x10000009, 0x10000001}  # both connect happily
+    api.create_rc_for = {0x10000009: 0x01}  # but only the second one has a raw CAN channel
+
+    bus = DPduBus(dll=api)
+    assert api.connected == [0x10000009, 0x10000001]
+    assert bus.module_label == "VAS6154A" and bus.hmod == 0x10000001 and not bus.spent
+    bus.shutdown()
+
+
+def test_the_last_module_refusing_raw_can_is_reported_in_words() -> None:
+    set_lang("en")
+    api = FakePduApi()
+    api.modules = [SOFTING]  # no VW VCI on this PC at all
+    api.connect_ok = {0x10000004}
+    api.create_rc = 0x01  # not only 0x50: another vendor's driver answers 0x01 here
+    with pytest.raises(can.CanError, match="VAS5054A#083600808.*raw CAN"):
+        DPduBus(dll=api)
+    assert api.destructed
+
+
+def test_an_adapter_without_rawmode_falls_back_to_fixed_id_links() -> None:
+    """Issue #12: a genuine VAS6154A refuses RawMode on every driver. Try the ODIS-style link instead, and only
+    keep it when it actually carries a 10 03 — a wrong guess must end as "not supported", not half working."""
+    set_lang("en")
+    api = FakePduApi()
+    api.rawmode_ok = False
+
+    bus = DPduBus(dll=api)
+    assert bus.nonraw and sorted(bus.nonraw) == [0x6F0, 0x710]  # both pairs opened
+    assert {v["phys"] for v in api.nonraw_links.values()} >= {0x710, 0x6F0}  # ids really written to the URID table
+    res = can_identify("", bus=bus)  # the whole UDS stack now runs over the fallback
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    bus.shutdown()
+
+
+def test_a_frame_to_an_id_the_fallback_has_no_link_for_is_refused() -> None:
+    set_lang("en")
+    api = FakePduApi()
+    api.rawmode_ok = False
+    bus = DPduBus(dll=api)
+    with pytest.raises(can.CanError, match="only on identifiers"):
+        bus.send(can.Message(arbitration_id=0x123, data=bytes(8), is_extended_id=False))
+    bus.shutdown()
+
+
+def test_a_fallback_link_that_opens_but_carries_nothing_is_refused(monkeypatch) -> None:
+    """Opening proves nothing. If 10 03 brings nothing back, the adapter is reported unsupported rather than
+    left half working — that is the whole point of verifying instead of guessing."""
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.2)
+    api = FakePduApi()
+    api.rawmode_ok = False
+    api.nonraw_silent = True
+    with pytest.raises(can.CanError, match="no raw CAN channel"):
+        DPduBus(dll=api)
+    assert api.destructed
+
+
+def test_an_adapter_that_gives_neither_rawmode_nor_the_fallback_reports_the_refusal() -> None:
+    set_lang("en")
+    api = FakePduApi()
+    api.rawmode_ok = api.nonraw_ok = False
+    with pytest.raises(can.CanError, match="no raw CAN channel"):
+        DPduBus(dll=api)
+    assert api.destructed
 
 
 def test_closing_never_pulls_the_handles_out_from_under_a_running_operation(monkeypatch) -> None:
