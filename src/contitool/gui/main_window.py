@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt, QTimer
@@ -45,6 +46,7 @@ from contitool.core import (
 )
 from contitool.gui.connection import CanConnection, ConnectionDialog, ensure_ready
 from contitool.gui.dialogs.guide import GuideDialog
+from contitool.gui.dialogs.problem_report import ProblemReportDialog
 from contitool.gui.dialogs.restore import RestoreDialog
 from contitool.gui.screens.ecu import EcuScreen
 from contitool.gui.screens.start import StartScreen
@@ -56,6 +58,7 @@ from contitool.gui.widgets.page import Dialog, TextResultDialog, button, hint, r
 from contitool.gui.worker import OperationRunner
 from contitool.gui.workspace import NAMES, Workspace
 from contitool.i18n import get_lang, set_lang, subscribe_lang_change, tr
+from contitool.report import Failure
 
 
 class MainWindow(QMainWindow):
@@ -122,6 +125,10 @@ class MainWindow(QMainWindow):
         self.conn.changed.connect(self._refresh_header)
         self.runner.operation_started.connect(self._ensure_console_visible)
         self.runner.busy_changed.connect(self._on_busy)
+        self.runner.operation_finished.connect(self._on_operation_finished)
+        self.terminal.problem.connect(self.offer_problem_report)
+        self._opened_at = time.time()
+        self._report_dlg: ProblemReportDialog | None = None
         self._unsub = subscribe_lang_change(lambda _l: self.retranslate_ui())
         self.retranslate_ui()
         self._refresh_screen()
@@ -208,9 +215,11 @@ class MainWindow(QMainWindow):
 
         self.menu_help = mb.addMenu("")
         self.act_guide = act(self.show_guide, QKeySequence.StandardKey.HelpContents)
+        self.act_problem = act(self.report_problem)
         self.act_about = act(self.show_about)
         self.act_about.setMenuRole(QAction.MenuRole.AboutRole)
         self.menu_help.addAction(self.act_guide)
+        self.menu_help.addAction(self.act_problem)
         self.menu_help.addAction(self.act_about)
 
     def _refresh_header(self) -> None:
@@ -402,6 +411,26 @@ class MainWindow(QMainWindow):
     def show_guide(self) -> None:
         run_dialog(GuideDialog(self))
 
+    def _on_operation_finished(self, ok: bool, _summary: str, _target: object) -> None:
+        if not ok and not self.runner.was_cancelled and self.runner.last_failure is not None:
+            self.offer_problem_report(self.runner.last_failure)
+
+    def report_problem(self) -> None:
+        """Help menu: about the last failed operation, or everything since the last operation started."""
+        since = self.runner.started_at or self._opened_at
+        self.offer_problem_report(self.runner.last_failure or Failure(tr("Сообщение о проблеме", "Problem report"), "", started=since))
+
+    def offer_problem_report(self, failure: Failure) -> None:
+        """Non-blocking: the log and the screen stay usable while the offer is open; a newer failure replaces it."""
+        if self._report_dlg is not None:
+            self._report_dlg.close()
+        dlg = ProblemReportDialog(self, failure, self.conn, self.console.txt_full.toPlainText())
+        dlg.setModal(False)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.destroyed.connect(lambda *_a, d=dlg: setattr(self, "_report_dlg", None) if self._report_dlg is d else None)
+        self._report_dlg = dlg
+        dlg.show()
+
     def show_about(self) -> None:
         QMessageBox.about(
             self,
@@ -472,6 +501,7 @@ class MainWindow(QMainWindow):
         self.act_mode_term.setText(tr("CAN-терминал", "CAN terminal"))
         self.menu_help.setTitle(tr("Справка", "Help"))
         self.act_guide.setText(tr("Памятка по стенду", "Bench guide"))
+        self.act_problem.setText(tr("Сообщить о проблеме…", "Report a problem…"))
         self.act_about.setText(tr("О программе", "About ContiTool"))
         self._refresh_header()
 

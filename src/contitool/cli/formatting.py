@@ -236,6 +236,22 @@ def format_startup_banner(style: Style) -> str:
                 )
             )
         ),
+        _row(
+            style.dim(
+                tr(
+                    "Не знаете, зачем это вам, или сомневаетесь в адаптере — не пользуйтесь. Лучше блок на столе.",
+                    "If you do not know why you need it or doubt your adapter, do not use it. Bench, not car.",
+                )
+            )
+        ),
+        _row(
+            style.dim(
+                tr(
+                    "В машине — на свой риск, автор не отвечает. Проблемы — в GitHub Issues, не в личку.",
+                    "In a car it is at your own risk. Problems go to GitHub Issues, not to the author's DMs.",
+                )
+            )
+        ),
         style.cyan(bot),
     ]
     return "\n".join(lines)

@@ -33,6 +33,25 @@ def create_window() -> tuple[QApplication, MainWindow]:
 
 def run_gui() -> int:
     """Launch the ContiTool Desktop GUI event loop."""
+    from contitool.gui.dialogs.disclaimer import confirm_disclaimer
+    from contitool.report import failure_from_exception
+
     app, win = create_window()
     win.show()
+    if not confirm_disclaimer(win):
+        return 0
+    reporting = False
+
+    def excepthook(exc_type, exc, tb) -> None:  # noqa: ANN001 - any error Qt slots let through: offer a report
+        nonlocal reporting
+        sys.__excepthook__(exc_type, exc, tb)
+        if reporting or not issubclass(exc_type, Exception):
+            return
+        reporting = True
+        try:
+            win.offer_problem_report(failure_from_exception(exc_type, exc, tb))
+        finally:
+            reporting = False
+
+    sys.excepthook = excepthook
     return app.exec()

@@ -6,6 +6,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import traceback
 
 from contitool import __version__
 from contitool.can import (
@@ -1215,7 +1216,23 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"\n✗ {tr('Ошибка', 'Error')}: {exc}", file=sys.stderr)
+        print(_issue_hint(), file=sys.stderr)
         return 1
+    except Exception:  # noqa: BLE001 - an unexpected error: keep the traceback, point at the issue tracker
+        traceback.print_exc()
+        print(_issue_hint(), file=sys.stderr)
+        return 1
+
+
+def _issue_hint() -> str:
+    from contitool.report import ISSUES_PAGE
+
+    return tr(
+        f"Если причина непонятна — опишите проблему в GitHub Issues: {ISSUES_PAGE}\n"
+        "Приложите журналы операции из папки contitool_runs (без дампов *.bin). В личные сообщения автору не пишите.",
+        f"If the cause is unclear, open an issue on GitHub: {ISSUES_PAGE}\n"
+        "Attach the operation logs from the contitool_runs folder (not the *.bin dumps). Please do not message the author.",
+    )
 
 
 if __name__ == "__main__":

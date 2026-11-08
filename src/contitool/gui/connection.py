@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+import time
 from typing import Any
 
 from PySide6.QtCore import QObject, QSettings, Qt, Signal
@@ -29,6 +30,7 @@ from contitool.gui.widgets.page import Dialog, button, group_label, hint, row, r
 from contitool.gui.widgets.pinout_card import PinoutCard
 from contitool.gui.worker import OperationWorker
 from contitool.i18n import tr
+from contitool.report import Failure
 
 
 BUILTIN_TERMINATION = ("dpdu", "j2534")  # VAS 6154 / VNCI and J2534 pass-thru adapters terminate CAN themselves
@@ -154,13 +156,29 @@ class ConnectionDialog(Dialog):
         self.btn_check = button(tr("Проверить связь", "Check link"), slot=self._check_link)
         self.lbl_check = hint()
         self.lbl_check.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.body.addLayout(row(self.btn_check, self.lbl_check, 0))
+        self.btn_report = _link(tr("Сообщить о проблеме…", "Report a problem…"), self._report_check)
+        self.btn_report.hide()
+        self._check_failure: Failure | None = None
+        self.body.addLayout(row(self.btn_check, self.lbl_check, 0, self.btn_report))
 
         self.chk_120ohm = QCheckBox()
         self._term_confirmed = conn.wiring_confirmed  # what the user ticked for an adapter without its own terminator
         self.chk_120ohm.setChecked(conn.wiring_confirmed)
         self.chk_120ohm.toggled.connect(self._term_toggled)
         self.body.addWidget(self.chk_120ohm)
+        self.lbl_term_help = hint(tr(
+            "Что это: на обоих концах шины CAN должно стоять по резистору 120 Ом — они гасят отражения сигнала, без "
+            "них кадры искажаются и теряются. На столе шина состоит только из шлюза и адаптера, и согласования может не "
+            "хватать: включите терминатор в адаптере (если он есть — обычно это перемычка или переключатель) или "
+            "поставьте резистор 120 Ом между CAN-H и CAN-L.<br><b>Галочка — только напоминание: ContiTool сам ничего не "
+            "проверяет и не измеряет.</b>",
+            "What this is: each end of a CAN bus needs a 120 Ω resistor — it stops signal reflections; without them frames "
+            "get corrupted and lost. On the bench the bus is just the gateway and the adapter, and that may not be "
+            "terminated enough: switch on the adapter's terminator (if it has one — usually a jumper or a switch) or fit a "
+            "120 Ω resistor between CAN-H and CAN-L.<br><b>The checkbox is only a reminder: ContiTool checks and measures "
+            "nothing itself.</b>",
+        ))
+        self.body.addWidget(self.lbl_term_help)
         self.chk_driver = QCheckBox()  # a D-PDU driver version ContiTool was not checked with
         self.chk_driver.toggled.connect(lambda *_a: self._sync())
         self.body.addWidget(self.chk_driver)
@@ -281,28 +299,23 @@ class ConnectionDialog(Dialog):
     def _picked(self) -> None:
         if self._check is None:
             self.lbl_check.clear()  # the last result was for another adapter
+            self.btn_report.hide()
         self._sync()
 
     def _term_toggled(self, on: bool) -> None:
-        if self.chk_120ohm.isEnabled():
+        if not self.chk_120ohm.isHidden():
             self._term_confirmed = on
         self._sync()
 
     def _sync(self) -> None:
         iface, port, _title = self.selection()
-        builtin = iface in BUILTIN_TERMINATION
-        self.chk_120ohm.setText(
-            tr(
-                "Включён CAN-терминатор — он встроен в этот адаптер",
-                "CAN termination is on — it is built into this adapter",
-            )
-            if builtin
-            else tr(
-                "Включён CAN-терминатор (резистор 120 Ом между Pin 19 CAN-H и Pin 9 CAN-L), питание +12 В стабильно",
-                "CAN termination is on (120 Ω resistor between Pin 19 CAN-H and Pin 9 CAN-L), +12 V supply is stable",
-            )
-        )
-        self.chk_120ohm.setEnabled(not builtin)
+        builtin = iface in BUILTIN_TERMINATION  # VAS 6154 / VNCI and J2534 terminate the bus themselves: nothing to ask
+        self.chk_120ohm.setText(tr(
+            "Включён CAN-терминатор (в адаптере или резистор 120 Ом между Pin 19 CAN-H и Pin 9 CAN-L), питание +12 В стабильно",
+            "CAN termination is on (in the adapter or a 120 Ω resistor between Pin 19 CAN-H and Pin 9 CAN-L), +12 V supply is stable",
+        ))
+        self.chk_120ohm.setVisible(not builtin)
+        self.lbl_term_help.setVisible(not builtin)
         self.chk_120ohm.blockSignals(True)
         self.chk_120ohm.setChecked(builtin or self._term_confirmed)
         self.chk_120ohm.blockSignals(False)
@@ -326,6 +339,7 @@ class ConnectionDialog(Dialog):
             "" if ok else tr("Выберите адаптер и подтвердите, что CAN-терминатор включён (и драйвер D-PDU, если спрошено)",
                              "Pick an adapter and confirm the CAN terminator is on (and the D-PDU driver, if asked)")
         )
+        self.fit_height()  # the terminator / driver texts come and go with the adapter
 
     # ---------------------------------------------------------------- link check
     def _check_link(self) -> None:
@@ -342,7 +356,13 @@ class ConnectionDialog(Dialog):
         )
         self._check.setObjectName("link-check")
         self._check.succeeded.connect(self._check_ok)
-        self._check.failed.connect(lambda msg, _tb: self._check_done(msg, "err"))
+        started = time.time()
+
+        def failed(msg: str, tb: str) -> None:
+            self._check_failure = Failure(tr("Проверка связи", "Link check"), msg, tb, started)
+            self._check_done(msg, "err")
+
+        self._check.failed.connect(failed)
         self._check.start()
         self._sync()
 
@@ -357,7 +377,14 @@ class ConnectionDialog(Dialog):
         self._check = None
         self.lbl_check.setText(text)
         set_tone(self.lbl_check, tone)
+        self.btn_report.setVisible(tone == "err" and self._check_failure is not None)
         self._sync()
+
+    def _report_check(self) -> None:
+        from contitool.gui.dialogs.problem_report import ProblemReportDialog  # it imports this module
+
+        if self._check_failure is not None:
+            run_dialog(ProblemReportDialog(self, self._check_failure, self.conn))
 
     # ---------------------------------------------------------------- folder & save
     def _show_outdir(self) -> None:

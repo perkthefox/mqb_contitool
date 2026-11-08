@@ -15,6 +15,7 @@ It is built for legitimate independent automotive diagnostics, ECU bench repair/
 - `src/contitool/`
   - `i18n.py` — Runtime bilingual localization (`ru` / `en`) with live observer callbacks.
   - `progress.py` — Thread-safe `OperationReporter` streaming step `[i/N]`, `%`, byte throughput (`KB/s`), elapsed time, `ETA`, and structured logs to both GUI and CLI.
+  - `report.py` — Problem report: zip of the program log, the operation's session files (no `*.bin`), D-PDU driver logs and an environment summary, plus a prefilled GitHub issue URL (`gui/dialogs/problem_report.py` offers it after any failure).
   - `core/dtc.py` + `core/dtc_j533.py` — gateway trouble codes: ODIS display code and RU/EN description per UDS code, status-byte groups (generated table; source texts come from ODIS-E, descriptions are our own).
   - `core/` — Offline firmware image inspection (`analyzer.py`), `CRC-16/CRC-32` & `SHA-256`/`RIPEMD-160` validation (`checksums.py`, `crypto.py`), VAG `J533` slot/pinout metadata (`constants.py`), and deterministic binary image preparation (`patcher.py`).
   - `can/` — `python-can` adapter discovery (`ports.py`), J2534 PassThru as a raw-CAN python-can bus (`j2534.py`, Windows), VAS 6154 / VNCI through the VW D-PDU API (`dpdu.py`: RawMode send link + monitor receive link, Windows), ISO-TP `0x710/0x77A` & `0x6F0/0x6F1` service loader transport (`transport.py`), verified RH850 bench loader stubs (`payloads.py`), and high-level bench workflows (`workflows.py`).

@@ -25,6 +25,8 @@
 ## Intended Use & Terms
 
 - **Scope & Intended Use**: **ContiTool** is a cross-platform Desktop GUI (**Qt 6 / PySide6**) and command-line (**CLI**) bench utility for automotive electronics technicians, independent workshops, and **VAG MQB** owners servicing **Continental J533 Gateways (`3Q0 907 530 xx`, Renesas `RH850/F1L`)**: full flash backup over CAN, ECU repair/replacement, **Component Protection** module adaptation, and **SWaP / FeC** certificate management.
+- **Do NOT use this program** if you do not know why you “need” it, cannot work with ODIS or VCTool, or have any, even the slightest doubt that the adapter, the wiring or the power supply is sound. Cheap Chinese adapters are not considered safe, even if the program “gets along” with them.
+- **Do not connect it to a working car.** Work with the gateway removed, on a bench, with a regulated power supply. In a car the gateway connects all the modules: while it sits in its bootloader, or if a write fails, the modules stop seeing each other — the car may not start or drive. Besides, the car's voltage sags during a long write, and any dip or dropout during a write leads to a brick. If you connect to a car anyway, it is your risk: the author takes no responsibility for a damaged ECU. Do not message the author about it — open a [GitHub issue](https://github.com/perkthefox/mqb_contitool/issues) and wait for an answer.
 - **FREE COMMUNITY TOOL — STRICTLY NOT FOR SALE!** Selling this software, bundling it into paid packages, or charging for access to it is strictly prohibited.
 - Provided **"AS IS"** without warranty of any kind, solely for authorized bench diagnostics, repair, and engineering research on owner-controlled hardware. The author (`PerkTheFox`) assumes zero liability for any direct or indirect damage. **Always save a verified full backup of all memory regions (`Cflash.bin` `1.5 MB`, `Uflash.bin` `32 KB`, `Dflash.bin` `64 KB`) before writing!**
 
@@ -104,9 +106,9 @@ flowchart LR
 ### Option 1 — Standalone Executables (Recommended)
 
 Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.0.1-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.0.1-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.0.1-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+- **Windows**: extract `ContiTool-v2.0.1a-windows-amd64.zip` and launch **`ContiTool.exe`**.
+- **macOS**: open `ContiTool-v2.0.1a-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
+- **Linux**: extract `ContiTool-v2.0.1a-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
 
 ### Option 2 — Run from Source (`Python 3.12+`)
 
@@ -197,6 +199,20 @@ python3 conti_cp_tool.py -l en can turnkey --port COM4 --set 5F=A1B2C3D4E5F60718
 ```
 
 ---
+
+## FAQ
+
+**The VNCI does not connect although the driver is supported.**
+Reconnect the adapter or press “Check link” a few times. On connect the D-PDU driver itself reflashes the adapter to its own version (about 30 seconds), and ContiTool takes that for a CAN link error. If that does not help, restart the computer.
+
+**My cheap Chinese adapter “works” — so I can use it?**
+No. Cheap Chinese adapters are not considered safe, even if the program “gets along” with them. A $2 adapter raises the chance of a brick by 99.9%.
+
+**The link dropped during the first read and the gateway no longer answers.**
+Switch the ignition off for a few seconds and back on; as a last resort disconnect the battery terminal. On the bench, cut the +12 V supply for a few seconds. And in general, better not play with this on a live car.
+
+**How do I report a problem?**
+After an error ContiTool offers a report itself (or Help → Report a problem…): it collects an archive with the program, operation and D-PDU driver logs and opens a new [GitHub issue](https://github.com/perkthefox/mqb_contitool/issues) with the text filled in — just drag the archive into it. Please do not message the author directly.
 
 ## Deep Technical Documentation (`docs/`)
 

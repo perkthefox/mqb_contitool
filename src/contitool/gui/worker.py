@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 import threading
+import time
 import traceback
 from typing import Any
 
@@ -18,6 +19,7 @@ from contitool.progress import (
     ProgressSnapshot,
     StepSnapshot,
 )
+from contitool.report import Failure
 
 
 class OperationWorker(QThread):
@@ -83,6 +85,8 @@ class OperationRunner(QObject):
         self._on_success: Callable[[Any], None] | None = None
         self._resolve_path: Callable[[Any], Path | None] | None = None
         self.was_cancelled = False  # how the last operation ended, for operation_finished(False, ...) listeners
+        self.started_at = 0.0  # wall clock of the last operation start
+        self.last_failure: Failure | None = None  # what the problem report is about
 
     @property
     def is_busy(self) -> bool:
@@ -108,6 +112,7 @@ class OperationRunner(QObject):
         self._active_title = title
         self._on_success = on_success
         self._resolve_path = resolve_path
+        self.started_at = time.time()
         self.busy_changed.emit(True)
         self.operation_started.emit(title)
 
@@ -151,7 +156,8 @@ class OperationRunner(QObject):
         self.operation_finished.emit(False, msg, None)
 
     @Slot(str, str)
-    def _on_worker_fail(self, msg: str, _tb: str) -> None:
+    def _on_worker_fail(self, msg: str, tb: str) -> None:
+        self.last_failure = Failure(self._active_title, msg, tb, self.started_at)
         self._cleanup_worker()
         self.was_cancelled = False
         self.operation_finished.emit(False, msg, None)

@@ -132,8 +132,8 @@ def test_closed_dialogs_are_freed(monkeypatch) -> None:
     win.close()
 
 
-def test_builtin_terminator_locks_the_checkbox(monkeypatch) -> None:
-    """VAS 6154 / VNCI (D-PDU) and J2534 adapters terminate CAN themselves: the box is ticked and cannot be cleared."""
+def test_builtin_terminator_hides_the_checkbox(monkeypatch) -> None:
+    """VAS 6154 / VNCI (D-PDU) and J2534 adapters terminate CAN themselves: the reminder is not shown at all."""
     set_lang("en")
     app, win = create_window()
     monkeypatch.setattr(connection, "discover_adapters", lambda: [
@@ -144,12 +144,13 @@ def test_builtin_terminator_locks_the_checkbox(monkeypatch) -> None:
     dlg = connection.ConnectionDialog(win.conn, win)
     _scanned(app, dlg)
     assert dlg.selection()[0] == "dpdu"
-    assert dlg.chk_120ohm.isChecked() and not dlg.chk_120ohm.isEnabled() and "built into this adapter" in dlg.chk_120ohm.text()
+    assert not dlg.chk_120ohm.isVisibleTo(dlg) and not dlg.lbl_term_help.isVisibleTo(dlg)  # nothing to confirm
     assert dlg.btn_ok.isEnabled()
 
     dlg.list.setCurrentRow(1)  # CANable: back to what the user confirmed themselves (nothing yet)
-    assert dlg.chk_120ohm.isEnabled() and not dlg.chk_120ohm.isChecked() and not dlg.btn_ok.isEnabled()
-    assert "CAN termination is on (120 Ω resistor" in dlg.chk_120ohm.text()
+    assert dlg.chk_120ohm.isVisibleTo(dlg) and not dlg.chk_120ohm.isChecked() and not dlg.btn_ok.isEnabled()
+    assert "120 Ω resistor between Pin 19 CAN-H" in dlg.chk_120ohm.text()
+    assert "only a reminder" in dlg.lbl_term_help.text()
 
     dlg.list.setCurrentRow(0)
     dlg._save()

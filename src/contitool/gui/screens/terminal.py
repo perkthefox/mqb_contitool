@@ -5,7 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSettings, QSortFilterProxyModel, Qt, QTimer
+import time
+
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSettings, QSortFilterProxyModel, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -31,6 +33,7 @@ from contitool.gui.theme import dot_icon, mono_font, set_tone
 from contitool.gui.widgets.page import Section, button, hint, run_dialog
 from contitool.gui.worker import OperationRunner
 from contitool.i18n import subscribe_lang_change, tr
+from contitool.report import Failure
 
 BITRATES = (125_000, 250_000, 500_000, 1_000_000)
 _HISTORY_MAX = 20
@@ -165,6 +168,8 @@ class _IdFilter(QSortFilterProxyModel):
 
 class TerminalScreen(QWidget):
     """Connection bar, live trace, and a send line for raw frames or UDS requests."""
+
+    problem = Signal(object)  # Failure: the link closed with an error
 
     def __init__(self, conn: CanConnection, runner: OperationRunner, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -492,6 +497,7 @@ class TerminalScreen(QWidget):
         s.opened.connect(self._on_opened)
         s.closed.connect(self._on_closed)
         self.session = s
+        self._opened_at = time.time()
         self._state, self._error = "connecting", ""
         self._apply_state()
         s.start()
@@ -532,6 +538,7 @@ class TerminalScreen(QWidget):
         self._apply_state()
         if error:
             self._say(error, "err")
+            self.problem.emit(Failure(tr("CAN-терминал", "CAN terminal"), error, started=self._opened_at))
 
     def _drain(self, session: CanSession | None = None) -> None:
         s = session or self.session

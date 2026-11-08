@@ -174,8 +174,17 @@ class Dialog(QDialog):
             ok.setDefault(True)
             self.buttons.addWidget(ok)
         self.body.addLayout(self.buttons)
+        self.ensurePolished()  # style-sheet fonts first
         self.adjustSize()  # grow to fit the content the subclass just added
         self.resize(max(self.width(), self._min_width), self.height())
+        self.fit_height()
+
+    def fit_height(self) -> None:
+        """Height for the current width. adjustSize() underestimates wrapped text, and the layout then squeezes a label
+        (its last line was cut off); call this again after showing or hiding a text."""
+        lay = self.layout()
+        if lay is not None and lay.hasHeightForWidth():
+            self.resize(self.width(), lay.totalHeightForWidth(self.width()))
 
 
 def run_dialog(dlg: QDialog) -> int:

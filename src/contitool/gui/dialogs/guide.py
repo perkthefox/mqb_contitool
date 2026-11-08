@@ -106,6 +106,38 @@ class GuideDialog(Dialog):
             )
         )
         body.addWidget(order)
+
+        body.addWidget(group_label(tr("ЧАСТЫЕ ВОПРОСЫ", "FAQ")))
+        faq = _text()
+        faq.setText(tr(
+            "<b>VNCI не подключается, хотя драйвер поддерживается.</b><br>"
+            "Переподключите адаптер или нажмите «Проверить связь» несколько раз подряд. При подключении драйвер D-PDU сам "
+            "перепрошивает адаптер под свою версию (около 30 секунд), и ContiTool принимает это за ошибку связи CAN. "
+            "Если не помогло — перезагрузите компьютер.<br><br>"
+            "<b>Дешёвый китайский адаптер «работает» — значит, им можно пользоваться?</b><br>"
+            "Нет. Любые дешёвые китайские адаптеры не считаются безопасными, даже если программа с ними «дружит». "
+            "Адаптер за 2 доллара повышает шанс окирпичивания на 99,9 %.<br><br>"
+            "<b>Во время первичного чтения связь оборвалась, и шлюз не выходит на связь.</b><br>"
+            "Выключите зажигание на несколько секунд и включите снова, в крайнем случае снимите клемму аккумулятора. "
+            "На столе — снимите питание +12 В на несколько секунд. И вообще, на живой машине лучше с этим не играть.<br><br>"
+            "<b>Как сообщить о проблеме?</b><br>"
+            "После ошибки ContiTool сам предложит отчёт (или «Справка → Сообщить о проблеме…»): соберёт архив с журналами "
+            "и откроет страницу нового issue на GitHub. В личные сообщения автору не пишите.",
+            "<b>The VNCI does not connect although the driver is supported.</b><br>"
+            "Reconnect the adapter or press “Check link” a few times. On connect the D-PDU driver itself reflashes the "
+            "adapter to its own version (about 30 seconds), and ContiTool takes that for a CAN link error. "
+            "If that does not help, restart the computer.<br><br>"
+            "<b>My cheap Chinese adapter “works” — so I can use it?</b><br>"
+            "No. Cheap Chinese adapters are not considered safe, even if the program “gets along” with them. "
+            "A $2 adapter raises the chance of a brick by 99.9%.<br><br>"
+            "<b>The link dropped during the first read and the gateway no longer answers.</b><br>"
+            "Switch the ignition off for a few seconds and back on; as a last resort disconnect the battery terminal. "
+            "On the bench, cut the +12 V supply for a few seconds. And in general, better not play with this on a live car.<br><br>"
+            "<b>How do I report a problem?</b><br>"
+            "After an error ContiTool offers a report itself (or Help → Report a problem…): it collects an archive with "
+            "the logs and opens a new issue on GitHub. Please do not message the author directly.",
+        ))
+        body.addWidget(faq)
         body.addStretch(1)
 
         self.body.addWidget(area, 1)
