@@ -114,9 +114,15 @@ def discover_adapters() -> list[FoundAdapter]:
     found = [FoundAdapter("slcan", p.device, _serial_title(p), f"SLCAN · {p.device}") for p in discover_serial_ports() if p.is_likely_can]
     from contitool.can.dpdu import discover_dpdu
 
-    for api in discover_dpdu()[:1]:  # one entry: OE and OS drive the same VCI
+    # One entry per installed D-PDU driver, ODIS-E's first: they drive the same VCI, but a machine can hold several
+    # (seen on one PC: OE 27.2.0, OS 31.1.0 and VCTOOL 30.4.0) and only one of them talks to a given adapter, so
+    # the user picks. With several around, the row has to say which is which, not three times "VAS 6154 / VNCI".
+    apis = discover_dpdu()
+    for api in apis:
         version = api["version"] or "?"
-        found.append(FoundAdapter("dpdu", api["name"], "VAS 6154 / VNCI", f"D-PDU {version} · {api['name']}",
+        variant = api["name"].split("·")[-1].strip().upper().removeprefix("VW_D_PDU_API_").removeprefix("VW_PDUAPI_")
+        title = "VAS 6154 / VNCI" if len(apis) == 1 else f"VAS 6154 / VNCI · {variant}"
+        found.append(FoundAdapter("dpdu", api["name"], title, f"D-PDU {version} · {api['name']}",
                                   driver=api["version"]))
     for d in discover_j2534():
         problem = "" if d.usable else tr(f"{d.bits}-битный драйвер — не подходит", f"{d.bits}-bit driver — not usable")

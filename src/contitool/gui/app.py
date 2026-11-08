@@ -7,6 +7,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from contitool import __version__
+from contitool.can import dpdu
 from contitool.gui.main_window import MainWindow
 from contitool.gui.theme import apply_theme, build_app_icon
 
@@ -54,4 +55,7 @@ def run_gui() -> int:
             reporting = False
 
     sys.excepthook = excepthook
+    # The VW driver wants its links stopped before the process goes away: a VCI left with a stale monitor link
+    # drops the next session about 2 s after it connects.
+    app.aboutToQuit.connect(dpdu.close_session)
     return app.exec()

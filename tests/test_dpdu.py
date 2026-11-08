@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ctypes as C
+import threading
+import time
 
 import can
 import pytest
@@ -31,10 +33,19 @@ from test_identify import FakeGateway
 U8 = C.c_uint8
 
 
+@pytest.fixture(autouse=True)
+def _no_kept_link():
+    """A kept-open D-PDU link is process-wide: never let one leak from a failed test into the next."""
+    dpdu.close_session()
+    yield
+    dpdu.close_session()
+
+
 class FakePduApi:
     """PDUAPI_VW.dll as a real VCI behaves: the monitor link gets every bus frame, our own ones flagged 00 00 00 01."""
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()  # the real DLL is called from the receive thread and the caller's at once
         self.gw = FakeGateway()
         self.links: dict[int, tuple[int, ...]] = {}
         self.params: dict[int, dict[int, int]] = {}
@@ -50,13 +61,19 @@ class FakePduApi:
         self.fail_next_send = False
         self.fail_connects = 0  # PDUConnect calls that answer PDU_ERR_COMM_PC_TO_VCI_FAILED
         self.calls: list[tuple] = []
+        # (ModuleTypeId, hMod, VendorModuleName) as PDUGetModuleIds reports them; 14 is a VW VCI, 12 a J2534 driver
+        self.modules = [(14, 0x10000001, b"VendorName='Volkswagen AG' ModuleName='VAS6154A' IP='192.168.13.69'")]
+        self.connect_ok = {0x10000001}
+        self.connect_rc: dict[int, int] = {}  # per-module PDUModuleConnect result other than 0 / 0x01
+        self.connected: list[int] = []
+        self.create_rc = 0  # what PDUCreateComLogicalLink answers (0x50: the module has no such resource)
 
     def PDUConstruct(self, *_a) -> int:  # noqa: N802 (D-PDU names)
         return 0
 
     def PDUGetModuleIds(self, out) -> int:  # noqa: N802
-        md = (ModuleData * 1)(ModuleData(14, 0x10000001, b"VAS6154A", b"", 0x8063))
-        item = ModuleItem(0x1600, 1, C.cast(md, C.POINTER(ModuleData)))
+        md = (ModuleData * len(self.modules))(*(ModuleData(t, h, n, b"", 0x8063) for t, h, n in self.modules))
+        item = ModuleItem(0x1600, len(self.modules), C.cast(md, C.POINTER(ModuleData)))
         self.keep += [md, item]
         out._obj.contents = item
         return 0
@@ -65,10 +82,14 @@ class FakePduApi:
         return 0
 
     def PDUModuleConnect(self, hmod) -> int:  # noqa: N802
-        assert hmod == 0x10000001
-        return 0
+        self.connected.append(hmod)
+        if hmod in self.connect_rc:
+            return self.connect_rc[hmod]
+        return 0 if hmod in self.connect_ok else 0x01  # PDU_ERR_FCT_FAILED, as a driver whose service is down
 
     def PDUCreateComLogicalLink(self, _hmod, rsc, resource, _tag, phcll, flag) -> int:  # noqa: N802
+        if self.create_rc:
+            return self.create_rc
         assert rsc is None and resource == RAWCAN_OBD6_14 and flag._obj.NumFlagBytes == 4
         h = 0x20010000 + len(self.links)
         self.links[h] = tuple(flag._obj.pFlagData[i] for i in range(4))
@@ -90,7 +111,11 @@ class FakePduApi:
         self.calls.append(("connect", hcll))
         return 0
 
-    def PDUStartComPrimitive(self, _hmod, hcll, cop, size, data, ctrl, _tag, hcop) -> int:  # noqa: N802
+    def PDUStartComPrimitive(self, *args) -> int:  # noqa: N802
+        with self._lock:
+            return self._start_cop(*args)
+
+    def _start_cop(self, _hmod, hcll, cop, size, data, ctrl, _tag, hcop) -> int:
         c = ctrl._obj
         assert c.TxFlag.NumFlagBytes == 4
         if hcll == self.monitor:
@@ -122,13 +147,18 @@ class FakePduApi:
         return 0
 
     def _result(self, raw: bytes, flags: bytes) -> None:
-        data, fl = (U8 * len(raw)).from_buffer_copy(raw), (U8 * 4).from_buffer_copy(flags)
-        r = ResultData(FlagData(4, fl), 0, 1, FlagData(0, None), 0, 0, None, len(raw), C.cast(data, C.POINTER(U8)))
-        ev = EventItem(IT_RESULT, 1, None, 0, C.cast(C.pointer(r), C.c_void_p))
-        self.keep += [data, fl, r, ev]
-        self.events[self.monitor].append(ev)
+        with self._lock:
+            data, fl = (U8 * len(raw)).from_buffer_copy(raw), (U8 * 4).from_buffer_copy(flags)
+            r = ResultData(FlagData(4, fl), 0, 1, FlagData(0, None), 0, 0, None, len(raw), C.cast(data, C.POINTER(U8)))
+            ev = EventItem(IT_RESULT, 1, None, 0, C.cast(C.pointer(r), C.c_void_p))
+            self.keep += [data, fl, r, ev]
+            self.events[self.monitor].append(ev)
 
-    def PDUGetEventItem(self, _hmod, hcll, out) -> int:  # noqa: N802
+    def PDUGetEventItem(self, *args) -> int:  # noqa: N802
+        with self._lock:
+            return self._get_event(*args)
+
+    def _get_event(self, _hmod, hcll, out) -> int:
         if hcll != self.monitor and self.tx_open and not self.events[hcll]:
             # the VCI finishes one send primitive per poll (it really takes ~3.5 ms each)
             cop = self.tx_open.pop(0)
@@ -228,7 +258,10 @@ def test_short_frames_keep_their_length_and_a_packed_result_is_an_error() -> Non
     assert (msg.arbitration_id, bytes(msg.data)) == (0x6F1, b"\x00\x00")
     api._result((0x6F1).to_bytes(4, "big") + bytes(5) + (0x6F1).to_bytes(4, "big") + b"\x00\x00", b"\x00\x00\x00\x00")
     with pytest.raises(can.CanOperationError, match="more than one CAN frame"):
-        bus.recv(0.1)
+        bus.recv(1.0)
+    # read_memory_area retries exactly this error, so the link has to stay alive for the retry to have a chance
+    api._result((0x6F1).to_bytes(4, "big") + b"\x11\x22", b"\x00\x00\x00\x00")
+    assert bytes(bus.recv(1.0).data) == b"\x11\x22" and not bus.spent
     bus.shutdown()
 
 
@@ -249,6 +282,9 @@ def test_a_vci_that_drops_on_connect_is_retried_once(monkeypatch) -> None:
     api.fail_connects = 1
     bus = DPduBus(dll=api)
     assert api.monitor_started
+    api.extra_rx += [(0x17F00010, bytes(8), b"\x00\x00\x00\x00")]
+    assert bus.recv(1.0) is not None  # the retry must come up fully alive, receive thread included
+    assert not bus.spent  # and be keepable: attempt 1's error must not condemn the link that worked
     bus.shutdown()
     api = FakePduApi()
     api.fail_connects = 2
@@ -267,3 +303,155 @@ def test_only_known_driver_versions_run_without_confirmation(monkeypatch) -> Non
             dpdu.check_driver(bad)
     dpdu.accepted_drivers.add("30.3.0")
     dpdu.check_driver("30.3.0")
+
+
+XHORSE = (12, 0x10000007, b"VendorName='XHorse ELECTRONICS Co.,Ltd.' ModuleName='XHorse - MVCI - 1.4.8'")
+DENSO = (12, 0x10000002, b"VendorName='DENSO CORPORATION' ModuleName='TIS Techstream VIM'")
+VAS6154 = (14, 0x10000001, b"VendorName='Volkswagen AG' ModuleName='VAS6154A' SerialNumber='6003982'")
+SOFTING = (12, 0x10000004, b"VendorName='Softing' ModuleName='VAS5054A#083600808'")
+
+
+def test_the_vw_vci_is_picked_out_of_every_j2534_driver_installed_on_the_pc() -> None:
+    """PDUGetModuleIds lists every D-PDU and J2534 driver on the PC, in an order that changes between calls.
+
+    Taking the first entry connected a foreign driver, whose own service refused on 127.0.0.1:4500 (0x01), and the
+    same PC then worked or failed depending on that order."""
+    api = FakePduApi()
+    api.modules = [XHORSE, DENSO, VAS6154, SOFTING]
+    bus = DPduBus(dll=api)
+    assert api.connected == [0x10000001]  # the foreign drivers are never even connected
+    assert bus.module_label == "VAS6154A"
+    bus.shutdown()
+
+
+def test_every_module_tried_is_named_when_none_of_them_connects() -> None:
+    set_lang("en")
+    api = FakePduApi()
+    api.modules = [VAS6154, (14, 0x10000009, b"VendorName='Volkswagen AG' ModuleName='VAS6154A-WLAN'")]
+    api.connect_ok = set()
+    with pytest.raises(can.CanError, match="VAS6154A, VAS6154A-WLAN"):
+        DPduBus(dll=api)
+    assert api.connected == [0x10000001, 0x10000009] and api.destructed
+
+
+def test_a_module_without_the_raw_can_resource_says_so() -> None:
+    """A real VAS 5054A connects and then has no 0x30030003 resource: name that, don't just report error 0x50."""
+    set_lang("en")
+    api = FakePduApi()
+    api.modules = [SOFTING]  # no VW VCI on this PC at all, so the J2534 module is the only candidate
+    api.connect_ok = {0x10000004}
+    api.create_rc = 0x50
+    with pytest.raises(can.CanError, match="VAS5054A#083600808.*raw CAN"):
+        DPduBus(dll=api)
+    assert api.destructed
+
+
+def test_one_link_serves_every_operation_and_only_one_at_a_time(monkeypatch) -> None:
+    """Reopening asks for the module list again, so the link is opened once and handed back, not closed."""
+    api = FakePduApi()
+    monkeypatch.setattr(dpdu, "DPduBus", lambda channel, bitrate: DPduBus(channel, bitrate, dll=api))
+    first = dpdu.open_session("VW_D_PDU_API_OE")
+    dpdu.release_session(first)
+    assert dpdu.open_session("VW_D_PDU_API_OE") is first and api.connected == [0x10000001]
+    assert not api.destructed
+    with pytest.raises(can.CanError, match="busy"):  # two operations at once would interleave their frames
+        dpdu.open_session("VW_D_PDU_API_OE")
+    dpdu.release_session(first)  # closing while an operation holds it is a separate test
+    dpdu.close_session()
+    assert api.destructed
+
+
+def _fake_dll(path, machine: int = 0x8664) -> None:
+    """Just enough of a PE header for the bit-width check (0x8664 = x64, 0x14C = x86)."""
+    buf = bytearray(0x80)
+    buf[:2] = b"MZ"
+    buf[0x3C:0x40] = (0x40).to_bytes(4, "little")
+    buf[0x40:0x44] = b"PE\0\0"
+    buf[0x44:0x46] = machine.to_bytes(2, "little")
+    path.write_bytes(bytes(buf))
+
+
+def test_a_driver_copied_next_to_contitool_is_offered_first_and_only_64_bit(monkeypatch, tmp_path) -> None:
+    """A PC without the driver installed (no registry key) can still use a copy put in `dpdu/`.
+
+    The VW package ships both builds; a 32-bit DLL cannot load into our process and must not shadow a working one."""
+    monkeypatch.setattr(dpdu.sys, "platform", "win32")  # the registry read then fails on its own
+    monkeypatch.setattr(dpdu, "bundled_dpdu_dir", lambda: tmp_path / "dpdu")
+    (tmp_path / "dpdu/VW_PDUAPI_OE").mkdir(parents=True)
+    (tmp_path / "dpdu/VW_PDUAPI_x86").mkdir(parents=True)
+    _fake_dll(tmp_path / "dpdu/VW_PDUAPI_OE/PDUAPI_VW.dll")
+    _fake_dll(tmp_path / "dpdu/VW_PDUAPI_x86/PDUAPI_VW.dll", machine=0x14C)
+
+    found = dpdu.discover_dpdu()
+    assert [a["name"] for a in found] == ["ContiTool · VW_PDUAPI_OE"]
+    assert found[0]["dll"].endswith("PDUAPI_VW.dll")
+
+
+def test_the_driver_the_user_picked_wins_over_a_longer_name_containing_it(monkeypatch) -> None:
+    api = FakePduApi()
+    loaded: list[str] = []
+    monkeypatch.setattr(dpdu, "discover_dpdu", lambda: [
+        {"name": "VW_D_PDU_API_OE_2", "dll": "b.dll", "version": "31.1.0"},
+        {"name": "VW_D_PDU_API_OE", "dll": "a.dll", "version": "31.1.0"},
+    ])
+    monkeypatch.setattr(dpdu.C, "WinDLL", lambda path: (loaded.append(path), api)[1], raising=False)
+    bus = DPduBus("VW_D_PDU_API_OE")
+    assert loaded == ["a.dll"] and bus.channel_key == "VW_D_PDU_API_OE"
+    bus.shutdown()
+
+
+def test_the_monitor_link_stays_drained_while_no_operation_runs(monkeypatch) -> None:
+    """The link is held open like ODIS holds it, so somebody has to keep taking the driver's events: a quiet spell
+    must not leave a backlog for the next operation to chew through before it sees its own answer."""
+    api = FakePduApi()
+    monkeypatch.setattr(dpdu, "DPduBus", lambda channel, bitrate: DPduBus(channel, bitrate, dll=api))
+    bus = dpdu.open_session("")
+    dpdu.release_session(bus)  # idle, as between two operations
+
+    api.extra_rx += [(0x17F00010, bytes(8), b"\x00\x00\x00\x00")] * 3
+    end = time.monotonic() + 2.0
+    while len(bus._pending) < 3 and time.monotonic() < end:
+        time.sleep(0.005)
+    assert len(bus._pending) == 3 and not api.events[api.monitor]  # taken with nobody polling
+
+    assert dpdu.open_session("") is bus and not bus._pending  # and the next operation starts on a clean queue
+    dpdu.close_session()
+
+
+def test_a_module_failing_in_an_unexpected_way_does_not_hide_the_vci_behind_it() -> None:
+    """Only 0x01 was tolerated before, so any other answer aborted the search at the first module."""
+    set_lang("en")
+    api = FakePduApi()
+    api.modules = [(14, 0x10000009, b"VendorName='Volkswagen AG' ModuleName='VAS6154A-WLAN'"), VAS6154]
+    api.connect_ok = {0x10000001}
+    api.connect_rc = {0x10000009: 0xA3}  # PDU_ERR_MODULE_NOT_CONNECTED, not the 0x01 we had expected
+    bus = DPduBus(dll=api)
+    assert api.connected == [0x10000009, 0x10000001]
+    assert bus.module_label == "VAS6154A" and not bus.spent
+    bus.shutdown()
+
+
+def test_closing_never_pulls_the_handles_out_from_under_a_running_operation(monkeypatch) -> None:
+    """Quitting mid-write: PDUDisconnect/PDUDestruct while a worker sits in a ctypes call takes the driver down."""
+    api = FakePduApi()
+    monkeypatch.setattr(dpdu, "CLOSE_WAIT", 0.1)
+    monkeypatch.setattr(dpdu, "DPduBus", lambda channel, bitrate: DPduBus(channel, bitrate, dll=api))
+    bus = dpdu.open_session("")  # claimed, as by a running operation
+
+    dpdu.close_session()
+    assert not api.destructed  # left alone…
+    assert bus.spent  # …but never handed to anyone again
+
+    dpdu.release_session(bus)
+    bus.shutdown()
+    assert api.destructed
+
+
+def test_a_link_that_saw_a_vci_error_is_not_handed_out_again(monkeypatch) -> None:
+    api = FakePduApi()
+    monkeypatch.setattr(dpdu, "DPduBus", lambda channel, bitrate: DPduBus(channel, bitrate, dll=api))
+    bus = dpdu.open_session("")
+    bus.spent = True  # set wherever the VCI drops a link or refuses a frame
+    dpdu.release_session(bus)
+    assert dpdu.open_session("") is not bus
+    dpdu.close_session()

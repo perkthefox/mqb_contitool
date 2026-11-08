@@ -20,6 +20,7 @@ ISSUES_PAGE = "https://github.com/perkthefox/mqb_contitool/issues"
 ISSUES_URL = f"{ISSUES_PAGE}/new"
 CAN_LOG_HEAD, CAN_LOG_TAIL = 300, 5000  # lines of a session can.jsonl: how it started and how it ended
 DRIVER_LOG_BUDGET = 40 * 1024 * 1024  # uncompressed; the D-PDU driver rotates 8 MB files, a backup writes dozens
+DRIVER_LOG_TAIL = 8 * 1024 * 1024  # a single log bigger than this goes in as its tail, never whole
 URL_BODY_LIMIT = 6000  # browsers and GitHub cut longer query strings
 
 _VIN = re.compile(r"\b([A-HJ-NPR-Z0-9]{11})[A-HJ-NPR-Z0-9]{6}\b")
@@ -71,16 +72,20 @@ def driver_log_dirs() -> list[Path]:
 
 
 def driver_logs(since: float, dirs: list[Path] | None = None) -> list[Path]:
-    """Driver logs written during the operation: the first one (how the link opened) and the newest (how it ended)."""
+    """Driver logs written during the operation, newest first: that is the one the failure is in.
+
+    The driver starts a new log on every PDUConstruct and writes every CAN frame into it, so a backup leaves
+    megabytes of trace behind. Taking the oldest of the window first once filled a report with the trace of a
+    *successful* read and nearly left out the log that held the error."""
     files = [p for d in (driver_log_dirs() if dirs is None else dirs) for p in d.glob("*.log") if p.is_file()]
     recent = sorted((p for p in files if p.stat().st_mtime >= since - 60), key=lambda p: p.stat().st_mtime)
     if not recent:
         recent = sorted(files, key=lambda p: p.stat().st_mtime)[-2:]
-    picked: list[Path] = recent[:1]
+    picked: list[Path] = recent[-1:]
     budget = DRIVER_LOG_BUDGET - sum(p.stat().st_size for p in picked)
-    for p in reversed(recent[1:]):
+    for p in reversed(recent[:-1]):
         if p.stat().st_size > budget:
-            break
+            continue  # one huge log in the middle must not drop the smaller older ones
         picked.append(p)
         budget -= p.stat().st_size
     return sorted(picked, key=lambda p: p.stat().st_mtime)
@@ -163,7 +168,13 @@ def build_report_zip(
             elif p.stat().st_size <= 20 * 1024 * 1024:
                 z.write(p, arc)
         for p in driver_logs(failure.started, driver_dirs):
-            z.write(p, f"driver_logs/{p.parent.parent.name}/{p.name}")
+            arc = f"driver_logs/{p.parent.parent.name}/{p.name}"
+            if p.stat().st_size > DRIVER_LOG_TAIL:  # one log now covers a whole run: keep its end, the error is there
+                with p.open("rb") as fh:
+                    fh.seek(-DRIVER_LOG_TAIL, os.SEEK_END)
+                    z.writestr(arc, fh.read())
+            else:
+                z.write(p, arc)
     return dest
 
 

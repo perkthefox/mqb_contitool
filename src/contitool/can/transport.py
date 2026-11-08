@@ -37,6 +37,7 @@ class J533CanLink:
         self.tx_frames = 0
         self.rx_frames = 0
         self._log_file = None
+        self._borrowed: Any = None  # a kept-open bus this link only borrows, handed back in close()
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = log_path.open("a", encoding="utf-8", buffering=1)
@@ -45,10 +46,12 @@ class J533CanLink:
             self.bus = bus
             self._owns_bus = False
         elif interface == "dpdu":
-            from contitool.can.dpdu import DPduBus
+            from contitool.can import dpdu
 
-            self.bus = DPduBus(port or "", bitrate)
-            self._owns_bus = True
+            # Kept open between operations: reopening re-rolls which D-PDU module the driver hands out.
+            self._borrowed = dpdu.open_session(port or "", bitrate)
+            self.bus = self._borrowed
+            self._owns_bus = False
         elif interface == "j2534":
             from contitool.can.j2534 import J2534Bus
 
@@ -76,6 +79,11 @@ class J533CanLink:
             except Exception:
                 pass
             self._owns_bus = False
+        if getattr(self, "_borrowed", None) is not None:
+            from contitool.can import dpdu
+
+            dpdu.release_session(self._borrowed)
+            self._borrowed = None
         if self._log_file is not None:
             try:
                 self._log_file.close()

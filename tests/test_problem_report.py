@@ -117,3 +117,32 @@ def test_disclaimer_needs_consent_and_can_stay_quiet_until_the_next_version() ->
             s.remove(disclaimer._SETTING)
         else:
             s.setValue(disclaimer._SETTING, saved)
+
+
+def test_the_newest_driver_log_is_always_collected(tmp_path: Path, monkeypatch) -> None:
+    """The error is in the log the driver wrote last; an older megabyte-sized CAN trace must not crowd it out."""
+    monkeypatch.setattr(report, "DRIVER_LOG_BUDGET", 100)
+    drv = tmp_path / "logs"
+    drv.mkdir()
+    started = time.time() - 5
+    for i, size in enumerate((200, 10, 20)):  # a huge trace of the successful read, then two small ones
+        p = drv / f"PDUAPI_VW_#{i}.log"
+        p.write_bytes(b"x" * size)
+        os.utime(p, (started + i, started + i))
+
+    assert [p.name for p in report.driver_logs(started, [drv])] == ["PDUAPI_VW_#1.log", "PDUAPI_VW_#2.log"]
+
+
+def test_an_oversized_driver_log_goes_in_as_its_tail(tmp_path: Path, monkeypatch) -> None:
+    """One log now covers a whole run and holds every CAN frame of it: zip its end, where the error is."""
+    monkeypatch.setattr(report, "DRIVER_LOG_TAIL", 64)
+    drv = tmp_path / "ProgramData/Volkswagen/VW_D_PDU_API_OE/logs"
+    drv.mkdir(parents=True)
+    (drv / "PDUAPI_VW_#9.log").write_bytes(b"old frames" * 100 + b"\nPDUModuleConnect FAILED\n")
+    failure = report.Failure("Reading the ECU memory", "boom", "Traceback …", time.time() - 1)
+    dest = report.build_report_zip(tmp_path / "r.zip", failure, report.environment("dpdu", "x", "y"),
+                                   "log\n", tmp_path / "runs", driver_dirs=[drv])
+
+    with zipfile.ZipFile(dest) as z:
+        kept = z.read("driver_logs/VW_D_PDU_API_OE/PDUAPI_VW_#9.log")
+    assert len(kept) == 64 and kept.endswith(b"PDUModuleConnect FAILED\n")

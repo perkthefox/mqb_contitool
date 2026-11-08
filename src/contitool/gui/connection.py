@@ -64,6 +64,8 @@ class CanConnection(QObject):
         )
 
     def update(self, interface: str, port: str, out_dir: Path, wiring_confirmed: bool, title: str = "") -> None:
+        if (interface, port) != (self.interface, self.port):
+            dpdu.close_session()  # a D-PDU link kept open belongs to the adapter that was picked before
         self.interface, self.port, self.out_dir, self.wiring_confirmed = interface, port, out_dir, wiring_confirmed
         self.title = title
         s = QSettings()

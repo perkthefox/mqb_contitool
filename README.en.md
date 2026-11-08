@@ -106,9 +106,9 @@ flowchart LR
 ### Option 1 — Standalone Executables (Recommended)
 
 Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.0.1a-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.0.1a-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.0.1a-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+- **Windows**: extract `ContiTool-v2.0.1b-windows-amd64.zip` and launch **`ContiTool.exe`**.
+- **macOS**: open `ContiTool-v2.0.1b-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
+- **Linux**: extract `ContiTool-v2.0.1b-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
 
 ### Option 2 — Run from Source (`Python 3.12+`)
 
@@ -210,6 +210,15 @@ No. Cheap Chinese adapters are not considered safe, even if the program “gets 
 
 **The link dropped during the first read and the gateway no longer answers.**
 Switch the ignition off for a few seconds and back on; as a last resort disconnect the battery terminal. On the bench, cut the +12 V supply for a few seconds. And in general, better not play with this on a live car.
+
+**Do I need ODIS to use a VAS 6154 / VNCI?**
+No. All you need is the **VW D-PDU API** driver, a standalone package (`VW_D-PDU_API_Win_x64` plus its VAS 6154 add-on); ODIS itself is not required.
+
+**Several D-PDU drivers are installed — which one does ContiTool use?**
+Every one it finds is its own row in the Connection window (`OE`, `OS`, `VCTOOL`…) with its version. The ODIS-E variant is picked by default, but you can choose any other and the choice is remembered. If the adapter does not answer through one driver, try another.
+
+**The driver is not installed, or may not be installed.**
+Copy the installed driver's folder into `dpdu/` next to ContiTool — it is found automatically and listed first. No registry entry and no administrator rights needed; it must be the 64-bit build. ContiTool ships no driver itself: the files are Volkswagen's, so bring your own copy.
 
 **How do I report a problem?**
 After an error ContiTool offers a report itself (or Help → Report a problem…): it collects an archive with the program, operation and D-PDU driver logs and opens a new [GitHub issue](https://github.com/perkthefox/mqb_contitool/issues) with the text filled in — just drag the archive into it. Please do not message the author directly.

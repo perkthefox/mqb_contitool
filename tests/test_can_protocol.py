@@ -153,6 +153,29 @@ def test_can_link_service_loader_entry_and_native_reader() -> None:
         assert sample == bytes(range(32))
 
 
+def test_silent_loader_entry_step_is_named_not_a_bare_timeout() -> None:
+    """Issue #1: UDS works but the ECU stays silent on stage 1 — say which step, not "No CAN frame from 0x77A"."""
+    import pytest
+
+    from contitool.i18n import set_lang
+
+    set_lang("en")
+    stage1 = build_service_loader_uds_steps()[0]
+
+    class SilentStage1(_MockGatewayBus):
+        def _handle_uds(self, req: bytes) -> None:
+            if req != stage1:
+                super()._handle_uds(req)
+
+        def send(self, message: can.Message, timeout: float = 1.0) -> None:
+            if message.arbitration_id == 0x6F0 and not self._in_loader:
+                return  # no loader runs: nobody answers on 0x6F1
+            super().send(message, timeout)
+
+    with J533CanLink("mock", bus=SilentStage1()) as link, pytest.raises(TimeoutError, match="multi-DID, stage 1"):
+        enter_ram_loader(link)
+
+
 def test_response_pending_waits_p2_star(monkeypatch) -> None:
     """The FBL repeats `7F 31 78` every ~2.5 s during an erase: the link must keep waiting (P2* is 5 s)."""
     from contitool.can import transport

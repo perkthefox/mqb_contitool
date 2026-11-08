@@ -1169,3 +1169,31 @@ def test_can_write_dflash_stops_before_erasing_when_the_protected_tail_holds_dat
     with pytest.raises(RuntimeError, match="protected DataFlash area"):
         can_write_dflash("mock0", tmp_path / "cand.bin", session_dir=tmp_path / "s_tail", skip_full_backup=True)
     assert mcu.read_phys(0xFF20DB00, 4) == synth_dflash[0xDB00:0xDB04]  # nothing was erased or programmed
+
+
+def test_writing_an_edited_backup_keeps_the_records_the_ecu_updated_itself(synth_dflash: bytes) -> None:
+    """Only the blocks the user edited are written: the gateway keeps some DataFlash records up to date itself,
+    and writing the whole edited copy rolled those back to how they were when the backup was taken."""
+    from contitool.can.workflows import merge_dflash_edits
+
+    base = synth_dflash
+    edited = bytearray(base)
+    edited[0x1000] ^= 0x0F  # what the user changed
+    current = bytearray(base)
+    current[0x2000] ^= 0xF0  # what the gateway changed by itself since the backup
+    merged, kept, conflicts = merge_dflash_edits(bytes(current), base, bytes(edited))
+
+    assert not conflicts and kept == [0x2000]
+    assert merged[0x1000:0x1040] == bytes(edited[0x1000:0x1040])  # the edit goes in
+    assert merged[0x2000:0x2040] == bytes(current[0x2000:0x2040])  # the ECU's own record stays
+    assert merged[:0x1000] == base[:0x1000] and merged[0x2040:] == base[0x2040:]  # nothing else moves
+
+    both = bytearray(edited)
+    both[0x2000] ^= 0x33  # user and ECU changed the same block differently
+    _, _, conflicts = merge_dflash_edits(bytes(current), base, bytes(both))
+    assert conflicts == [0x2000]
+
+    same = bytearray(edited)
+    same[0x2000] ^= 0xF0  # both changed it the same way: nothing to refuse
+    _, _, conflicts = merge_dflash_edits(bytes(current), base, bytes(same))
+    assert not conflicts

@@ -17,9 +17,11 @@ checked before that: only versions known to work run without an explicit confirm
 
 from __future__ import annotations
 
+import atexit
 import collections
 import ctypes as C
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -38,6 +40,9 @@ PT_UNUM32 = 0x105
 ERR_COMM_PC_TO_VCI_FAILED = 0x11  # the VCI dropped the connection (it restarts its service in ~3 s)
 ERR_EVENT_QUEUE_EMPTY = 0x71
 ERR_TX_QUEUE_FULL = 0x70
+ERR_FCT_FAILED = 0x01  # "the call failed": from PDUModuleConnect it is a module whose own service did not answer
+ERR_INVALID_PARAMETERS = 0x50
+VW_MODULE_TYPE_ID = 14  # a Volkswagen VCI (VAS 6154 / 6154A); 12 is some other vendor's J2534 driver
 VCI_RESTART_WAIT = 4.0
 # Driver versions (major.minor) that run without asking: 27.2 is verified on hardware (backup + write);
 # 31.0/31.1 is what ODIS installs today. Others reflash the VCI and need the user's explicit go-ahead.
@@ -56,6 +61,35 @@ MODULE_READY = (0x8060, 0x8063)  # MODST_READY, MODST_AVAIL
 # 1000 ms suits a log file; 10 ms hands every frame over right away (the gateway answers ~0.6 ms after a request).
 MONITOR_PARAMS = ((165, 2, 1), (163, 3, 2300), (164, 1, 10))  # CP_MonitoredChannels=CAN1, CP_DataPacketSize, CP_CollectTimeout
 CP_BAUDRATE = 126
+# The receive thread polls this fast while frames keep coming, and backs off to the second value when the bus is
+# quiet. CP_CollectTimeout above already batches for 10 ms, so a 2 ms idle poll costs nothing in latency.
+RX_POLL, RX_IDLE_POLL = 0.0005, 0.002
+# Frames waiting to be handed to a caller. A full 500 kbit/s bus is ~4000 frames/s and the largest burst we ever
+# read is one 4 KB loader chunk (512 frames), so this only ever matters if nobody reads for seconds — an idle link
+# kept open between operations. Same bound as the terminal's own trace.
+RX_QUEUE_MAX = 50_000
+
+
+CLOSE_WAIT = 3.0  # how long close_session waits for a running operation to hand the link back
+
+
+class FrameError(can.CanOperationError):
+    """A result we refuse to interpret. The read is retried (`read_memory_area` does); the link itself is fine."""
+
+
+def _is_x64_dll(path: Path) -> bool:
+    """PE machine type: the VW package ships both builds, and only a 64-bit one loads into our process."""
+    try:
+        with path.open("rb") as fh:
+            if fh.read(2) != b"MZ":
+                return False
+            fh.seek(0x3C)
+            fh.seek(int.from_bytes(fh.read(4), "little"))
+            if fh.read(4) != b"PE\0\0":
+                return False
+            return int.from_bytes(fh.read(2), "little") in (0x8664, 0xAA64)  # IMAGE_FILE_MACHINE_AMD64 / ARM64
+    except OSError:
+        return False
 
 
 class FlagData(C.Structure):
@@ -129,19 +163,39 @@ def check_driver(version: str) -> None:
         ))
 
 
+def bundled_dpdu_dir() -> Path:
+    """`dpdu/` next to the ContiTool executable (the repo root when run from source).
+
+    A D-PDU driver folder copied in there is used as it is, with no installer run and no registry entry — for a PC
+    where the driver is not installed, or where the installed one does not talk to this adapter. ContiTool ships no
+    driver itself: the files are Volkswagen's, so the user puts their own copy there."""
+    root = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[3]
+    return root / "dpdu"
+
+
 def discover_dpdu() -> list[dict[str, str]]:
-    """64-bit D-PDU APIs from the root file named in HKLM\\SOFTWARE\\D-PDU API ("Root File"); ODIS-E's first."""
+    """64-bit D-PDU APIs: whatever sits in `dpdu/` next to ContiTool first, then the installed ones from the root
+    file named in HKLM\\SOFTWARE\\D-PDU API ("Root File"), ODIS-E's first."""
     if sys.platform != "win32":
         return []
-    import winreg
-
+    folder = bundled_dpdu_dir()
+    found: list[dict[str, str]] = []
+    for dll in sorted(folder.rglob("PDUAPI*.dll")) if folder.is_dir() else []:
+        if not _is_x64_dll(dll):
+            continue  # the 32-bit build of the same package must not shadow a working 64-bit driver
+        name = f"ContiTool · {dll.parent.name}"
+        if any(a["name"] == name for a in found):  # several DLLs in one folder still need separate rows
+            name = f"{name}/{dll.stem}"
+        found.append({"name": name, "dll": str(dll), "version": dll_version(str(dll))})
     try:
+        import winreg
+
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\D-PDU API", 0,
                             winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
             root_file = str(winreg.QueryValueEx(key, "Root File")[0])
         root = ET.parse(root_file).getroot()
-    except (OSError, ET.ParseError):
-        return []
+    except (OSError, ImportError, ET.ParseError):
+        return found
     apis = []
     for node in root.iter("MVCI_PDU_API"):
         lib = node.find("LIBRARY_FILE")
@@ -149,7 +203,7 @@ def discover_dpdu() -> list[dict[str, str]]:
         dll = dll.replace("%20", " ")
         if dll and Path(dll).exists():
             apis.append({"name": node.findtext("SHORT_NAME", ""), "dll": dll, "version": dll_version(dll)})
-    return sorted(apis, key=lambda a: not a["name"].upper().endswith("_OE"))
+    return found + sorted(apis, key=lambda a: not a["name"].upper().endswith("_OE"))
 
 
 class DPduBus(can.BusABC):
@@ -157,23 +211,45 @@ class DPduBus(can.BusABC):
 
     def __init__(self, channel: str = "", bitrate: int = 500_000, *, dll: Any = None, module_wait: float = 15.0,
                  **kwargs: Any) -> None:
+        self.channel_key, self.bitrate = channel, bitrate  # what open_session matches a kept-open link against
+        self.spent = False  # a VCI or link error happened: this link must not be handed to the next operation
+        self.claimed = False
+        self.module_label = ""
         if dll is None:
             apis = [a for a in discover_dpdu() if not channel or channel.upper() in a["name"].upper()]
+            # The driver the user picked wins over one whose name merely contains it (…_OE vs …_OE_2).
+            apis = [a for a in apis if a["name"].upper() == channel.upper()] or apis
             if not apis:
-                raise RuntimeError(tr("D-PDU API (VAS 6154 / VNCI) не найден: установите драйвер VAS 6154 из ODIS.",
-                                      "No D-PDU API (VAS 6154 / VNCI) found: install the VAS 6154 driver from ODIS."))
+                raise RuntimeError(tr(
+                    "D-PDU API (VAS 6154 / VNCI) не найден. Поставьте драйвер «VW D-PDU API» (отдельный пакет, "
+                    "ODIS для него не нужен) или положите свою копию его папки в dpdu/ рядом с ContiTool.",
+                    "No D-PDU API (VAS 6154 / VNCI) found. Install the \"VW D-PDU API\" driver (a standalone package, "
+                    "it does not need ODIS) or copy your own copy of its folder into dpdu/ next to ContiTool.",
+                ))
             channel = apis[0]["name"]
             check_driver(apis[0]["version"])
-            dll = C.WinDLL(apis[0]["dll"])  # type: ignore[attr-defined]
+            try:
+                dll = C.WinDLL(apis[0]["dll"])  # type: ignore[attr-defined]
+            except OSError as exc:  # a 32-bit driver gives a bare "[WinError 193] not a valid Win32 application"
+                raise can.CanInitializationError(tr(
+                    f"Драйвер D-PDU не загрузился: {apis[0]['dll']} ({exc}). Нужна 64-разрядная версия "
+                    "(VW_D-PDU_API_Win_x64), 32-разрядная не подходит.",
+                    f"The D-PDU driver did not load: {apis[0]['dll']} ({exc}). It must be the 64-bit build "
+                    "(VW_D-PDU_API_Win_x64); a 32-bit one cannot be used.",
+                )) from exc
         self._dll = dll
-        self._pending: collections.deque[can.Message] = collections.deque()
+        self._pending: collections.deque[can.Message] = collections.deque(maxlen=RX_QUEUE_MAX)
         self._tx_in_flight: set[int] = set()
         self.hmod = self.h_rx = self.h_tx = self._mon_cop = 0
         self._tx_started = False
+        self._stop = threading.Event()
+        self._rx_thread: threading.Thread | None = None
+        self._rx_error: BaseException | None = None
         for attempt in (1, 2):
             self._call("PDUConstruct", None, None)
             try:
                 self._open(bitrate, module_wait)
+                self.spent = False  # a failed first attempt set it; this link is healthy and may be kept
                 break
             except can.CanError as exc:
                 self._teardown()
@@ -185,43 +261,131 @@ class DPduBus(can.BusABC):
                 raise
         self.channel_info = f"D-PDU {channel}"
         super().__init__(channel=channel, **kwargs)
+        self._stop.clear()  # a first attempt that failed went through _teardown, which sets it
+        self._rx_thread = threading.Thread(target=self._rx_loop, name="dpdu-rx", daemon=True)
+        self._rx_thread.start()
 
     def _open(self, bitrate: int, module_wait: float) -> None:
-        self.hmod = self._find_module(module_wait)
-        self._call("PDUModuleConnect", self.hmod)
+        self._connect_module(module_wait)
         self.h_rx = self._open_monitor(bitrate)
         self.h_tx = self._create((0x80, 0, 0, 0))
         self._call("PDUConnect", self.hmod, self.h_tx)
         self._start(self.h_tx, COPT_STARTCOMM, b"", 0, 0)
         self._tx_started = True
 
+    # ------------------------------------------------------------------ receiving
+    def _rx_loop(self) -> None:
+        """Keep the monitor link drained for as long as the link is open.
+
+        The driver queues every frame as an event on the logical link and waits for its owner to take it — ODIS
+        hands it a callback for this, which is why its own log complains that ours is NULL. Draining only while an
+        operation runs was fine while the link was closed in between; with the link kept open, a quiet period let
+        the queue grow and the next operation had to chew through stale frames before its own answer. This thread
+        owns the monitor link; the send link stays with the calling thread, which waits for each frame itself."""
+        while not self._stop.is_set():
+            try:
+                busy = self._drain(self.h_rx)
+            except FrameError as exc:
+                # One result we would not interpret. The caller retries the read, so the link must stay up.
+                self._rx_error, busy = exc, True
+            except BaseException as exc:  # noqa: BLE001 - the link died; whoever asks next gets told
+                self._rx_error = exc
+                self.spent = True
+                return
+            self._stop.wait(RX_POLL if busy else RX_IDLE_POLL)
+
+    def _check_rx(self) -> None:
+        """Re-raise, in the caller's thread, whatever ended the receive thread."""
+        if self._rx_error is not None:
+            err, self._rx_error = self._rx_error, None
+            raise err
+
     # ------------------------------------------------------------------ driver calls
     def _call(self, fn: str, *args: Any, also_ok: tuple[int, ...] = ()) -> int:
         rc = getattr(self._dll, fn)(*args)
         if rc not in (0, ERR_EVENT_QUEUE_EMPTY, *also_ok):
+            self.spent = True
             raise can.CanOperationError(f"{fn}: D-PDU error 0x{rc:02X}", error_code=rc)
         return rc
 
-    def _find_module(self, wait: float) -> int:
+    @staticmethod
+    def _label(vendor_module_name: bytes | None) -> str:
+        """`VendorName='X' ModuleName='Y' SerialNumber=…` → "Y", whatever the driver puts around it."""
+        raw = (vendor_module_name or b"").decode("latin-1", "replace")
+        _, mark, tail = raw.partition("ModuleName='")
+        return tail.split("'", 1)[0] if mark else (raw.strip() or "?")
+
+    def _modules(self, wait: float) -> list[tuple[int, str]]:
+        """Ready modules as (hMod, name), VW VCIs first — never just the one the driver happens to list first.
+
+        PDUGetModuleIds returns every D-PDU and J2534 driver installed on the PC, in an order that changes between
+        calls: a user with 8 modules got them back as 7,5,2,3,1,4,6,8 with the VAS6154A fifth. Connecting the first
+        one reached another vendor's J2534 service on 127.0.0.1:4500, which refused it (PDU_ERR_FCT_FAILED), so the
+        same PC worked or failed depending on the order. Modules of other vendors are tried only when no VW VCI is
+        there at all: our raw-CAN resource is a VAS 6154 one, so for them a clear error is the best outcome."""
         end = time.monotonic() + wait
         while True:
             items = C.POINTER(ModuleItem)()
             self._call("PDUGetModuleIds", C.byref(items))
-            ready = []
+            vw: list[tuple[int, str]] = []
+            other: list[tuple[int, str]] = []
             if items:
-                ready = [items.contents.pModuleData[i].hMod for i in range(items.contents.NumEntries)
-                         if items.contents.pModuleData[i].ModuleStatus in MODULE_READY]
+                for i in range(items.contents.NumEntries):
+                    m = items.contents.pModuleData[i]
+                    if m.ModuleStatus not in MODULE_READY:
+                        continue
+                    raw = (m.pVendorModuleName or b"").decode("latin-1", "replace")
+                    entry = (m.hMod, self._label(m.pVendorModuleName))
+                    (vw if m.ModuleTypeId == VW_MODULE_TYPE_ID or "Volkswagen" in raw else other).append(entry)
                 self._dll.PDUDestroyItem(items)
-            if ready:
-                return ready[0]
+            if vw or other:
+                return vw or other
             if time.monotonic() > end:
                 raise can.CanInitializationError(tr("VAS 6154 / VNCI не найден: подключён ли он и закрыт ли ODIS?",
                                                     "VAS 6154 / VNCI not found: is it plugged in and ODIS closed?"))
             time.sleep(0.5)
 
+    def _connect_module(self, wait: float) -> None:
+        """Connect the first module that accepts it, so one unreachable driver cannot hide the VCI behind itself."""
+        tried: list[str] = []
+        failure = ERR_FCT_FAILED
+        for hmod, name in self._modules(wait):
+            self.hmod = hmod
+            try:
+                if self._call("PDUModuleConnect", hmod, also_ok=(ERR_FCT_FAILED,)) == 0:
+                    self.module_label = name
+                    return
+            except can.CanError as exc:
+                # Whatever this module answered, the next one still gets its turn — otherwise one driver that
+                # fails in an unexpected way keeps hiding the VCI listed behind it.
+                failure = exc.error_code or failure
+                self.spent = False
+            self._dll.PDUModuleDisconnect(hmod)  # the API holds the failed attempt open otherwise
+            self.hmod = 0
+            tried.append(name)
+        raise can.CanInitializationError(
+            tr(
+                f"Ни один модуль D-PDU не принял подключение (пробовали: {', '.join(tried)}). Включите VCI и "
+                "закройте ODIS; если в списке адаптеров есть другой драйвер D-PDU, выберите его.",
+                f"No D-PDU module accepted the connection (tried: {', '.join(tried)}). Switch the VCI on and close "
+                "ODIS; if the adapter list offers another D-PDU driver, pick that one.",
+            ),
+            error_code=failure,  # a VCI that dropped the link (0x11) still gets the one retry __init__ does
+        )
+
     def _create(self, flags: tuple[int, int, int, int]) -> int:
         h, fl = U32(0), (U8 * 4)(*flags)
-        self._call("PDUCreateComLogicalLink", self.hmod, None, RAWCAN_OBD6_14, None, C.byref(h), C.byref(FlagData(4, fl)))
+        if self._call("PDUCreateComLogicalLink", self.hmod, None, RAWCAN_OBD6_14, None, C.byref(h),
+                      C.byref(FlagData(4, fl)), also_ok=(ERR_INVALID_PARAMETERS,)):
+            raise can.CanInitializationError(
+                tr(
+                    f"Модуль «{self.module_label}» не даёт сырой канал CAN: ресурс 0x{RAWCAN_OBD6_14:08X} есть "
+                    "только у VAS 6154 / VNCI. Для другого адаптера выберите в списке J2534.",
+                    f"Module “{self.module_label}” gives no raw CAN channel: resource 0x{RAWCAN_OBD6_14:08X} exists "
+                    "only on a VAS 6154 / VNCI. For another adapter pick J2534 in the list instead.",
+                ),
+                error_code=ERR_INVALID_PARAMETERS,
+            )
         return h.value
 
     def _set_u32(self, hcll: int, param_id: int, cls: int, value: int) -> None:
@@ -266,6 +430,7 @@ class DPduBus(can.BusABC):
             try:
                 ev = item.contents
                 if ev.ItemType == IT_STATUS and ev.pData and C.cast(ev.pData, C.POINTER(U32)).contents.value == CLLST_OFFLINE:
+                    self.spent = True
                     raise can.CanOperationError(tr("VCI закрыл канал D-PDU", "The VCI closed the D-PDU link"))
                 if hcll == self.h_rx and ev.ItemType == IT_RESULT and ev.pData:
                     self._take_result(C.cast(ev.pData, C.POINTER(ResultData)).contents)
@@ -275,6 +440,7 @@ class DPduBus(can.BusABC):
                 elif hcll == self.h_tx and ev.ItemType == IT_ERROR:
                     # a frame the VCI could not send (e.g. its queue overflowed): fail now, not by a later timeout
                     self._tx_in_flight.discard(ev.hCop)
+                    self.spent = True
                     raise can.CanOperationError(tr("VCI не смог отправить кадр", "The VCI could not send a frame"))
             finally:
                 self._dll.PDUDestroyItem(item)
@@ -290,7 +456,7 @@ class DPduBus(can.BusABC):
         if len(raw) < 4:
             return
         if len(raw) > 12:
-            raise can.CanOperationError(
+            raise FrameError(
                 tr(f"D-PDU: неожиданный результат {len(raw)} Б (больше одного кадра CAN)",
                    f"D-PDU: unexpected {len(raw)}-byte result (more than one CAN frame)")
             )
@@ -304,12 +470,10 @@ class DPduBus(can.BusABC):
     def _recv_internal(self, timeout: float | None) -> tuple[can.Message | None, bool]:
         end = None if timeout is None else time.monotonic() + timeout
         while not self._pending:
-            self._drain(self.h_tx)  # keeps the send link's status events from piling up
-            if self._drain(self.h_rx) or self._pending:
-                continue
+            self._check_rx()  # the receive thread fills the queue; it only stops on a dead link
             if end is not None and time.monotonic() >= end:
                 return None, False
-            time.sleep(0.0005)
+            time.sleep(RX_POLL)
         return self._pending.popleft(), False
 
     def send(self, msg: can.Message, timeout: float | None = None) -> None:
@@ -318,6 +482,7 @@ class DPduBus(can.BusABC):
         flag = (0, 0, 1 if msg.is_extended_id else 0, 0)
         end = time.monotonic() + (2.0 if timeout is None else timeout)
         while True:
+            self._check_rx()
             self._drain(self.h_tx)
             if len(self._tx_in_flight) < MAX_TX_IN_FLIGHT:
                 rc, hcop = self._start(self.h_tx, COPT_SENDRECV, payload, 1, 0, tx_flag=flag,
@@ -326,6 +491,7 @@ class DPduBus(can.BusABC):
                     self._tx_in_flight.add(hcop)
                     return
             if time.monotonic() > end:
+                self.spent = True
                 raise can.CanOperationError(tr("D-PDU: очередь отправки VCI переполнена", "D-PDU: the VCI send queue is full"))
             time.sleep(0.0005)
 
@@ -350,6 +516,10 @@ class DPduBus(can.BusABC):
             self._mon_cop = 0
 
     def _teardown(self) -> None:
+        self._stop.set()  # before the links go: the receive thread must not poll a handle that is being destroyed
+        if self._rx_thread is not None:
+            self._rx_thread.join(timeout=2.0)
+            self._rx_thread = None
         self._stop_links()
         for h in (self.h_rx, self.h_tx):
             if h:
@@ -364,8 +534,71 @@ class DPduBus(can.BusABC):
         self.hmod = self.h_rx = self.h_tx = 0
         self._tx_in_flight.clear()
 
+    def claim(self) -> None:
+        """Take the kept-open link for one operation: two at once would interleave their frames."""
+        if self.claimed:
+            raise can.CanOperationError(tr("Адаптер D-PDU занят другой операцией",
+                                           "The D-PDU adapter is busy with another operation"))
+        self.claimed = True
+        try:
+            self._check_rx()  # the link may have died while no operation was using it
+        except BaseException:  # noqa: BLE001 - `spent` is set, so open_session opens a fresh link instead
+            pass
+        self._pending.clear()  # bus traffic recorded while nobody was asking for it
+
     def shutdown(self) -> None:
         if self._is_shutdown:
             return
         super().shutdown()
         self._teardown()
+
+
+# ------------------------------------------------------------------ the one kept-open link of this process
+_session: DPduBus | None = None
+
+
+def open_session(channel: str = "", bitrate: int = 500_000) -> DPduBus:
+    """The process's D-PDU link, opened once and kept open between operations.
+
+    Opening asks the driver for its module list again, and that list comes back in a different order every time, so
+    closing the link after each operation re-rolled which module gets connected — hence reports of "works only
+    after a restart" and "works only while the CAN monitor is open". The driver also spends seconds enumerating its
+    own log files on each PDUConstruct. `release_session()` hands the link back, `close_session()` really closes it."""
+    global _session
+    live = _session
+    if live is not None and not live.spent and (live.channel_key, live.bitrate) == (channel, bitrate):
+        live.claim()  # which also notices a link that died while it was idle
+        if not live.spent:
+            return live
+    close_session()
+    bus = DPduBus(channel, bitrate)
+    bus.claim()
+    _session = bus
+    return bus
+
+
+def release_session(bus: DPduBus) -> None:
+    """An operation finished with the link it borrowed; the next one reuses it."""
+    bus.claimed = False
+
+
+def close_session() -> None:
+    """Really close the kept link: the adapter changed, or the program is quitting.
+
+    An operation can still hold the link — the user may quit in the middle of a flash write. Destroying the
+    driver's handles under a worker thread that sits inside a ctypes call takes the driver down with it, so wait
+    for the operation and, if it will not let go, leave its handles alone and let the process exit drop them."""
+    global _session
+    bus, _session = _session, None
+    if bus is None:
+        return
+    end = time.monotonic() + CLOSE_WAIT
+    while bus.claimed and time.monotonic() < end:
+        time.sleep(0.05)
+    if bus.claimed:
+        bus.spent = True  # nobody may hand this link out again, but nobody pulls it out from under the operation
+        return
+    bus.shutdown()
+
+
+atexit.register(close_session)  # a CLI run or a crash must not leave the VCI with a live monitor primitive

@@ -1726,6 +1726,7 @@ class EcuScreen(QWidget):
         cf_path = self.ws.path("cflash") if "cflash" in pending_kinds else None
         df_path = self.ws.path("dflash") if "dflash" in pending_kinds else None
         cf_orig = self.ws.original.get("cflash")
+        df_orig = self.ws.original.get("dflash")  # the backup the edits were made on: only the edits are written
         check_swap = df_path is not None and self._swap_area_changed()
 
         def task(rep: Any) -> dict[str, Any]:
@@ -1751,6 +1752,7 @@ class EcuScreen(QWidget):
                 out["dflash"] = can_write_dflash(
                     port,
                     df_path,
+                    base_dflash=df_orig.read_bytes() if df_orig is not None else None,
                     interface=iface,
                     session_dir=sdir / "dflash",
                     skip_full_backup=did_backup,

@@ -148,6 +148,14 @@ def _probe_beacon_in_loader(link: J533CanLink, reporter: OperationReporter) -> s
     return beacon_bytes.decode("ascii")
 
 
+STAGE1_SILENT = (  # (ru, en): the language can change while the app runs
+    "Блок не ответил на шаге входа в заводской RAM-Loader (multi-DID, этап 1). На предыдущие запросы он ответил, "
+    "значит связь есть, но чтение памяти по CAN на этом блоке не получилось. Сообщите о проблеме и приложите отчёт.",
+    "The ECU did not answer a step of the factory RAM-Loader entry (multi-DID, stage 1). It answered the requests "
+    "before it, so the link works, but reading memory over CAN did not succeed on this ECU. Please report it with the archive.",
+)
+
+
 def _enter_ram_loader_once(link: J533CanLink, reporter: OperationReporter) -> dict[str, Any]:
     """Execute the verified multi-DID UDS staging sequence to enter the 0x6F0 RAM-loader."""
     stage1, stage2, trigger = build_service_loader_uds_steps()
@@ -170,7 +178,10 @@ def _enter_ram_loader_once(link: J533CanLink, reporter: OperationReporter) -> di
     reporter.can_log(tr("UDS 27 11 + multi-DID 0x22 Stage 1/2 -> Подготовка дескриптора 0x0100120E", "UDS 27 11 + multi-DID 0x22 Stage 1/2 -> Staging descriptor 0x0100120E"))
     info["seed"] = link.request_uds(b"\x27\x11", 0x67, timeout=2.0).hex()
     info["write_0410_05"] = link.request_uds(bytes.fromhex("2e041005"), 0x6E, timeout=2.0).hex()
-    resp1 = link.request_uds(stage1, 0x62, timeout=3.0)
+    try:
+        resp1 = link.request_uds(stage1, 0x62, timeout=3.0)
+    except TimeoutError:
+        raise TimeoutError(tr(*STAGE1_SILENT)) from None
     if len(resp1) != 338 or resp1[-3:] != bytes.fromhex("041005"):
         raise RuntimeError(f"Unexpected multi-DID stage 1 response ({len(resp1)} bytes)")
     info["stage1_length"] = len(resp1)
@@ -218,8 +229,8 @@ def enter_ram_loader(
             try:
                 reporter.info(
                     tr(
-                        "Шлюз не ответил на 10 03 — проверяем, не активен ли уже заводской RAM-Loader (0x6F0)…",
-                        "No UDS 10 03 reply — checking if factory RAM-Loader (0x6F0) is already active…",
+                        "Проверяем, не активен ли уже заводской RAM-Loader (0x6F0)…",
+                        "Checking whether the factory RAM-Loader (0x6F0) is already active…",
                     )
                 )
                 beacon = _probe_beacon_in_loader(link, reporter)
@@ -499,6 +510,9 @@ ECU_IDENT_DIDS: tuple[tuple[int, str, str], ...] = (
     (0xF187, "Номер детали", "Part number"),
     (0xF191, "Номер оборудования", "Hardware number"),
     (0xF189, "Версия ПО", "Software version"),
+    # Boot software (FBL) identification: the RAM-loader entry is staged inside the FBL, so this is the version
+    # that decides whether it works. An ODIS recovery flash can change it without touching F189.
+    (0xF180, "Версия загрузчика", "Boot software version"),
     (0xF1A3, "Версия оборудования", "Hardware version"),
     (0xF197, "Система", "System name"),
     (0xF18C, "Серийный номер", "Serial number"),
@@ -1168,11 +1182,33 @@ def _validate_dflash_candidate_blank_state(raw_cand: bytes) -> None:
         )
 
 
+def merge_dflash_edits(current: bytes, base: bytes, edited: bytes) -> tuple[bytes, list[int], list[int]]:
+    """Put only the blocks the user changed (`edited` vs the `base` backup they were made on) onto what the ECU holds now.
+
+    The gateway keeps some DataFlash records up to date itself (seen: 0xF040/0xF080 changed between a backup and a
+    write 12 minutes later). Writing the whole edited copy rolled those back to the backup's state.
+    Returns (image to write, blocks the ECU changed itself and that stay as they are, blocks both changed)."""
+    out = bytearray(current)
+    kept: list[int] = []
+    conflicts: list[int] = []
+    for off in range(0, DFLASH_SIZE, DFLASH_BLOCK_SIZE):
+        blk = slice(off, off + DFLASH_BLOCK_SIZE)
+        user, ecu = edited[blk] != base[blk], current[blk] != base[blk]
+        if user and ecu and edited[blk] != current[blk]:
+            conflicts.append(off)
+        elif user:
+            out[blk] = edited[blk]
+        elif ecu:
+            kept.append(off)
+    return bytes(out), kept, conflicts
+
+
 def can_write_dflash(
     port: str,
     candidate_dflash: bytes | Path,
     *,
     expected_before_dflash: bytes | None = None,
+    base_dflash: bytes | None = None,
     full_rewrite: bool = False,
     allow_icus_tail: bool = False,
     interface: str = "slcan",
@@ -1243,6 +1279,24 @@ def can_write_dflash(
                         "Input base DataFlash differs from physical gateway DataFlash! Write refused for safety.",
                     )
                 )
+
+            if base_dflash is not None:  # an edited copy of a backup: write the edits, keep what the ECU changed since
+                raw_cand, kept, conflicts = merge_dflash_edits(current_df, base_dflash, raw_cand)
+                result["kept_ecu_blocks"] = [f"0x{off:04X}" for off in kept]
+                if conflicts:
+                    raise RuntimeError(tr(
+                        "После бэкапа блок сам изменил те же блоки DataFlash, что и вы: "
+                        f"{', '.join(f'0x{o:04X}' for o in conflicts)}. Запись остановлена до первой команды стирания: "
+                        "снимите свежий бэкап и внесите правки в него.",
+                        "Since the backup the ECU itself changed the same DataFlash blocks you edited: "
+                        f"{', '.join(f'0x{o:04X}' for o in conflicts)}. Write stopped before any erase command: "
+                        "take a fresh backup and make your edits on it.",
+                    ))
+                if kept:
+                    reporter.info(tr(
+                        f"Блок сам изменил после бэкапа {', '.join(result['kept_ecu_blocks'])} — эти блоки остаются как в блоке.",
+                        f"The ECU changed {', '.join(result['kept_ecu_blocks'])} itself since the backup — these stay as the ECU has them.",
+                    ))
 
             tail = slice(DFLASH_ICUS_RESERVED_OFFSET, DFLASH_SIZE)
             if not allow_icus_tail and current_df[tail] != raw_cand[tail]:
