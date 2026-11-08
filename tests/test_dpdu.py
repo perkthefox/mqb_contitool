@@ -8,9 +8,11 @@ import can
 import pytest
 
 from contitool.can import can_identify
+from contitool.can import dpdu
 from contitool.can.dpdu import (
     COPT_SENDRECV,
     COPT_STARTCOMM,
+    COPT_STOPCOMM,
     IT_ERROR,
     IT_RESULT,
     IT_STATUS,
@@ -46,6 +48,8 @@ class FakePduApi:
         self.tx_open: list[int] = []  # send primitives the "VCI" has not finished yet
         self.max_open = 0
         self.fail_next_send = False
+        self.fail_connects = 0  # PDUConnect calls that answer PDU_ERR_COMM_PC_TO_VCI_FAILED
+        self.calls: list[tuple] = []
 
     def PDUConstruct(self, *_a) -> int:  # noqa: N802 (D-PDU names)
         return 0
@@ -79,7 +83,11 @@ class FakePduApi:
         self.params[hcll][p.ComParamId] = C.cast(p.pComParamData, C.POINTER(C.c_uint32)).contents.value
         return 0
 
-    def PDUConnect(self, *_a) -> int:  # noqa: N802
+    def PDUConnect(self, _hmod, hcll) -> int:  # noqa: N802
+        if self.fail_connects:
+            self.fail_connects -= 1
+            return 0x11
+        self.calls.append(("connect", hcll))
         return 0
 
     def PDUStartComPrimitive(self, _hmod, hcll, cop, size, data, ctrl, _tag, hcop) -> int:  # noqa: N802
@@ -89,8 +97,16 @@ class FakePduApi:
             assert cop == COPT_SENDRECV and (c.NumSendCycles, c.NumReceiveCycles) == (0, -1)
             assert c.NumPossibleExpectedResponses >= 1  # the exported API refuses an empty list
             self.monitor_started = True
-        elif cop == COPT_STARTCOMM:
+            hcop._obj.value = 0x01
+            return 0
+        elif cop in (COPT_STARTCOMM, COPT_STOPCOMM):
             assert (c.NumSendCycles, c.NumReceiveCycles) == (0, 0)  # 1 makes the VCI send an empty frame
+            self.calls.append(("stopcomm" if cop == COPT_STOPCOMM else "startcomm", hcll))
+            if cop == COPT_STOPCOMM:
+                hcop._obj.value = self.next_cop
+                self.tx_open.append(self.next_cop)
+                self.next_cop += 1
+                return 0
         else:
             hcop._obj.value = self.next_cop
             self.tx_open.append(self.next_cop)
@@ -131,7 +147,12 @@ class FakePduApi:
         out._obj.contents = self.events[hcll].pop(0)
         return 0
 
-    def PDUDisconnect(self, *_a) -> int:  # noqa: N802
+    def PDUCancelComPrimitive(self, _hmod, hcll, hcop) -> int:  # noqa: N802
+        self.calls.append(("cancel", hcll, hcop))
+        return 0
+
+    def PDUDisconnect(self, _hmod, hcll) -> int:  # noqa: N802
+        self.calls.append(("disconnect", hcll))
         return 0
 
     def PDUDestroyComLogicalLink(self, *_a) -> int:  # noqa: N802
@@ -209,3 +230,40 @@ def test_short_frames_keep_their_length_and_a_packed_result_is_an_error() -> Non
     with pytest.raises(can.CanOperationError, match="more than one CAN frame"):
         bus.recv(0.1)
     bus.shutdown()
+
+
+def test_close_stops_the_send_link_and_cancels_the_monitor_before_disconnecting() -> None:
+    """Driver 30.x: without STOPCOMM / cancel the next session's monitor PDUConnect dropped the VCI every second time."""
+    api = FakePduApi()
+    bus = DPduBus(dll=api)
+    tx = next(h for h, f in api.links.items() if f == (0x80, 0, 0, 0))
+    api.calls.clear()
+    bus.shutdown()
+    assert api.calls == [("stopcomm", tx), ("cancel", api.monitor, 0x01), ("disconnect", api.monitor), ("disconnect", tx)]
+    assert api.destructed
+
+
+def test_a_vci_that_drops_on_connect_is_retried_once(monkeypatch) -> None:
+    monkeypatch.setattr(dpdu, "VCI_RESTART_WAIT", 0)
+    api = FakePduApi()
+    api.fail_connects = 1
+    bus = DPduBus(dll=api)
+    assert api.monitor_started
+    bus.shutdown()
+    api = FakePduApi()
+    api.fail_connects = 2
+    with pytest.raises(can.CanOperationError):
+        DPduBus(dll=api)
+    assert api.destructed
+
+
+def test_only_known_driver_versions_run_without_confirmation(monkeypatch) -> None:
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "accepted_drivers", set())
+    for ok in ("27.2.0", "31.0.0", "31.1.2"):
+        dpdu.check_driver(ok)
+    for bad in ("30.3.0", "34.0.0", ""):
+        with pytest.raises(can.CanInitializationError, match="not verified"):
+            dpdu.check_driver(bad)
+    dpdu.accepted_drivers.add("30.3.0")
+    dpdu.check_driver("30.3.0")

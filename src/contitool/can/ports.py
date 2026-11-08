@@ -93,6 +93,7 @@ class FoundAdapter:
     title: str
     detail: str
     problem: str = ""
+    driver: str = ""  # D-PDU driver version, checked before connecting
 
 
 _DETECTED_NAMES = {"pcan": "PEAK PCAN-USB", "kvaser": "Kvaser", "vector": "Vector", "socketcan": "SocketCAN"}
@@ -114,7 +115,9 @@ def discover_adapters() -> list[FoundAdapter]:
     from contitool.can.dpdu import discover_dpdu
 
     for api in discover_dpdu()[:1]:  # one entry: OE and OS drive the same VCI
-        found.append(FoundAdapter("dpdu", api["name"], "VAS 6154 / VNCI", f"D-PDU · {api['name']}"))
+        version = api["version"] or "?"
+        found.append(FoundAdapter("dpdu", api["name"], "VAS 6154 / VNCI", f"D-PDU {version} · {api['name']}",
+                                  driver=api["version"]))
     for d in discover_j2534():
         problem = "" if d.usable else tr(f"{d.bits}-битный драйвер — не подходит", f"{d.bits}-bit driver — not usable")
         found.append(FoundAdapter("j2534", d.name, d.name, " · ".join(filter(None, ("J2534", d.vendor))), problem))

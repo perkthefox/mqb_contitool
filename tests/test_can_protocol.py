@@ -151,3 +151,71 @@ def test_can_link_service_loader_entry_and_native_reader() -> None:
         assert info["beacon"] == BEACON_ASCII.decode("ascii")
         sample = read_memory_bytes(link, 0x01000000, 32)
         assert sample == bytes(range(32))
+
+
+def test_response_pending_waits_p2_star(monkeypatch) -> None:
+    """The FBL repeats `7F 31 78` every ~2.5 s during an erase: the link must keep waiting (P2* is 5 s)."""
+    from contitool.can import transport
+
+    clock = [0.0]
+
+    class SlowEraseBus:
+        def __init__(self) -> None:
+            self.schedule: list[tuple[float, can.Message]] = []
+
+        def send(self, message: can.Message, timeout: float = 1.0) -> None:
+            t = clock[0]
+            for at in (0.025, 2.53, 5.035, 7.54):
+                self.schedule.append((t + at, can.Message(arbitration_id=0x77A, data=bytes.fromhex("037f3178aaaaaaaa"))))
+            self.schedule.append((t + 9.0, can.Message(arbitration_id=0x77A, data=bytes.fromhex("057101ff0000aaaa"))))
+
+        def recv(self, timeout: float = 0.0):
+            if self.schedule and self.schedule[0][0] <= clock[0] + timeout:
+                at, msg = self.schedule.pop(0)
+                clock[0] = max(clock[0], at)
+                return msg
+            clock[0] += timeout
+            return None
+
+    monkeypatch.setattr(transport.time, "monotonic", lambda: clock[0])
+    link = J533CanLink("x", bus=SlowEraseBus())
+    assert link.request_uds(bytes.fromhex("3101ff000101"), 0x71, timeout=120.0) == bytes.fromhex("7101ff0000")
+
+
+def test_a_stream_that_stops_midway_names_the_lost_bytes_and_a_slow_slcan(monkeypatch, tmp_path) -> None:
+    """A serial SLCAN clone drops frames of the full-speed memory stream: say so instead of a bare timeout."""
+    import pytest
+
+    from contitool.can import workflows
+    from contitool.i18n import set_lang
+
+    set_lang("en")
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+
+    class LossyLink:
+        interface, LOADER_RX_ID = "slcan", 0x6F1
+
+        def send_loader_payload(self, payload, **_k):
+            self.left = 300  # of the 8192 frames a 64 KB payload streams
+
+        def receive_frame(self, _ident, timeout):
+            if self.left:
+                self.left -= 1
+                return can.Message(arbitration_id=0x6F1, data=bytes(8))
+            raise TimeoutError(f"No CAN frame from 0x6F1 within {timeout:.1f}s")
+
+        def drain_rx(self, max_frames=0):
+            pass
+
+    errors: list[str] = []
+
+    class Rep:
+        def error(self, msg):
+            errors.append(msg)
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    with pytest.raises(TimeoutError, match="stopped after 2400/65536 bytes"):
+        workflows.read_memory_area(LossyLink(), 0, 0x10000, tmp_path / "Cflash.bin", reporter=Rep())
+    assert len(errors) == 1 and "loses frames" in errors[0]

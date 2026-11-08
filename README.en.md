@@ -42,7 +42,7 @@
    - Every operation shows its current step, progress (`%`), byte counter, transfer speed (`KB/s`), elapsed time and `ETA` in the status bar. The log at the bottom is a short summary by default — the operation, its steps and the outcome; "Detailed" shows the full technical log with addresses, UDS and CAN.
    - Live 1-click **Русский ⇄ English** language toggle in the header.
 2. **Full Bench-Programmer Replacement Over Diagnosis CAN (`500 kbit/s` — No ECU Opening Needed)**:
-   - Automatic adapter discovery for `CANable` / `SLCAN`, `SocketCAN`, `PCAN`, `Vector`, `Kvaser` and, on Windows, `J2534 PassThru` (Tactrix, Mongoose…) plus `VAS 6154` / `VNCI 6154A` through the ODIS D-PDU driver with a one-click link check, built-in **20-pin J533 `T20`** wiring diagram, and a CAN termination confirmation (`VAS 6154` / `VNCI` and `J2534` adapters terminate the bus themselves). While an operation runs, no second link to the adapter is opened.
+   - Automatic adapter discovery for `CANable` / `SLCAN`, `SocketCAN`, `PCAN`, `Vector`, `Kvaser` and, on Windows, `J2534 PassThru` (Tactrix, Mongoose…) plus `VAS 6154` / `VNCI 6154A` through the ODIS D-PDU driver with a one-click link check, built-in **20-pin J533 `T20`** wiring diagram, and a CAN termination confirmation (`VAS 6154` / `VNCI` and `J2534` adapters terminate the bus themselves). While an operation runs, no second link to the adapter is opened. The installed D-PDU driver is used; versions `27.2` and `31.0` / `31.1` run as is, others only after an explicit confirmation (on connect the driver reflashes the VCI to its own version). Memory reads need a native USB adapter: serial SLCAN clones (CH340 etc.) lose frames.
    - Full read-only CAN backup of **`Cflash.bin` (`1.5 MB`)** + **`Uflash.bin` (`32 KB`)** + **`Dflash.bin` (`64 KB`)** with `SHA-256` manifests, plus arbitrary physical address range reading (`can read-mem` — flash, `Local RAM`, MMIO registers).
    - Direct differential CAN writing of **`DataFlash.bin` (`64 KB`, `0xFF200000..0xFF20FFFF`)** via a native RAM `FACI` driver (`FENTRYR = 0xAA80`, `64`-byte blocks, `4`-byte word programming preserving valid `R_FDL` hardware `ECC`, `ICUSB 0xF800..0xFFFF` guard, and full `64 KB` readback verification).
    - Atomic RAM `FACI` programming of the **`Uflash` (`32 KB`)** bootloader with automatic pre-backup, full `32 KB` readback verification, and live `RSA` status probe.
@@ -104,9 +104,9 @@ flowchart LR
 ### Option 1 — Standalone Executables (Recommended)
 
 Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.0.0-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.0.0-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.0.0-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+- **Windows**: extract `ContiTool-v2.0.1-windows-amd64.zip` and launch **`ContiTool.exe`**.
+- **macOS**: open `ContiTool-v2.0.1-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
+- **Linux**: extract `ContiTool-v2.0.1-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
 
 ### Option 2 — Run from Source (`Python 3.12+`)
 

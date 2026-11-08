@@ -137,7 +137,7 @@ def test_builtin_terminator_locks_the_checkbox(monkeypatch) -> None:
     set_lang("en")
     app, win = create_window()
     monkeypatch.setattr(connection, "discover_adapters", lambda: [
-        FoundAdapter("dpdu", "VW_PDUAPI", "VAS 6154 / VNCI", "D-PDU · VW_PDUAPI"),
+        FoundAdapter("dpdu", "VW_PDUAPI", "VAS 6154 / VNCI", "D-PDU 27.2.0 · VW_PDUAPI", driver="27.2.0"),
         FoundAdapter("slcan", "/dev/cu.usbmodem1101", "CANable2", "SLCAN · /dev/cu.usbmodem1101"),
     ])
     win.conn.port, win.conn.wiring_confirmed = "", False
@@ -154,4 +154,31 @@ def test_builtin_terminator_locks_the_checkbox(monkeypatch) -> None:
     dlg.list.setCurrentRow(0)
     dlg._save()
     assert win.conn.interface == "dpdu" and win.conn.ready
+    win.close()
+
+
+def test_unverified_dpdu_driver_needs_an_explicit_go_ahead(monkeypatch) -> None:
+    """A D-PDU driver ContiTool was not checked with reflashes the VCI on connect: never use it silently."""
+    from contitool.can import dpdu
+
+    set_lang("en")
+    app, win = create_window()
+    monkeypatch.setattr(dpdu, "accepted_drivers", set())
+    monkeypatch.setattr(connection, "discover_adapters", lambda: [
+        FoundAdapter("dpdu", "VW_D_PDU_API_OE", "VAS 6154 / VNCI", "D-PDU 30.3.0 · VW_D_PDU_API_OE", driver="30.3.0")])
+    dlg = connection.ConnectionDialog(win.conn, win)
+    _scanned(app, dlg)
+    assert dlg.chk_driver.isVisibleTo(dlg) and "30.3.0" in dlg.chk_driver.text()
+    assert not dlg.btn_ok.isEnabled() and not dlg.btn_check.isEnabled()
+    dlg.chk_driver.setChecked(True)
+    assert dlg.btn_ok.isEnabled()
+    dlg._save()
+    assert dpdu.accepted_drivers == {"30.3.0"}
+
+    monkeypatch.setattr(connection, "discover_adapters", lambda: [
+        FoundAdapter("dpdu", "VW_D_PDU_API_OE", "VAS 6154 / VNCI", "D-PDU 31.0.0 · VW_D_PDU_API_OE", driver="31.0.0")])
+    dlg = connection.ConnectionDialog(win.conn, win)
+    _scanned(app, dlg)
+    assert not dlg.chk_driver.isVisibleTo(dlg) and dlg.btn_ok.isEnabled()  # a supported driver asks nothing
+    dlg.done(0)
     win.close()

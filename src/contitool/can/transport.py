@@ -10,6 +10,8 @@ from typing import Any
 from contitool.can.payloads import LOADER_SYNC, build_loader_packet
 from contitool.progress import NULL_REPORTER, OperationReporter
 
+P2_STAR_WAIT = 6.0  # P2*server 5.0 s + 1 s for adapter latency
+
 
 class J533CanLink:
     """Clean, logged CAN bus link for Continental J533 Diagnosis CAN (500 kbit/s)."""
@@ -222,11 +224,12 @@ class J533CanLink:
         req_sid = req[0]
         self.send_uds(req)
         deadline = time.monotonic() + timeout
+        wait = 2.5
         while True:
             rem = deadline - time.monotonic()
             if rem <= 0:
                 raise TimeoutError(f"UDS response timeout ({timeout:.1f}s) for {req[:8].hex()}")
-            resp = self.receive_uds(timeout=min(2.5, rem))
+            resp = self.receive_uds(timeout=min(wait, rem))
             if (
                 allow_pending
                 and len(resp) >= 3
@@ -234,6 +237,9 @@ class J533CanLink:
                 and resp[1] == req_sid
                 and resp[2] == 0x78
             ):
+                # After 78 the ECU has P2* (5000 ms, from `50 xx 00 32 01 F4`) for the next frame; the FBL repeats
+                # 78 every ~2.5 s, so waiting only 2.5 s raced it and broke an erase over a slower adapter.
+                wait = P2_STAR_WAIT
                 continue
             if resp and resp[0] == 0x7F:
                 raise RuntimeError(f"UDS negative response for 0x{req_sid:02X}: {resp.hex()}")

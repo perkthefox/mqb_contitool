@@ -8,7 +8,11 @@ What works is two links on the raw-CAN resource of pins 6/14:
     CP_MonitoredChannels/CP_DataPacketSize/CP_CollectTimeout/CP_Baudrate, then a SENDRECV with 0 sends and -1
     receives. The exported API needs at least one expected response there; an accept-anything one is enough.
     Every bus frame arrives as a result: 4-byte ID + data; RxFlag byte 3 bit 0 = our own frame, byte 2 bit 0 = 29-bit.
-Note: PDUModuleConnect lets the VW driver update the VCI firmware when its version differs (about 30 s, once).
+Closing follows the driver's own CAN trace (CMonitor2Logfile, 27.2 and 31.0): cancel the monitor primitive, then
+disconnect and destroy; the send link gets STOPCOMM first, as ODIS does. Without that, drivers 30.x left the VCI with
+a stale monitor and every second session died 2 s after the monitor PDUConnect (PDU_ERR_COMM_PC_TO_VCI_FAILED).
+Note: PDUModuleConnect lets the VW driver reflash the VCI to its own version (about 30 s), so the driver version is
+checked before that: only versions known to work run without an explicit confirmation.
 """
 
 from __future__ import annotations
@@ -31,8 +35,14 @@ RAWCAN_OBD6_14 = 0x30030003  # MDF_VW resource VAS6154_RAWCAN_CAN1_HS_OBD6_14 (V
 COPT_STARTCOMM, COPT_STOPCOMM, COPT_SENDRECV = 0x8001, 0x8002, 0x8004
 IT_RESULT, IT_STATUS, IT_ERROR, IT_PARAM = 0x1300, 0x1301, 0x1302, 0x1200
 PT_UNUM32 = 0x105
+ERR_COMM_PC_TO_VCI_FAILED = 0x11  # the VCI dropped the connection (it restarts its service in ~3 s)
 ERR_EVENT_QUEUE_EMPTY = 0x71
 ERR_TX_QUEUE_FULL = 0x70
+VCI_RESTART_WAIT = 4.0
+# Driver versions (major.minor) that run without asking: 27.2 is verified on hardware (backup + write);
+# 31.0/31.1 is what ODIS installs today. Others reflash the VCI and need the user's explicit go-ahead.
+SUPPORTED_DRIVERS = ("27.2", "31.0", "31.1")
+accepted_drivers: set[str] = set()  # other versions the user confirmed in this run
 CLLST_OFFLINE = 0x8050
 COPST_DONE = (0x8012, 0x8013)  # FINISHED, CANCELLED
 # One frame at a time. Every frame is a primitive the VCI runs about every 4 ms. When its firmware queue overflows
@@ -88,6 +98,37 @@ class ResultData(C.Structure):
                 ("pExtraInfo", C.c_void_p), ("NumDataBytes", U32), ("pDataBytes", C.POINTER(U8))]
 
 
+def dll_version(path: str) -> str:
+    """File version of a DLL ("31.0.0"), or "" if Windows does not report one."""
+    try:
+        ver = C.windll.version  # type: ignore[attr-defined]
+        size = ver.GetFileVersionInfoSizeW(path, None)
+        buf = C.create_string_buffer(size)
+        info, n = C.c_void_p(), C.c_uint()
+        if not size or not ver.GetFileVersionInfoW(path, 0, size, buf) or not ver.VerQueryValueW(buf, "\\", C.byref(info), C.byref(n)):
+            return ""
+        fixed = C.cast(info, C.POINTER(U32 * 4)).contents  # VS_FIXEDFILEINFO: signature, struc version, MS, LS
+        return f"{fixed[2] >> 16}.{fixed[2] & 0xFFFF}.{fixed[3] >> 16}"
+    except (AttributeError, OSError):
+        return ""
+
+
+def driver_supported(version: str) -> bool:
+    return ".".join(version.split(".")[:2]) in SUPPORTED_DRIVERS or version in accepted_drivers
+
+
+def check_driver(version: str) -> None:
+    """Refuse a driver version nobody confirmed before PDUModuleConnect gets the chance to reflash the VCI."""
+    if not driver_supported(version):
+        shown = version or "?"
+        raise can.CanInitializationError(tr(
+            f"Драйвер D-PDU {shown} не проверен с ContiTool (проверены {', '.join(SUPPORTED_DRIVERS)}). При подключении он "
+            "перепрошьёт VCI под свою версию. Установите поддерживаемую версию или подтвердите этот драйвер в окне «Подключение».",
+            f"D-PDU driver {shown} is not verified with ContiTool (verified: {', '.join(SUPPORTED_DRIVERS)}). On connect it "
+            "reflashes the VCI to its own version. Install a supported version or confirm this driver in the Connection dialog.",
+        ))
+
+
 def discover_dpdu() -> list[dict[str, str]]:
     """64-bit D-PDU APIs from the root file named in HKLM\\SOFTWARE\\D-PDU API ("Root File"); ODIS-E's first."""
     if sys.platform != "win32":
@@ -107,7 +148,7 @@ def discover_dpdu() -> list[dict[str, str]]:
         dll = (lib.get("URI", "") if lib is not None else "").replace("file:///", "").replace("file:/", "")
         dll = dll.replace("%20", " ")
         if dll and Path(dll).exists():
-            apis.append({"name": node.findtext("SHORT_NAME", ""), "dll": dll})
+            apis.append({"name": node.findtext("SHORT_NAME", ""), "dll": dll, "version": dll_version(dll)})
     return sorted(apis, key=lambda a: not a["name"].upper().endswith("_OE"))
 
 
@@ -122,30 +163,43 @@ class DPduBus(can.BusABC):
                 raise RuntimeError(tr("D-PDU API (VAS 6154 / VNCI) не найден: установите драйвер VAS 6154 из ODIS.",
                                       "No D-PDU API (VAS 6154 / VNCI) found: install the VAS 6154 driver from ODIS."))
             channel = apis[0]["name"]
+            check_driver(apis[0]["version"])
             dll = C.WinDLL(apis[0]["dll"])  # type: ignore[attr-defined]
         self._dll = dll
         self._pending: collections.deque[can.Message] = collections.deque()
         self._tx_in_flight: set[int] = set()
-        self.hmod = self.h_rx = self.h_tx = 0
-        self._call("PDUConstruct", None, None)
-        try:
-            self.hmod = self._find_module(module_wait)
-            self._call("PDUModuleConnect", self.hmod)
-            self.h_rx = self._open_monitor(bitrate)
-            self.h_tx = self._create((0x80, 0, 0, 0))
-            self._call("PDUConnect", self.hmod, self.h_tx)
-            self._start(self.h_tx, COPT_STARTCOMM, b"", 0, 0)
-        except Exception:
-            self._teardown()
-            raise
+        self.hmod = self.h_rx = self.h_tx = self._mon_cop = 0
+        self._tx_started = False
+        for attempt in (1, 2):
+            self._call("PDUConstruct", None, None)
+            try:
+                self._open(bitrate, module_wait)
+                break
+            except can.CanError as exc:
+                self._teardown()
+                if attempt == 2 or exc.error_code != ERR_COMM_PC_TO_VCI_FAILED:
+                    raise
+                time.sleep(VCI_RESTART_WAIT)  # the session after a dropped one always connected in the logs
+            except Exception:
+                self._teardown()
+                raise
         self.channel_info = f"D-PDU {channel}"
         super().__init__(channel=channel, **kwargs)
+
+    def _open(self, bitrate: int, module_wait: float) -> None:
+        self.hmod = self._find_module(module_wait)
+        self._call("PDUModuleConnect", self.hmod)
+        self.h_rx = self._open_monitor(bitrate)
+        self.h_tx = self._create((0x80, 0, 0, 0))
+        self._call("PDUConnect", self.hmod, self.h_tx)
+        self._start(self.h_tx, COPT_STARTCOMM, b"", 0, 0)
+        self._tx_started = True
 
     # ------------------------------------------------------------------ driver calls
     def _call(self, fn: str, *args: Any, also_ok: tuple[int, ...] = ()) -> int:
         rc = getattr(self._dll, fn)(*args)
         if rc not in (0, ERR_EVENT_QUEUE_EMPTY, *also_ok):
-            raise can.CanOperationError(f"{fn}: D-PDU error 0x{rc:02X}")
+            raise can.CanOperationError(f"{fn}: D-PDU error 0x{rc:02X}", error_code=rc)
         return rc
 
     def _find_module(self, wait: float) -> int:
@@ -176,12 +230,12 @@ class DPduBus(can.BusABC):
         self._call("PDUSetComParam", self.hmod, hcll, C.byref(item))
 
     def _open_monitor(self, bitrate: int) -> int:
-        h = self._create((0x80, 0, 0, 0x01))
+        h = self.h_rx = self._create((0x80, 0, 0, 0x01))  # set at once: a failure from here on still closes it
         for param_id, cls, value in MONITOR_PARAMS:
             self._set_u32(h, param_id, cls, value)
         self._set_u32(h, CP_BAUDRATE, 5, bitrate)
         self._call("PDUConnect", self.hmod, h)
-        self._start(h, COPT_SENDRECV, b"", 0, -1, accept_any=True)
+        _, self._mon_cop = self._start(h, COPT_SENDRECV, b"", 0, -1, accept_any=True)
         return h
 
     def _start(self, hcll: int, cop: int, data: bytes, send: int, recv: int, *, accept_any: bool = False,
@@ -275,7 +329,28 @@ class DPduBus(can.BusABC):
                 raise can.CanOperationError(tr("D-PDU: очередь отправки VCI переполнена", "D-PDU: the VCI send queue is full"))
             time.sleep(0.0005)
 
+    def _stop_links(self) -> None:
+        """STOPCOMM on the send link (waiting for it like ODIS does), then cancel the monitor primitive."""
+        if self._tx_started:
+            self._tx_started = False
+            try:
+                _, cop = self._start(self.h_tx, COPT_STOPCOMM, b"", 0, 0)
+                self._tx_in_flight.add(cop)
+                end = time.monotonic() + 1.0
+                while cop in self._tx_in_flight and time.monotonic() < end:
+                    self._drain(self.h_tx)
+                    time.sleep(0.001)
+            except Exception:  # noqa: BLE001 - closing goes on whatever the VCI says
+                pass
+        if self._mon_cop:
+            try:
+                self._dll.PDUCancelComPrimitive(self.hmod, self.h_rx, self._mon_cop)
+            except Exception:  # noqa: BLE001
+                pass
+            self._mon_cop = 0
+
     def _teardown(self) -> None:
+        self._stop_links()
         for h in (self.h_rx, self.h_tx):
             if h:
                 for fn, args in (("PDUDisconnect", (self.hmod, h)), ("PDUDestroyComLogicalLink", (self.hmod, h))):
@@ -287,6 +362,7 @@ class DPduBus(can.BusABC):
             self._dll.PDUModuleDisconnect(self.hmod)
         self._dll.PDUDestruct()
         self.hmod = self.h_rx = self.h_tx = 0
+        self._tx_in_flight.clear()
 
     def shutdown(self) -> None:
         if self._is_shutdown:

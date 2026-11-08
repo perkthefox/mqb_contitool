@@ -261,7 +261,15 @@ def _stream_loader_read_payload(
     data = bytearray()
     deadline = time.monotonic() + max(10.0, length / 1000.0, frame_timeout + 1.0)
     while len(data) < length and time.monotonic() < deadline:
-        frame = link.receive_frame(link.LOADER_RX_ID, timeout=frame_timeout)
+        try:
+            frame = link.receive_frame(link.LOADER_RX_ID, timeout=frame_timeout)
+        except TimeoutError:
+            if not data:
+                raise
+            # the ECU streams at full bus speed; an adapter that cannot keep up drops frames and the stream "stops"
+            raise TimeoutError(
+                f"Stream from 0x6F1 at 0x{address:08X} stopped after {len(data)}/{length} bytes (frames lost by the adapter?)"
+            ) from None
         data.extend(bytes(frame.data))
     out = bytes(data[:length])
     if len(out) != length:
@@ -312,6 +320,16 @@ def read_memory_bytes(
     return bytes(out)
 
 
+SLOW_ADAPTER_HINT = (  # (ru, en): the language can change while the app runs
+    "Адаптер теряет кадры, когда блок передаёт память на полной скорости шины. Так ведут себя SLCAN-клоны с "
+    "последовательным портом (CH340 и т. п. на 115200 бод): для UDS их хватает, для чтения памяти — нет. "
+    "Нужен адаптер с прямым USB (CANable, candleLight) или VAS 6154 / VNCI.",
+    "The adapter loses frames while the ECU streams memory at full bus speed. Serial SLCAN clones (CH340 etc. at "
+    "115200 baud) behave like this: fine for UDS, too slow for memory reads. Use a native USB adapter "
+    "(CANable, candleLight) or VAS 6154 / VNCI.",
+)
+
+
 def read_memory_area(
     link: J533CanLink,
     start: int,
@@ -351,6 +369,8 @@ def read_memory_area(
                 break
             except LINK_ERRORS as exc:
                 if attempt == AREA_READ_RETRIES:
+                    if link.interface == "slcan" and "stopped after" in str(exc):
+                        reporter.error(tr(*SLOW_ADAPTER_HINT))
                     raise
                 reporter.warning(
                     tr(

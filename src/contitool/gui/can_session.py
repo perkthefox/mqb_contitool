@@ -13,6 +13,7 @@ from typing import Any
 from PySide6.QtCore import QThread, Signal
 
 from contitool.can import J533CanLink
+from contitool.can.transport import P2_STAR_WAIT
 from contitool.i18n import tr
 
 # ISO 14229-1 negative response codes
@@ -38,7 +39,6 @@ NRC = {
     0x7E: "subFunctionNotSupportedInActiveSession",
     0x7F: "serviceNotSupportedInActiveSession",
 }
-_PENDING_EXTRA_SEC = 5.0  # P2*server: how long a 7F xx 78 may extend the wait
 
 
 def parse_hex(text: str, max_len: int) -> bytes:
@@ -200,7 +200,7 @@ class CanSession(QThread):
             except TimeoutError:
                 continue  # reported above with a readable message
             if len(resp) >= 3 and resp[0] == 0x7F and resp[2] == 0x78:
-                deadline = time.monotonic() + _PENDING_EXTRA_SEC
+                deadline = time.monotonic() + P2_STAR_WAIT  # a 7F xx 78 extends the wait by P2*
                 continue
             self._push("uds-resp", rx_id, resp, describe_uds(resp))
             return

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from contitool.can import SUPPORTED_CAN_INTERFACES, FoundAdapter, can_identify, discover_adapters
+from contitool.can import dpdu
 from contitool.core import clean_user_path
 from contitool.gui.theme import set_tone
 from contitool.gui.widgets.page import Dialog, button, group_label, hint, row, run_dialog
@@ -160,6 +161,9 @@ class ConnectionDialog(Dialog):
         self.chk_120ohm.setChecked(conn.wiring_confirmed)
         self.chk_120ohm.toggled.connect(self._term_toggled)
         self.body.addWidget(self.chk_120ohm)
+        self.chk_driver = QCheckBox()  # a D-PDU driver version ContiTool was not checked with
+        self.chk_driver.toggled.connect(lambda *_a: self._sync())
+        self.body.addWidget(self.chk_driver)
         self.btn_pinout = _link("", self._toggle_pinout)
         self.body.addLayout(row(self.btn_pinout))
         self.pinout_card = PinoutCard()
@@ -262,6 +266,18 @@ class ConnectionDialog(Dialog):
         self.btn_pinout.setText(tr("Схема подключения T20 ", "T20 wiring diagram ") + ("▾" if show else "▸"))
         self.adjustSize()
 
+    def _unverified_driver(self) -> str | None:
+        """Version of the picked D-PDU driver when it needs the user's go-ahead, else None."""
+        a = None if self._manual_open else self._adapter(self.list.currentItem())
+        if a is None or a.interface != "dpdu" or dpdu.driver_supported(a.driver):
+            return None
+        return a.driver
+
+    def _accept_driver(self) -> None:
+        drv = self._unverified_driver()
+        if drv is not None and self.chk_driver.isChecked():
+            dpdu.accepted_drivers.add(drv)
+
     def _picked(self) -> None:
         if self._check is None:
             self.lbl_check.clear()  # the last result was for another adapter
@@ -290,7 +306,16 @@ class ConnectionDialog(Dialog):
         self.chk_120ohm.blockSignals(True)
         self.chk_120ohm.setChecked(builtin or self._term_confirmed)
         self.chk_120ohm.blockSignals(False)
-        picked = bool(iface) and (bool(port) or iface in ("j2534", "dpdu"))
+        drv = self._unverified_driver()
+        self.chk_driver.setVisible(drv is not None)
+        self.chk_driver.setText(tr(
+            f"Разрешить непроверенный драйвер D-PDU {drv or '?'} — при подключении он перепрошьёт VCI под себя",
+            f"Allow unverified D-PDU driver {drv or '?'} — on connect it reflashes the VCI to its own version",
+        ))
+        self.chk_driver.setToolTip(tr(f"Проверены: {', '.join(dpdu.SUPPORTED_DRIVERS)}",
+                                      f"Verified: {', '.join(dpdu.SUPPORTED_DRIVERS)}"))
+        driver_ok = drv is None or self.chk_driver.isChecked()
+        picked = bool(iface) and (bool(port) or iface in ("j2534", "dpdu")) and driver_ok
         busy = self._check is not None
         taken = self.conn.busy_reason()
         self.btn_check.setEnabled(picked and not busy and not taken)
@@ -298,7 +323,8 @@ class ConnectionDialog(Dialog):
         ok = picked and self.chk_120ohm.isChecked() and not busy
         self.btn_ok.setEnabled(ok)
         self.btn_ok.setToolTip(
-            "" if ok else tr("Выберите адаптер и подтвердите, что CAN-терминатор включён", "Pick an adapter and confirm the CAN terminator is on")
+            "" if ok else tr("Выберите адаптер и подтвердите, что CAN-терминатор включён (и драйвер D-PDU, если спрошено)",
+                             "Pick an adapter and confirm the CAN terminator is on (and the D-PDU driver, if asked)")
         )
 
     # ---------------------------------------------------------------- link check
@@ -308,6 +334,7 @@ class ConnectionDialog(Dialog):
         if taken:  # a flash or the terminal holds the adapter: a second link would steal its frames
             self._check_done(taken, "warn")
             return
+        self._accept_driver()
         set_tone(self.lbl_check, "")
         self.lbl_check.setText(tr("Проверяю связь с блоком…", "Checking the link to the ECU…"))
         self._check = OperationWorker(
@@ -345,6 +372,7 @@ class ConnectionDialog(Dialog):
 
     def _save(self) -> None:
         iface, port, title = self.selection()
+        self._accept_driver()
         self.conn.update(iface, port, self.out_dir, self.chk_120ohm.isChecked(), title)
         self.accept()
 

@@ -737,9 +737,12 @@ def print_dtc_report(records: list[dict]) -> None:
 def cmd_can(args: argparse.Namespace) -> int:
     action = args.can_action
     if action == "ports":
+        from contitool.can import dpdu
+
         ports = discover_serial_ports()
         passthru = discover_j2534()
-        if not ports and not passthru:
+        pdu_apis = dpdu.discover_dpdu()
+        if not ports and not passthru and not pdu_apis:
             print(tr("Адаптеры не обнаружены (USB/COM порты и J2534).", "No adapters detected (USB/COM ports and J2534)."))
             return 0
         for p in ports:
@@ -750,6 +753,10 @@ def cmd_can(args: argparse.Namespace) -> int:
             print(f"J2534  {d.name:<36}  {d.dll}{note}")
         if passthru:
             print(tr('J2534: --interface j2534 --port "<имя>"', 'J2534: --interface j2534 --port "<name>"'))
+        for api in pdu_apis:
+            note = "" if dpdu.driver_supported(api["version"]) else tr(
+                "  [версия не проверена — нужен --allow-dpdu-driver]", "  [unverified version — needs --allow-dpdu-driver]")
+            print(f"D-PDU  {api['name']:<36}  {api['version'] or '?'}{note}")
         return 0
 
     if not args.port and args.interface not in ("j2534", "dpdu"):  # these pick the installed driver themselves
@@ -759,6 +766,11 @@ def cmd_can(args: argparse.Namespace) -> int:
                 "Specify adapter port via --port (list available ports with: contitool can ports)",
             )
         )
+
+    if args.interface == "dpdu" and args.allow_dpdu_driver:
+        from contitool.can import dpdu
+
+        dpdu.accepted_drivers.update(api["version"] for api in dpdu.discover_dpdu())
 
     write_actions = ("write-uflash", "write-dflash", "write-cflash", "turnkey", "zdc-upload")
     if action in write_actions and not args.yes:
@@ -1172,6 +1184,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_can.add_argument("--no-cp-patch", action="store_true", help=tr("Не патчить KSCHUTZ CP в turnkey", "Skip KSCHUTZ CP patch in turnkey"))
     p_can.add_argument("--no-engineering-patch", action="store_true", help=tr("Не патчить Engineering Mode в CodeFlash в turnkey", "Skip CodeFlash Engineering patch in turnkey"))
     p_can.add_argument("--yes", action="store_true", help=tr("Подтвердить запись во Flash и включённый CAN-терминатор", "Confirm flash erase/write and CAN termination"))
+    p_can.add_argument(
+        "--allow-dpdu-driver",
+        action="store_true",
+        help=tr("Разрешить установленный драйвер D-PDU непроверенной версии (он перепрошьёт VCI под себя)",
+                "Allow an unverified installed D-PDU driver version (it reflashes the VCI to its own version)"),
+    )
     p_can.set_defaults(func=cmd_can)
 
     return ap
