@@ -1,0 +1,366 @@
+"""CAN adapter settings (persisted) plus the per-session CAN termination confirmation, and their dialog."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from PySide6.QtCore import QObject, QSettings, Qt, Signal
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QSizePolicy,
+    QListWidgetItem,
+    QMessageBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from contitool.can import SUPPORTED_CAN_INTERFACES, FoundAdapter, can_identify, discover_adapters
+from contitool.core import clean_user_path
+from contitool.gui.theme import set_tone
+from contitool.gui.widgets.page import Dialog, button, group_label, hint, row, run_dialog
+from contitool.gui.widgets.pinout_card import PinoutCard
+from contitool.gui.worker import OperationWorker
+from contitool.i18n import tr
+
+
+BUILTIN_TERMINATION = ("dpdu", "j2534")  # VAS 6154 / VNCI and J2534 pass-thru adapters terminate CAN themselves
+
+
+class CanConnection(QObject):
+    """Where and how to talk to the bench gateway. `ready` gates every CAN operation."""
+
+    changed = Signal()
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        s = QSettings()
+        self.interface = str(s.value("can/interface", "slcan"))
+        self.port = str(s.value("can/port", ""))
+        self.title = str(s.value("can/title", ""))
+        self.out_dir = Path(str(s.value("can/out_dir", Path.cwd() / "contitool_runs")))
+        self.wiring_confirmed = False  # asked again every session on purpose
+        self.in_use: Callable[[], str] = lambda: ""  # set by the main window: why the adapter is taken right now
+
+    def busy_reason(self) -> str:
+        """Why no new CAN link may open now (an operation, the terminal, a link check still running), or ""."""
+        if any(w.isRunning() for w in _ORPHANS if w.objectName() == "link-check"):
+            return tr("Ещё идёт проверка связи — подождите несколько секунд.", "A link check is still running — wait a few seconds.")
+        return self.in_use()
+
+    @property
+    def ready(self) -> bool:
+        return (bool(self.port) or self.interface in BUILTIN_TERMINATION) and (
+            self.wiring_confirmed or self.interface in BUILTIN_TERMINATION
+        )
+
+    def update(self, interface: str, port: str, out_dir: Path, wiring_confirmed: bool, title: str = "") -> None:
+        self.interface, self.port, self.out_dir, self.wiring_confirmed = interface, port, out_dir, wiring_confirmed
+        self.title = title
+        s = QSettings()
+        s.setValue("can/interface", interface)
+        s.setValue("can/port", port)
+        s.setValue("can/title", title)
+        s.setValue("can/out_dir", str(out_dir))
+        self.changed.emit()
+
+    def adapter_name(self) -> str:
+        for code, en_name, ru_name in SUPPORTED_CAN_INTERFACES:
+            if code == self.interface:
+                return tr(ru_name, en_name).split(" (")[0]
+        return self.interface
+
+    def display(self) -> str:
+        """Short label for the header chip: "CANable2 · cu.usbmodem…", "VAS6154A"."""
+        port = self.port.replace("\\", "/").rsplit("/", 1)[-1]
+        if self.title:
+            return self.title if self.title == self.port else f"{self.title} · {port}"
+        return f"{self.adapter_name()} · {port}" if port else self.adapter_name()
+
+
+_ORPHANS: set[OperationWorker] = set()  # threads of closed dialogs, kept alive until they end
+
+
+def _let_finish(worker: OperationWorker | None) -> None:
+    """Never block the GUI on a closing dialog and never destroy a running thread: detach it, drop it when it ends."""
+    if worker is None or not worker.isRunning():
+        return
+    for sig in (worker.succeeded, worker.failed):
+        try:
+            sig.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+    worker.setParent(None)
+    _ORPHANS.add(worker)
+    worker.finished.connect(lambda w=worker: (_ORPHANS.discard(w), w.deleteLater()))
+
+
+def _link(text: str, slot: Any) -> Any:
+    b = button(text, "LinkBtn", slot=slot)
+    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    return b
+
+
+class ConnectionDialog(Dialog):
+    """Found adapters as a list (one is picked for you), manual entry folded away, a link check, the terminator box."""
+
+    def __init__(self, conn: CanConnection, parent: QWidget | None = None) -> None:
+        super().__init__(
+            parent,
+            tr("Подключение к блоку", "ECU connection"),
+            tr(
+                "Шлюз на стенде подключается к адаптеру по шине Diagnosis CAN (500 кбит/с) через разъём T20.",
+                "The bench gateway talks to the adapter over Diagnosis CAN (500 kbit/s) via the T20 connector.",
+            ),
+            width=620,
+        )
+        self.conn = conn
+        self._check: OperationWorker | None = None
+        self._scan: OperationWorker | None = None
+        self._first_scan = True
+
+        self.body.addLayout(row(group_label(tr("Адаптер", "Adapter")), 1,
+                                button(tr("Обновить", "Refresh"), "GhostBtn", slot=self.refresh)))
+        self.list = QListWidget()
+        self.list.setObjectName("Adapters")
+        self.list.currentItemChanged.connect(lambda *_a: self._picked())
+        self.list.itemClicked.connect(lambda *_a: self._toggle_manual(False))
+        self.body.addWidget(self.list)
+
+        # Manual entry: for adapters the search cannot see (gs_usb, a port behind a hub, a remote can0…)
+        self.btn_manual = _link("", self._toggle_manual)
+        self.manual = QWidget()
+        lay = QVBoxLayout(self.manual)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.cmb_iface = QComboBox()
+        for code, en_name, ru_name in SUPPORTED_CAN_INTERFACES:
+            self.cmb_iface.addItem(tr(ru_name, en_name), code)
+        self.ed_port = QLineEdit()
+        self.ed_port.setPlaceholderText(tr("Порт: COM4, /dev/cu.usbmodem…, can0", "Port: COM4, /dev/cu.usbmodem…, can0"))
+        self.ed_port.textChanged.connect(lambda *_a: self._picked())
+        lay.addLayout(row(self.cmb_iface, self.ed_port, 0))
+        self.manual.setVisible(False)
+        self._manual_open = False  # isVisible() is False for every child until the dialog is shown
+        self.body.addLayout(row(self.btn_manual))
+        self.body.addWidget(self.manual)
+
+        self.btn_check = button(tr("Проверить связь", "Check link"), slot=self._check_link)
+        self.lbl_check = hint()
+        self.lbl_check.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.body.addLayout(row(self.btn_check, self.lbl_check, 0))
+
+        self.chk_120ohm = QCheckBox()
+        self._term_confirmed = conn.wiring_confirmed  # what the user ticked for an adapter without its own terminator
+        self.chk_120ohm.setChecked(conn.wiring_confirmed)
+        self.chk_120ohm.toggled.connect(self._term_toggled)
+        self.body.addWidget(self.chk_120ohm)
+        self.btn_pinout = _link("", self._toggle_pinout)
+        self.body.addLayout(row(self.btn_pinout))
+        self.pinout_card = PinoutCard()
+        self.pinout_card.setVisible(False)
+        self.body.addWidget(self.pinout_card)
+
+        self.out_dir = conn.out_dir
+        self.lbl_outdir = QLabel()
+        self.lbl_outdir.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.body.addLayout(row(hint(tr("Папка для бэкапов:", "Backup folder:")), self.lbl_outdir, 1,
+                                button(tr("Изменить…", "Change…"), "GhostBtn", slot=self._browse_outdir)))
+        self._show_outdir()
+
+        self.btn_ok = button(tr("Готово", "Done"), "PrimaryBtn", slot=self._save)
+        self.finish(ok=self.btn_ok)
+
+        self._toggle_pinout(False)
+        self._toggle_manual(self._manual_open)
+        self.refresh()
+
+    # ---------------------------------------------------------------- adapter list
+    def refresh(self) -> None:
+        """Search in the background: vendor libraries (PCAN, Kvaser, Vector) can take a while to load."""
+        if self._scan is not None:
+            return
+        self.list.clear()
+        item = QListWidgetItem(tr("Поиск адаптеров…", "Looking for adapters…"))
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.list.addItem(item)
+        self.list.setFixedHeight(52)
+        self._scan = OperationWorker(tr("Поиск адаптеров", "Adapter search"), lambda _rep: discover_adapters(), self)
+        self._scan.succeeded.connect(self._show_found)
+        self._scan.failed.connect(lambda _msg, _tb: self._show_found([]))
+        self._scan.start()
+        self._sync()
+
+    def _show_found(self, found: list[FoundAdapter]) -> None:
+        if self._scan is not None:
+            self._scan.wait()
+        self._scan = None
+        self.list.clear()
+        for a in found:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, a)
+            if a.problem:
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
+            card = QWidget()
+            lay = QVBoxLayout(card)
+            lay.setContentsMargins(10, 6, 10, 6)
+            lay.setSpacing(1)
+            title = QLabel(a.title)
+            title.setObjectName("AdapterTitle")
+            detail = QLabel(a.problem or a.detail)
+            detail.setObjectName("Hint")
+            set_tone(detail, "warn" if a.problem else "")
+            set_tone(title, "muted" if a.problem else "")
+            lay.addWidget(title)
+            lay.addWidget(detail)
+            item.setSizeHint(card.sizeHint())
+            self.list.addItem(item)
+            self.list.setItemWidget(item, card)
+        if not found:
+            item = QListWidgetItem(tr("Адаптеры не найдены — подключите адаптер и нажмите «Обновить»",
+                                      "No adapters found — plug one in and press Refresh"))
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.list.addItem(item)
+        usable = [i for i in range(self.list.count()) if self.list.item(i).flags() & Qt.ItemFlag.ItemIsEnabled]
+        saved = [i for i in usable if self._adapter(self.list.item(i)).channel == self.conn.port]
+        if saved or usable:
+            self.list.setCurrentRow((saved or usable)[0])
+        self.list.setFixedHeight(min(5, max(1, self.list.count())) * 46 + 6)
+        if self._first_scan and self.list.currentItem() is None and self.conn.port:  # saved adapter not found
+            self.cmb_iface.setCurrentIndex(max(0, self.cmb_iface.findData(self.conn.interface)))
+            self.ed_port.setText(self.conn.port)
+            self._toggle_manual(True)
+        self._first_scan = False
+        self._sync()
+
+    @staticmethod
+    def _adapter(item: QListWidgetItem | None) -> FoundAdapter | None:
+        return None if item is None else item.data(Qt.ItemDataRole.UserRole)
+
+    def selection(self) -> tuple[str, str, str]:
+        """(interface, port, title) — manual entry wins while it is open and filled in."""
+        if self._manual_open and (self.ed_port.text().strip() or self.cmb_iface.currentData() in ("j2534", "dpdu")):
+            return str(self.cmb_iface.currentData()), self.ed_port.text().strip(), ""
+        a = self._adapter(self.list.currentItem())
+        return (a.interface, a.channel, a.title) if a else ("", "", "")
+
+    def _toggle_manual(self, show: bool | None = None) -> None:
+        show = not self._manual_open if show is None else show
+        self._manual_open = show
+        self.manual.setVisible(show)
+        self.btn_manual.setText(tr("Нет в списке? Указать вручную ", "Not listed? Enter manually ") + ("▾" if show else "▸"))
+        self._sync()
+
+    def _toggle_pinout(self, show: bool | None = None) -> None:
+        show = self.pinout_card.isHidden() if show is None else show
+        self.pinout_card.setVisible(show)
+        self.btn_pinout.setText(tr("Схема подключения T20 ", "T20 wiring diagram ") + ("▾" if show else "▸"))
+        self.adjustSize()
+
+    def _picked(self) -> None:
+        if self._check is None:
+            self.lbl_check.clear()  # the last result was for another adapter
+        self._sync()
+
+    def _term_toggled(self, on: bool) -> None:
+        if self.chk_120ohm.isEnabled():
+            self._term_confirmed = on
+        self._sync()
+
+    def _sync(self) -> None:
+        iface, port, _title = self.selection()
+        builtin = iface in BUILTIN_TERMINATION
+        self.chk_120ohm.setText(
+            tr(
+                "Включён CAN-терминатор — он встроен в этот адаптер",
+                "CAN termination is on — it is built into this adapter",
+            )
+            if builtin
+            else tr(
+                "Включён CAN-терминатор (резистор 120 Ом между Pin 19 CAN-H и Pin 9 CAN-L), питание +12 В стабильно",
+                "CAN termination is on (120 Ω resistor between Pin 19 CAN-H and Pin 9 CAN-L), +12 V supply is stable",
+            )
+        )
+        self.chk_120ohm.setEnabled(not builtin)
+        self.chk_120ohm.blockSignals(True)
+        self.chk_120ohm.setChecked(builtin or self._term_confirmed)
+        self.chk_120ohm.blockSignals(False)
+        picked = bool(iface) and (bool(port) or iface in ("j2534", "dpdu"))
+        busy = self._check is not None
+        taken = self.conn.busy_reason()
+        self.btn_check.setEnabled(picked and not busy and not taken)
+        self.btn_check.setToolTip(taken)
+        ok = picked and self.chk_120ohm.isChecked() and not busy
+        self.btn_ok.setEnabled(ok)
+        self.btn_ok.setToolTip(
+            "" if ok else tr("Выберите адаптер и подтвердите, что CAN-терминатор включён", "Pick an adapter and confirm the CAN terminator is on")
+        )
+
+    # ---------------------------------------------------------------- link check
+    def _check_link(self) -> None:
+        iface, port, _title = self.selection()
+        taken = self.conn.busy_reason()
+        if taken:  # a flash or the terminal holds the adapter: a second link would steal its frames
+            self._check_done(taken, "warn")
+            return
+        set_tone(self.lbl_check, "")
+        self.lbl_check.setText(tr("Проверяю связь с блоком…", "Checking the link to the ECU…"))
+        self._check = OperationWorker(
+            tr("Проверка связи", "Link check"), lambda rep: can_identify(port, interface=iface, reporter=rep), self
+        )
+        self._check.setObjectName("link-check")
+        self._check.succeeded.connect(self._check_ok)
+        self._check.failed.connect(lambda msg, _tb: self._check_done(msg, "err"))
+        self._check.start()
+        self._sync()
+
+    def _check_ok(self, res: dict[str, Any]) -> None:
+        values = {i["did"]: i["value"] for i in res.get("ident", [])}
+        found = " · ".join(filter(None, (values.get("F187"), values.get("F197"), values.get("F189") and f"SW {values['F189']}")))
+        self._check_done("✓ " + tr("Блок отвечает", "ECU answers") + (f": {found}" if found else ""), "ok")
+
+    def _check_done(self, text: str, tone: str) -> None:
+        if self._check is not None:
+            self._check.wait()
+        self._check = None
+        self.lbl_check.setText(text)
+        set_tone(self.lbl_check, tone)
+        self._sync()
+
+    # ---------------------------------------------------------------- folder & save
+    def _show_outdir(self) -> None:
+        self.lbl_outdir.setText(str(self.out_dir))
+        self.lbl_outdir.setToolTip(str(self.out_dir))
+
+    def _browse_outdir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, tr("Папка для бэкапов", "Backup folder"), str(self.out_dir))
+        if chosen:
+            self.out_dir = clean_user_path(chosen)
+            self._show_outdir()
+
+    def _save(self) -> None:
+        iface, port, title = self.selection()
+        self.conn.update(iface, port, self.out_dir, self.chk_120ohm.isChecked(), title)
+        self.accept()
+
+    def done(self, result: int) -> None:  # accept() and reject() both end here
+        _let_finish(self._check)
+        _let_finish(self._scan)
+        self._check = self._scan = None
+        super().done(result)
+
+
+def ensure_ready(conn: CanConnection, parent: QWidget) -> bool:
+    """Open the connection dialog if the adapter is not set up yet. True when CAN work may start."""
+    taken = conn.busy_reason()
+    if taken:
+        QMessageBox.information(parent, tr("Адаптер занят", "Adapter busy"), taken)
+        return False
+    if not conn.ready:
+        run_dialog(ConnectionDialog(conn, parent))
+    return conn.ready

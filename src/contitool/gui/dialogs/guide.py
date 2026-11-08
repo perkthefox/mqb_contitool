@@ -1,0 +1,113 @@
+"""Bench reference: wiring, the 64 KB programmer rule, and where the module key comes from."""
+
+from __future__ import annotations
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
+
+from contitool.gui.widgets.page import Callout, Dialog, group_label
+from contitool.gui.widgets.pinout_card import PinoutCard
+from contitool.i18n import tr
+
+
+def _text() -> QLabel:
+    lbl = QLabel()
+    lbl.setWordWrap(True)
+    lbl.setTextFormat(Qt.TextFormat.RichText)
+    return lbl
+
+
+class GuideDialog(Dialog):
+    """Everything someone needs before touching the ECU on the bench."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(
+            parent,
+            tr("Памятка по стенду", "Bench guide"),
+            tr(
+                "Как подключить шлюз по Diagnosis CAN, откуда берётся ключ модуля и как работать с внешними дампами.",
+                "How to wire the gateway over Diagnosis CAN, where the module key comes from, and how to handle external dumps.",
+            ),
+            width=1200,  # wide enough for the T20 diagram and its legend
+        )
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.Shape.NoFrame)
+        content = QWidget()
+        area.setWidget(content)
+        body = QVBoxLayout(content)
+        body.setContentsMargins(0, 0, 10, 0)
+        body.setSpacing(14)
+
+        body.addWidget(PinoutCard())
+
+        body.addWidget(group_label(tr("ЧТЕНИЕ ПРОГРАММАТОРОМ", "READING WITH A PROGRAMMER")))
+        rule = Callout("err")
+        rule.label.setText(
+            tr(
+                "<b>Выбирайте профиль с DataFlash 64 КБ.</b><br>"
+                "На корпусе микроконтроллера шлюзов 3Q0 907 530 указано <b>R7F7010343AFP</b>, но внутри "
+                "распаяны полные <b>64 КБ DataFlash (65 536 байт)</b>. Ключи модулей и данные функций лежат "
+                "в верхней половине — <b>0xC000..0xFFFF</b>.<br>"
+                "Профиль R7F7010343AFP читает только первые 32 КБ, и они теряются. Выбирайте пресет блока "
+                "<b>3Q0907530</b> или профиль <b>R7F7010543 / R7F7010563</b>.<br>"
+                "При чтении по CAN ContiTool всегда считывает все 64 КБ.",
+                "<b>Pick a profile with 64 KB DataFlash.</b><br>"
+                "3Q0 907 530 microcontrollers are marked <b>R7F7010343AFP</b>, but the silicon carries a full "
+                "<b>64 KB DataFlash (65,536 bytes)</b>. Module keys and feature data live in the upper half — "
+                "<b>0xC000..0xFFFF</b>.<br>"
+                "The R7F7010343AFP profile reads only the first 32 KB and loses them. Use the <b>3Q0907530</b> "
+                "preset or profile <b>R7F7010543 / R7F7010563</b>.<br>"
+                "Reading over CAN, ContiTool always takes all 64 KB.",
+            )
+        )
+        body.addWidget(rule)
+
+        body.addWidget(group_label(tr("КЛЮЧ МОДУЛЯ (IKA)", "MODULE KEY (IKA)")))
+        ika = _text()
+        ika.setText(
+            tr(
+                "Привязку проверяет сам модуль — мультимедиа, приборная панель, усилитель и другие. "
+                "Он сравнивает ответ шлюза со своим 16-байтным ключом <b>IKA</b>, поэтому ключ должен совпадать "
+                "с обеих сторон.<br><br>"
+                "<b>Ключ донора.</b> Прочитайте открытый ключ IKA из дампа самого модуля и укажите его при привязке.<br>"
+                "<b>Своя пара.</b> Нажмите «Сгенерировать» в окне привязки и запишите один и тот же ключ "
+                "и в шлюз, и в слот IKA модуля.<br><br>"
+                "Не подходят 16 нулей (<code>00..00</code>) и строка <code>000000000000000000000000000000E5</code> — "
+                "это заголовок зашифрованного контейнера, а не ключ.",
+                "Pairing is enforced by the module itself — infotainment, instrument cluster, amplifier and others. "
+                "It compares the gateway's answer against its own 16-byte <b>IKA</b> key, so the key must match "
+                "on both sides.<br><br>"
+                "<b>Donor key.</b> Read the plaintext IKA key from the module's own dump and enter it when binding.<br>"
+                "<b>Your own pair.</b> Click “Generate” in the binding window and write the same key into both "
+                "the gateway and the module's IKA slot.<br><br>"
+                "All zeros (<code>00..00</code>) and the string <code>000000000000000000000000000000E5</code> are not "
+                "keys — the latter is an encrypted container header.",
+            )
+        )
+        body.addWidget(ika)
+
+        body.addWidget(group_label(tr("ПОРЯДОК РАБОТЫ", "ORDER OF WORK")))
+        order = _text()
+        order.setText(
+            tr(
+                "1. Подключите блок по схеме выше и настройте адаптер.<br>"
+                "2. Считайте блок — ContiTool сохранит полную копию памяти и откроет её.<br>"
+                "3. Внесите нужные изменения: они пишутся в копии файлов, оригинал бэкапа не трогается.<br>"
+                "4. Нажмите «Записать в блок». Перед записью снимается резервная копия, после — побайтовая проверка чтением.<br><br>"
+                "Все три области памяти (<b>CodeFlash</b> включая область загрузчика, <b>DataFlash</b> 64 КБ и <b>Uflash</b> 32 КБ) "
+                "читаются и записываются напрямую по CAN — внешний программатор не требуется.",
+                "1. Wire the ECU as shown above and set up the adapter.<br>"
+                "2. Read the ECU — ContiTool saves a full memory copy and opens it.<br>"
+                "3. Make your changes: they go into copies of the files, the backup itself is never touched.<br>"
+                "4. Click “Write to ECU”. A backup is taken first, and the result is verified byte by byte.<br><br>"
+                "All three memory regions (<b>CodeFlash</b> including boot blocks, <b>DataFlash</b> 64 KB, and <b>Uflash</b> 32 KB) "
+                "are read and written directly over CAN — no external programmer is needed.",
+            )
+        )
+        body.addWidget(order)
+        body.addStretch(1)
+
+        self.body.addWidget(area, 1)
+        self.finish(cancel_text=tr("Закрыть", "Close"))
+        self.resize(1200, 780)

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contitool"
+version = "2.0.0"
+description = "ContiTool — Desktop GUI Studio & CLI for Continental VAG MQB Gateway J533 (Renesas RH850/F1L)"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "PerkTheFox", email = "noreply@antonperk.com" }
+]
+dependencies = [
+    "PySide6-Essentials>=6.6.0",
+    "python-can>=4.3.0",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pyinstaller>=6.5.0",
+]
+
+[project.urls]
+Homepage = "https://vwhacking.antonperk.com"
+Telegram = "https://t.me/perkthefox"
+Drive2 = "https://www.drive2.ru/users/perkthefox/"
+
+[project.scripts]
+contitool = "contitool.cli.main:main"
+
+[project.gui-scripts]
+contitool-gui = "contitool.gui.app:run_gui"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

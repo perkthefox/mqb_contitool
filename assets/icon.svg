@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E3A8A"/>
+      <stop offset="55%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#0EA5E9"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)" stroke="#38BDF8" stroke-width="6"/>
+  <g stroke="#93C5FD" stroke-width="8" stroke-linecap="round">
+    <line x1="92" y1="42" x2="92" y2="68"/>
+    <line x1="128" y1="42" x2="128" y2="68"/>
+    <line x1="164" y1="42" x2="164" y2="68"/>
+    <line x1="92" y1="188" x2="92" y2="214"/>
+    <line x1="128" y1="188" x2="128" y2="214"/>
+    <line x1="164" y1="188" x2="164" y2="214"/>
+    <line x1="42" y1="92" x2="68" y2="92"/>
+    <line x1="42" y1="128" x2="68" y2="128"/>
+    <line x1="42" y1="164" x2="68" y2="164"/>
+    <line x1="188" y1="92" x2="214" y2="92"/>
+    <line x1="188" y1="128" x2="214" y2="128"/>
+    <line x1="188" y1="164" x2="214" y2="164"/>
+  </g>
+  <rect x="68" y="68" width="120" height="120" rx="20" fill="#0B1120" stroke="#38BDF8" stroke-width="6"/>
+  <text x="128" y="139" text-anchor="middle" fill="#F8FAFC" font-family="Menlo, Consolas, monospace" font-size="36" font-weight="bold">J533</text>
+</svg>

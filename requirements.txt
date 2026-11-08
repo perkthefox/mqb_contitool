@@ -1,0 +1,3 @@
+PySide6-Essentials>=6.6.0
+python-can>=4.3.0
+pyserial>=3.5

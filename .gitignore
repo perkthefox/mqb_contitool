@@ -1,26 +1,33 @@
-# Python bytecode & environments
+# Python bytecode & caches
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
 .venv/
 venv/
-env/
+ENV/
 
-# OS & IDE metadata
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
+# Build & PyInstaller artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+src/*.egg-info/
 
-# Never accidentally commit vehicle ECU dumps, certificates, or private RSA keys
+# Local runtime session outputs & user dumps (never commit private dumps/keys)
+contitool_runs/
 *.bin
 *.raw
 *.fsc
-*.sig
 *.odx
-*.frf
-*.sgo
+*.jsonl
 *.private.pem
-*keypair*.json
-dumps/
-backup/
+*_keypair.json
+
+# OS files
+.DS_Store
+Thumbs.db
