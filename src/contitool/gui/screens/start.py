@@ -56,6 +56,7 @@ class StartScreen(QWidget):
     """Shown until a gateway is loaded. Files can also be dropped anywhere on it."""
 
     read_can_requested = Signal()
+    restore_requested = Signal()
     open_files_requested = Signal()
     open_folder_requested = Signal(str)  # "" = ask for a folder
     files_dropped = Signal(list)  # list[Path]
@@ -86,13 +87,17 @@ class StartScreen(QWidget):
 
         self.tile_can = Section()
         self.btn_read = button("", "PrimaryBtn", slot=self.read_can_requested.emit)
+        self.btn_restore = button("", "GhostBtn", slot=self.restore_requested.emit)
         self.btn_wiring = button("", "GhostBtn", slot=self.wiring_requested.emit)
         self.tile_files = Section()
         self.btn_folder = button("", slot=lambda: self.open_folder_requested.emit(""))
         self.btn_files = button("", "GhostBtn", slot=self.open_files_requested.emit)
         tiles = QHBoxLayout()
         tiles.setSpacing(14)
-        for tile, actions in ((self.tile_can, (self.btn_read, self.btn_wiring)), (self.tile_files, (self.btn_folder, self.btn_files))):
+        for tile, actions in (
+            (self.tile_can, (self.btn_read, self.btn_restore, self.btn_wiring)),
+            (self.tile_files, (self.btn_folder, self.btn_files)),
+        ):
             tile.body.addStretch(1)
             buttons = QHBoxLayout()
             buttons.setSpacing(6)
@@ -148,7 +153,15 @@ class StartScreen(QWidget):
             ),
         )
         self.btn_read.setText(tr("Считать блок", "Read the ECU"))
-        self.btn_wiring.setText(tr("Схема подключения", "Wiring"))
+        self.btn_restore.setText(tr("Залить бэкап…", "Write backup…"))
+        self.btn_restore.setToolTip(
+            tr(
+                "Восстановить блок из ранее сохранённого бэкапа (в том числе если блок остался в загрузчике FBL)",
+                "Write a previously saved backup back into this ECU (including when stuck in FBL bootloader)",
+            )
+        )
+        self.btn_wiring.setText(tr("Схема", "Wiring"))
+        self.btn_wiring.setToolTip(tr("Схема подключения к блоку на стенде", "ECU bench wiring diagram"))
         self.btn_folder.setText(tr("Открыть папку…", "Open folder…"))
         self.btn_files.setText(tr("Выбрать файлы…", "Choose files…"))
         self.lbl_recent.setText(tr("НЕДАВНИЕ", "RECENT"))

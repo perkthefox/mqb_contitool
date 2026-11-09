@@ -106,9 +106,9 @@ flowchart LR
 ### Option 1 — Standalone Executables (Recommended)
 
 Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.0.1c-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.0.1c-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.0.1c-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+- **Windows**: extract `ContiTool-v2.0.1d-windows-amd64.zip` and launch **`ContiTool.exe`**.
+- **macOS**: open `ContiTool-v2.0.1d-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
+- **Linux**: extract `ContiTool-v2.0.1d-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
 
 ### Option 2 — Run from Source (`Python 3.12+`)
 
@@ -216,6 +216,8 @@ No. All you need is the **VW D-PDU API** driver, a standalone package (`VW_D-PDU
 
 **Several D-PDU drivers are installed — which one does ContiTool use?**
 Every one it finds is its own row in the Connection window (`OE`, `OS`, `VCTOOL`…) with its version. The ODIS-E variant is picked by default, but you can choose any other and the choice is remembered. If the adapter does not answer through one driver, try another.
+
+**Update the VAS 6154 / VNCI adapter firmware.** Some adapters on older firmware refuse the raw CAN channel, without which reading memory does not work. The D-PDU driver updates the firmware itself on the first connect (about 30 seconds) — let it finish and do not unplug the adapter.
 
 **What does "adapter provides no raw CAN channel" mean?**
 ContiTool reads memory through RawMode on pins 6/14. Some adapters do not provide it: other vendors' J2534 drivers, and some VAS 6154 / VNCI units — genuine ones included — where the refusal comes from the adapter itself on every driver. ContiTool then tries a fallback (ODIS-style links on fixed identifiers) and verifies it with one request. If that answers nothing, the adapter cannot be used; try another D-PDU driver, otherwise another adapter.

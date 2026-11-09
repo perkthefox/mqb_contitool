@@ -1,5 +1,42 @@
 # Changelog / История изменений
 
+## 2.0.1d — 2026-11-09
+
+По отчётам на 2.0.1b и 2.0.1c: медленная запись через VNCI и обрыв на середине, блоки, оставшиеся в загрузчике, и молчание при входе в RAM-Loader.
+From the 2.0.1b and 2.0.1c reports: slow VNCI writes that broke off halfway, gateways left in the bootloader, and silence on the RAM-Loader entry.
+
+### 🇷🇺 Исправлено
+- **Запись CodeFlash через VAS 6154 / VNCI шла 0,9 КБ/с и обрывалась ошибкой «очередь отправки VCI переполнена».** Каждый кадр CAN был отдельным обращением к VCI по сети (~7 мс), так что блок 514 байт уходил 74 обращениями и почти всё время уходило на дорогу до адаптера, а не на запись. Теперь вся сессия программирования идёт одним каналом через ISO-TP самого VCI, как у ODIS: блок — одно обращение, кадры нарезает и Flow Control обрабатывает сам адаптер. Так же загружаются наборы ZDC. Если ISO-TP адаптера откажет на каком-то запросе, этот запрос уходит повторно обычным путём, и запись продолжается — блок не остаётся стёртым.
+- **«Очередь отправки VCI переполнена» говорилось не о том.** Очередь не переполнялась: после ~125 тысяч кадров на одном канале VCI переставал подтверждать отправку и перезапускал свою службу. Канал сырого CAN теперь переоткрывается между пакетами каждые 20 000 кадров (между операциями — от 5 000), а сообщение называет обе настоящие причины: кадр никто не подтверждает на шине (питание блока, провода, терминатор 120 Ом) или завис сам VCI.
+- **Мёртвый канал больше не ждёт таймаут на каждом кадре.** Ожидание отправки кадра снова 1 с, а после отказа канала следующие кадры отклоняются сразу, без минут ожидания в повторах вокруг сброса.
+- **Блок, оставшийся в загрузчике FBL после записи, больше не считается успехом.** `10 03 → 50 03` отвечает и загрузчик, поэтому работа приложения теперь подтверждается чтением `F197` или `0600` — этих идентификаторов в таблице загрузчика нет. Это касается и чтения/бэкапа: если исправный блок после операции остался в FBL, это ошибка, а не «готово».
+- **Блок в загрузчике FBL распознаётся.** После оборванной записи (`10 03 → 7F 10 7E`) и после включения со стёртым приложением (загрузчик в Default Session) проверка связи, вход в RAM-Loader, сбросы и запись проходят штатно. Отказ предусловий программирования (`27 03`, `31 01 0203`) больше не останавливает вход — решает ответ на `10 02`, как в 2.0.1c.
+- **Вход в RAM-Loader на блоках, где он молчал.** Ответ на подготовительное чтение не помещается в буфер загрузчика, и последние восемь байт ложатся на его служебные ячейки; одну из них загрузчик проверяет и, если она не подходит, не отвечает вовсе. Значение берётся из записи F15B, которую переписывает прошивка, — поэтому на одних блоках работало, на других нет, а перепрошивка «лечила». Если проверенная последовательность осталась без ответа, ContiTool читает идентификаторы этого блока и собирает запрос так, чтобы на служебные ячейки легли допустимые значения. Байт проверки и прочитанные длины сохраняются в отчёте.
+- **В отчёт о проблеме попадают журналы драйвера, через который шла работа.** Раньше, если за время операции новых журналов не было, подкладывались два последних файла любого драйвера — например, VCTool часовой давности вместо ODIS-S.
+- J2534: ответ сверяется с запросом, запоздавшие ответы отбрасываются, ожидание после `7F xx 78` — честные P2/P2*.
+
+### 🇷🇺 Добавлено
+- **Кнопка «Залить бэкап…»** на карточке блока на стартовом экране.
+- **Блок в загрузчике виден сразу.** «Проверить связь» показывает «Блок отвечает (в режиме загрузчика FBL)», а «Считать блок» на таком блоке предупреждает, что основная прошивка не запущена, и предлагает залить бэкап.
+- **Напоминание обновить прошивку VAS 6154 / VNCI** — в окне подключения при выборе адаптера и в FAQ.
+- Аппаратный ISO15765 для прошивки через адаптеры J2534 и отправка Consecutive Frame пачкой.
+
+### 🇬🇧 Fixed
+- **Writing CodeFlash through a VAS 6154 / VNCI ran at 0.9 KB/s and broke off with "the VCI send queue is full".** Every CAN frame was a separate round trip to the VCI over the network (~7 ms), so a 514-byte block took 74 of them and nearly all the time went on reaching the adapter rather than writing. The whole programming session now runs on one link through the VCI's own ISO-TP, as ODIS does: one request per block, with the adapter cutting the frames and handling Flow Control itself. ZDC datasets are uploaded the same way. Should the adapter's ISO-TP fail on a request, that request goes again on the regular path and the write carries on — the gateway is not left erased.
+- **"The VCI send queue is full" was about something else.** No queue overflowed: after ~125,000 frames on one link the VCI stopped confirming sends and restarted its service. The raw CAN link is now reopened between packets every 20,000 frames (from 5,000 between operations), and the message names both real causes: nothing on the bus acknowledges the frame (ECU power, wiring, 120 Ω terminator), or the VCI itself hung.
+- **A dead link no longer waits out a timeout on every frame.** A frame send waits 1 s again, and once the link has failed the next frames are refused at once instead of minutes of waiting in the retries around a reset.
+- **A gateway left in its FBL bootloader after a write is no longer reported as success.** The bootloader answers `10 03 → 50 03` too, so a running application is now confirmed by reading `F197` or `0600`, which the bootloader's table does not have. The same goes for reads and backups: a healthy gateway left in FBL afterwards is an error, not "done".
+- **A gateway in its FBL bootloader is recognised.** After an interrupted write (`10 03 → 7F 10 7E`) and after power-up with an erased application (bootloader in Default Session), the link check, RAM-Loader entry, resets and writes work as usual. A refused programming precondition (`27 03`, `31 01 0203`) no longer stops the entry — the answer to `10 02` decides, as in 2.0.1c.
+- **RAM-Loader entry on gateways where it stayed silent.** The answer to the staging read does not fit the bootloader's buffer, and its last eight bytes land on the bootloader's own state cells; it checks one of them and, if the value is wrong, does not answer at all. That value comes from the F15B record, which a flash rewrites — which is why it worked on some gateways and not others, and why a reflash "cured" it. When the verified sequence goes unanswered, ContiTool reads this gateway's identifiers and lays the request out so the state cells receive acceptable values. The checked byte and the lengths read go into the report.
+- **Problem reports carry the logs of the driver the operation ran on.** When no new log had been written during the operation, the last two files of any driver were taken instead — for example VCTool logs from an hour earlier in place of ODIS-S.
+- J2534: answers are matched to their request, late answers are dropped, and the wait after `7F xx 78` uses proper P2/P2*.
+
+### 🇬🇧 Added
+- **A "Write backup…" button** on the bench ECU card of the start screen.
+- **A gateway in the bootloader shows at once.** "Check link" reports "ECU answers (in FBL bootloader mode)", and "Read ECU" on such a gateway warns that the main firmware is not running and offers to write a backup.
+- **A reminder to update the VAS 6154 / VNCI firmware** — in the connection dialog when that adapter is chosen, and in the FAQ.
+- Hardware ISO15765 for flashing through J2534 adapters, and Consecutive Frames sent in batches.
+
 ## 2.0.1c — 2026-11-09
 
 По отчётам на 2.0.1b: адаптеры, которые отказывают в сыром CAN.

@@ -141,6 +141,10 @@ class _MockGatewayBus:
             pass  # Suppressed negative response
         elif req == trigger:
             self._in_loader = True
+        elif req[:1] == b"\x22":
+            # A real gateway answers an identifier it does not keep, so a length measurement never sits on a
+            # timeout. Only the staged multi-DID reads above are special.
+            self._reply(0x77A, b"\x03\x7f\x22\x31\xaa\xaa\xaa\xaa")
 
 
 def test_can_link_service_loader_entry_and_native_reader() -> None:
@@ -148,6 +152,8 @@ def test_can_link_service_loader_entry_and_native_reader() -> None:
     with J533CanLink("mock", bus=bus) as link:
         info = enter_ram_loader(link)
         assert info["loader_ready"] is True
+        # every successful entry reports the byte that landed on the bootloader's gated state cell
+        assert info["stage1_gate_byte"] == "00"
         assert info["beacon"] == BEACON_ASCII.decode("ascii")
         sample = read_memory_bytes(link, 0x01000000, 32)
         assert sample == bytes(range(32))
@@ -172,8 +178,95 @@ def test_silent_loader_entry_step_is_named_not_a_bare_timeout() -> None:
                 return  # no loader runs: nobody answers on 0x6F1
             super().send(message, timeout)
 
-    with J533CanLink("mock", bus=SilentStage1()) as link, pytest.raises(TimeoutError, match="multi-DID, stage 1"):
+    with J533CanLink("mock", bus=SilentStage1()) as link, pytest.raises(TimeoutError) as err:
         enter_ram_loader(link)
+    # The lengths this gateway really answers go into the message, so even a failure carries the explanation
+    assert "multi-DID, stage 1" in str(err.value) and "DID lengths read" in str(err.value)
+
+
+def test_every_staged_did_answers_a_length_fixed_in_the_firmware() -> None:
+    """The bootloader builds each of these answers with a constant length — its F15B handler copies two 10-byte
+    NvM records in a loop that always runs twice — so the staged answer measures the same on every gateway."""
+    from contitool.can.payloads import KNOWN_DID_LENGTHS, STAGE1_TOTAL, UNKNOWN_DIDS
+
+    req = build_service_loader_uds_steps()[0]
+    dids = [int.from_bytes(req[i : i + 2], "big") for i in range(1, len(req), 2)]
+    total = 1 + sum(2 + KNOWN_DID_LENGTHS[d] for d in dids if d not in UNKNOWN_DIDS)
+    assert total == STAGE1_TOTAL and dids[-1] == 0x0410
+
+
+def test_stage1_layout_is_rebuilt_so_the_gate_byte_gets_through() -> None:
+    """The answer overruns the bootloader's 330-byte buffer by eight bytes onto its state block, and the byte
+    landing on 0xFEDE0C66 is gated: 0 or 0x04..0x7F makes the bootloader return without answering at all. Which
+    byte lands there is decided by the layout, so reading the DIDs first makes it computable."""
+    from contitool.can.payloads import (
+        STAGE1_GATE_INDEX,
+        STAGE1_GATE_OK,
+        STAGE1_TOTAL,
+        UNKNOWN_DIDS,
+        build_stage1_did_list,
+        plan_stage1_dids,
+        simulate_stage1_response,
+        stage1_state_ok,
+    )
+
+    base = {0xF17C: b"TST-AAA01.01.0100000001", 0xF1A2: b"013026", 0x0410: b"\x05"}  # 23 bytes, as the DID table
+    # Two 10-byte fingerprint records, as F15B answers them; only the last byte differs and it is the gate byte.
+    tail_ok = bytes.fromhex("00010100000000000000" "26110800000000002E03")
+    tail_bad = bytes.fromhex("00010100000000000000" "26110800000000002E00")
+
+    verified = build_stage1_did_list()
+    good = simulate_stage1_response(verified, {**base, 0xF15B: tail_ok})
+    bad = simulate_stage1_response(verified, {**base, 0xF15B: tail_bad})
+    assert len(good) == len(bad) == STAGE1_TOTAL  # the length never moves; only the gate byte does
+    assert good[STAGE1_GATE_INDEX] in STAGE1_GATE_OK
+    assert bad[STAGE1_GATE_INDEX] not in STAGE1_GATE_OK  # this is the gateway that stays silent
+
+    # Gate-passing layouts exist here, but only by putting 040F last — whose DID byte 0x0F then lands on 0C62,
+    # the suppress-response flag, and the bootloader drops the answer. That is no fix, so no plan.
+    values = {**base, 0xF15B: tail_bad, 0x040A: bytes(31), 0x040F: bytes([2, 0, 0, 3]),
+              0xF186: b"\x02", 0xF1DF: b"\x01", 0xF1D5: bytes([1, 2, 3, 0, 0, 0])}
+    assert plan_stage1_dids(values) is None
+
+    # A binary DID whose value ends 00 ?? 00 ?? <gate> is what makes a working layout.
+    values[0x040A] = bytes(26) + bytes([0x00, 0x07, 0x00, 0x09, 0x03])
+    plan = plan_stage1_dids(values)
+    assert plan is not None
+    resp = simulate_stage1_response(plan, values)
+    assert stage1_state_ok(resp)
+    assert len(resp) == STAGE1_TOTAL
+    assert resp[STAGE1_GATE_INDEX] in STAGE1_GATE_OK  # the gate now passes
+    assert resp[330] == 0 and resp[332] == 0  # the response is not suppressed, the boot-flags update still runs
+    assert plan[-1] == 0x0410  # 0410 last, so the answer still ends 04 10 <value>
+    assert plan.index(UNKNOWN_DIDS[0]) == 8  # the descriptor stays at offset 18 of the request
+
+
+def test_the_verified_layout_on_a_working_gateway_meets_every_state_byte_rule() -> None:
+    """The rules are taken from the firmware; the layout proven on hardware must satisfy all of them."""
+    from contitool.can.payloads import build_stage1_did_list, simulate_stage1_response, stage1_state_ok
+
+    good = {0xF17C: b"TST-AAA01.01.0100000001", 0xF1A2: b"013026", 0x0410: b"\x05",
+            0xF15B: bytes.fromhex("00010100000000000000" "26110800000000002E03")}
+    assert stage1_state_ok(simulate_stage1_response(build_stage1_did_list(), good))
+
+
+def test_a_late_answer_to_the_previous_did_is_not_taken_as_this_ones_length() -> None:
+    """The replan is only as good as the lengths it reads; a stale 62 F17C … arriving while F1A2 is asked must not
+    become F1A2's 23-byte value."""
+    from contitool.can.workflows import _read_dids
+
+    answers = {
+        0xF17C: b"\x62\xf1\x7c" + b"A" * 23,
+        0xF1A2: b"\x62\xf1\x7c" + b"A" * 23,  # the late echo of F17C, not F1A2
+        0x0410: b"\x62\x04\x10\x05",
+    }
+
+    class Link:
+        def request_uds(self, req: bytes, expected: int, timeout: float) -> bytes:
+            return answers[int.from_bytes(req[1:3], "big")]
+
+    got = _read_dids(Link(), (0xF17C, 0xF1A2, 0x0410))
+    assert got == {0xF17C: b"A" * 23, 0x0410: b"\x05"}
 
 
 def test_response_pending_waits_p2_star(monkeypatch) -> None:
@@ -242,3 +335,259 @@ def test_a_stream_that_stops_midway_names_the_lost_bytes_and_a_slow_slcan(monkey
     with pytest.raises(TimeoutError, match="stopped after 2400/65536 bytes"):
         workflows.read_memory_area(LossyLink(), 0, 0x10000, tmp_path / "Cflash.bin", reporter=Rep())
     assert len(errors) == 1 and "loses frames" in errors[0]
+
+
+def test_gateway_stuck_in_fbl_after_interrupted_flash_recovers_cleanly(monkeypatch) -> None:
+    """After EraseMemory + mid-flash disconnect, the ECU boots into FBL where `10 03` returns `7F 10 7E`.
+    Link check, RAM-loader entry, and pre-flash resets must succeed, while strict post-flash check still fails."""
+    from contitool.i18n import set_lang
+
+    set_lang("en")  # the messages below are matched in English
+    import pytest
+
+    from contitool.can import can_identify, workflows
+
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+
+    class FblOnlyGateway(_MockGatewayBus):
+        def _handle_uds(self, req: bytes) -> None:
+            if req == b"\x10\x03":
+                self._reply(0x77A, b"\x03\x7f\x10\x7e\xaa\xaa\xaa\xaa")
+                return
+            if req in (b"\x27\x03", bytes.fromhex("31010203")) or req.startswith(b"\x27\x04"):
+                raise AssertionError(f"Application-only service {req.hex()} must not be sent in FBL")
+            if req == b"\x3e\x00":
+                self._reply(0x77A, b"\x02\x7e\x00\xaa\xaa\xaa\xaa\xaa")
+                return
+            if req == b"\x22\xf1\x87":
+                resp = b"\x62\xf1\x873Q0907530AR"
+                self._reply(0x77A, bytes([0x10, len(resp)]) + resp[:6])
+                self._reply(0x77A, b"\x21" + resp[6:13])
+                self._reply(0x77A, b"\x22" + resp[13:].ljust(7, b"\xaa"))
+                return
+            if req == b"\x11\x01":
+                self._in_loader = False
+                self._reply(0x77A, b"\x02\x51\x01\xaa\xaa\xaa\xaa\xaa")
+                return
+            super()._handle_uds(req)
+
+        def send(self, message: can.Message, timeout: float = 1.0) -> None:
+            if message.arbitration_id == 0x6F0 and not self._in_loader:
+                return
+            super().send(message, timeout)
+
+    ident = can_identify("mock", bus=FblOnlyGateway())
+    assert ident["responding"] is True and ident.get("in_fbl") is True
+    assert {i["did"]: i["value"] for i in ident["ident"]}["F187"] == "3Q0907530AR"
+
+    bus = FblOnlyGateway()
+    with J533CanLink("mock", bus=bus) as link:
+        info = enter_ram_loader(link)
+        assert info["loader_ready"] is True
+        # every successful entry reports the byte that landed on the bootloader's gated state cell
+        assert info["stage1_gate_byte"] == "00" and info.get("already_in_fbl") is True
+        rst = workflows._reset_to_application(link, allow_fbl=True)
+        assert rst.get("in_fbl") is True and rst["fbl_session"].startswith("5002")
+        # Strict post-flash check (allow_fbl=False) MUST still reject an ECU whose Application failed to boot
+        with pytest.raises(RuntimeError, match="Application did not come up"):
+            workflows._reset_to_application(link, allow_fbl=False)
+
+        # A write that started from a healthy gateway must not accept FBL as its landing: that is the ECU
+        # telling us what we just wrote did not come up, and calling it success hides a dead unit.
+        with pytest.raises(RuntimeError, match="Application did not come up"):
+            workflows._return_to_application(link, {"session_1003": "5003"})
+        # One that was already stuck in FBL before the write cannot be expected to leave it.
+        rst = workflows._return_to_application(link, {"already_in_fbl": True})
+        assert rst.get("in_fbl") is True
+        # Started from a loader an earlier run entered: the start state is unknown, so FBL is not held against it.
+        assert workflows._return_to_application(link, None).get("in_fbl") is True
+
+
+def test_gateway_cold_booted_into_fbl_default_session_after_power_cycle_recovers_cleanly(monkeypatch) -> None:
+    """After a power cycle / MCU reset with erased Application (`*(u32*)0xC000 != 0x90482442`), RH850 FBL
+    starts in Default Session (`0`): `10 02` directly -> `7F 10 7E`, `10 03` -> `50 03` (Extended `2`),
+    `27 03` in Extended -> `7F 27 7F`, `10 02` from Extended -> `50 02` (Programming `1`), `22 F1 DF` -> `0x44`."""
+    from contitool.i18n import set_lang
+
+    set_lang("en")  # the messages below are matched in English
+    import pytest
+
+    from contitool.can import can_identify, workflows
+
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+
+    class ColdBootFblGateway(_MockGatewayBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fbl_session = 0  # 0 = Default, 1 = Programming, 2 = Extended (FUN_ram_01003716)
+
+        def _handle_uds(self, req: bytes) -> None:
+            if req == b"\x10\x03":
+                if self.fbl_session == 1:
+                    self._reply(0x77A, b"\x03\x7f\x10\x7e\xaa\xaa\xaa\xaa")
+                else:
+                    self.fbl_session = 2
+                    self._reply(0x77A, b"\x06\x50\x03\x00\x32\x01\xf4\xaa")
+                return
+            if req == b"\x10\x02":
+                if self.fbl_session == 0:
+                    self._reply(0x77A, b"\x03\x7f\x10\x7e\xaa\xaa\xaa\xaa")
+                else:
+                    self.fbl_session = 1
+                    self._reply(0x77A, b"\x03\x7f\x10\x78\xaa\xaa\xaa\xaa")
+                    self._reply(0x77A, b"\x06\x50\x02\x00\x32\x01\xf4\xaa")
+                return
+            if req == b"\x27\x03":
+                self._reply(0x77A, b"\x03\x7f\x27\x7f\xaa\xaa\xaa\xaa")
+                return
+            if req.startswith(b"\x27\x04") or req == bytes.fromhex("31010203"):
+                raise AssertionError(f"Application precondition {req.hex()} must not follow 7F 27 7F")
+            if req == b"\x22\xf1\xdf":
+                self._reply(0x77A, b"\x04\x62\xf1\xdf\x44\xaa\xaa\xaa")
+                return
+            if req == b"\x22\xf1\x87":
+                resp = b"\x62\xf1\x873Q0907530AR"
+                self._reply(0x77A, bytes([0x10, len(resp)]) + resp[:6])
+                self._reply(0x77A, b"\x21" + resp[6:13])
+                self._reply(0x77A, b"\x22" + resp[13:].ljust(7, b"\xaa"))
+                return
+            if req == b"\x11\x01":
+                self._in_loader = False
+                self.fbl_session = 0
+                self._reply(0x77A, b"\x02\x51\x01\xaa\xaa\xaa\xaa\xaa")
+                return
+            if req == b"\x3e\x00":
+                self._reply(0x77A, b"\x02\x7e\x00\xaa\xaa\xaa\xaa\xaa")
+                return
+            super()._handle_uds(req)
+
+        def send(self, message: can.Message, timeout: float = 1.0) -> None:
+            if message.arbitration_id == 0x6F0 and not self._in_loader:
+                return
+            super().send(message, timeout)
+
+    ident = can_identify("mock", bus=ColdBootFblGateway())
+    assert ident["responding"] is True and ident.get("in_fbl") is True
+    assert ident.get("app_valid") is False and ident.get("f1df") == "44"
+    assert {i["did"]: i["value"] for i in ident["ident"]}["F187"] == "3Q0907530AR"
+
+    bus = ColdBootFblGateway()
+    with J533CanLink("mock", bus=bus) as link:
+        info = enter_ram_loader(link)
+        assert info["loader_ready"] is True and info.get("already_in_fbl") is True
+        rst = workflows._reset_to_application(link, allow_fbl=True)
+        assert rst.get("in_fbl") is True and rst["fbl_session"].startswith("5003")
+        bus.fbl_session = 0
+        workflows._enter_fbl_uds_programming(link, workflows.NULL_REPORTER)
+        assert bus.fbl_session == 1
+        with pytest.raises(RuntimeError, match="F197/0600 did not"):
+            workflows._reset_to_application(link, allow_fbl=False)
+
+
+def test_loader_payload_deadline_pacing_skips_sleep_when_send_already_took_longer(monkeypatch) -> None:
+    from contitool.can import transport
+
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    class SlowSyncAdapter(_MockGatewayBus):
+        def send(self, message: can.Message, timeout: float = 1.0) -> None:
+            super().send(message, timeout)
+            if message.arbitration_id == 0x6F0 and bytes(message.data) != LOADER_SYNC:
+                clock[0] += 0.005  # VNCI RawMode takes ~5 ms synchronously per frame
+
+    monkeypatch.setattr(transport.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(transport.time, "sleep", lambda dt: sleeps.append(dt))
+    with J533CanLink("mock", bus=SlowSyncAdapter()) as link:
+        link.send_loader_payload(b"\xfe\xff", inter_frame_delay=0.003)
+    assert sleeps == []  # 5 ms per send already exceeds 3 ms spacing; zero extra sleep wasted
+
+
+def test_after_a_write_only_f197_proves_the_application_runs() -> None:
+    """10 03 -> 50 03 is answered by a cold FBL too, and F1DF bit 2 comes from a check outside the dump: a FBL
+    that clears it must still not pass for a running application once something has been written."""
+    from contitool.i18n import set_lang
+
+    set_lang("en")  # the messages below are matched in English
+    import pytest
+
+    from contitool.can import workflows
+
+    class ColdFblLink:
+        def request_uds(self, req: bytes, expected: int, timeout: float, allow_pending: bool = False) -> bytes:
+            if req == b"\x10\x03":
+                return b"\x50\x03\x00\x32\x01\xf4"
+            if req == b"\x22\xf1\xdf":
+                return b"\x62\xf1\xdf\x40"  # bit 2 clear
+            raise TimeoutError("no answer")  # F197: the bootloader does not know it
+
+    with pytest.raises(RuntimeError, match="F197/0600 did not"):
+        workflows._probe_app_or_fbl(ColdFblLink(), attempts=2, allow_fbl=False)
+    # where FBL is an acceptable landing, the clear bit still reads as "application" — the cheaper mistake there
+    assert workflows._probe_app_or_fbl(ColdFblLink(), attempts=1, allow_fbl=True)[1] is False
+
+
+def test_a_request_the_adapter_iso_tp_drops_goes_again_on_the_software_path() -> None:
+    """Mid-flash the application may already be erased: a transport failure on the adapter's ISO-TP must not end
+    the operation. The same request goes again on the verified software path, and the user is told."""
+    import contextlib
+
+    import pytest
+
+    from contitool.can import J533CanLink
+    from test_identify import FakeGateway
+
+    class HwThenSoftware(FakeGateway):
+        hw_calls = ended = 0
+
+        @contextlib.contextmanager
+        def uds_session(self, tx_id: int, rx_id: int):
+            yield True
+
+        def request_uds(self, req: bytes, *, timeout: float, allow_pending: bool) -> bytes:
+            self.hw_calls += 1
+            raise can.CanOperationError("D-PDU: the frame never went out")
+
+        def end_uds_session(self) -> None:
+            self.ended += 1
+
+    bus = HwThenSoftware()
+    told: list[str] = []
+    with J533CanLink("mock", bus=bus) as link, link.uds_session() as hw:
+        assert hw is True
+        link.on_hw_fallback = told.append
+        assert link.request_uds(b"\x10\x03", 0x50).startswith(b"\x50\x03")  # answered on the software path
+        assert bus.hw_calls == 1 and bus.ended == 1 and told and told[0].startswith("10 03")
+        assert link.request_uds(b"\x10\x03", 0x50).startswith(b"\x50\x03")  # and it stays there
+        assert bus.hw_calls == 1
+
+    # A reset is expected to go unanswered: a hardware failure on it is not a reason to send it twice.
+    bus = HwThenSoftware()
+    with J533CanLink("mock", bus=bus) as link, link.uds_session():
+        with pytest.raises(can.CanOperationError):
+            link.request_uds(b"\x11\x01", 0x51, resend=False)
+        assert bus.ended == 0
+
+
+def test_a_refused_precondition_does_not_stop_the_fbl_entry_the_10_02_answer_decides(monkeypatch) -> None:
+    """2.0.1c behaviour, verified on hardware: 27 03 answering 7F 27 37 (delay) used to fall through to 10 02."""
+    from contitool.can import workflows
+    from contitool.can.transport import UdsNegativeResponse
+    from contitool.progress import NULL_REPORTER
+
+    sent: list[bytes] = []
+
+    class DelayedLink:
+        def request_uds(self, req: bytes, expected: int, timeout: float, allow_pending: bool = False) -> bytes:
+            sent.append(req)
+            if req == b"\x10\x03":
+                return b"\x50\x03\x00\x32\x01\xf4"
+            if req == b"\x27\x03":
+                raise UdsNegativeResponse(0x27, 0x37, b"\x7f\x27\x37")
+            if req == b"\x10\x02":
+                return b"\x50\x02\x00\x32\x01\xf4"
+            raise AssertionError(req.hex())
+
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    workflows._enter_fbl_uds_programming(DelayedLink(), NULL_REPORTER)
+    assert sent[-1] == b"\x10\x02"

@@ -150,7 +150,8 @@ class FakePduApi:
         return 0
 
     def PDUSetComParam(self, _hmod, hcll, item) -> int:  # noqa: N802
-        p = item._obj
+        # byref(ParamItem) for a param we build, or the POINTER that PDUGetComParam handed out and we edited
+        p = item._obj if hasattr(item, "_obj") else item.contents
         self.params[hcll][p.ComParamId] = C.cast(p.pComParamData, C.POINTER(C.c_uint32)).contents.value
         return 0
 
@@ -592,3 +593,380 @@ def test_a_link_that_saw_a_vci_error_is_not_handed_out_again(monkeypatch) -> Non
     dpdu.release_session(bus)
     assert dpdu.open_session("") is not bus
     dpdu.close_session()
+
+
+class UdsCapablePduApi(FakePduApi):
+    """FakePduApi extended with ISO 22900-2 `ISO_15765_3_on_ISO_15765_2` UDS link + VAG FBL responder."""
+
+    UDS_RSC_ID = 0x30010001
+
+    def __init__(self, *, require_resource_lookup: bool = False, silent_uds: bool = False,
+                 finish_on_78: bool = False) -> None:
+        super().__init__()
+        self.require_resource_lookup = require_resource_lookup
+        self.silent_uds = silent_uds
+        self.finish_on_78 = finish_on_78
+        self.uds_links: set[int] = set()
+        self.uds_urid: dict[int, dict[int, int]] = {}
+        self.uds_sendrecv_count = 0
+        self.flashed_app = bytearray()
+        self._unlocked = False
+        self.objects.update({
+            "ISO_15765_3_on_ISO_15765_2": 0x30,
+            "CP_Baudrate": 126,
+            "CP_CanFillerByteHandling": 0x41,
+            "CP_CanFillerByte": 0x42,
+            "CP_TesterPresentHandling": 0x43,
+            "CP_BlockSize": 0x44,
+            "CP_StMin": 0x45,
+            "CP_P2Max": 0x46,
+            "CP_P2Star": 0x47,
+            "CP_RC78CompletionTimeout": 0x48,
+            "CP_RC78Handling": 0x49,
+            "CP_CanPhysReqFormat": 0x1C,
+            "CP_CanRespUSDTId": 0x1D,
+            "CP_CanRespUSDTFormat": 0x1E,
+        })
+
+    def PDUGetComParam(self, _hmod, hcll, param_id, out) -> int:  # noqa: N802
+        val = C.c_uint32(self.params.get(hcll, {}).get(param_id, 0))
+        item = ParamItem(0x1200, param_id, 0x105, 2, C.cast(C.pointer(val), C.c_void_p))
+        self.keep += [val, item]
+        out._obj.contents = item
+        return 0
+
+    def PDUGetResourceIds(self, hmod, rsc, out) -> int:  # noqa: N802
+        assert rsc._obj.ProtocolId == self.objects["ISO_15765_3_on_ISO_15765_2"]
+        rids = (C.c_uint32 * 1)(self.UDS_RSC_ID)
+        mod_entry = (dpdu.RscIdItemData * 1)(dpdu.RscIdItemData(hmod, 1, C.cast(rids, C.POINTER(C.c_uint32))))
+        top = dpdu.RscIdItem(0x1100, 1, C.cast(mod_entry, C.POINTER(dpdu.RscIdItemData)))
+        self.keep += [rids, mod_entry, top]
+        out._obj.contents = top
+        return 0
+
+    def PDUGetUniqueRespIdTable(self, hmod, hcll, out) -> int:  # noqa: N802
+        if hcll not in self.uds_links:
+            return super().PDUGetUniqueRespIdTable(hmod, hcll, out)
+        pids = (0x1A, 0x1C, 0x1D, 0x1E, 0x1B)
+        # what the real driver hands out for a fresh UDS link (probe v6 on a VNCI): 0x7E0/0x7E8, formats 5, no UUDT
+        vals = (C.c_uint32 * len(pids))(0x7E0, 5, 0x7E8, 5, 0xFFFFFFFF)
+        params = (ParamItem * len(pids))(*(
+            ParamItem(0x1200, pid, 0x105, 1, C.cast(C.byref(vals, idx * C.sizeof(C.c_uint32)), C.c_void_p))
+            for idx, pid in enumerate(pids)
+        ))
+        entry = (EcuUniqueRespData * 1)(EcuUniqueRespData(0, len(pids), C.cast(params, C.POINTER(ParamItem))))
+        table = UridTable(0x1700, 1, C.cast(entry, C.POINTER(EcuUniqueRespData)))
+        self.keep += [vals, params, entry, table]
+        out._obj.contents = table
+        return 0
+
+    def PDUSetUniqueRespIdTable(self, hmod, hcll, table) -> int:  # noqa: N802
+        if hcll not in self.uds_links:
+            return super().PDUSetUniqueRespIdTable(hmod, hcll, table)
+        t = table._obj if hasattr(table, "_obj") else table.contents
+        entry = t.pUniqueData[0]
+        self.uds_urid[hcll] = {
+            entry.pParams[i].ComParamId: C.cast(entry.pParams[i].pComParamData, C.POINTER(C.c_uint32)).contents.value
+            for i in range(entry.NumParamItems)
+        }
+        return 0
+
+    def PDUCreateComLogicalLink(self, hmod, rsc, resource, tag, phcll, flag) -> int:  # noqa: N802
+        is_uds_rsc = rsc is not None and rsc._obj.ProtocolId == self.objects["ISO_15765_3_on_ISO_15765_2"]
+        if is_uds_rsc and self.require_resource_lookup and resource == 0xFFFFFFFE:
+            return 0x50
+        if is_uds_rsc or resource == self.UDS_RSC_ID:
+            h = 0x20020000 + len(self.links)
+            self.links[h] = tuple(flag._obj.pFlagData[i] for i in range(4))
+            self.params[h], self.events[h] = {}, []
+            self.uds_links.add(h)
+            phcll._obj.value = h
+            return 0
+        return super().PDUCreateComLogicalLink(hmod, rsc, resource, tag, phcll, flag)
+
+    def _queue_uds_result(self, hcll: int, hcop: int, payload: bytes) -> None:
+        buf = (U8 * len(payload)).from_buffer_copy(payload)
+        fl = (U8 * 4)(0, 0, 0, 0)
+        r = ResultData(FlagData(4, fl), 0, 1, FlagData(0, None), 0, 0, None, len(payload), C.cast(buf, C.POINTER(U8)))
+        ev = EventItem(IT_RESULT, hcop, None, 0, C.cast(C.pointer(r), C.c_void_p))
+        self.keep += [buf, fl, r, ev]
+        self.events[hcll].append(ev)
+
+    def _queue_uds_done(self, hcll: int, hcop: int) -> None:
+        st = C.c_uint32(0x8012)
+        ev = EventItem(IT_STATUS, hcop, None, 0, C.cast(C.pointer(st), C.c_void_p))
+        self.keep += [st, ev]
+        self.events[hcll].append(ev)
+
+    def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+        if hcll not in self.uds_links:
+            return super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+        c = ctrl._obj
+        cid = self.next_cop
+        self.next_cop += 1
+        hcop._obj.value = cid
+        if cop in (COPT_STARTCOMM, COPT_STOPCOMM):
+            self._queue_uds_done(hcll, cid)
+            return 0
+        assert cop == COPT_SENDRECV and c.NumPossibleExpectedResponses == 2
+        if self.silent_uds:
+            return 0
+        if c.NumSendCycles == 0:
+            # Follow-up receive-only primitive after a driver finished early on 7F 31 78
+            self._queue_uds_result(hcll, cid, bytes.fromhex("7101ff0000"))
+            self._queue_uds_done(hcll, cid)
+            return 0
+
+        self.uds_sendrecv_count += 1
+        req = bytes(data[:size])
+        req_sid = req[0]
+        exp0, exp1 = c.pExpectedResponseArray[0], c.pExpectedResponseArray[1]
+        assert exp0.ResponseType == 0 and exp0.pPatternData[0] == ((req_sid + 0x40) & 0xFF)
+        assert exp1.ResponseType == 1 and exp1.pPatternData[0] == 0x7F and exp1.pPatternData[1] == req_sid
+
+        from contitool.can.payloads import fbl_sa2
+
+        if req == b"\x3e\x00":
+            self._queue_uds_result(hcll, cid, b"\x7e\x00")
+            self._queue_uds_done(hcll, cid)
+        elif req == b"\x10\x03":
+            self._queue_uds_result(hcll, cid, b"\x7f\x10\x7e")
+            self._queue_uds_done(hcll, cid)
+        elif req == b"\x10\x02":
+            self._queue_uds_result(hcll, cid, bytes.fromhex("5002003201f4"))
+            self._queue_uds_done(hcll, cid)
+        elif req == b"\x27\x11":
+            self._queue_uds_result(hcll, cid, bytes.fromhex("671112345678"))
+            self._queue_uds_done(hcll, cid)
+        elif req[:2] == b"\x27\x12":
+            assert int.from_bytes(req[2:6], "big") == fbl_sa2(0x12345678)
+            self._unlocked = True
+            self._queue_uds_result(hcll, cid, b"\x67\x12")
+            self._queue_uds_done(hcll, cid)
+        elif req[:3] == b"\x2e\xf1\x5a":
+            self._queue_uds_result(hcll, cid, b"\x6e\xf1\x5a")
+            self._queue_uds_done(hcll, cid)
+        elif req == bytes.fromhex("3101ff000101"):
+            assert self._unlocked
+            self.flashed_app.clear()
+            self._queue_uds_result(hcll, cid, bytes.fromhex("7f3178"))
+            if not self.finish_on_78:
+                self._queue_uds_result(hcll, cid, bytes.fromhex("7101ff0000"))
+            self._queue_uds_done(hcll, cid)
+        elif req[:3] == b"\x34\x00\x44":
+            self._queue_uds_result(hcll, cid, bytes.fromhex("74200f02"))
+            self._queue_uds_done(hcll, cid)
+        elif req[0] == 0x36:
+            self.flashed_app.extend(req[2:])
+            self._queue_uds_result(hcll, cid, bytes([0x76, req[1]]))
+            self._queue_uds_done(hcll, cid)
+        elif req == b"\x37":
+            self._queue_uds_result(hcll, cid, b"\x77")
+            self._queue_uds_done(hcll, cid)
+        elif req[:4] == bytes.fromhex("31010202"):
+            self._queue_uds_result(hcll, cid, bytes.fromhex("7101020200"))
+            self._queue_uds_done(hcll, cid)
+        elif req == bytes.fromhex("3101ff01"):
+            self._queue_uds_result(hcll, cid, bytes.fromhex("7101ff0100"))
+            self._queue_uds_done(hcll, cid)
+        elif req == b"\x11\x01":
+            err = dpdu.ErrorData(dpdu.ERR_EVT_RX_TIMEOUT, 0)
+            ev = EventItem(IT_ERROR, cid, None, 0, C.cast(C.pointer(err), C.c_void_p))
+            self.keep += [err, ev]
+            self.events[hcll].append(ev)
+            self._queue_uds_done(hcll, cid)
+        return 0
+
+
+def test_uds_application_flash_uses_one_isotp_primitive_per_514b_block_and_restores_rawmode(monkeypatch) -> None:
+    """1.52 MB Application UDS write sends 2,975 ISO-TP primitives (not 220,150 raw frames) and restores RawMode."""
+    from contitool.can import J533CanLink, workflows
+    from contitool.core.constants import APP_SIZE
+
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    api = UdsCapablePduApi(require_resource_lookup=True, finish_on_78=True)
+    bus = DPduBus(dll=api)
+    app_image = bytes(((i * 37) ^ (i >> 8)) & 0xFF for i in range(APP_SIZE))
+
+    with J533CanLink("", bus=bus) as link:
+        res = workflows._program_application_uds(link, app_image)
+        assert res["hardware_isotp"] is True
+        assert res["bytes_transferred"] == APP_SIZE
+        assert res["reset_response"] == "no response after reset"
+        assert bytes(api.flashed_app) == app_image
+        # 2,975 TransferData blocks + ~10 setup/check/reset primitives (vs 220,150 RawMode primitives!)
+        assert 2980 <= api.uds_sendrecv_count <= 2995
+        urid = next(iter(api.uds_urid.values()))
+        assert urid[0x1A] == 0x710 and urid[0x1D] == 0x77A
+        assert urid[0x1C] == urid[0x1E] == 5 and urid[0x1B] == 0xFFFFFFFF  # the rest stays as the driver has it
+        # the last frame of every block is padded like the verified software path pads ConsecutiveFrames
+        uds_link = next(iter(api.uds_urid))
+        assert api.params[uds_link][api.objects["CP_CanFillerByte"]] == 0x00
+        assert api.params[uds_link][api.objects["CP_CanFillerByteHandling"]] == 1
+        # After _program_application_uds exits, RawMode (0x6F0/0x6F1 + monitor) is immediately live again
+        assert not bus.spent and bus.h_rx and bus.h_tx
+        api._result((0x6F1).to_bytes(4, "big") + b"\x84\x00\x00\x00\x00", b"\x00\x00\x00\x00")
+        assert bytes(link.receive_frame(0x6F1, timeout=1.0).data) == b"\x84\x00\x00\x00\x00"
+    bus.shutdown()
+
+
+def test_uds_session_falls_back_to_rawmode_when_isotp_probe_stays_silent() -> None:
+    from contitool.can import J533CanLink
+
+    api = UdsCapablePduApi(silent_uds=True)
+    bus = DPduBus(dll=api)
+    with J533CanLink("", bus=bus) as link:
+        with link.uds_session() as hw_active:
+            assert hw_active is False
+        assert not bus.spent and bus.h_rx and bus.h_tx
+        res = can_identify("", bus=bus)
+        assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    bus.shutdown()
+
+
+def test_rawmode_tx_link_is_never_recycled_in_the_middle_of_a_frame_stream(monkeypatch) -> None:
+    """A STOPCOMM wait between two frames of one packet outlives the receiver, so send() must never recycle."""
+    monkeypatch.setattr(dpdu, "MAX_RAW_TX_COPS_BEFORE_RECYCLE", 25)
+    api = FakePduApi()
+    bus = DPduBus(dll=api)
+    first_tx = bus.h_tx
+    mon = bus.h_rx
+    for i in range(60):
+        bus.send(can.Message(arbitration_id=0x6F0, data=i.to_bytes(8, "little"), is_extended_id=False))
+    assert bus.h_tx == first_tx and bus._tx_cop_count == 60  # the stream ran on one link, untouched
+    assert bus.h_rx == mon and not bus.spent
+    bus.shutdown()
+
+
+def test_rawmode_tx_link_recycles_at_a_boundary_before_vci_primitive_table_overflows(monkeypatch) -> None:
+    monkeypatch.setattr(dpdu, "MAX_RAW_TX_COPS_BEFORE_RECYCLE", 25)
+    api = FakePduApi()
+    bus = DPduBus(dll=api)
+    first_tx = bus.h_tx
+    mon = bus.h_rx
+    for i in range(20):
+        bus.send(can.Message(arbitration_id=0x6F0, data=i.to_bytes(8, "little"), is_extended_id=False))
+    bus.maybe_recycle_tx()
+    assert bus.h_tx == first_tx and bus._tx_cop_count == 20  # not due yet: 20 < 25
+    for i in range(10):
+        bus.send(can.Message(arbitration_id=0x6F0, data=i.to_bytes(8, "little"), is_extended_id=False))
+    bus.maybe_recycle_tx()
+    assert bus.h_tx != first_tx and bus._tx_cop_count == 0  # due at 30, reopened and counted from scratch
+    assert bus.h_rx == mon and not bus.spent
+    bus.shutdown()
+
+
+def test_the_isotp_and_loader_paths_ask_for_a_recycle_at_their_own_boundaries(monkeypatch) -> None:
+    from contitool.can import J533CanLink
+
+    monkeypatch.setattr(dpdu, "MAX_RAW_TX_COPS_BEFORE_RECYCLE", 1)
+    api = FakePduApi()
+    bus = DPduBus(dll=api)
+    with J533CanLink("", bus=bus) as link:
+        link.send_uds(b"\x3e\x80")  # one frame out, so one COP is now on the clock
+        before = bus.h_tx
+        link.send_uds(b"\x3e\x80")  # the next request begins: a boundary, so the worn link is replaced first
+        assert bus.h_tx != before
+        before = bus.h_tx
+        with pytest.raises(TimeoutError):  # no loader to answer the sync frame; the recycle still happened
+            link.send_loader_payload(b"\x00" * 8)
+        assert bus.h_tx != before
+        before = bus.h_tx
+        with link.no_link_recycle():  # the RAM-loader entry: due or not, nothing may pause it
+            link.send_uds(b"\x3e\x80")
+            link.send_uds(b"\x3e\x80")
+        assert bus.h_tx == before
+    bus.shutdown()
+
+
+def test_stuck_send_primitive_reports_lost_vci_ack_instead_of_fake_queue_full() -> None:
+    """Reproduces #113.log hCoP=0x1e8f0: a primitive stuck in IDLE without 0x70 means nothing acknowledged it."""
+    set_lang("en")
+    api = FakePduApi()
+    bus = DPduBus(dll=api)
+    api._get_event = lambda *_a: 0x71  # the primitive sits in IDLE: no COPST_FINISHED, no CLLST_OFFLINE either
+    bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False), timeout=0.05)
+    # From the PC side a missing CAN acknowledge and a hung VCI look the same, so the message names both.
+    with pytest.raises(can.CanOperationError, match="never went out.*bus.*VCI itself hung"):
+        bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False), timeout=0.05)
+    assert any(c[0] == "cancel" for c in api.calls)
+    assert bus.spent
+    bus.shutdown()
+
+
+def test_a_spent_link_refuses_the_next_frame_at_once_instead_of_waiting_out_the_timeout() -> None:
+    """A retry loop around an ECU reset sends many frames; each one must not cost another full timeout."""
+    set_lang("en")
+    api = FakePduApi()
+    bus = DPduBus(dll=api)
+    api._get_event = lambda *_a: 0x71
+    bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False), timeout=0.05)
+    with pytest.raises(can.CanOperationError):
+        bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False), timeout=0.05)
+    started = time.monotonic()
+    for _ in range(5):
+        with pytest.raises(can.CanOperationError, match="no longer works"):
+            bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False), timeout=2.0)
+    assert time.monotonic() - started < 0.5  # five frames, not five two-second waits
+    bus.shutdown()
+
+
+def test_a_stuck_primitive_on_a_fixed_id_adapter_is_cancelled_on_its_own_link() -> None:
+    """Without raw CAN each id has its own link; cancelling a stuck cop on the wrong one leaves it stuck."""
+    set_lang("en")
+    api = FakePduApi()
+    api.rawmode_ok = False
+    bus = DPduBus(dll=api)
+    assert bus.nonraw and len(bus.nonraw) >= 2
+    link_710 = bus.nonraw[0x710]
+    api._get_event = lambda *_a: 0x71  # from here on nothing finishes
+    tester_present = b"\x02\x3e\x80" + b"\xaa" * 5
+    bus.send(can.Message(arbitration_id=0x710, data=tester_present, is_extended_id=False), timeout=0.05)
+    other = next(i for i in sorted(bus.nonraw) if i != 0x710)
+    with pytest.raises(can.CanOperationError):
+        bus.send(can.Message(arbitration_id=other, data=tester_present, is_extended_id=False), timeout=0.05)
+    cancels = [c for c in api.calls if c[0] == "cancel"]
+    assert cancels and all(c[1] == link_710 for c in cancels)  # the link the stuck frame was started on
+    bus.shutdown()
+
+
+def test_leaving_hardware_iso_tp_on_a_fixed_id_adapter_comes_back_even_after_an_error_marked_the_bus_spent() -> None:
+    """A failed 36 can set `spent`; the reopened fixed-id links are new and must not inherit it, or their own
+    check frame is refused and the software retry of that block never gets a link."""
+    set_lang("en")
+    api = FakePduApi()
+    api.rawmode_ok = False
+    bus = DPduBus(dll=api)
+    assert bus.nonraw and bus._nonraw_verified
+    bus._pause_raw()
+    bus.spent = True  # what CLLST_OFFLINE / a failed _call on the hardware link leaves behind
+    bus._nonraw_verified = False  # as after a VCI restart: the links are checked again with a real 10 03
+    bus._resume_raw()
+    assert not bus.spent and sorted(bus.nonraw) == [0x6F0, 0x710]
+    bus.shutdown()
+
+
+def test_reopening_a_proven_fixed_id_fallback_does_not_ask_a_rebooting_ecu_again() -> None:
+    """After `11 01` the ECU is silent for a while; a reopen that insisted on a `10 03` answer would call a
+    successful flash failed. The fallback proved itself when the session opened, so the reopen does not ask."""
+    set_lang("en")
+    api = FakePduApi()
+    api.rawmode_ok = False
+    bus = DPduBus(dll=api)
+    bus._pause_raw()
+    api.gw.answers = False  # rebooting
+    bus._resume_raw()
+    assert not bus.spent and bus.nonraw
+    bus.shutdown()
+
+
+def test_a_bus_that_cannot_reopen_after_a_refused_hardware_link_is_marked_spent_not_handed_out_again() -> None:
+    set_lang("en")
+    api = UdsCapablePduApi(silent_uds=True)
+    bus = DPduBus(dll=api)
+    api.rawmode_ok = api.nonraw_ok = False  # the adapter gives nothing back once the links are closed
+    with pytest.raises(can.CanError):
+        with bus.uds_session():
+            pass
+    assert bus.spent
+    bus.shutdown()

@@ -8,6 +8,7 @@ and gateway health/DTC diagnostics.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import json
@@ -26,6 +27,9 @@ from contitool.can.payloads import (
     EXPECTED_RSA_PROBE_SHA256,
     LOADER_RESET_PAYLOAD,
     RSA_PROBE_PAYLOAD,
+    STAGE1_GATE_INDEX,
+    STAGE1_MEASURE_DIDS,
+    STAGE1_TOTAL,
     build_cflash_faci_block_payloads,
     build_dflash_faci_payloads,
     build_dflash_reader_payload,
@@ -33,11 +37,14 @@ from contitool.can.payloads import (
     build_reader_payload,
     build_service_loader_uds_steps,
     build_uflash_faci_payloads,
+    build_stage1_did_list,
     cflash_block_ranges,
     fbl_sa2,
+    plan_stage1_dids,
+    simulate_stage1_response,
     verify_payload_self_tests,
 )
-from contitool.can.transport import J533CanLink
+from contitool.can.transport import TRANSPORT_ERRORS, J533CanLink, UdsNegativeResponse
 from contitool.core.analyzer import (
     analyze_cflash,
     analyze_dflash_swap,
@@ -156,6 +163,67 @@ STAGE1_SILENT = (  # (ru, en): the language can change while the app runs
 )
 
 
+def _read_dids(link: J533CanLink, dids: tuple[int, ...]) -> dict[int, bytes]:
+    """What each DID actually answers, read one at a time. A DID the ECU refuses is simply left out."""
+    out: dict[int, bytes] = {}
+    for did in dids:
+        try:
+            resp = link.request_uds(bytes([0x22, did >> 8, did & 0xFF]), 0x62, timeout=1.0)
+        except LINK_ERRORS:
+            continue
+        # A late answer to the previous DID also starts with 0x62; taking it would plan around the wrong length.
+        if len(resp) >= 3 and resp[1:3] == did.to_bytes(2, "big"):
+            out[did] = resp[3:]  # drop 0x62 and the 2-byte DID echo
+    return out
+
+
+def _stage1_replan(link: J533CanLink, reporter: OperationReporter, info: dict[str, Any]) -> bytes:
+    """The staging stayed silent: read this gateway's DIDs and lay the request out so its answer gets through.
+
+    The answer overruns the bootloader's 330-byte buffer by eight bytes onto a state block, and one of those
+    bytes is read back through a gate that returns without answering unless it is 1..3 or 0x80..0xFF; two more
+    must stay zero (STAGE1_STATE_OK). Which bytes land there depends on which DID covers those offsets, so
+    reading the DIDs first makes the layout computable instead of guessed. The readings go into the result
+    either way, so a failure still carries its explanation.
+
+    The extra reads sit between `27 11` and the trigger. That is safe: the seed state (0xFEDE0AF3 = 3) is written
+    only by the 27 handler itself and by the attempt-delay timer, which only moves 1 -> 2 — a 22 never touches it
+    and it does not expire (bench AA Uflash 0x01002F08..0x010031B4)."""
+    reporter.info(tr("Блок не ответил — читаем его DID по одному и пересобираем запрос под него…",
+                     "The ECU did not answer — reading its DIDs one by one to lay the request out for it…"))
+    values = _read_dids(link, STAGE1_MEASURE_DIDS)
+    info["did_lengths"] = {f"{did:04X}": len(v) for did, v in sorted(values.items())}
+    reporter.info(", ".join(f"{did:04X}={len(v)}" for did, v in sorted(values.items())))
+
+    known = simulate_stage1_response(build_stage1_did_list(), values)
+    if len(known) > STAGE1_GATE_INDEX:
+        info["stage1_gate_byte"] = f"{known[STAGE1_GATE_INDEX]:02X}"
+    plan = plan_stage1_dids(values)
+    if plan is None:
+        raise TimeoutError(tr(*STAGE1_SILENT) + tr(
+            f" Прочитанные длины: {info['did_lengths']}. Раскладка под этот блок не подбирается.",
+            f" DID lengths read: {info['did_lengths']}. No layout fits this gateway."))
+    info["stage1_replanned"] = [f"{did:04X}" for did in plan]
+    reporter.info(tr(f"Пересобрали запрос под этот блок ({len(plan)} DID) и пробуем ещё раз…",
+                     f"Rebuilt the request for this gateway ({len(plan)} DIDs) and retrying…"))
+    try:
+        return link.request_uds(build_service_loader_uds_steps(plan)[0], 0x62, timeout=3.0)
+    except TimeoutError:
+        raise TimeoutError(tr(*STAGE1_SILENT) + tr(
+            f" Прочитанные длины: {info['did_lengths']}. Пересобранный запрос тоже остался без ответа.",
+            f" DID lengths read: {info['did_lengths']}. The rebuilt request went unanswered as well.")) from None
+
+
+def _is_fbl_session_nrc(exc: BaseException) -> bool:
+    """True when `10 03` returned NRC 0x7E / 0x12 because the gateway is in FBL Programming Session."""
+    return isinstance(exc, UdsNegativeResponse) and exc.sid == 0x10 and exc.nrc in (0x7E, 0x12)
+
+
+def _is_fbl_precondition_nrc(exc: BaseException) -> bool:
+    """True when `27 03` returned NRC 0x7F / 0x12 after `10 03` succeeded in cold-boot FBL Extended Session."""
+    return isinstance(exc, UdsNegativeResponse) and exc.sid == 0x27 and exc.nrc in (0x7F, 0x12)
+
+
 def _enter_ram_loader_once(link: J533CanLink, reporter: OperationReporter) -> dict[str, Any]:
     """Execute the verified multi-DID UDS staging sequence to enter the 0x6F0 RAM-loader."""
     stage1, stage2, trigger = build_service_loader_uds_steps()
@@ -164,27 +232,66 @@ def _enter_ram_loader_once(link: J533CanLink, reporter: OperationReporter) -> di
         "flash_commands_sent": False,
     }
     reporter.can_log(tr("UDS 10 03 -> Расширенная диагностическая сессия", "UDS 10 03 -> Extended Diagnostic Session"))
-    info["session_1003"] = link.request_uds(b"\x10\x03", 0x50, timeout=2.0).hex()
-
-    reporter.can_log(tr("UDS 27 03 / 27 04 -> Разблокировка предпосылок программирования", "UDS 27 03 / 27 04 -> Precondition SecurityAccess"))
-    info["security_2703"] = link.request_uds(b"\x27\x03", 0x67, timeout=2.0).hex()
-    info["security_2704"] = link.request_uds(bytes.fromhex("2704caffe012"), 0x67, timeout=2.0).hex()
-    info["preconditions"] = link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0).hex()
+    try:
+        info["session_1003"] = link.request_uds(b"\x10\x03", 0x50, timeout=2.0).hex()
+    except RuntimeError as exc:
+        if not _is_fbl_session_nrc(exc):
+            raise
+        info["already_in_fbl"] = True
+        reporter.can_log(
+            tr(
+                "Шлюз уже находится в загрузчике FBL (NRC 0x7E на 10 03) — прямой переход к 10 02",
+                "Gateway is already in FBL bootloader (NRC 0x7E on 10 03) — proceeding directly to 10 02",
+            )
+        )
+    else:
+        reporter.can_log(tr("UDS 27 03 / 27 04 -> Разблокировка предпосылок программирования", "UDS 27 03 / 27 04 -> Precondition SecurityAccess"))
+        try:
+            info["security_2703"] = link.request_uds(b"\x27\x03", 0x67, timeout=2.0).hex()
+        except RuntimeError as exc:
+            if not _is_fbl_precondition_nrc(exc):
+                raise
+            info["already_in_fbl"] = True
+            reporter.can_log(
+                tr(
+                    "Шлюз находится в загрузчике FBL после сброса (NRC на 27 03) — прямой переход к 10 02",
+                    "Gateway is in FBL bootloader after reset (NRC on 27 03) — proceeding directly to 10 02",
+                )
+            )
+        else:
+            info["security_2704"] = link.request_uds(bytes.fromhex("2704caffe012"), 0x67, timeout=2.0).hex()
+            info["preconditions"] = link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0).hex()
 
     reporter.can_log(tr("UDS 10 02 -> Переход в загрузчик FBL (Programming Session)", "UDS 10 02 -> Entering FBL Programming Session"))
     info["session_1002"] = link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True).hex()
     time.sleep(1.0)
 
     reporter.can_log(tr("UDS 27 11 + multi-DID 0x22 Stage 1/2 -> Подготовка дескриптора 0x0100120E", "UDS 27 11 + multi-DID 0x22 Stage 1/2 -> Staging descriptor 0x0100120E"))
+    with link.no_link_recycle():  # from here to the beacon the entry must not pause for a TX link reopen
+        return _stage_and_trigger_loader(link, reporter, info, stage1, stage2, trigger)
+
+
+def _stage_and_trigger_loader(
+    link: J533CanLink,
+    reporter: OperationReporter,
+    info: dict[str, Any],
+    stage1: bytes,
+    stage2: bytes,
+    trigger: bytes,
+) -> dict[str, Any]:
+    """`27 11`, both staged DID reads and the trigger, then the beacon: the timing-critical half of the entry."""
     info["seed"] = link.request_uds(b"\x27\x11", 0x67, timeout=2.0).hex()
     info["write_0410_05"] = link.request_uds(bytes.fromhex("2e041005"), 0x6E, timeout=2.0).hex()
     try:
         resp1 = link.request_uds(stage1, 0x62, timeout=3.0)
     except TimeoutError:
-        raise TimeoutError(tr(*STAGE1_SILENT)) from None
-    if len(resp1) != 338 or resp1[-3:] != bytes.fromhex("041005"):
+        resp1 = _stage1_replan(link, reporter, info)
+    if len(resp1) != STAGE1_TOTAL or resp1[-3:] != bytes.fromhex("041005"):
         raise RuntimeError(f"Unexpected multi-DID stage 1 response ({len(resp1)} bytes)")
     info["stage1_length"] = len(resp1)
+    # The byte that overruns onto the bootloader's gated state cell, free of charge on a gateway that answered —
+    # a silent one reports the same field from _stage1_replan, so both sides of the story end up in the reports.
+    info["stage1_gate_byte"] = f"{resp1[STAGE1_GATE_INDEX]:02X}"
     info["write_0410_48"] = link.request_uds(bytes.fromhex("2e041048"), 0x6E, timeout=2.0).hex()
 
     link.send_uds(stage2)
@@ -255,7 +362,7 @@ def enter_ram_loader(
                 f"Initial entry failed ({first_err}) — resetting gateway back to Application and retrying…",
             )
         )
-        _reset_to_application(link, reporter=reporter)
+        _reset_to_application(link, reporter=reporter, allow_fbl=True)
         return _enter_ram_loader_once(link, reporter)
 
 
@@ -469,18 +576,97 @@ def _loader_reset_command(link: J533CanLink) -> str:
         return "no response after reset"
 
 
-def _request_with_retries(link: J533CanLink, uds_payload: bytes, expected_sid: int, attempts: int = 10) -> bytes:
+# In the application's DID tables and absent from the bootloader's read table (bench AA CodeFlash 0x1B24..0x1BC3),
+# so an answer to either can only come from a running application. Both answer on every build in the reports
+# (5366, 5388, 5502, 5504).
+APP_ONLY_DIDS = (0xF197, 0x0600)
+
+
+def _application_answers(link: J533CanLink) -> BaseException | None:
+    """None if the running application answered one of APP_ONLY_DIDS, otherwise the last failure."""
+    last: BaseException | None = None
+    for did in APP_ONLY_DIDS:
+        try:
+            link.request_uds(bytes([0x22, did >> 8, did & 0xFF]), 0x62, timeout=1.0)
+            return None
+        except LINK_ERRORS as exc:
+            last = exc
+    return last
+
+
+def _probe_app_or_fbl(link: J533CanLink, *, attempts: int, allow_fbl: bool) -> tuple[str, bool]:
     last_err: Exception | None = None
     for _ in range(attempts):
         try:
-            return link.request_uds(uds_payload, expected_sid, timeout=1.2, allow_pending=True)
+            sess = link.request_uds(b"\x10\x03", 0x50, timeout=1.2, allow_pending=True).hex()
         except LINK_ERRORS as exc:
-            last_err = exc
+            if allow_fbl and _is_fbl_session_nrc(exc):
+                try:
+                    return link.request_uds(b"\x10\x02", 0x50, timeout=2.5, allow_pending=True).hex(), True
+                except LINK_ERRORS as fbl_exc:
+                    last_err = fbl_exc
+            else:
+                last_err = exc
             time.sleep(0.5)
-    raise RuntimeError(f"Application did not answer {uds_payload.hex()}: {last_err}")
+            continue
+
+        # Cold-boot FBL Default Session also accepts `10 03 -> 50 03` when Application is erased/invalid, so a
+        # positive 10 03 alone does not prove the application runs. An application-only DID does.
+        exc = _application_answers(link)
+        if exc is None:
+            return sess, False
+        if not allow_fbl:
+            # Where FBL is no acceptable landing nothing short of that proof counts: F1DF bit 2 is only the result
+            # of a check whose code lies outside the dump, and a clear bit is no evidence the application started.
+            last_err = RuntimeError(tr(f"на 10 03 ответ есть, а на F197/0600 нет — работа приложения не подтверждена ({exc})",
+                                       f"10 03 answered but F197/0600 did not, so the Application is not proven ({exc})"))
+            time.sleep(0.5)
+            continue
+        # Where landing in FBL is acceptable, a running application mistaken for FBL is the costlier error (the
+        # entry then skips its preconditions), so a clear "application invalid" bit keeps treating it as one.
+        f1df_val: int | None = None
+        try:
+            f1df = link.request_uds(b"\x22\xf1\xdf", 0x62, timeout=1.0)
+            if len(f1df) >= 4:
+                f1df_val = f1df[3]
+        except LINK_ERRORS:
+            pass
+        return sess, f1df_val is not None and bool(f1df_val & 0x04)
+    raise RuntimeError(tr(f"Приложение шлюза не запустилось: {last_err}", f"Application did not come up: {last_err}"))
 
 
-def _reset_to_application(link: J533CanLink, *, reporter: OperationReporter = NULL_REPORTER) -> dict[str, Any]:
+def _return_to_application(
+    link: J533CanLink,
+    session: dict[str, Any] | None,
+    *,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Bring the gateway back to its Application at the end of an operation, and refuse to call it done if not.
+
+    A gateway that was already stuck in FBL when we started cannot be expected to leave it, so for that one FBL is
+    an acceptable landing — and so it is when the start is unknown (`session` None: the loader was entered by an
+    earlier run). For every other gateway staying in FBL means the operation left it without a running
+    application, and reporting that as "done" is how a user learns about it only when the car will not start."""
+    started_in_fbl = session is None or bool(session.get("already_in_fbl"))
+    info = _reset_to_application(link, reporter=reporter, allow_fbl=started_in_fbl)
+    if info.get("in_fbl"):
+        reporter.warning(
+            tr(
+                "Шлюз был в загрузчике FBL ещё до операции и остаётся в нём: приложение нужно восстановить "
+                "(заливка бэкапа или прошивка через ODIS).",
+                "The gateway was already in its FBL bootloader before this operation and is still there: its "
+                "application has to be restored (write a backup back, or an ODIS flash).",
+            )
+        )
+    return info
+
+
+def _reset_to_application(
+    link: J533CanLink,
+    *,
+    reporter: OperationReporter = NULL_REPORTER,
+    allow_fbl: bool = False,
+) -> dict[str, Any]:
     info: dict[str, Any] = {}
     try:
         info["uds_reset"] = link.request_uds(b"\x11\x01", 0x51, timeout=1.2, allow_pending=True).hex()
@@ -489,7 +675,7 @@ def _reset_to_application(link: J533CanLink, *, reporter: OperationReporter = NU
         info["uds_reset_error"] = str(exc)
     time.sleep(2.0)
     try:
-        info["application_session"] = _request_with_retries(link, b"\x10\x03", 0x50, attempts=2).hex()
+        sess, in_fbl = _probe_app_or_fbl(link, attempts=2, allow_fbl=allow_fbl)
         info["reset_method"] = info.get("reset_method", "uds")
     except LINK_ERRORS:
         reporter.can_log(
@@ -501,7 +687,12 @@ def _reset_to_application(link: J533CanLink, *, reporter: OperationReporter = NU
         info["loader_reset"] = _loader_reset_command(link)
         info["reset_method"] = "factory-loader"
         time.sleep(2.0)
-        info["application_session"] = _request_with_retries(link, b"\x10\x03", 0x50, attempts=10).hex()
+        sess, in_fbl = _probe_app_or_fbl(link, attempts=10, allow_fbl=allow_fbl)
+    if in_fbl:
+        info["fbl_session"] = sess
+        info["in_fbl"] = True
+    else:
+        info["application_session"] = sess
     return info
 
 
@@ -534,19 +725,23 @@ def can_identify(
 
     Read-only: no reset, no RAM-Loader. Identifiers the ECU rejects are left out. `bus` is for tests."""
     result: dict[str, Any] = {"responding": False, "ident": []}
+    in_fbl = False
     with J533CanLink(port, interface=interface, bus=bus) as link:
         reporter.step(1, 2, tr("Проверка связи с блоком (UDS 10 03)", "Checking the link to the ECU (UDS 10 03)"))
         try:
             link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
         except LINK_ERRORS as exc:
-            raise RuntimeError(
-                tr(
-                    f"Блок не отвечает по CAN ({exc}). Проверьте питание +12 В (Pin 1 и Pin 14), массу (Pin 11), "
-                    "CAN-H на Pin 19, CAN-L на Pin 9 и что включён CAN-терминатор (или стоит резистор 120 Ом между ними).",
-                    f"The ECU does not answer on CAN ({exc}). Check +12 V (Pin 1 and Pin 14), ground (Pin 11), "
-                    "CAN-H on Pin 19, CAN-L on Pin 9 and that CAN termination is on (or a 120 Ω resistor between them).",
-                )
-            ) from exc
+            if _is_fbl_session_nrc(exc):
+                in_fbl = True
+            else:
+                raise RuntimeError(
+                    tr(
+                        f"Блок не отвечает по CAN ({exc}). Проверьте питание +12 В (Pin 1 и Pin 14), массу (Pin 11), "
+                        "CAN-H на Pin 19, CAN-L на Pin 9 и что включён CAN-терминатор (или стоит резистор 120 Ом между ними).",
+                        f"The ECU does not answer on CAN ({exc}). Check +12 V (Pin 1 and Pin 14), ground (Pin 11), "
+                        "CAN-H on Pin 19, CAN-L on Pin 9 and that CAN termination is on (or a 120 Ω resistor between them).",
+                    )
+                ) from exc
         result["responding"] = True
         reporter.step(2, 2, tr("Чтение идентификации блока", "Reading the ECU identification"))
         for did, ru, en in ECU_IDENT_DIDS:
@@ -558,6 +753,29 @@ def can_identify(
             value = text.strip() if text and all(32 <= ord(ch) < 127 for ch in text) else raw.hex().upper()
             result["ident"].append({"did": f"{did:04X}", "label_ru": ru, "label_en": en, "value": value})
             reporter.info(f"{did:04X} {tr(ru, en)}: {value}")
+
+        # Cold-boot FBL Default Session answers `10 03 -> 50 03`, omits Application-only DIDs (`F197`, `0600`),
+        # and reports bit 2 (`0x04`, e.g. `0x44`) in `22 F1 DF` when the Application is erased or invalid.
+        answered = {item["did"] for item in result["ident"]}
+        if in_fbl or not ({f"{did:04X}" for did in APP_ONLY_DIDS} & answered):
+            try:
+                raw_df = link.request_uds(b"\x22\xf1\xdf", 0x62, timeout=1.0)
+                if len(raw_df) >= 4:
+                    f1df_val = raw_df[3]
+                    result["f1df"] = f"{f1df_val:02X}"
+                    if f1df_val & 0x04:
+                        in_fbl = True
+                        result["app_valid"] = False
+            except LINK_ERRORS:
+                pass
+        if in_fbl:
+            result["in_fbl"] = True
+            reporter.warning(
+                tr(
+                    "Блок отвечает из загрузчика FBL — основная прошивка сейчас не запущена.",
+                    "The ECU answered from the FBL bootloader — the main application is not running.",
+                )
+            )
     return result
 
 
@@ -744,7 +962,7 @@ def can_verify(
 
             if return_to_app:
                 reporter.step(4, total_steps, tr("Возврат шлюза в штатный рабочий режим (10 03)", "Returning gateway to normal Application mode (10 03)"))
-                report["return_to_app"] = _reset_to_application(link, reporter=reporter)
+                report["return_to_app"] = _return_to_application(link, report.get("loader_session"), reporter=reporter)
 
             report["complete"] = True
             reporter.progress(100, 100)
@@ -830,7 +1048,7 @@ def can_backup(
 
             if return_to_app:
                 reporter.step(total_steps, total_steps, tr("Возврат шлюза в штатный режим после бэкапа", "Returning gateway to normal Application mode"))
-                manifest["return_to_app"] = _reset_to_application(link, reporter=reporter)
+                manifest["return_to_app"] = _return_to_application(link, manifest.get("loader_session"), reporter=reporter)
 
             manifest["complete"] = True
             reporter.progress(100, 100)
@@ -925,7 +1143,7 @@ def can_read_memory(
 
             if return_to_app:
                 reporter.step(3, total_steps, tr("Возврат шлюза в штатный режим (10 03)", "Returning gateway to normal Application mode (10 03)"))
-                report["return_to_app"] = _reset_to_application(link, reporter=reporter)
+                report["return_to_app"] = _return_to_application(link, report.get("loader_session"), reporter=reporter)
 
             report["complete"] = True
             reporter.progress(100, 100)
@@ -1145,7 +1363,9 @@ def can_write_uflash(
 
             if return_to_app:
                 reporter.step(6, total_steps, tr("Перезапуск шлюза и проверка штатного режима (10 03 / 3E 00)", "Resetting gateway & verifying normal Application communication"))
-                result["return_to_app"] = _reset_to_application(link, reporter=reporter)
+                result["return_to_app"] = _return_to_application(
+                    link, result.get("loader_session"), reporter=reporter
+                )
                 result["tester_present"] = link.request_uds(b"\x3e\x00", 0x7E, timeout=2.0).hex()
 
             result["complete"] = True
@@ -1413,7 +1633,9 @@ def can_write_dflash(
 
             if return_to_app:
                 reporter.step(6, total_steps, tr("Перезапуск шлюза и проверка штатного режима (10 03 / 3E 00)", "Resetting gateway & verifying normal Application communication"))
-                result["return_to_app"] = _reset_to_application(link, reporter=reporter)
+                result["return_to_app"] = _return_to_application(
+                    link, result.get("loader_session"), reporter=reporter
+                )
                 result["tester_present"] = link.request_uds(b"\x3e\x00", 0x7E, timeout=2.0).hex()
 
             result["complete"] = True
@@ -1439,9 +1661,13 @@ def _enter_fbl_uds_programming(link: J533CanLink, reporter: OperationReporter) -
         link.request_uds(b"\x27\x03", 0x67, timeout=2.0)
         link.request_uds(bytes.fromhex("2704caffe012"), 0x67, timeout=2.0)
         link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0)
-    except RuntimeError:
-        # Already in FBL Programming Session (where 10 03 returns NRC 0x7E)
-        pass
+    except RuntimeError as exc:
+        # The preconditions are best effort, as in the hardware-verified 2.0.1c: in FBL they are refused by design
+        # (7F 10 7E, 7F 27 7F/12), and in the application a 27 03 delay (7F 27 37) or a refused 31 01 0203 does not
+        # have to stop the entry. Whether programming may start is the answer to `10 02` below. Transport errors
+        # are not RuntimeError and still end the operation.
+        if not (_is_fbl_session_nrc(exc) or _is_fbl_precondition_nrc(exc)):
+            reporter.can_log(tr(f"Предусловие отклонено ({exc}) — пробуем 10 02", f"Precondition refused ({exc}) — trying 10 02"))
     link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True)
     time.sleep(1.0)
 
@@ -1455,6 +1681,25 @@ def _bcd_byte(val: int) -> int:
     return ((val // 10) << 4) | (val % 10)
 
 
+def _uds_session(link: Any) -> Any:
+    uds_ctx = getattr(link, "uds_session", None)
+    return uds_ctx() if callable(uds_ctx) else contextlib.nullcontext(False)
+
+
+def _note_hw_fallback(link: Any, info: dict[str, Any], reporter: OperationReporter) -> None:
+    """Have the link tell the user, and the result, when its hardware ISO-TP gives way to the software path."""
+    def note(where: str) -> None:
+        info["hardware_isotp"] = False
+        info["hardware_isotp_fell_back_at"] = where
+        reporter.warning(tr(
+            f"Аппаратный ISO-TP адаптера отказал ({where}) — продолжаем проверенным программным путём "
+            "(медленнее, но надёжно)",
+            f"The adapter's hardware ISO-TP failed ({where}) — continuing on the verified software path "
+            "(slower, but reliable)",
+        ))
+    link.on_hw_fallback = note
+
+
 def _program_application_uds(
     link: J533CanLink,
     app_bytes: bytes,
@@ -1462,7 +1707,16 @@ def _program_application_uds(
     signature_128b: bytes | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
-    """Program 1,523,200-byte FD_0DATA (`0x0000C200..0x0017FFFF`) via standard VAG FBL UDS."""
+    """Program 1,523,200-byte FD_0DATA (`0x0000C200..0x0017FFFF`) via standard VAG FBL UDS.
+
+    Over an adapter with its own ISO-TP (VNCI through D-PDU, J2534) the whole programming session runs on one
+    link, as ODIS does: one primitive per request instead of one per CAN frame. The adapter's ISO-TP is proven
+    by ODIS; our settings of it are proven by the steps before the erase, every time: `10 02` always answers
+    `7F 10 78` first, and `2E F15A` is a multi-frame request. Should it fail on any request anyway, the link sends
+    that request again on the verified software path (`J533CanLink.request_uds`) rather than leave the gateway
+    without its application. The erase and both routines are idempotent, and a `36` resent with the same
+    sequence counter is a repeated block that ISO 14229 accepts without writing twice; a `34` or `37` the ECU had
+    already acted on comes back refused, and that refusal is reported, never assumed away."""
     if len(app_bytes) != APP_SIZE:
         raise ValueError(f"Expected {APP_SIZE:,} bytes of Application data, got {len(app_bytes):,}")
 
@@ -1473,105 +1727,108 @@ def _program_application_uds(
         "download_accepted": False,
         "bytes_transferred": 0,
     }
-    reporter.can_log(tr("Вход в сессию программирования FBL (10 02) и авторизация SA2 (27 11/12)…", "Entering FBL Programming Session (10 02) & unlocking SA2 (27 11/12)…"))
-    _enter_fbl_uds_programming(link, reporter)
-    seed_resp = link.request_uds(b"\x27\x11", 0x67, timeout=3.0)
-    if len(seed_resp) != 6:
-        raise RuntimeError(f"Unexpected FBL 27 11 seed response: {seed_resp.hex()}")
-    seed = int.from_bytes(seed_resp[2:6], "big")
-    if seed != 0:
-        key = fbl_sa2(seed)
-        link.request_uds(b"\x27\x12" + key.to_bytes(4, "big"), 0x67, timeout=3.0)
-    info["security_unlocked"] = True
+    _note_hw_fallback(link, info, reporter)
+    with _uds_session(link) as hw_uds:
+        info["hardware_isotp"] = bool(hw_uds)
+        reporter.can_log(tr("Вход в сессию программирования FBL (10 02) и авторизация SA2 (27 11/12)…", "Entering FBL Programming Session (10 02) & unlocking SA2 (27 11/12)…"))
+        _enter_fbl_uds_programming(link, reporter)
+        seed_resp = link.request_uds(b"\x27\x11", 0x67, timeout=3.0)
+        if len(seed_resp) != 6:
+            raise RuntimeError(f"Unexpected FBL 27 11 seed response: {seed_resp.hex()}")
+        seed = int.from_bytes(seed_resp[2:6], "big")
+        if seed != 0:
+            key = fbl_sa2(seed)
+            link.request_uds(b"\x27\x12" + key.to_bytes(4, "big"), 0x67, timeout=3.0)
+        info["security_unlocked"] = True
 
-    # Write mandatory 9-byte VAG Fingerprint (DID 0xF15A: BCD YY MM DD + 6-byte tester serial)
-    now = datetime.datetime.now(datetime.timezone.utc)
-    fp = bytes([
-        _bcd_byte(now.year % 100),
-        _bcd_byte(now.month),
-        _bcd_byte(now.day),
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-    ])
-    link.request_uds(b"\x2e\xf1\x5a" + fp, 0x6E, timeout=3.0)
-    info["fingerprint_written"] = True
+        # Write mandatory 9-byte VAG Fingerprint (DID 0xF15A: BCD YY MM DD + 6-byte tester serial)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        fp = bytes([
+            _bcd_byte(now.year % 100),
+            _bcd_byte(now.month),
+            _bcd_byte(now.day),
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+        ])
+        link.request_uds(b"\x2e\xf1\x5a" + fp, 0x6E, timeout=3.0)
+        info["fingerprint_written"] = True
 
-    reporter.can_log(
-        tr(
-            "Стирание прикладной области CodeFlash (31 01 FF 00 01 01: 0x0000C000..0x0017FFFF)…",
-            "Erasing Application CodeFlash block (31 01 FF 00 01 01: 0x0000C000..0x0017FFFF)…",
+        reporter.can_log(
+            tr(
+                "Стирание прикладной области CodeFlash (31 01 FF 00 01 01: 0x0000C000..0x0017FFFF)…",
+                "Erasing Application CodeFlash block (31 01 FF 00 01 01: 0x0000C000..0x0017FFFF)…",
+            )
         )
-    )
-    erase_resp = link.request_uds(bytes.fromhex("3101ff000101"), 0x71, timeout=120.0, allow_pending=True)
-    _routine_ok(erase_resp, "EraseMemory (FF00)")
-    info["erase_completed"] = True
-    info["erase_response"] = erase_resp.hex()
+        erase_resp = link.request_uds(bytes.fromhex("3101ff000101"), 0x71, timeout=120.0, allow_pending=True)
+        _routine_ok(erase_resp, "EraseMemory (FF00)")
+        info["erase_completed"] = True
+        info["erase_response"] = erase_resp.hex()
 
-    req_dl = b"\x34\x00\x44" + APP_BASE.to_bytes(4, "big") + APP_SIZE.to_bytes(4, "big")
-    dl_resp = link.request_uds(req_dl, 0x74, timeout=5.0)
-    len_bytes = dl_resp[1] >> 4
-    if not (1 <= len_bytes <= 4) or len(dl_resp) < 2 + len_bytes:
-        raise RuntimeError(f"Malformed RequestDownload response: {dl_resp.hex()}")
-    max_block_len = int.from_bytes(dl_resp[2 : 2 + len_bytes], "big")
-    # FBL ISO-TP RX buffer cap is 0x202 (514 bytes = 2-byte `36 <seq>` header + 512 payload bytes)
-    chunk_size = min(512, ((max_block_len - 2) // 256) * 256)
-    if chunk_size < 256:
-        raise RuntimeError(f"FBL reported invalid maxNumberOfBlockLength={max_block_len}")
-    info["download_accepted"] = True
-    info["max_block_length"] = max_block_len
-    info["chunk_size"] = chunk_size
+        req_dl = b"\x34\x00\x44" + APP_BASE.to_bytes(4, "big") + APP_SIZE.to_bytes(4, "big")
+        dl_resp = link.request_uds(req_dl, 0x74, timeout=5.0)
+        len_bytes = dl_resp[1] >> 4
+        if not (1 <= len_bytes <= 4) or len(dl_resp) < 2 + len_bytes:
+            raise RuntimeError(f"Malformed RequestDownload response: {dl_resp.hex()}")
+        max_block_len = int.from_bytes(dl_resp[2 : 2 + len_bytes], "big")
+        # FBL ISO-TP RX buffer cap is 0x202 (514 bytes = 2-byte `36 <seq>` header + 512 payload bytes)
+        chunk_size = min(512, ((max_block_len - 2) // 256) * 256)
+        if chunk_size < 256:
+            raise RuntimeError(f"FBL reported invalid maxNumberOfBlockLength={max_block_len}")
+        info["download_accepted"] = True
+        info["max_block_length"] = max_block_len
+        info["chunk_size"] = chunk_size
 
-    reporter.reset_stage_timer()
-    reporter.progress(0, APP_SIZE, unit="B", detail="UDS TransferData (0x36)")
-    total_blocks = (APP_SIZE + chunk_size - 1) // chunk_size
-    for blk_idx, offset in enumerate(range(0, APP_SIZE, chunk_size)):
-        reporter.check_cancelled()
-        chunk = app_bytes[offset : offset + chunk_size]
-        seq = (blk_idx + 1) & 0xFF
-        link.request_uds(bytes([0x36, seq]) + chunk, 0x76, timeout=30.0, allow_pending=True)
-        done = offset + len(chunk)
-        info["bytes_transferred"] = done
-        if blk_idx % 8 == 0 or done == APP_SIZE:
-            reporter.progress(
-                done,
-                APP_SIZE,
-                unit="B",
-                detail=f"Block {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X})",
-            )
-        if (blk_idx + 1) % 250 == 0 or done == APP_SIZE:
-            reporter.can_log(
-                tr(
-                    f"TransferData: передано {done:,} / {APP_SIZE:,} Б (блок {blk_idx + 1}/{total_blocks})",
-                    f"TransferData: sent {done:,} / {APP_SIZE:,} B (block {blk_idx + 1}/{total_blocks})",
+        reporter.reset_stage_timer()
+        reporter.progress(0, APP_SIZE, unit="B", detail="UDS TransferData (0x36)")
+        total_blocks = (APP_SIZE + chunk_size - 1) // chunk_size
+        for blk_idx, offset in enumerate(range(0, APP_SIZE, chunk_size)):
+            reporter.check_cancelled()
+            chunk = app_bytes[offset : offset + chunk_size]
+            seq = (blk_idx + 1) & 0xFF
+            link.request_uds(bytes([0x36, seq]) + chunk, 0x76, timeout=30.0, allow_pending=True)
+            done = offset + len(chunk)
+            info["bytes_transferred"] = done
+            if blk_idx % 8 == 0 or done == APP_SIZE:
+                reporter.progress(
+                    done,
+                    APP_SIZE,
+                    unit="B",
+                    detail=f"Block {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X})",
                 )
-            )
+            if (blk_idx + 1) % 250 == 0 or done == APP_SIZE:
+                reporter.can_log(
+                    tr(
+                        f"TransferData: передано {done:,} / {APP_SIZE:,} Б (блок {blk_idx + 1}/{total_blocks})",
+                        f"TransferData: sent {done:,} / {APP_SIZE:,} B (block {blk_idx + 1}/{total_blocks})",
+                    )
+                )
 
-    link.request_uds(b"\x37", 0x77, timeout=5.0)
-    info["transfer_exit_ok"] = True
-    info["blocks"] = total_blocks
+        link.request_uds(b"\x37", 0x77, timeout=5.0)
+        info["transfer_exit_ok"] = True
+        info["blocks"] = total_blocks
 
-    sig = signature_128b if (signature_128b and len(signature_128b) == 128) else (b"\x00" * 128)
-    chk_mem_req = (
-        bytes.fromhex("3101020244")
-        + APP_BASE.to_bytes(4, "big")
-        + APP_SIZE.to_bytes(4, "big")
-        + (128).to_bytes(2, "big")
-        + sig
-    )
-    reporter.can_log(tr("Проверка контрольной суммы и подписи в FBL (31 01 02 02)…", "Running FBL CheckMemory (31 01 02 02)…"))
-    chk_resp = link.request_uds(chk_mem_req, 0x71, timeout=120.0, allow_pending=True)
-    _routine_ok(chk_resp, "CheckMemory (0202)")
-    info["check_memory_response"] = chk_resp.hex()
+        sig = signature_128b if (signature_128b and len(signature_128b) == 128) else (b"\x00" * 128)
+        chk_mem_req = (
+            bytes.fromhex("3101020244")
+            + APP_BASE.to_bytes(4, "big")
+            + APP_SIZE.to_bytes(4, "big")
+            + (128).to_bytes(2, "big")
+            + sig
+        )
+        reporter.can_log(tr("Проверка контрольной суммы и подписи в FBL (31 01 02 02)…", "Running FBL CheckMemory (31 01 02 02)…"))
+        chk_resp = link.request_uds(chk_mem_req, 0x71, timeout=120.0, allow_pending=True)
+        _routine_ok(chk_resp, "CheckMemory (0202)")
+        info["check_memory_response"] = chk_resp.hex()
 
-    reporter.can_log(tr("Проверка зависимостей и запись маркера присутствия (31 01 FF 01)…", "Running CheckProgrammingDependencies (31 01 FF 01)…"))
-    dep_resp = link.request_uds(bytes.fromhex("3101ff01"), 0x71, timeout=60.0, allow_pending=True)
-    _routine_ok(dep_resp, "CheckProgrammingDependencies (FF01)")
-    info["dependencies_response"] = dep_resp.hex()
+        reporter.can_log(tr("Проверка зависимостей и запись маркера присутствия (31 01 FF 01)…", "Running CheckProgrammingDependencies (31 01 FF 01)…"))
+        dep_resp = link.request_uds(bytes.fromhex("3101ff01"), 0x71, timeout=60.0, allow_pending=True)
+        _routine_ok(dep_resp, "CheckProgrammingDependencies (FF01)")
+        info["dependencies_response"] = dep_resp.hex()
 
-    try:
-        info["reset_response"] = link.request_uds(b"\x11\x01", 0x51, timeout=2.0).hex()
-    except TimeoutError:
-        info["reset_response"] = "no response after reset"
-    time.sleep(2.0)
+        try:
+            info["reset_response"] = link.request_uds(b"\x11\x01", 0x51, timeout=2.0, resend=False).hex()
+        except TRANSPORT_ERRORS:
+            # the ECU is rebooting: on a hardware link that can surface as an error event, not only as silence
+            info["reset_response"] = "no response after reset"
     return info
 
 
@@ -1825,7 +2082,7 @@ def can_write_cflash(
                     reporter.step(3, total_steps, tr("Область загрузчика 0x000000..0x00BFFF без изменений", "Boot region 0x000000..0x00BFFF unchanged"))
 
                 if app_blocks:
-                    _reset_to_application(link, reporter=reporter)
+                    _reset_to_application(link, reporter=reporter, allow_fbl=True)
                     reporter.step(
                         4,
                         total_steps,
@@ -1978,7 +2235,7 @@ def can_restore_backup(
         cf_path, df_path = own_dir / "Cflash_fazit.bin", own_dir / "Dflash_vcrn.bin"
         read_memory_area(link, CFLASH_ADDR_START + cf_chunk, CFLASH_ADDR_START + cf_chunk + READ_CHUNK_BYTES, cf_path, label="FAZIT", reporter=reporter)
         read_memory_area(link, DFLASH_ADDR_START + df_chunk, DFLASH_ADDR_START + df_chunk + READ_CHUNK_BYTES, df_path, label="VCRN", reporter=reporter)
-        _reset_to_application(link, reporter=reporter)
+        _reset_to_application(link, reporter=reporter, allow_fbl=True)
     at = FAZIT_OFFSET - cf_chunk
     df = bytearray(b"\xff" * DFLASH_SIZE)
     df[df_chunk : df_chunk + READ_CHUNK_BYTES] = df_path.read_bytes()
@@ -2288,7 +2545,8 @@ def can_upload_zdc_datasets(
     if out_dir is not None:
         result["session_dir"] = str(out_dir)
 
-    with J533CanLink(port, interface=interface, bus=bus, log_path=log_path) as link:
+    with J533CanLink(port, interface=interface, bus=bus, log_path=log_path) as link, _uds_session(link):
+        _note_hw_fallback(link, result, reporter)
         reporter.step(1, total_steps, tr("Вход в EOL-сессию (UDS 10 40) и авторизация 20103", "Entering EOLSession (UDS 10 40) & SecurityAccess 20103"))
         link.request_uds(b"\x10\x40", 0x50, timeout=3.0)
         _uds_security_20103(link, reporter=reporter)
@@ -2365,7 +2623,7 @@ def can_upload_zdc_datasets(
         if reset_after:
             reporter.step(total_steps, total_steps, tr("Перезагрузка шлюза для применения датасета (UDS 11 02)", "Resetting gateway to reload dataset tables (UDS 11 02)"))
             try:
-                link.request_uds(b"\x11\x02", 0x51, timeout=2.0, allow_pending=True)
+                link.request_uds(b"\x11\x02", 0x51, timeout=2.0, allow_pending=True, resend=False)
             except LINK_ERRORS:
                 try:
                     link.request_uds(b"\x10\x03", 0x50, timeout=2.0)

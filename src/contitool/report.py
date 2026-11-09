@@ -71,7 +71,7 @@ def driver_log_dirs() -> list[Path]:
     return sorted(Path(root, "Volkswagen").glob("VW_D_PDU_API_*/logs"))
 
 
-def driver_logs(since: float, dirs: list[Path] | None = None) -> list[Path]:
+def driver_logs(since: float, dirs: list[Path] | None = None, *, fallback: bool = True) -> list[Path]:
     """Driver logs written during the operation, newest first: that is the one the failure is in.
 
     The driver starts a new log on every PDUConstruct and writes every CAN frame into it, so a backup leaves
@@ -80,6 +80,8 @@ def driver_logs(since: float, dirs: list[Path] | None = None) -> list[Path]:
     files = [p for d in (driver_log_dirs() if dirs is None else dirs) for p in d.glob("*.log") if p.is_file()]
     recent = sorted((p for p in files if p.stat().st_mtime >= since - 60), key=lambda p: p.stat().st_mtime)
     if not recent:
+        if not fallback:
+            return []
         recent = sorted(files, key=lambda p: p.stat().st_mtime)[-2:]
     picked: list[Path] = recent[-1:]
     budget = DRIVER_LOG_BUDGET - sum(p.stat().st_size for p in picked)
@@ -167,7 +169,12 @@ def build_report_zip(
                 z.writestr(arc, _can_log_excerpt(p))
             elif p.stat().st_size <= 20 * 1024 * 1024:
                 z.write(p, arc)
-        for p in driver_logs(failure.started, driver_dirs):
+        dirs = driver_log_dirs() if driver_dirs is None else driver_dirs
+        # Only the driver this operation ran on: another one's logs mislead. A 2.0.1c report for a run on the
+        # ODIS-S driver came with VCTool driver logs from an hour earlier, because "the newest two anywhere" was
+        # the fallback. The newest of the right driver are still taken when none falls inside the window.
+        own = [d for d in dirs if d.parent.name and d.parent.name in env.get("Adapter", "")]
+        for p in driver_logs(failure.started, own or dirs, fallback=bool(own)):
             arc = f"driver_logs/{p.parent.parent.name}/{p.name}"
             if p.stat().st_size > DRIVER_LOG_TAIL:  # one log now covers a whole run: keep its end, the error is there
                 with p.open("rb") as fh:

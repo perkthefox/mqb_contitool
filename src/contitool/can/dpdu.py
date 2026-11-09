@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import atexit
 import collections
+from collections.abc import Iterator
+import contextlib
 import ctypes as C
 import sys
 import threading
@@ -79,6 +81,14 @@ NONRAW_PAIRS = ((0x710, 0x77A), (0x6F0, 0x6F1))  # diagnostics, then the factory
 NONRAW_BUS, NONRAW_PROTOCOL = "ISO_11898_2_DWCAN", "ISO_11898_RAW"
 NONRAW_PINS = ((6, "HI"), (14, "LOW"))
 NONRAW_VERIFY_WAIT = 2.0  # the gateway answers 10 03 in under a millisecond; this only has to outlast the driver
+UDS_PROTOCOLS = ("ISO_15765_3_on_ISO_15765_2", "ISO_14229_3_on_ISO_15765_2", "ISO_OBD_on_ISO_15765_2")
+ERR_EVT_RX_TIMEOUT = 0x00000103
+ERR_EVT_LOST_COMM_TO_VCI = 0x00000106
+ERR_EVT_VCI_HARDWARE_FAULT = 0x00000107
+# In #113.log the VNCI's internal TCP service restarted after ~125,000 un-freed RawMode send primitives on one link.
+# Recycling the RawMode TX link periodically keeps the VCI's primitive table bounded while the monitor stays up.
+MAX_RAW_TX_COPS_BEFORE_RECYCLE = 20_000
+RAW_TX_IDLE_RECYCLE_THRESHOLD = 5_000
 
 
 class RawModeUnavailable(can.CanInitializationError):
@@ -115,6 +125,14 @@ class PinData(C.Structure):
 
 class RscData(C.Structure):
     _fields_ = [("BusTypeId", U32), ("ProtocolId", U32), ("NumPinData", U32), ("pDLCPinData", C.POINTER(PinData))]
+
+
+class RscIdItemData(C.Structure):
+    _fields_ = [("hMod", U32), ("NumIds", U32), ("pResourceIdArray", C.POINTER(U32))]
+
+
+class RscIdItem(C.Structure):
+    _fields_ = [("ItemType", U32), ("NumModules", U32), ("pResourceIdDataArray", C.POINTER(RscIdItemData))]
 
 
 class ModuleData(C.Structure):
@@ -159,6 +177,10 @@ class ResultData(C.Structure):
     _fields_ = [("RxFlag", FlagData), ("UniqueRespIdentifier", U32), ("AcceptanceId", U32),
                 ("TimestampFlags", FlagData), ("TxMsgDoneTimestamp", U32), ("StartMsgTimestamp", U32),
                 ("pExtraInfo", C.c_void_p), ("NumDataBytes", U32), ("pDataBytes", C.POINTER(U8))]
+
+
+class ErrorData(C.Structure):
+    _fields_ = [("ErrorCodeId", U32), ("ExtraErrorInfoId", U32)]
 
 
 def dll_version(path: str) -> str:
@@ -268,8 +290,12 @@ class DPduBus(can.BusABC):
                 )) from exc
         self._dll = dll
         self._pending: collections.deque[can.Message] = collections.deque(maxlen=RX_QUEUE_MAX)
-        self._tx_in_flight: set[int] = set()
-        self.hmod = self.h_rx = self.h_tx = self._mon_cop = 0
+        # cop -> the logical link it was started on: a fixed-id adapter has one link per CAN id, and a stuck
+        # primitive can only be cancelled on its own link
+        self._tx_in_flight: dict[int, int] = {}
+        self._tx_cop_count = 0
+        self.hmod = self.h_rx = self.h_tx = self._mon_cop = self._uds_link = 0
+        self._nonraw_verified = False  # the fixed-id fallback answered a 10 03 on this module
         self._tx_started = False
         self.nonraw: dict[int, int] = {}  # CAN id we send on -> its link, when the adapter refused RawMode
         self._rx_id: dict[int, int] = {}  # link -> the CAN id its results carry (RawMode puts it in the data)
@@ -334,8 +360,13 @@ class DPduBus(can.BusABC):
             error_code=failure,  # a VCI that dropped the link (0x11) still gets the one retry __init__ does
         )
 
-    def _open_links(self, bitrate: int) -> None:
-        """RawMode first — the verified path — and the ODIS-style fallback only if the adapter refuses it."""
+    def _open_links(self, bitrate: int, *, verify: bool = True) -> None:
+        """RawMode first — the verified path — and the ODIS-style fallback only if the adapter refuses it.
+
+        These links are new, so nothing about them is spent yet: whatever marked the old ones dead must not make
+        `send()` refuse the very first frame of the fallback's own check. `verify=False` reopens a fallback this
+        module has already proven, without asking an ECU that may be rebooting right now."""
+        self.spent = False
         try:
             self.h_rx = self._open_monitor(bitrate)
             self.h_tx = self._create((0x80, 0, 0, 0))
@@ -344,7 +375,7 @@ class DPduBus(can.BusABC):
             self._tx_started = True
         except RawModeUnavailable as refused:
             self._close_links()
-            if not self._open_nonraw(bitrate):
+            if not self._open_nonraw(bitrate, verify=verify):
                 raise refused  # the adapter gives neither, so its own refusal is the useful message
             self.spent = False
 
@@ -355,6 +386,7 @@ class DPduBus(can.BusABC):
             self._try("PDUModuleDisconnect", self.hmod)
         self.hmod = 0
         self.module_label = ""
+        self._nonraw_verified = False
 
     # ------------------------------------------------------------------ fallback for adapters without RawMode
     def _try(self, fn: str, *args: Any) -> int:
@@ -369,25 +401,28 @@ class DPduBus(can.BusABC):
         out = U32(0)
         return out.value if self._try("PDUGetObjectId", kind, name.encode(), C.byref(out)) == 0 else 0
 
-    def _set_urid(self, hcll: int, phys: int, resp: int) -> None:
-        """Request/response ids live in the unique-response table: read it, patch both ids, write it back."""
-        want = {self._object_id(OBJT_COMPARAM, "CP_CanPhysReqId"): phys,
-                self._object_id(OBJT_COMPARAM, "CP_CanRespUUDTId"): resp}
-        want.pop(0, None)
+    def _patch_urid(self, hcll: int, want: dict[str, int]) -> None:
+        """Ids live in the unique-response table: read it, set the named UNUM32 params, write it back."""
+        by_id = {self._object_id(OBJT_COMPARAM, name): value for name, value in want.items()}
+        by_id.pop(0, None)  # a param this MDF does not know
         table = C.POINTER(UridTable)()
-        if not want or self._try("PDUGetUniqueRespIdTable", self.hmod, hcll, C.byref(table)) != 0 or not table:
+        if not by_id or self._try("PDUGetUniqueRespIdTable", self.hmod, hcll, C.byref(table)) != 0 or not table:
             return
         t = table.contents
         for e in range(t.NumEntries):
             entry = t.pUniqueData[e]
             for i in range(entry.NumParamItems):
                 item = entry.pParams[i]
-                if item.ComParamId in want and item.ComParamDataType == PT_UNUM32:
-                    C.cast(item.pComParamData, C.POINTER(U32)).contents.value = want[item.ComParamId]
+                if item.ComParamId in by_id and item.ComParamDataType == PT_UNUM32 and item.pComParamData:
+                    C.cast(item.pComParamData, C.POINTER(U32)).contents.value = by_id[item.ComParamId]
         self._try("PDUSetUniqueRespIdTable", self.hmod, hcll, table)
         self._try("PDUDestroyItem", table)
 
-    def _open_nonraw(self, bitrate: int) -> bool:
+    def _set_urid(self, hcll: int, phys: int, resp: int) -> None:
+        """A fixed-id link: requests on `phys`, unsegmented responses on `resp`."""
+        self._patch_urid(hcll, {"CP_CanPhysReqId": phys, "CP_CanRespUUDTId": resp})
+
+    def _open_nonraw(self, bitrate: int, *, verify: bool = True) -> bool:
         """One ODIS-style link per id pair, for an adapter whose firmware refuses RawMode.
 
         None of this is bench-verified, so the links must prove themselves: `_verify_nonraw` sends one `10 03` and
@@ -417,7 +452,10 @@ class DPduBus(can.BusABC):
         if NONRAW_PAIRS[0][0] not in self.nonraw:
             return False
         self._tx_started = True
-        return self._verify_nonraw()
+        if not verify:
+            return True
+        self._nonraw_verified = self._verify_nonraw()
+        return self._nonraw_verified
 
     def _verify_nonraw(self) -> bool:
         """One `10 03` through the fallback. Nothing back means the guess was wrong, and the adapter is refused."""
@@ -443,10 +481,335 @@ class DPduBus(can.BusABC):
             self._try("PDUDisconnect", self.hmod, h)
             self._try("PDUDestroyComLogicalLink", self.hmod, h)
         self._links.clear()
-        self.h_rx = self.h_tx = self._mon_cop = 0
+        self.h_rx = self.h_tx = self._mon_cop = self._uds_link = 0
+        self._tx_cop_count = 0
         self.nonraw.clear()
         self._rx_id.clear()
         self._tx_in_flight.clear()
+
+    # ------------------------------------------------------------------ hardware ISO-TP / UDS link for fast flashing
+    def _set_named_u32(self, hcll: int, name: str, value: int, cls: int = 2) -> bool:
+        """Set a named UNUM32 ComParam via PDUGetComParam -> PDUSetComParam so MDF class/type always match."""
+        pid = self._object_id(OBJT_COMPARAM, name)
+        if not pid:
+            return False
+        item = C.POINTER(ParamItem)()
+        if self._try("PDUGetComParam", self.hmod, hcll, pid, C.byref(item)) == 0 and item:
+            try:
+                p = item.contents
+                if p.ComParamDataType == PT_UNUM32 and p.pComParamData:
+                    C.cast(p.pComParamData, C.POINTER(U32)).contents.value = value
+                    return self._try("PDUSetComParam", self.hmod, hcll, item) == 0
+                return False
+            finally:
+                self._try("PDUDestroyItem", item)
+        v = U32(value)
+        raw = ParamItem(IT_PARAM, pid, PT_UNUM32, cls, C.cast(C.pointer(v), C.c_void_p))
+        return self._try("PDUSetComParam", self.hmod, hcll, C.byref(raw)) == 0
+
+    def _set_uds_urid(self, hcll: int, phys: int, resp: int) -> None:
+        """Physical request (0x710) and segmented response (0x77A) ids in the UDS link's URID table — nothing else.
+
+        Exactly what read `22 F187` through a VNCI on the bench (probe v6, 2026-11-08): the driver's own defaults
+        for the rest (both formats 5, UUDT id 0xFFFFFFFF) stay as they are."""
+        self._patch_urid(hcll, {"CP_CanPhysReqId": phys, "CP_CanRespUSDTId": resp})
+
+    def _find_resource_id(self, rsc: RscData) -> int:
+        """Resolve a module-specific ResourceId via PDUGetResourceIds when PDU_ID_UNDEF is not accepted."""
+        items = C.POINTER(RscIdItem)()
+        if self._try("PDUGetResourceIds", self.hmod, C.byref(rsc), C.byref(items)) != 0 or not items:
+            return 0
+        try:
+            top = items.contents
+            for i in range(top.NumModules):
+                mod_entry = top.pResourceIdDataArray[i]
+                if mod_entry.hMod == self.hmod and mod_entry.NumIds and mod_entry.pResourceIdArray:
+                    return int(mod_entry.pResourceIdArray[0])
+            return 0
+        finally:
+            self._try("PDUDestroyItem", items)
+
+    def _uds_control(self, hcll: int, cop_type: int, timeout: float) -> None:
+        """STARTCOMM / STOPCOMM on the UDS link, then poll its own events until that primitive finishes.
+
+        Not `_start` + `_drain`: those treat a refusal or an error event as a dead adapter, while here it only
+        means this link variant does not work and the caller moves on."""
+        ctrl = CopCtrl(0, 0, 0, 0, FlagData(4, (U8 * 4)(0, 0, 0, 0)))
+        cop = U32(0)
+        if self._try("PDUStartComPrimitive", self.hmod, hcll, cop_type, 0, None, C.byref(ctrl), None,
+                     C.byref(cop)) != 0 or not cop.value:
+            return
+        hcop, end = cop.value, time.monotonic() + timeout
+        while time.monotonic() < end:
+            item = C.POINTER(EventItem)()
+            if self._try("PDUGetEventItem", self.hmod, hcll, C.byref(item)) != 0 or not item:
+                time.sleep(0.001)
+                continue
+            ev = item.contents
+            done = (ev.ItemType == IT_STATUS and bool(ev.pData) and ev.hCop == hcop
+                    and C.cast(ev.pData, C.POINTER(U32)).contents.value in COPST_DONE)
+            self._try("PDUDestroyItem", item)
+            if done:
+                return
+
+    def _close_uds_link(self) -> None:
+        hcll = self._uds_link
+        if not hcll:
+            return
+        self._uds_link = 0
+        try:
+            self._uds_control(hcll, COPT_STOPCOMM, 0.5)
+        except Exception:  # noqa: BLE001 - closing goes on whatever the VCI says
+            pass
+        self._try("PDUDisconnect", self.hmod, hcll)
+        self._try("PDUDestroyComLogicalLink", self.hmod, hcll)
+        if hcll in self._links:
+            self._links.remove(hcll)
+
+    def _pause_raw(self) -> None:
+        self._stop.set()
+        if self._rx_thread is not None:
+            self._rx_thread.join(timeout=2.0)
+            self._rx_thread = None
+        self._close_links()
+        self._pending.clear()
+
+    def _resume_raw(self) -> None:
+        """Reopen the links `_pause_raw` closed. If that fails the bus has no links and no receive thread, so it is
+        marked spent before the error goes up — the kept-open session must never hand it out again."""
+        self._rx_error = None
+        try:
+            try:
+                # a reset usually follows the UDS session, so a fallback already proven here is not asked again
+                self._open_links(self.bitrate, verify=not self._nonraw_verified)
+            except can.CanError as exc:
+                if exc.error_code != ERR_COMM_PC_TO_VCI_FAILED:
+                    raise
+                self._drop_module()
+                time.sleep(VCI_RESTART_WAIT)
+                self._open(self.bitrate, 15.0)
+        except BaseException:
+            self.spent = True
+            raise
+        self.spent = False
+        self._stop.clear()
+        self._rx_thread = threading.Thread(target=self._rx_loop, name="dpdu-rx", daemon=True)
+        self._rx_thread.start()
+
+    def _open_uds_link(self, bus: int, protos: list[int], hi: int, low: int, tx_id: int, rx_id: int) -> bool:
+        """Open and live-verify (`3E 00`) an ISO 15765-2/3 link so VCI firmware segments 514-byte `0x36` blocks."""
+        pins = (PinData * 2)(PinData(6, hi), PinData(14, low))
+        for proto in protos:
+            rsc = RscData(bus, proto, 2, C.cast(pins, C.POINTER(PinData)))
+            h, flag = U32(0), (U8 * 4)(0, 0, 0, 0)
+            rc = self._try("PDUCreateComLogicalLink", self.hmod, C.byref(rsc), PDU_ID_UNDEF, None, C.byref(h),
+                           C.byref(FlagData(4, flag)))
+            if rc != 0 or not h.value:
+                rid = self._find_resource_id(rsc)
+                if not rid:
+                    continue
+                rc = self._try("PDUCreateComLogicalLink", self.hmod, None, rid, None, C.byref(h),
+                               C.byref(FlagData(4, flag)))
+                if rc != 0 or not h.value:
+                    continue
+            hcll = h.value
+            self._links.append(hcll)
+            self._uds_link = hcll
+            if not self._set_named_u32(hcll, "CP_Baudrate", self.bitrate, cls=5):
+                v = U32(self.bitrate)
+                p = ParamItem(IT_PARAM, CP_BAUDRATE, PT_UNUM32, 5, C.cast(C.pointer(v), C.c_void_p))
+                self._try("PDUSetComParam", self.hmod, hcll, C.byref(p))
+            self._set_named_u32(hcll, "CP_CanFillerByteHandling", 1)
+            self._set_named_u32(hcll, "CP_CanFillerByte", 0x00)  # as send_uds pads ConsecutiveFrames
+            self._set_named_u32(hcll, "CP_TesterPresentHandling", 0)
+            self._set_named_u32(hcll, "CP_BlockSize", 0)
+            self._set_named_u32(hcll, "CP_StMin", 0)
+            if not self._set_named_u32(hcll, "CP_P2Max", 2_500_000):
+                self._set_named_u32(hcll, "CP_P2Max", 500_000)
+            if not self._set_named_u32(hcll, "CP_P2Star", 6_000_000):
+                self._set_named_u32(hcll, "CP_P2Star", 5_000_000)
+            if not self._set_named_u32(hcll, "CP_RC78CompletionTimeout", 150_000_000):
+                self._set_named_u32(hcll, "CP_RC78CompletionTimeout", 30_000_000)
+            if not self._set_named_u32(hcll, "CP_RC78Handling", 2):
+                self._set_named_u32(hcll, "CP_RC78Handling", 1)
+            self._set_uds_urid(hcll, tx_id, rx_id)
+            if self._try("PDUConnect", self.hmod, hcll) != 0:
+                self._close_uds_link()
+                continue
+            self._uds_control(hcll, COPT_STARTCOMM, 1.0)
+            try:
+                probe = self.request_uds(b"\x3e\x00", timeout=1.5, allow_pending=True)
+                if probe and (probe[0] == 0x7E or (len(probe) >= 3 and probe[:2] == b"\x7f\x3e")):
+                    return True
+            except (can.CanError, TimeoutError):
+                pass
+            self.spent = False
+            self._close_uds_link()
+        return False
+
+    @contextlib.contextmanager
+    def uds_session(self, tx_id: int = 0x710, rx_id: int = 0x77A) -> Iterator[bool]:
+        """Temporarily switch CAN1 from RawMode to hardware ISO 15765-2/3 for bulk UDS transfers (`0x34/0x36/0x37`).
+
+        On a VNCI 6154A each RawMode primitive takes ~5 ms over TCP, turning 2,975 x 74 frames into 27 minutes and
+        overflowing the VCI's primitive table at ~125k primitives. Hardware ISO-TP sends one 514-byte primitive per
+        block (2,975 total) and handles `30 0F 00` FlowControls locally inside the VCI firmware. If the driver or
+        adapter refuses or fails the live `3E 00` probe, RawMode is restored transparently."""
+        if self._uds_link:
+            yield True
+            return
+        if not self.hmod:
+            yield False
+            return
+        bus = self._object_id(OBJT_BUSTYPE, NONRAW_BUS)
+        hi, low = self._object_id(OBJT_PINTYPE, "HI"), self._object_id(OBJT_PINTYPE, "LOW")
+        protos = [p for name in UDS_PROTOCOLS if (p := self._object_id(OBJT_PROTOCOL, name))]
+        if not (bus and hi and low and protos):
+            yield False
+            return
+        self._pause_raw()
+        opened = False
+        try:
+            opened = self._open_uds_link(bus, protos, hi, low, tx_id, rx_id)
+        except Exception:  # noqa: BLE001
+            self.spent = False
+            self._close_uds_link()
+            opened = False
+        if not opened:
+            # One refusal is not proof the adapter can never do it — a busy or rebooting ECU fails the probe too,
+            # and sticking would silently condemn every later flash in this process to the slow RawMode path.
+            self._resume_raw()
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            self.end_uds_session()
+
+    def end_uds_session(self) -> None:
+        """Leave the hardware ISO-TP link and bring RawMode back. Idempotent: the caller may already have done it.
+
+        Whatever happens here must not replace the error that brought us here, and must never leave the bus
+        looking healthy while it has no links — the kept-open session would hand that out to the next operation."""
+        if not self._uds_link:
+            return
+        self._close_uds_link()
+        try:
+            self._resume_raw()
+        except BaseException:  # noqa: BLE001 - the flash error, if any, is the one worth reporting
+            self.spent = True
+
+    def _drain_uds_leftovers(self, hcll: int) -> None:
+        while True:
+            item = C.POINTER(EventItem)()
+            if self._try("PDUGetEventItem", self.hmod, hcll, C.byref(item)) != 0 or not item:
+                return
+            try:
+                ev = item.contents
+                if ev.ItemType == IT_STATUS and ev.pData and C.cast(ev.pData, C.POINTER(U32)).contents.value == CLLST_OFFLINE:
+                    self.spent = True
+                    raise can.CanOperationError(tr("VCI закрыл канал D-PDU", "The VCI closed the D-PDU link"))
+            finally:
+                self._try("PDUDestroyItem", item)
+
+    def request_uds(self, req: bytes, *, timeout: float = 2.0, allow_pending: bool = True) -> bytes:
+        """Send one full UDS PDU through the active ISO 15765 link and return the reassembled UDS response."""
+        hcll = self._uds_link
+        if not hcll:
+            raise can.CanOperationError("D-PDU hardware UDS link is not active")
+        payload = bytes(req)
+        if not payload:
+            raise ValueError("Empty UDS payload")
+        req_sid = payload[0]
+        self._drain_uds_leftovers(hcll)
+
+        pos_mask, pos_pat = (U8 * 1)(0xFF), (U8 * 1)((req_sid + 0x40) & 0xFF)
+        neg_mask, neg_pat = (U8 * 2)(0xFF, 0xFF), (U8 * 2)(0x7F, req_sid)
+        exps = (ExpResp * 2)(
+            ExpResp(0, 1, 1, pos_mask, pos_pat, 0, None),
+            ExpResp(1, 2, 2, neg_mask, neg_pat, 0, None),
+        )
+        tx = (U8 * 4)(0, 0, 0, 0)
+        deadline = time.monotonic() + timeout
+
+        def start_primitive(send_cycles: int, tx_bytes: bytes) -> int:
+            ctrl = CopCtrl(0, send_cycles, 1, 0, FlagData(4, tx), 2, C.cast(exps, C.POINTER(ExpResp)))
+            buf = (U8 * len(tx_bytes)).from_buffer_copy(tx_bytes) if tx_bytes else None
+            hcop_out = U32(0)
+            self._call("PDUStartComPrimitive", self.hmod, hcll, COPT_SENDRECV, len(tx_bytes), buf, C.byref(ctrl),
+                       None, C.byref(hcop_out))
+            return hcop_out.value
+
+        hcop = start_primitive(1, payload)
+        cop_done = hcop == 0
+        result_bytes: bytes | None = None
+        seen_pending_78 = False
+
+        while True:
+            while True:
+                item = C.POINTER(EventItem)()
+                rc = self._call("PDUGetEventItem", self.hmod, hcll, C.byref(item))
+                if rc == ERR_EVENT_QUEUE_EMPTY or not item:
+                    break
+                try:
+                    ev = item.contents
+                    if ev.ItemType == IT_STATUS and ev.pData:
+                        st = C.cast(ev.pData, C.POINTER(U32)).contents.value
+                        if st == CLLST_OFFLINE:
+                            self.spent = True
+                            raise can.CanOperationError(tr("VCI закрыл канал D-PDU", "The VCI closed the D-PDU link"))
+                        if ev.hCop == hcop and st in COPST_DONE:
+                            cop_done = True
+                    elif ev.ItemType == IT_RESULT and ev.pData and (ev.hCop == hcop or hcop == 0):
+                        r = C.cast(ev.pData, C.POINTER(ResultData)).contents
+                        flags = bytes(r.RxFlag.pFlagData[: r.RxFlag.NumFlagBytes]) if r.RxFlag.NumFlagBytes else b""
+                        if len(flags) >= 4 and flags[3] & 0x01:
+                            continue
+                        raw = bytes(r.pDataBytes[: min(r.NumDataBytes, 4128)]) if r.NumDataBytes else b""
+                        if allow_pending and len(raw) >= 3 and raw[0] == 0x7F and raw[1] == req_sid and raw[2] == 0x78:
+                            seen_pending_78 = True
+                        elif raw:
+                            result_bytes = raw
+                    elif ev.ItemType == IT_ERROR and (ev.hCop == hcop or hcop == 0):
+                        err_code = C.cast(ev.pData, C.POINTER(ErrorData)).contents.ErrorCodeId if ev.pData else 0
+                        self._drain_uds_leftovers(hcll)
+                        if err_code == ERR_EVT_RX_TIMEOUT:
+                            raise TimeoutError(f"UDS response timeout ({timeout:.1f}s) for {payload[:8].hex()}")
+                        if err_code in (ERR_EVT_LOST_COMM_TO_VCI, ERR_EVT_VCI_HARDWARE_FAULT, 0):
+                            self.spent = True
+                            raise can.CanOperationError(tr(
+                                "Потеряна связь с VCI по каналу D-PDU",
+                                "Lost communication with VCI on D-PDU link",
+                            ))
+                        raise can.CanOperationError(tr(
+                            f"Ошибка протокола UDS D-PDU (0x{err_code:X})",
+                            f"D-PDU UDS protocol error (0x{err_code:X})",
+                        ))
+                finally:
+                    self._dll.PDUDestroyItem(item)
+
+            if cop_done:
+                if result_bytes is not None:
+                    return result_bytes
+                if seen_pending_78 and time.monotonic() < deadline:
+                    # Fallback if a driver ignores CP_RC78Handling and finishes the primitive on 7F xx 78
+                    seen_pending_78 = False
+                    hcop = start_primitive(0, b"")
+                    cop_done = hcop == 0
+                    continue
+                raise TimeoutError(f"UDS response timeout ({timeout:.1f}s) for {payload[:8].hex()}")
+
+            if time.monotonic() >= deadline:
+                if hcop:
+                    self._try("PDUCancelComPrimitive", self.hmod, hcll, hcop)
+                    cancel_end = time.monotonic() + 0.2
+                    while time.monotonic() < cancel_end:
+                        item = C.POINTER(EventItem)()
+                        if self._try("PDUGetEventItem", self.hmod, hcll, C.byref(item)) != 0 or not item:
+                            break
+                        self._try("PDUDestroyItem", item)
+                raise TimeoutError(f"UDS response timeout ({timeout:.1f}s) for {payload[:8].hex()}")
+            time.sleep(RX_POLL)
 
     # ------------------------------------------------------------------ receiving
     def _drain_rx_links(self) -> bool:
@@ -598,10 +961,10 @@ class DPduBus(can.BusABC):
                     self._take_result(C.cast(ev.pData, C.POINTER(ResultData)).contents, self._rx_id.get(hcll))
                 elif ev.ItemType == IT_STATUS and ev.pData and hcll != self.h_rx:
                     if C.cast(ev.pData, C.POINTER(U32)).contents.value in COPST_DONE:
-                        self._tx_in_flight.discard(ev.hCop)
+                        self._tx_in_flight.pop(ev.hCop, None)
                 elif ev.ItemType == IT_ERROR and hcll != self.h_rx:
                     # a frame the VCI could not send (e.g. its queue overflowed): fail now, not by a later timeout
-                    self._tx_in_flight.discard(ev.hCop)
+                    self._tx_in_flight.pop(ev.hCop, None)
                     self.spent = True
                     raise can.CanOperationError(tr("VCI не смог отправить кадр", "The VCI could not send a frame"))
             finally:
@@ -644,7 +1007,50 @@ class DPduBus(can.BusABC):
             time.sleep(RX_POLL)
         return self._pending.popleft(), False
 
+    def maybe_recycle_tx(self, threshold: int | None = None) -> None:
+        """Recycle the RawMode TX link if it is due — call only between packets, never inside one.
+
+        Recycling costs a STOPCOMM wait of up to a second plus several VCI round trips. In the middle of a
+        RAM-loader packet or an ISO-TP block that gap outlives the receiver's tolerance and breaks the transfer,
+        so the decision belongs at a boundary where a pause is harmless."""
+        if self.spent or self.nonraw or not self.h_tx:
+            return
+        if self._tx_cop_count < (MAX_RAW_TX_COPS_BEFORE_RECYCLE if threshold is None else threshold):
+            return
+        end = time.monotonic() + 0.25  # let the last frames of the stream finish; they are already on the wire
+        while self._tx_in_flight and time.monotonic() < end:
+            self._drain(self.h_tx)
+            time.sleep(0.001)
+        if self._tx_in_flight:
+            return  # still busy: the next boundary tries again, and there are thousands of them before the limit
+        self._recycle_raw_tx()
+
+    def _recycle_raw_tx(self) -> None:
+        """Reopen the RawMode TX link while keeping the RX monitor running so VCI primitive tables never overflow."""
+        if not self.h_tx or self.nonraw or self._tx_in_flight:
+            return
+        old_tx = self.h_tx
+        if self._tx_started:
+            self._tx_started = False
+            self._stopcomm(old_tx)
+        self._try("PDUDisconnect", self.hmod, old_tx)
+        self._try("PDUDestroyComLogicalLink", self.hmod, old_tx)
+        if old_tx in self._links:
+            self._links.remove(old_tx)
+        self.h_tx = 0
+        self._tx_cop_count = 0
+        self.h_tx = self._create((0x80, 0, 0, 0))
+        self._call("PDUConnect", self.hmod, self.h_tx)
+        self._start(self.h_tx, COPT_STARTCOMM, b"", 0, 0)
+        self._tx_started = True
+
     def send(self, msg: can.Message, timeout: float | None = None) -> None:
+        if self.spent:
+            # A dead link costs the full timeout on every frame otherwise, and a retry loop around a reset
+            # turns that into minutes of waiting for an answer that can no longer come.
+            self._check_rx()
+            raise can.CanOperationError(tr("D-PDU: канал больше не работает",
+                                           "D-PDU: this link no longer works"))
         if self.nonraw:  # fixed-id links: the id is the link's, the payload goes on its own
             link = self.nonraw.get(msg.arbitration_id)
             if link is None:
@@ -660,7 +1066,8 @@ class DPduBus(can.BusABC):
             payload, tx_link = msg.arbitration_id.to_bytes(4, "big") + bytes(msg.data), self.h_tx
             # 29-bit sending mirrors the RxFlag layout (byte 2 bit 0); only 11-bit sending is verified on hardware
             flag = (0, 0, 1 if msg.is_extended_id else 0, 0)
-        end = time.monotonic() + (2.0 if timeout is None else timeout)
+        end = time.monotonic() + (5.0 if timeout is None else timeout)
+        saw_queue_full = False
         while True:
             self._check_rx()
             self._drain(tx_link)
@@ -668,27 +1075,61 @@ class DPduBus(can.BusABC):
                 rc, hcop = self._start(tx_link, COPT_SENDRECV, payload, 1, 0, tx_flag=flag,
                                        also_ok=(ERR_TX_QUEUE_FULL,))
                 if rc == 0:
-                    self._tx_in_flight.add(hcop)
+                    self._tx_in_flight[hcop] = tx_link
+                    self._tx_cop_count += 1
                     return
+                saw_queue_full = True
             if time.monotonic() > end:
+                # Mark the link unusable first: _check_rx re-raises whatever killed the receive thread, and if it
+                # does, `spent` must already be set or the kept-open session hands this dead bus out again.
                 self.spent = True
-                raise can.CanOperationError(tr("D-PDU: очередь отправки VCI переполнена", "D-PDU: the VCI send queue is full"))
+                stuck_links = set()
+                for stuck, stuck_link in list(self._tx_in_flight.items()):
+                    self._try("PDUCancelComPrimitive", self.hmod, stuck_link, stuck)
+                    stuck_links.add(stuck_link)
+                for link in stuck_links | {tx_link}:
+                    self._drain(link)
+                self._check_rx()
+                if saw_queue_full:
+                    raise can.CanOperationError(tr(
+                        "D-PDU: очередь отправки VCI переполнена",
+                        "D-PDU: the VCI send queue is full",
+                    ))
+                # The previous frame never finished. From the PC side two causes look the same: nothing on the bus
+                # acknowledges it (no ECU power, wiring, termination), or the VCI's own service hung (#113.log). The
+                # empty event queue the driver keeps returning is answered by the DLL locally, so it proves neither.
+                raise can.CanOperationError(tr(
+                    "D-PDU: кадр так и не ушёл. Либо его никто не подтверждает на шине (питание блока, "
+                    "провода CAN-H/CAN-L, терминатор 120 Ом), либо завис сам VCI (переподключите адаптер).",
+                    "D-PDU: the frame never went out. Either nothing on the bus acknowledges it (ECU power, "
+                    "CAN-H/CAN-L wiring, 120 Ohm terminator) or the VCI itself hung (reconnect the adapter).",
+                ))
             time.sleep(0.0005)
+
+    def _stopcomm(self, link: int) -> None:
+        """STOPCOMM on a send link, waiting up to a second for it like ODIS does. Whatever the VCI answers,
+        nothing started on this link is in flight any more afterwards."""
+        try:
+            _, cop = self._start(link, COPT_STOPCOMM, b"", 0, 0)
+            if cop:
+                self._tx_in_flight[cop] = link
+                end = time.monotonic() + 1.0
+                while cop in self._tx_in_flight and time.monotonic() < end:
+                    self._drain(link)
+                    time.sleep(0.001)
+        except Exception:  # noqa: BLE001 - closing goes on whatever the VCI says
+            pass
+        for cop in [c for c, owner in self._tx_in_flight.items() if owner == link]:
+            del self._tx_in_flight[cop]
 
     def _stop_links(self) -> None:
         """STOPCOMM on the send link (waiting for it like ODIS does), then cancel the monitor primitive."""
         if self._tx_started:
             self._tx_started = False
             for link in [self.h_tx] if self.h_tx else list(self.nonraw.values()):
-                try:
-                    _, cop = self._start(link, COPT_STOPCOMM, b"", 0, 0)
-                    self._tx_in_flight.add(cop)
-                    end = time.monotonic() + 1.0
-                    while cop in self._tx_in_flight and time.monotonic() < end:
-                        self._drain(link)
-                        time.sleep(0.001)
-                except Exception:  # noqa: BLE001 - closing goes on whatever the VCI says
-                    pass
+                self._stopcomm(link)
+        if self._uds_link:
+            self._close_uds_link()
         if self._mon_cop:
             try:
                 self._dll.PDUCancelComPrimitive(self.hmod, self.h_rx, self._mon_cop)
@@ -749,6 +1190,10 @@ def open_session(channel: str = "", bitrate: int = 500_000) -> DPduBus:
 
 def release_session(bus: DPduBus) -> None:
     """An operation finished with the link it borrowed; the next one reuses it."""
+    try:  # between operations nothing is streaming, so a worn link can go earlier than mid-run
+        bus.maybe_recycle_tx(RAW_TX_IDLE_RECYCLE_THRESHOLD)
+    except Exception:  # noqa: BLE001
+        bus.spent = True
     bus.claimed = False
 
 

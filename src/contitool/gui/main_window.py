@@ -54,7 +54,7 @@ from contitool.gui.screens.terminal import TerminalScreen
 from contitool.gui import theme
 from contitool.gui.theme import build_app_icon, dot_icon, mono_font
 from contitool.gui.widgets.execution_panel import ExecutionPanel
-from contitool.gui.widgets.page import Dialog, TextResultDialog, button, hint, run_dialog
+from contitool.gui.widgets.page import Callout, Dialog, TextResultDialog, button, hint, run_dialog
 from contitool.gui.worker import OperationRunner
 from contitool.gui.workspace import NAMES, Workspace
 from contitool.i18n import get_lang, set_lang, subscribe_lang_change, tr
@@ -92,6 +92,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.ecu_screen)
 
         self.start_screen.read_can_requested.connect(self.read_over_can)
+        self.start_screen.restore_requested.connect(self.restore_backup)
         self.start_screen.open_folder_requested.connect(self.open_folder)
         self.start_screen.open_files_requested.connect(self.open_files)
         self.start_screen.files_dropped.connect(self._load_paths)
@@ -345,8 +346,12 @@ class MainWindow(QMainWindow):
         )
 
     def _confirm_read(self, ident: dict[str, Any]) -> None:
-        if run_dialog(EcuFoundDialog(ident, self.conn, self)):
-            self._backup_over_can()
+        dlg = EcuFoundDialog(ident, self.conn, self)
+        if run_dialog(dlg):
+            if dlg.restore_chosen:
+                self.restore_backup()
+            else:
+                self._backup_over_can()
 
     def _backup_over_can(self) -> None:
         port, iface = self.conn.port, self.conn.interface
@@ -532,9 +537,13 @@ class EcuFoundDialog(Dialog):
     """The ECU that answered on CAN, before its memory is read."""
 
     def __init__(self, ident: dict[str, Any], conn: CanConnection, parent: QWidget | None = None) -> None:
+        in_fbl = bool(ident.get("in_fbl"))
+        self.restore_chosen = False
         super().__init__(
             parent,
-            tr("Блок на связи", "ECU found"),
+            tr("Блок в режиме загрузчика (FBL)", "ECU in bootloader mode (FBL)")
+            if in_fbl
+            else tr("Блок на связи", "ECU found"),
             tr(
                 f"Ответил блок на {conn.display()}. Проверьте, что это нужный блок.",
                 f"An ECU answered on {conn.display()}. Check that it is the one you want.",
@@ -554,16 +563,48 @@ class EcuFoundDialog(Dialog):
             grid.addWidget(name, r, 0, Qt.AlignmentFlag.AlignTop)
             grid.addWidget(value, r, 1)
         grid.setColumnStretch(1, 1)
-        self.body.addLayout(grid)
-        self.body.addWidget(
-            hint(
+        if ident.get("ident"):
+            self.body.addLayout(grid)
+        if in_fbl:
+            warn = Callout("warn")
+            warn.label.setText(
                 tr(
-                    "Будет снята полная копия памяти: CodeFlash, Uflash и DataFlash, около полутора минут. "
-                    "Блок перейдёт в режим загрузчика и потом вернётся в обычный режим; в память ничего не пишется.",
-                    "A full memory copy will be taken: CodeFlash, Uflash and DataFlash, about a minute and a half. "
-                    "The ECU switches to its loader and back to normal afterwards; nothing is written to its memory.",
+                    "Основная прошивка блока сейчас не запущена (например, после прерванной записи). "
+                    "Чтобы восстановить блок из ранее сохранённого бэкапа, нажмите <b>«Залить бэкап в блок…»</b>.",
+                    "The main ECU firmware is not running right now (for example, after an interrupted write). "
+                    "To recover the ECU from a previously saved backup, click <b>“Write backup to ECU…”</b>.",
                 )
             )
-        )
-        self.btn_ok = button(tr("Считать блок", "Read the ECU"), "PrimaryBtn", slot=self.accept)
-        self.finish(ok=self.btn_ok)
+            self.body.addWidget(warn)
+            self.body.addWidget(
+                hint(
+                    tr(
+                        "Если нажать «Считать как есть», программа снимет текущее (частично стёртое) содержимое памяти.",
+                        "If you click “Read anyway”, ContiTool will read the current (partially erased) memory contents.",
+                    )
+                )
+            )
+            self.btn_read_anyway = button(tr("Считать как есть", "Read anyway"), "GhostBtn", slot=self.accept)
+            self.btn_ok = button(
+                tr("Залить бэкап в блок…", "Write backup to ECU…"),
+                "PrimaryBtn",
+                slot=self._choose_restore,
+            )
+            self.finish(self.btn_read_anyway, ok=self.btn_ok)
+        else:
+            self.body.addWidget(
+                hint(
+                    tr(
+                        "Будет снята полная копия памяти: CodeFlash, Uflash и DataFlash, около полутора минут. "
+                        "Блок перейдёт в режим загрузчика и потом вернётся в обычный режим; в память ничего не пишется.",
+                        "A full memory copy will be taken: CodeFlash, Uflash and DataFlash, about a minute and a half. "
+                        "The ECU switches to its loader and back to normal afterwards; nothing is written to its memory.",
+                    )
+                )
+            )
+            self.btn_ok = button(tr("Считать блок", "Read the ECU"), "PrimaryBtn", slot=self.accept)
+            self.finish(ok=self.btn_ok)
+
+    def _choose_restore(self) -> None:
+        self.restore_chosen = True
+        self.accept()

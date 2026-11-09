@@ -146,3 +146,26 @@ def test_an_oversized_driver_log_goes_in_as_its_tail(tmp_path: Path, monkeypatch
     with zipfile.ZipFile(dest) as z:
         kept = z.read("driver_logs/VW_D_PDU_API_OE/PDUAPI_VW_#9.log")
     assert len(kept) == 64 and kept.endswith(b"PDUModuleConnect FAILED\n")
+
+
+def test_driver_logs_come_from_the_driver_the_operation_ran_on(tmp_path: Path) -> None:
+    """A 2.0.1c report for a run on VW_D_PDU_API_OS carried VCTool driver logs from an hour before, and the log
+    of the failure was missing. Another driver's logs are never a stand-in for the one in use."""
+    set_lang("en")
+    root = tmp_path / "ProgramData/Volkswagen"
+    used, other = root / "VW_D_PDU_API_OS/logs", root / "VW_D_PDU_API_VCTOOL_29_0_0_X64/logs"
+    used.mkdir(parents=True)
+    other.mkdir(parents=True)
+    started = time.time()
+    for d, name, age in ((used, "PDUAPI_VW_#3.log", 600), (other, "PDUAPI_VW_#4.log", 60)):
+        p = d / name
+        p.write_text("x\n")
+        os.utime(p, (started - age, started - age))  # neither was written during the operation
+
+    failure = report.Failure("Writing to ECU: CodeFlash", "boom", "Traceback …", started)
+    env = report.environment("dpdu", "VW_D_PDU_API_OS", "VAS 6154 / VNCI")
+    dest = report.build_report_zip(tmp_path / "r.zip", failure, env, "log\n", tmp_path / "runs",
+                                   driver_dirs=[used, other])
+    with zipfile.ZipFile(dest) as z:
+        logs = [n for n in z.namelist() if n.startswith("driver_logs/")]
+    assert logs == ["driver_logs/VW_D_PDU_API_OS/PDUAPI_VW_#3.log"]

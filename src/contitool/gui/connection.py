@@ -184,6 +184,15 @@ class ConnectionDialog(Dialog):
         self.chk_driver = QCheckBox()  # a D-PDU driver version ContiTool was not checked with
         self.chk_driver.toggled.connect(lambda *_a: self._sync())
         self.body.addWidget(self.chk_driver)
+        self.lbl_vnci = hint(tr(
+            "<b>Обновите прошивку адаптера до последней версии.</b> Часть VAS 6154 / VNCI со старой прошивкой "
+            "отказывает в сыром канале CAN, без которого чтение памяти не работает. Прошивку обновляет сам драйвер "
+            "D-PDU при первом подключении (около 30 секунд) — дождитесь окончания и не отключайте адаптер.",
+            "<b>Update the adapter firmware to the latest version.</b> Some VAS 6154 / VNCI units on older firmware "
+            "refuse the raw CAN channel, without which reading memory does not work. The D-PDU driver updates the "
+            "firmware itself on the first connect (about 30 seconds) — let it finish and do not unplug the adapter.",
+        ))
+        self.body.addWidget(self.lbl_vnci)
         self.btn_pinout = _link("", self._toggle_pinout)
         self.body.addLayout(row(self.btn_pinout))
         self.pinout_card = PinoutCard()
@@ -321,6 +330,7 @@ class ConnectionDialog(Dialog):
         self.chk_120ohm.blockSignals(True)
         self.chk_120ohm.setChecked(builtin or self._term_confirmed)
         self.chk_120ohm.blockSignals(False)
+        self.lbl_vnci.setVisible(iface == "dpdu")  # only the VAS 6154 / VNCI path depends on adapter firmware
         drv = self._unverified_driver()
         self.chk_driver.setVisible(drv is not None)
         self.chk_driver.setText(tr(
@@ -371,6 +381,10 @@ class ConnectionDialog(Dialog):
     def _check_ok(self, res: dict[str, Any]) -> None:
         values = {i["did"]: i["value"] for i in res.get("ident", [])}
         found = " · ".join(filter(None, (values.get("F187"), values.get("F197"), values.get("F189") and f"SW {values['F189']}")))
+        if res.get("in_fbl"):
+            msg = "✓ " + tr("Блок отвечает (в режиме загрузчика FBL)", "ECU answers (in FBL bootloader mode)")
+            self._check_done(msg + (f": {found}" if found else ""), "warn")
+            return
         self._check_done("✓ " + tr("Блок отвечает", "ECU answers") + (f": {found}" if found else ""), "ok")
 
     def _check_done(self, text: str, tone: str) -> None:

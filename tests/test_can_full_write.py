@@ -50,6 +50,7 @@ from contitool.core import (
     apply_dflash_swap_rsa_modulus,
     apply_engineering_patch,
     bind_cp_turnkey,
+    fbl_app_valid,
     generate_rsa1024_e3_keypair,
     load_rsa1024_key_material,
     parse_hex_key,
@@ -759,6 +760,16 @@ class SimulatedJ533CanBus:
             assert analyze_cflash(bytes(self.mcu.cflash)).crc_ok, "FD_0DATA CRC-16 invalid!"
             struct.pack_into("<I", self.mcu.cflash, 0xC000, FBL_PRESENCE_MAGIC)
             self._reply_uds(b"\x71\x01\xff\x01\x00")
+        elif req == b"\x22\xf1\xdf":
+            valid = fbl_app_valid(bytes(self.mcu.cflash))
+            self._reply_uds(bytes([0x62, 0xF1, 0xDF, 0x40 if valid else 0x44]))
+        elif req in (b"\x22\xf1\x97", b"\x22\x06\x00"):
+            # F197 and 0600 live in the application's DID tables only — the bootloader's read table has no entry
+            # for either, so an ECU sitting in FBL refuses them. That tells a running application from a cold FBL.
+            if fbl_app_valid(bytes(self.mcu.cflash)):
+                self._reply_uds(b"\x62\xf1\x97GW MQB High" if req[1] == 0xF1 else bytes.fromhex("620600030100347f08"))
+            else:
+                self._reply_uds(b"\x7f\x22\x31")
         else:
             raise AssertionError(f"Unhandled UDS request in SimulatedJ533CanBus: {req.hex()}")
 

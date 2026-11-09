@@ -105,3 +105,73 @@ def test_gui_reads_only_after_the_user_confirms(monkeypatch) -> None:
     run(1)
     assert backups == ["read"]
     win.close()
+
+
+def test_fbl_ecu_warns_and_offers_to_write_backup(monkeypatch) -> None:
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    from contitool.can import FoundAdapter
+    from contitool.gui import connection, main_window
+    from contitool.gui.app import create_window
+
+    set_lang("en")
+    app, win = create_window()
+    fbl_ident = {
+        "responding": True,
+        "in_fbl": True,
+        "app_valid": False,
+        "f1df": "44",
+        "ident": [{"did": "F187", "label_ru": "Номер детали", "label_en": "Part number", "value": "3Q0907530AR"}],
+    }
+
+    # 1. Link check in ConnectionDialog reports FBL bootloader mode with warning tone
+    monkeypatch.setattr(
+        connection,
+        "discover_adapters",
+        lambda: [FoundAdapter("slcan", "/dev/cu.usbmodem1101", "CANable2", "SLCAN")],
+    )
+    monkeypatch.setattr(connection, "can_identify", lambda port, **k: fbl_ident)
+    dlg = connection.ConnectionDialog(win.conn, win)
+    while dlg._scan is not None:
+        dlg._scan.wait(3000)
+        app.processEvents()
+    loop = QEventLoop()
+    dlg._check_link()
+    dlg._check.finished.connect(loop.quit)
+    QTimer.singleShot(3000, loop.quit)
+    loop.exec()
+    for _ in range(5):
+        app.processEvents()
+    assert dlg.lbl_check.text() == "✓ ECU answers (in FBL bootloader mode): 3Q0907530AR"
+    assert dlg.lbl_check.property("tone") == "warn"
+    dlg.close()
+
+    # 2. Clicking "Read the ECU" on an FBL unit warns and lets the user jump straight to "Write backup to ECU…"
+    actions: list[str] = []
+    monkeypatch.setattr(main_window, "ensure_ready", lambda *_a: True)
+    monkeypatch.setattr(main_window, "can_identify", lambda *a, **k: fbl_ident)
+    monkeypatch.setattr(main_window, "can_backup", lambda *a, **k: actions.append("backup") or {})
+    monkeypatch.setattr(win, "restore_backup", lambda: actions.append("restore"))
+
+    def choose_restore_in_dialog(self) -> int:
+        assert self.windowTitle() == "ECU in bootloader mode (FBL)"
+        assert self.btn_ok.text() == "Write backup to ECU…"
+        self.btn_ok.click()
+        return self.result()
+
+    monkeypatch.setattr(main_window.EcuFoundDialog, "exec", choose_restore_in_dialog)
+    loop2 = QEventLoop()
+    win.runner.operation_finished.connect(loop2.quit)
+    win.read_over_can()
+    QTimer.singleShot(5000, loop2.quit)
+    loop2.exec()
+    win.runner.operation_finished.disconnect(loop2.quit)
+    for _ in range(20):
+        app.processEvents()
+    assert actions == ["restore"]
+
+    # 3. Start screen also exposes "Write backup…" directly
+    win.start_screen.btn_restore.click()
+    app.processEvents()
+    assert actions == ["restore", "restore"]
+    win.close()
