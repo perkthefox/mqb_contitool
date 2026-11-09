@@ -104,8 +104,8 @@ def test_windows_paths_keep_their_backslashes(monkeypatch) -> None:
         r"\\bench\share\[2026]\Uflash.bin",
     ):
         assert str(clean_user_path(raw)) == raw
-    # a path dropped from a macOS / Linux terminal is still unescaped
-    assert str(clean_user_path(r"/tmp/My\ Dumps/\(1\)/Cflash.bin")) == "/tmp/My Dumps/(1)/Cflash.bin"
+    if sys.platform != "win32":  # a path dropped from a macOS / Linux terminal is still unescaped
+        assert str(clean_user_path(r"/tmp/My\ Dumps/\(1\)/Cflash.bin")) == "/tmp/My Dumps/(1)/Cflash.bin"
     monkeypatch.setattr(sys, "platform", "win32")
     assert str(clean_user_path(r"dumps\(old)\Cflash.bin")) == r"dumps\(old)\Cflash.bin"
 
