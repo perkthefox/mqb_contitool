@@ -341,7 +341,11 @@ def _parse_der_integers(der: bytes) -> list[int]:
 def load_rsa1024_key_material(raw_spec: str | Path) -> tuple[bytes, int | None]:
     """Load 128-byte RSA-1024 modulus (and optional private d) from JSON, PEM, .bin, or 256-hex string."""
     p = clean_user_path(raw_spec)
-    if p.is_file():
+    try:
+        is_file = p.is_file()
+    except OSError:  # a 256-hex modulus is too long for a file name (raised on Python 3.12 / 3.13)
+        is_file = False
+    if is_file:
         data = p.read_bytes()
         if len(data) == 128:
             if (data[0] & 0x80) == 0:
@@ -442,6 +446,10 @@ def build_signed_fsc(
         )
     vin_field = (vin_clean.encode("ascii") + b"\x00") if vin_clean else (b"\x00" * 18)
     ts = int(time.time()) if timestamp_unix is None else int(timestamp_unix)
+    if not 0 <= fec_code <= 0xFFFFFFFF:  # the certificate holds both in 32 bits: refuse, never cut to fit
+        raise ValueError(tr(f"Код FeC вне диапазона 0..0xFFFFFFFF: {fec_code:#x}", f"FeC code out of range 0..0xFFFFFFFF: {fec_code:#x}"))
+    if not 0 <= ts <= 0xFFFFFFFF:
+        raise ValueError(tr(f"Время вне диапазона 0..0xFFFFFFFF: {ts}", f"Timestamp out of range 0..0xFFFFFFFF: {ts}"))
     validity_9b = b"\x00" * 9
     body = (
         b"\x11\x02"

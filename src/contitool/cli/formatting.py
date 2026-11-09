@@ -271,6 +271,9 @@ def format_cflash_report(summary: CflashSummary, style: Style | None = None, pat
         st.badge_ok(f"0x{summary.crc_stored:04X} == 0x{summary.crc_calc:04X}")
         if summary.crc_ok
         else st.badge_err(f"0x{summary.crc_stored:04X} != 0x{summary.crc_calc:04X}")
+        if summary.crc_range_count
+        else st.badge_err(tr("нет таблицы CRC — приложение стёрто (блок в загрузчике) или повреждено",
+                             "no CRC table — application erased (unit in its bootloader) or damaged"))
     )
     cp_map = {
         "STOCK": st.dim(tr("STOCK (штатный KSCHUTZ 0x40)", "STOCK (factory KSCHUTZ 0x40)")),

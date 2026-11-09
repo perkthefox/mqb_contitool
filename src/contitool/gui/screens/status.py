@@ -335,7 +335,8 @@ def passport_rows(ws: Workspace) -> list[tuple[str, str, str]]:
         rows.append(
             (
                 tr("Контрольная сумма", "Checksum"),
-                tr("верна", "valid") if c.crc_ok else tr("не сходится", "mismatch"),
+                tr("верна", "valid") if c.crc_ok else tr("не сходится", "mismatch") if c.crc_range_count
+                else tr("нет таблицы CRC: приложение стёрто или повреждено", "no CRC table: application erased or damaged"),
                 "ok" if c.crc_ok else "err",
             )
         )

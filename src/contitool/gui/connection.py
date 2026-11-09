@@ -347,10 +347,13 @@ class ConnectionDialog(Dialog):
 
     def selection(self) -> tuple[str, str, str]:
         """(interface, port, title) — manual entry wins while it is open and filled in."""
-        if self._manual_open and (self.ed_port.text().strip() or self.cmb_iface.currentData() in ("j2534", "dpdu")):
+        if self._manual_wins():
             return str(self.cmb_iface.currentData()), self.ed_port.text().strip(), ""
         a = self._adapter(self.list.currentItem())
         return (a.interface, a.channel, a.title) if a else ("", "", "")
+
+    def _manual_wins(self) -> bool:
+        return self._manual_open and bool(self.ed_port.text().strip() or self.cmb_iface.currentData() in ("j2534", "dpdu"))
 
     def _toggle_manual(self, show: bool | None = None) -> None:
         show = not self._manual_open if show is None else show
@@ -366,7 +369,7 @@ class ConnectionDialog(Dialog):
 
     def _unverified_driver(self) -> str | None:
         """Version of the picked D-PDU driver when it needs the user's go-ahead, else None."""
-        a = None if self._manual_open else self._adapter(self.list.currentItem())
+        a = None if self._manual_wins() else self._adapter(self.list.currentItem())  # the one selection() uses
         if a is None or a.interface != "dpdu" or dpdu.driver_supported(a.driver):
             return None
         return a.driver

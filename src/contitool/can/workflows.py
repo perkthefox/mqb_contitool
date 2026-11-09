@@ -82,6 +82,7 @@ from contitool.core.zdc import (
     parse_zdc_passport,
     sync_gateway_coding_for_zdc,
     zdc_crc32_le,
+    zdc_ver_ok,
 )
 from contitool.i18n import tr
 from contitool.progress import NULL_REPORTER, OperationCancelledError, OperationReporter
@@ -1564,18 +1565,19 @@ def can_write_uflash(
                     ),
                 )
                 result["flash_commands_sent"] = True
-                pkt_logs = _execute_faci_payloads(
-                    link,
-                    payloads,
-                    label="FACI Uflash Packet",
-                    status_words=2 if len(payloads) == 1 and pages <= 122 else 3,
-                    reporter=reporter,
-                )
-                result["packets"] = pkt_logs
-                result["loader_response"] = pkt_logs[-1]["loader_response"]
-                result["marker"] = pkt_logs[-1]["marker"]
-                result["fstatr"] = pkt_logs[-1]["fstatr"]
-                result["write_performed"] = True
+                with reporter.uninterruptible():  # a cancel held back by the write must not skip its record
+                    pkt_logs = _execute_faci_payloads(
+                        link,
+                        payloads,
+                        label="FACI Uflash Packet",
+                        status_words=2 if len(payloads) == 1 and pages <= 122 else 3,
+                        reporter=reporter,
+                    )
+                    result["packets"] = pkt_logs
+                    result["loader_response"] = pkt_logs[-1]["loader_response"]
+                    result["marker"] = pkt_logs[-1]["marker"]
+                    result["fstatr"] = pkt_logs[-1]["fstatr"]
+                    result["write_performed"] = True
                 reporter.success(
                     tr(
                         f"Запись FACI завершена штатно (marker=1, FSTATR=0x{result['fstatr']:04X})",
@@ -1844,17 +1846,18 @@ def can_write_dflash(
                     ),
                 )
                 result["flash_commands_sent"] = True
-                pkt_logs = _execute_faci_payloads(
-                    link,
-                    payloads,
-                    label="FACI DataFlash Packet",
-                    status_words=3,
-                    reporter=reporter,
-                )
-                result["packets"] = pkt_logs
-                result["marker"] = pkt_logs[-1]["marker"]
-                result["fstatr"] = pkt_logs[-1]["fstatr"]
-                result["write_performed"] = True
+                with reporter.uninterruptible():  # a cancel held back by the write must not skip its record
+                    pkt_logs = _execute_faci_payloads(
+                        link,
+                        payloads,
+                        label="FACI DataFlash Packet",
+                        status_words=3,
+                        reporter=reporter,
+                    )
+                    result["packets"] = pkt_logs
+                    result["marker"] = pkt_logs[-1]["marker"]
+                    result["fstatr"] = pkt_logs[-1]["fstatr"]
+                    result["write_performed"] = True
                 reporter.success(
                     tr(
                         f"Блоки DataFlash успешно записаны через FACI ({len(blocks_to_write)} бл., FSTATR=0x{result['fstatr']:04X})",
@@ -2421,13 +2424,14 @@ def can_write_cflash(
                     ),
                 )
                 result["flash_commands_sent"] = True
-                result["faci_blocks"] = _program_cflash_blocks_in_loader(
-                    link,
-                    bytes(expected_full),
-                    changed_blocks,
-                    flid_16b=live_selfid,
-                    reporter=reporter,
-                )
+                with reporter.uninterruptible():  # a cancel held back by the write must not skip its record
+                    result["faci_blocks"] = _program_cflash_blocks_in_loader(
+                        link,
+                        bytes(expected_full),
+                        changed_blocks,
+                        flid_16b=live_selfid,
+                        reporter=reporter,
+                    )
                 reporter.step(4, total_steps, tr("Прямая запись FACI завершена — переход к верификации", "Direct FACI write complete — proceeding to readback"))
                 reporter.step(5, total_steps, tr("Побайтовая сверка всех 1.5 МБ CodeFlash", "Verifying full 1.5 MB CodeFlash readback"))
                 rb_path = out_dir / "Cflash_readback.bin"
@@ -2441,7 +2445,12 @@ def can_write_cflash(
                     reporter=reporter,
                 )
                 result["readback"] = rb
-                if not rb.get("reference_match"):
+                actual = rb_path.read_bytes()
+                # validity words of a block 6 not written here stay as the FBL set them; written here, it must match
+                if not rb.get("reference_match") and not (
+                    6 not in changed_blocks
+                    and _same_but_validity_words(actual, bytes(expected_full)) and fbl_app_valid(actual)
+                ):
                     raise RuntimeError(f"CodeFlash readback mismatch at {rb.get('first_mismatch_address')!r}")
             else:
                 if app_blocks and rsa_res["rsa_status"] != 0 and signature_128b is None:
@@ -2527,10 +2536,11 @@ def can_write_cflash(
                         # The image's record was deliberately not written (unfinished download): the one this
                         # download made stays, and is what we read back.
                         expected_cmp[0x8000:0xA000] = actual[0x8000:0xA000]
-                    # The FBL sets its own validity words (0xC000 / 0xC100) during 34/36/37: accept a difference only
-                    # there, and only if the FBL's own rule then calls the application valid.
+                    # The FBL sets its own validity words (0xC000 / 0xC100) during 34/36/37, or did so long ago when
+                    # no application is written now: accept a difference only there, and only if the FBL's own rule
+                    # then calls the application valid.
                     if actual != bytes(expected_cmp) and not (
-                        app_blocks and _same_but_validity_words(actual, bytes(expected_cmp)) and fbl_app_valid(actual)
+                        _same_but_validity_words(actual, bytes(expected_cmp)) and fbl_app_valid(actual)
                     ):
                         at = next(i for i in range(len(actual)) if actual[i] != expected_cmp[i])
                         raise RuntimeError(
@@ -2668,9 +2678,10 @@ def can_restore_backup(
         except LINK_ERRORS:
             pass  # no UDS answer (left in the RAM-loader, say): the loader reads it below
         # VCRN lives in DataFlash and no bootloader DID carries it, so only the RAM-loader can read it. It is
-        # needed when FAZIT did not answer, and when DataFlash is written from a backup with a blank VCRN: the
-        # ECU's own must not be erased by it.
-        in_loader = not ecu["fazit"] or ("dflash" in writes and backup["vcrn"] == "")
+        # needed when FAZIT did not answer, when the backup has no FAZIT but a VCRN (DataFlash alone), and when
+        # DataFlash is written from a backup with a blank VCRN: the ECU's own must not be erased by it.
+        in_loader = (not ecu["fazit"] or (not backup["fazit"] and bool(backup["vcrn"]))
+                     or ("dflash" in writes and backup["vcrn"] == ""))
         if in_loader:
             entry = enter_ram_loader(link, reporter=reporter)
             if not entry.get("already_in_loader"):
@@ -2743,7 +2754,11 @@ def can_restore_backup(
                 return_to_app=False, reporter=reporter,
             )
             did_backup = True
-    except Exception:
+    except (Exception, OperationCancelledError):  # a cancel leaves the same ECU behind as a failure
+        eng_record = out_dir / "uflash_eng" / "uflash_write_result.json"
+        if "uflash_engineering" not in result and eng_record.is_file():  # the write itself raised: its own record
+            with contextlib.suppress(OSError, ValueError):  # what is re-raised below stays the cancel or the error
+                result["uflash_engineering"] = json.loads(eng_record.read_text(encoding="utf-8"))
         if result.get("uflash_engineering", {}).get("write_performed"):
             # Deliberately not put back: with the factory bootloader a half-written application could not be
             # programmed again over UDS. The engineering one lets the user simply repeat the restore.
@@ -3298,7 +3313,7 @@ def can_upload_zdc_datasets(
         if write_passport:
             pp = parse_zdc_passport(dflash_bytes)
             pn_str = (pp.dataset_pn or "V03935256AA")[:11]
-            ver_str = pp.dataset_ver if (len(pp.dataset_ver) == 4 and pp.dataset_ver != "0000") else "0001"
+            ver_str = pp.dataset_ver if zdc_ver_ok(pp.dataset_ver) else "0001"
             eq_12 = pp.equip_bytes if len(pp.equip_bytes) == 12 else (b"\xff" * 12)
 
             reporter.step(

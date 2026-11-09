@@ -62,7 +62,7 @@ class OperationWorker(QThread):
         except OperationCancelledError as exc:
             self.reporter.warning(str(exc))
             self.cancelled.emit(str(exc))
-        except Exception as exc:
+        except BaseException as exc:  # SystemExit from a library too: escaping run() it would end the program
             tb = traceback.format_exc()
             self.reporter.error(str(exc))
             self.failed.emit(str(exc), tb)
@@ -90,7 +90,7 @@ class OperationRunner(QObject):
 
     @property
     def is_busy(self) -> bool:
-        return self._worker is not None and self._worker.isRunning()
+        return self._worker is not None  # from run_task() until its result is handled, thread started or not
 
     def cancel_current(self) -> None:
         if self._worker is not None and self._worker.isRunning():

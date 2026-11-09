@@ -74,6 +74,7 @@ from contitool.core import (
     inject_ssa_preset,
     load_rsa1024_key_material,
     parameterize_dflash_for_fecs,
+    parse_fec_code,
     parse_fec_list,
     parse_hex_key,
     parse_mke_block,
@@ -105,6 +106,13 @@ def _out_style(args: argparse.Namespace) -> Style:
 def _make_cli_display(args: argparse.Namespace) -> CliProgressDisplay:
     color = False if getattr(args, "no_color", False) else None
     return CliProgressDisplay(sys.stderr, color=color)
+
+
+def _u32_timestamp(ts: int | None) -> int | None:
+    """An FSC holds the time in 32 bits: refuse what would be cut to fit."""
+    if ts is not None and not 0 <= ts <= 0xFFFFFFFF:
+        raise ValueError(tr(f"--timestamp вне диапазона 0..0xFFFFFFFF: {ts}", f"--timestamp out of range 0..0xFFFFFFFF: {ts}"))
+    return ts
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
@@ -319,7 +327,19 @@ def cmd_patch_engineering(args: argparse.Namespace) -> int:
     return 0
 
 
+def _only_with(option: str, used: list[str]) -> None:
+    """Options that change something only together with `option`: refuse them alone rather than ignore them."""
+    if used:
+        names = ", ".join(used)
+        raise ValueError(tr(f"Без {option} эти параметры ничего не меняют: {names}",
+                            f"Without {option} these options do nothing: {names}"))
+
+
 def cmd_activate_swap(args: argparse.Namespace) -> int:
+    if not args.auto_parameterize:
+        _only_with("--auto-parameterize", [o for o, v in (
+            ("--fpa-preset", args.fpa_preset), ("--button-mode", args.button_mode), ("--mfl-key", args.mfl_key),
+            ("--kl15-memory", args.kl15_memory or None)) if v is not None])
     raw_df = clean_user_path(args.input).read_bytes()
     enable_tokens: list[str | int] = []
     if args.all_gateway:
@@ -357,9 +377,9 @@ def cmd_activate_swap(args: argparse.Namespace) -> int:
         target_set -= set(parse_fec_list(disable_tokens))
         ap_cfg = ZdcAutoParamConfig(
             enabled=True,
-            fpa_preset=args.fpa_preset,
-            button_mode=args.button_mode,
-            mfl_keycode=args.mfl_key,
+            fpa_preset=args.fpa_preset or "surgical",
+            button_mode=args.button_mode or "keep",
+            mfl_keycode=0x19 if args.mfl_key is None else args.mfl_key,
             kl15_persist_profiles=args.kl15_memory,  # S029 only; the S075 pass-through has its own flag
         )
         raw_df, _ = parameterize_dflash_for_fecs(raw_df, sorted(target_set), ap_cfg, reporter=rep)
@@ -369,7 +389,7 @@ def cmd_activate_swap(args: argparse.Namespace) -> int:
         enable_fecs=enable_tokens,
         disable_fecs=disable_tokens,
         vin=vin_arg,
-        timestamp_unix=args.timestamp,
+        timestamp_unix=_u32_timestamp(args.timestamp),
         preserve_existing_active=not args.replace,
         reporter=rep,
     )
@@ -385,6 +405,13 @@ def cmd_activate_swap(args: argparse.Namespace) -> int:
 
 
 def cmd_parameterize(args: argparse.Namespace) -> int:
+    if not args.button_mode:
+        _only_with("--button-mode", [o for o, v in (
+            ("--mfl-key", args.mfl_key), ("--mfl-long-press", args.mfl_long_press or None),
+            ("--console-ring", args.console_ring), ("--mfl-ring", args.mfl_ring)) if v is not None])
+    for opt, kmh in (("--mke-speed-on", args.mke_speed_on), ("--mke-speed-off-high", args.mke_speed_off_high)):
+        if kmh is not None and not 0 <= kmh <= 255:
+            raise ValueError(tr(f"{opt}: допустимо 0..255 км/ч, указано {kmh}", f"{opt}: allowed 0..255 km/h, given {kmh}"))
     raw_df = clean_user_path(args.input).read_bytes()
     disp = _make_cli_display(args)
     rep = disp.create_reporter()
@@ -494,7 +521,7 @@ def cmd_parameterize(args: argparse.Namespace) -> int:
                 m_ring = [int(x, 0) for x in args.mfl_ring.split(",") if x.strip()] if args.mfl_ring else None
                 fpa.configure_buttons(
                     mode=args.button_mode,
-                    mfl_keycode=args.mfl_key,
+                    mfl_keycode=0x19 if args.mfl_key is None else args.mfl_key,
                     mfl_long_press=args.mfl_long_press,
                     console_ring=c_ring,
                     mfl_ring=m_ring,
@@ -563,6 +590,13 @@ def cmd_set_rsa_key(args: argparse.Namespace) -> int:
         raise ValueError(tr("Укажите --cflash-out", "Provide --cflash-out"))
     if args.dflash_in and not args.dflash_out:
         raise ValueError(tr("Укажите --dflash-out", "Provide --dflash-out"))
+    if args.dflash_in and args.target == "fbl":
+        raise ValueError(tr(
+            "--dflash-in: в DataFlash хранится только ключ SWaP, с --target fbl менять там нечего. "
+            "Уберите --dflash-in или укажите --target swap / both",
+            "--dflash-in: DataFlash holds only the SWaP key, with --target fbl there is nothing to change there. "
+            "Leave out --dflash-in or use --target swap / both",
+        ))
 
     disp = _make_cli_display(args)
     rep = disp.create_reporter()
@@ -635,7 +669,7 @@ def cmd_sign_fsc(args: argparse.Namespace) -> int:
                 "Signing requires a private RSA-1024 key (.json or .private.pem containing private exponent d)!",
             )
         )
-    fec_code = int(args.fec.strip(), 16)
+    fec_code = parse_fec_code(args.fec)
     vcrn_5b = b""
     vin_str = ""
     if args.dflash:
@@ -665,7 +699,7 @@ def cmd_sign_fsc(args: argparse.Namespace) -> int:
         vin_str,
         n_bytes,
         d_int,
-        timestamp_unix=args.timestamp,
+        timestamp_unix=_u32_timestamp(args.timestamp),
         reporter=disp.create_reporter(),
     )
     disp.finish()
@@ -1076,9 +1110,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=tr("Автоматически параметрировать ZDC #1 / ZDC #4 под включаемые функции FeC", "Auto-parameterize ZDC #1 / ZDC #4 for enabled FeC features"),
     )
-    p_asw.add_argument("--fpa-preset", choices=("surgical", "fwd", "fwd_dcc", "awd", "awd_dcc"), default="surgical")
-    p_asw.add_argument("--button-mode", choices=("keep", "console", "both", "mfl"), default="keep")
-    p_asw.add_argument("--mfl-key", type=lambda x: int(x, 0), default=0x19)
+    p_asw.add_argument("--fpa-preset", choices=("surgical", "fwd", "fwd_dcc", "awd", "awd_dcc"))
+    p_asw.add_argument("--button-mode", choices=("keep", "console", "both", "mfl"))
+    p_asw.add_argument("--mfl-key", type=lambda x: int(x, 0))
     p_asw.add_argument("--kl15-memory", action="store_true", help=tr("Оставлять выбранный профиль после выключения зажигания", "Keep the selected profile after the ignition is off"))
     p_asw.set_defaults(func=cmd_activate_swap)
 
@@ -1096,7 +1130,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_par.add_argument("--enable-fpa-slots", type=int, nargs="+")
     p_par.add_argument("--disable-fpa-slots", type=int, nargs="+")
     p_par.add_argument("--button-mode", choices=("none", "console", "mfl", "both"))
-    p_par.add_argument("--mfl-key", type=lambda x: int(x, 0), default=0x19)
+    p_par.add_argument("--mfl-key", type=lambda x: int(x, 0))
     p_par.add_argument("--mfl-long-press", action="store_true")
     p_par.add_argument("--console-ring")
     p_par.add_argument("--mfl-ring")
@@ -1211,6 +1245,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd is None or args.cmd in ("gui", "wizard"):
         return cmd_gui(args)
 
+    for name in ("stdin", "stdout", "stderr"):  # None in a windowed build (no console): run the command all the same
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "r" if name == "stdin" else "w", encoding="utf-8"))
     try:
         err_color = (not getattr(args, "no_color", False)) and sys.stderr.isatty() and ("NO_COLOR" not in os.environ)
         print(format_startup_banner(Style(err_color)), file=sys.stderr)

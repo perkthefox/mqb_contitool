@@ -25,8 +25,9 @@ DUMP_BUDGET = 40 * 1024 * 1024  # uncompressed *.bin of the operation when dumps
 GITHUB_ATTACH_LIMIT = 25 * 1024 * 1024  # what GitHub takes as one issue attachment
 URL_LIMIT = 7500  # characters of the whole URL, encoded: GitHub refuses a new-issue URL much over 8 KB
 
-_VIN = re.compile(r"\b([A-HJ-NPR-Z0-9]{11})[A-HJ-NPR-Z0-9]{6}\b")
-_FAZIT = re.compile(r"\b([A-Z0-9]{3}-[A-Z0-9]{3}\d{2}\.\d{2}\.\d{2})\d{8}\b")
+# "_" counts as a separator: the gateway folder is <part>_<FAZIT>, and \b would not see an ID there
+_VIN = re.compile(r"(?<![^\W_])([A-HJ-NPR-Z0-9]{11})[A-HJ-NPR-Z0-9]{6}(?![^\W_])")
+_FAZIT = re.compile(r"(?<![^\W_])([A-Z0-9]{3}-[A-Z0-9]{3}\d{2}\.\d{2}\.\d{2})\d{8}(?![^\W_])")
 
 
 @dataclasses.dataclass
@@ -39,7 +40,12 @@ class Failure:
 
 
 def mask_ids(text: str) -> str:
-    """Hide the serial part of VINs and FAZIT IDs in text that may end up in a public issue."""
+    """Hide the serial part of VINs and FAZIT IDs, and the user's home folder (its name is the OS user name), in text
+    that may end up in a public issue."""
+    home = os.path.expanduser("~")
+    if len(Path(home).parts) > 1:  # "~" when unknown, "/" for root: nothing to hide
+        for h in {home, Path(home).as_posix()}:
+            text = re.sub(re.escape(h) + r"(?![\w.-])", "~", text, flags=re.I)
     return _FAZIT.sub(r"\1********", _VIN.sub(r"\1******", text))
 
 
@@ -101,14 +107,28 @@ def driver_logs(since: float, dirs: list[Path] | None = None, *, fallback: bool 
 
 def session_files(out_dir: Path, since: float, *, with_dumps: bool = False) -> list[Path]:
     """Files ContiTool wrote during the operation (logs, JSON results); memory dumps (*.bin) only `with_dumps`, never
-    archives (*.zip — the report itself is saved into the same folder by default)."""
+    archives (*.zip — the report itself is saved into the same folder by default), never key material (ContiTool_keys,
+    *.pem — a new key pair is saved next to the dumps, and the report is meant for a public issue)."""
     if not out_dir.is_dir():
         return []
-    skip = (".zip",) if with_dumps else (".bin", ".zip")
+    skip = (".zip", ".pem") if with_dumps else (".bin", ".zip", ".pem")
     return sorted(
         p for p in out_dir.rglob("*")
         if p.is_file() and p.suffix.lower() not in skip and p.stat().st_mtime >= since - 5
+        and "contitool_keys" not in (part.lower() for part in p.relative_to(out_dir).parts)
+        and not _key_bundle(p)
     )
+
+
+def _key_bundle(p: Path) -> bool:
+    """A key pair saved as JSON anywhere (crypto.save_rsa1024_keypair_bundle): it holds the private exponent d_hex.
+    Only small .json files are read; one that cannot be read is treated as a key."""
+    if p.suffix.lower() != ".json" or p.stat().st_size > 64 * 1024:
+        return False
+    try:
+        return b'"d_hex"' in p.read_bytes()
+    except OSError:
+        return True
 
 
 def _can_log_excerpt(path: Path) -> str:

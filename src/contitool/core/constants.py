@@ -6,6 +6,7 @@ import dataclasses
 from pathlib import Path
 import re
 import os
+import sys
 
 from contitool.i18n import get_lang
 
@@ -536,6 +537,6 @@ def clean_user_path(raw: str | Path) -> Path:
     s = raw.strip()
     if len(s) >= 2 and ((s[0] == "'" and s[-1] == "'") or (s[0] == '"' and s[-1] == '"')):
         s = s[1:-1]
-    else:
+    elif sys.platform != "win32" and not re.match(r"[A-Za-z]:[\\/]|\\\\", s):  # a backslash separates Windows paths
         s = re.sub(r"\\([ ()\[\]{}&'!#$~])", r"\1", s)
     return Path(os.path.expanduser(s))

@@ -204,7 +204,14 @@ class J533CanLink:
     def drain_rx(self, max_frames: int = 64) -> None:
         """Drain any stale buffered frames before starting a fresh handshake."""
         for _ in range(max_frames):
-            msg = self.bus.recv(timeout=0.0)
+            try:
+                msg = self.bus.recv(timeout=0.0)
+            except can.CanOperationError as exc:
+                from contitool.can.dpdu import FrameError
+
+                if not isinstance(exc, FrameError):
+                    raise
+                continue  # a result of the stale stream the bus could not interpret: thrown away with the rest
             if msg is None:
                 break
             raw = bytes(msg.data)
@@ -415,6 +422,7 @@ class J533CanLink:
                 self._write_trace("uds_rx", self.UDS_RX_ID, len(resp), resp[:16])
                 self.rx_frames += 1
                 return _checked_response(req_sid, resp, expected_sid)
+        self.drain_rx()  # a late answer to an earlier request must not be read as the answer to this one
         self.send_uds(req)
         deadline = time.monotonic() + timeout
         wait = 2.5

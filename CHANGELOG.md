@@ -1,5 +1,47 @@
 # Changelog / История изменений
 
+## 2.0.3 — 2026-11-10
+
+### 🇷🇺 Исправлено
+- **Отчёт о проблеме:** в архив больше не попадают файлы ключей (папка `ContiTool_keys`, `*.pem`, JSON с закрытым ключом). FAZIT и VIN скрываются и в имени папки блока, путь к домашней папке заменяется на `~`.
+- **Изменённый DataFlash считался уже записанным** после записи параметрии по CAN: «Записать в блок» писал только CodeFlash.
+- **Запись только загрузочных блоков CodeFlash** заканчивалась ошибкой сверки по адресу 0xC100 при верной записи, и блок оставался в RAM-Loader.
+- **Закрытие программы во время операции** обрывало её на середине. Теперь программа ждёт, пока операция остановится (запись во Flash — пока закончится), и закрывается сама.
+- **Остановка во время записи:** журнал записи теперь верно показывает, что запись выполнена; при восстановлении выводится предупреждение об оставленном инженерном загрузчике.
+- **VAS 6154 / VNCI:** чтение и запись могли оборваться после пересоздания канала отправки и при повторной ошибке кадра во время чтения.
+- **Блок в загрузчике (приложение стёрто):** чтение памяти завершалось ошибкой, а CodeFlash такого блока не опознавался как дамп шлюза.
+- **Восстановление одного DataFlash:** владелец сверяется по VCRN, раньше сравнить было нечем.
+- **Редактор профилей движения:** сохранение без изменений меняло кольцо кнопки руля; сохранение во время «Определить нажатие по CAN» теряло правки; нехватка свободного входа под кнопку приводила к сбою вместо сообщения.
+- Кнопки экрана блока оставались активными во время операции; результаты операции (DTC, SWaP, считанный загрузчик) попадали в другой блок, открытый до её конца.
+- **Windows:** пути со скобками, `#` и `~` портились в командной строке и при перетаскивании файла.
+- Ключ RSA строкой из 256 hex-цифр не принимался в сборках для macOS и Linux.
+- **Командная строка:** `set-rsa-key --target fbl` менял ключ SWaP в DataFlash; `sign-fsc` принимал FeC и время, не помещающиеся в 32 бита; в сборке без консоли команды не выполнялись.
+
+### 🇷🇺 Изменено
+- **Командная строка:** параметры, которые раньше молча игнорировались (`--mfl-key` без `--button-mode`, `--fpa-preset` без `--auto-parameterize` и подобные), теперь дают ошибку с названием нужного параметра.
+- **CAN-терминал, режим UDS:** ID больше 7FF отклоняется с сообщением; раньше такой запрос уходил 11-битным кадром.
+- При запуске через `python -m contitool` папка `contitool_runs` создаётся в текущей папке, а не внутри установленного пакета.
+
+### 🇬🇧 Fixed
+- **Problem report:** key files no longer go into the archive (the `ContiTool_keys` folder, `*.pem`, a JSON holding a private key). FAZIT and VIN are hidden in the gateway folder name too, and the home folder path becomes `~`.
+- **An edited DataFlash counted as already written** after a dataset write over CAN: “Write to ECU” wrote CodeFlash only.
+- **Writing only the boot blocks of CodeFlash** ended in a readback mismatch at 0xC100 after a correct write, leaving the ECU in the RAM-Loader.
+- **Quitting during an operation** cut it off halfway. ContiTool now waits for the operation to stop (a flash write — to finish) and then quits by itself.
+- **Stopping during a write:** the write log now correctly says the write was performed; a restore warns that the engineering bootloader stays in the ECU.
+- **VAS 6154 / VNCI:** a read or write could break off after the send link was reopened, or on a second frame error during a read.
+- **ECU in its bootloader (application erased):** the memory read ended in an error, and such a CodeFlash was not recognised as a gateway dump.
+- **Restoring DataFlash alone:** the owner is checked by VCRN; there used to be nothing to compare.
+- **Driving-profile editor:** saving with nothing changed altered the wheel-button ring; saving during “Detect press over CAN” lost the edits; no free input for a button caused a crash instead of a message.
+- ECU-screen buttons stayed enabled during an operation; the results of an operation (DTCs, SWaP, the bootloader read back) went to another gateway opened before it ended.
+- **Windows:** paths with brackets, `#` or `~` were corrupted on the command line and on file drop.
+- An RSA key given as a 256-digit hex string was refused in the macOS and Linux builds.
+- **Command line:** `set-rsa-key --target fbl` changed the SWaP key in DataFlash; `sign-fsc` took a FeC or time that does not fit in 32 bits; commands did not run in a build without a console.
+
+### 🇬🇧 Changed
+- **Command line:** options that used to be silently ignored (`--mfl-key` without `--button-mode`, `--fpa-preset` without `--auto-parameterize` and the like) are now an error naming the option they need.
+- **CAN terminal, UDS mode:** an ID above 7FF is refused with a message; such a request used to go out as an 11-bit frame.
+- Started with `python -m contitool`, the `contitool_runs` folder is created in the working folder, not inside the installed package.
+
 ## 2.0.2b — 2026-11-10
 
 ### 🇷🇺 Добавлено

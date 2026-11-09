@@ -30,13 +30,15 @@ FAZIT_OFFSET, HW_PN_OFFSET = 0xA240, 0xA25A  # in CodeFlash: 23 ASCII, 11 ASCII
 
 
 def app_dir() -> Path:
-    """The folder ContiTool is run from: next to the .exe (the .app bundle on macOS), or next to conti_cp_tool.py."""
+    """The folder ContiTool is run from: next to the .exe (the .app bundle on macOS), or next to conti_cp_tool.py.
+    Started any other way (`python -m contitool`, the `contitool` command) it is the working folder: not inside the
+    installed package or the venv's bin folder, which go when the venv is rebuilt."""
     if getattr(sys, "frozen", False):
         exe = Path(sys.executable).resolve()
         bundle = next((p for p in exe.parents if p.suffix == ".app"), None)
         return bundle.parent if bundle is not None else exe.parent
     main = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else None
-    return main.parent if main is not None and main.is_file() else Path.cwd()
+    return main.parent if main is not None and main.name == "conti_cp_tool.py" and main.is_file() else Path.cwd()
 
 
 def runs_root() -> Path:
@@ -125,7 +127,7 @@ def has_full_read(unit_dir: Path) -> bool:
     def complete(d: Path) -> bool:
         return all((d / n).is_file() and (d / n).stat().st_size == size for n, size in AREA_SIZES.items())
 
-    return any(d.is_dir() and (d.name == BASE_READ or d.name.endswith("_read")) and complete(d) for d in dumps.iterdir())
+    return any(d.is_dir() and (d.name == BASE_READ or re.search(r"_read(_\d+)?$", d.name)) and complete(d) for d in dumps.iterdir())
 
 
 def latest_area(unit_dir: Path, name: str) -> Path | None:

@@ -386,6 +386,8 @@ def build_factory_multi_fsc_slot(
 
     fec_u32 = parse_fec_code(fec_code)
     ts = int(time.time()) if timestamp_unix is None else int(timestamp_unix)
+    if not 0 <= ts <= 0xFFFFFFFF:  # the slot holds it in 32 bits: refuse, never cut to fit
+        raise ValueError(tr(f"Время вне диапазона 0..0xFFFFFFFF: {ts}", f"Timestamp out of range 0..0xFFFFFFFF: {ts}"))
     ts_u32 = max(1, ts & 0xFFFFFFFF)
 
     spay = (

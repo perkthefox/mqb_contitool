@@ -299,7 +299,7 @@ class CflashSummary:
     crc_stored: int = 0
     crc_calc: int = 0
     crc_ok: bool = False
-    crc_range_count: int = 1
+    crc_range_count: int = 1  # 0: no usable CRC range table (application erased or its header damaged)
     hook_vaddr: int | None = None
     hook_mode: str = "NOT_FOUND"
     cave_target: int | None = None
@@ -426,11 +426,11 @@ def analyze_cflash(raw: bytes) -> CflashSummary:
     prefix, app = split_cflash_or_app(raw)
     sha = hashlib.sha256(raw).hexdigest()
     stored_word, range_cnt = struct.unpack_from("<HH", app, 0x1C)
-    if range_cnt == 0:
-        stored_crc, calc_crc, crc_valid = stored_word, stored_word, False
-    else:
+    try:
         stored_crc, calc_crc = app_crc(app)
         crc_valid = stored_crc == calc_crc
+    except ValueError:  # no usable range table: erased (unit in its bootloader) or damaged application header
+        stored_crc, calc_crc, crc_valid, range_cnt = stored_word, stored_word, False, 0
 
     res = CflashSummary(
         size=len(raw),

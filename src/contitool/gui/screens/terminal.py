@@ -532,6 +532,7 @@ class TerminalScreen(QWidget):
             return  # stopped by disconnect_bus() (the session may already be gone), already handled
         self._drain(s)
         self.session = None
+        s.wait()  # `closed` is the last thing run() does: a short wait; deleting a running QThread aborts the app
         s.deleteLater()
         self._timer.stop()
         self._state, self._error = ("err", error) if error else ("off", "")
@@ -579,6 +580,11 @@ class TerminalScreen(QWidget):
                     raise ValueError(tr("Введите байты запроса, например 22 F1 90", "Enter the request bytes, e.g. 22 F1 90"))
                 tx, _ = parse_id(self.ed_tx.text())
                 rx, _ = parse_id(self.ed_rx.text())
+                if tx > 0x7FF or rx > 0x7FF:  # 0710 stays what it always was here: 11-bit 0x710
+                    raise ValueError(tr("UDS-запрос идёт только с 11-битными ID (не больше 7FF); "
+                                        "29-битный ID отправьте кадром",
+                                        "UDS requests use 11-bit IDs only (at most 7FF); "
+                                        "send a 29-bit ID as a raw frame"))
                 self.session.send_uds(tx, rx, payload)
                 self._remember(self.cmb_uds, "uds", text)
                 self._say(tr("Ждём ответ…", "Waiting for the reply…"), "info")

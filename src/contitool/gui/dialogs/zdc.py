@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid
 
 from contitool.can import can_learn_mfl_button, can_read_gateway_coding, can_write_gateway_coding
 from contitool.core.analyzer import analyze_dflash_swap
@@ -58,6 +60,7 @@ from contitool.core import (
     parse_zdc_passport,
     replace_bem_slot_from_rom,
     sync_gateway_coding_for_zdc,
+    zdc_ver_ok,
 )
 from contitool.gui import theme
 from contitool.gui.connection import CanConnection, ensure_ready
@@ -254,6 +257,8 @@ class FpaEditorDialog(Dialog):
 
         self.btn_ok = button(tr("Сохранить настройки", "Save settings"), "PrimaryBtn", slot=self._on_accept)
         self.finish(ok=self.btn_ok)
+        if runner is not None:
+            runner.busy_changed.connect(self._on_runner_busy)
         self.resize(940, 780)
         self._load_all_from_fpa()
 
@@ -715,7 +720,8 @@ class FpaEditorDialog(Dialog):
     def _sync_onboarding_banner(self) -> None:
         for tab_idx in (1, 2, 3):
             self.tabs.setTabEnabled(tab_idx, not self._unconfigured)
-        self.btn_ok.setEnabled(not self._unconfigured)
+        # a CAN action of this editor puts its result here when it ends: no saving before that
+        self.btn_ok.setEnabled(not self._unconfigured and not (self._runner is not None and self._runner.is_busy))
         if self.onboard_frame is None or self.lbl_onboard is None:
             return
         if self._unconfigured:
@@ -924,9 +930,8 @@ class FpaEditorDialog(Dialog):
 
     def set_mfl_ring_slots(self, slots: list[int]) -> None:
         """Programmatically select a profile list (or quick 2-mode pair) for the steering-wheel button."""
-        def_ring = self.fpa.default_cycle_ring()
         matched_key = None
-        if slots == def_ring:
+        if list(slots) == self._current_console_ring():  # "all" on the wheel is the MODE button's ring
             matched_key = "all"
         else:
             for key, pair, _ru, _en in _WHEEL_QUICK_PAIRS:
@@ -983,6 +988,8 @@ class FpaEditorDialog(Dialog):
         self._set_ring_checks(self._mfl_ring_checks, m_ring)
         self.set_console_ring_slots(c_ring)
         self.set_mfl_ring_slots(m_ring)
+        # the controls cannot show every ring (order, slot 9): one left as loaded is saved as the dataset has it
+        self._rings_loaded = (self._current_console_ring(), self._current_mfl_ring(), c_ring, m_ring)
 
         self.chk_led_off_normal.setChecked(cfg.normal_led_off)
         self.chk_mib_popup.setChecked(cfg.mib_popup)
@@ -1064,6 +1071,9 @@ class FpaEditorDialog(Dialog):
 
         c_ring = self._current_console_ring()
         m_ring = self._current_mfl_ring()
+        shown_c, shown_m, loaded_c, loaded_m = self._rings_loaded
+        c_ring = loaded_c if c_ring == shown_c else c_ring
+        m_ring = loaded_m if m_ring == shown_m else m_ring
         # Automatically enable any profile explicitly picked for a quick toggle (e.g. Sport / Race / Individual)
         if mode in ("mfl", "both"):
             for s in m_ring:
@@ -1130,12 +1140,20 @@ class FpaEditorDialog(Dialog):
 
     def _run_live(self, title: str, fn: Any, done: Any = None) -> None:
         """CAN work always goes through the shared runner: never on the GUI thread, never next to another operation."""
-        if self._runner is None or not self._runner.run_task(title, fn, on_success=done):
+
+        def to_dialog(res: Any) -> None:  # the editor may have been closed while the CAN action ran
+            if done is not None and isValid(self) and self.isVisible():
+                done(res)
+
+        if self._runner is None or not self._runner.run_task(title, fn, on_success=to_dialog):
             QMessageBox.information(
                 self,
                 tr("Адаптер занят", "Adapter busy"),
                 tr("Дождитесь окончания текущей операции с блоком.", "Wait until the current ECU operation finishes."),
             )
+
+    def _on_runner_busy(self, _busy: bool) -> None:
+        self._sync_onboarding_banner()
 
     def _on_tab_changed(self, idx: int) -> None:
         if idx in (2, 3):
@@ -1292,10 +1310,15 @@ class FpaEditorDialog(Dialog):
         )
 
     def _on_accept(self) -> None:
+        before = copy.deepcopy(self.fpa)
         try:
             self._commit_buttons_to_fpa()
-        except ValueError as exc:  # no room for the knob: say so and stay in the dialog
-            QMessageBox.warning(self, tr("Шайба 4MOTION Active Control", "4MOTION Active Control knob"), str(exc))
+        except ValueError as exc:  # no room for the knob or the buttons: say so and stay in the dialog
+            knob_refused = self.chk_knob.isChecked() and not self.fpa.has_knob  # the knob goes in before the buttons
+            self.fpa = before  # the knob may already be in: nothing of the failed attempt stays
+            title = (tr("Шайба 4MOTION Active Control", "4MOTION Active Control knob") if knob_refused
+                     else tr("Настройки не сохранены", "Settings not saved"))
+            QMessageBox.warning(self, title, str(exc))
             return
         self.accept()
 
@@ -1761,7 +1784,7 @@ class ZdcPassportBlocksDialog(Dialog):
         self.ed_pn = QLineEdit(pp.dataset_pn or "V03935256AA")
         self.ed_pn.setFont(mono_font(13))
         self.ed_pn.setMaxLength(11)
-        self.ed_ver = QLineEdit(pp.dataset_ver if (len(pp.dataset_ver) == 4 and pp.dataset_ver != "0000") else "0001")
+        self.ed_ver = QLineEdit(pp.dataset_ver if zdc_ver_ok(pp.dataset_ver) else "0001")
         self.ed_ver.setFont(mono_font(13))
         self.ed_ver.setMaxLength(4)
         init_equip = "" if pp.equip_bytes == b"\xff" * 12 else (pp.equip_ascii or pp.equip_hex)

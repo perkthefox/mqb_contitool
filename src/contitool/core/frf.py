@@ -76,7 +76,7 @@ def read_frf(data: bytes) -> FrfImage:
         zf = zipfile.ZipFile(io.BytesIO(plain))
         odx_name = next(n for n in zf.namelist() if n.lower().endswith(".odx"))
         root = ET.fromstring(zf.read(odx_name))  # noqa: S314 - a file the user picked; no entities are resolved
-    except (zipfile.BadZipFile, StopIteration, ET.ParseError, KeyError) as exc:
+    except (zipfile.BadZipFile, StopIteration, ET.ParseError, KeyError, zlib.error) as exc:
         raise ValueError(tr("Это не FRF ODIS или он повреждён", "Not an ODIS FRF, or it is damaged")) from exc
 
     app, signature, idents, mem = None, None, {}, ""

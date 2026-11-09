@@ -173,6 +173,7 @@ class EcuScreen(QWidget):
         self._swap_live: list[dict[str, Any]] | None = None  # last UDS 22 3C 00 answer
         self._swap_at = ""
         self._key_file: Path | None = None  # last key generated or picked, offered again when signing
+        self._folder: Path | None = None  # the gateway the three above belong to
         self.actions: dict[str, QPushButton] = {}  # buttons of the page on screen
 
         outer = QVBoxLayout(self)
@@ -296,9 +297,15 @@ class EcuScreen(QWidget):
 
     # ────────────────────────────── state ──────────────────────────────
     def _on_workspace_changed(self) -> None:
-        if not self.ws.is_open:  # a different ECU next time: forget what belonged to this one
+        if self.ws.folder != self._folder:  # another ECU (or none): forget what belonged to the last one
+            self._folder = self.ws.folder
             self._dtc, self._key_file, self._swap_live = None, None, None
         self.refresh()
+
+    def _here(self, fn: Any) -> Any:
+        """`fn` as on_success of a task on the open ECU: dropped if another one (or none) is open when it ends."""
+        folder = self.ws.folder
+        return lambda res: fn(res) if self.ws.folder == folder else None
 
     def refresh(self) -> None:
         if not self.ws.is_open:
@@ -1342,7 +1349,7 @@ class EcuScreen(QWidget):
             rep.success(tr(f"Сохранено: {out}", f"Saved: {out}"))
             return out
 
-        self.runner.run_task(title, task, on_success=lambda p: self.ws.commit(kind, p))
+        self.runner.run_task(title, task, on_success=self._here(lambda p: self.ws.commit(kind, p)))
 
     def _bind_modules(self) -> None:
         inf = self.ws.info("dflash")
@@ -1383,7 +1390,7 @@ class EcuScreen(QWidget):
             self.ws.commit("dflash", df_out)
 
         addrs = ", ".join(s.ecu_addr for s in banks)
-        self.runner.run_task(tr(f"Адаптация IKA/CP: {addrs}", f"IKA/CP adaptation: {addrs}"), task, on_success=done)
+        self.runner.run_task(tr(f"Адаптация IKA/CP: {addrs}", f"IKA/CP adaptation: {addrs}"), task, on_success=self._here(done))
 
     def _patch_engineering(self, restore: bool) -> None:
         self._edit(
@@ -1559,7 +1566,7 @@ class EcuScreen(QWidget):
             tr("Проверка блока перед загрузкой параметрии", "Checking the ECU before the dataset upload"),
             precheck,
             # the runner is still busy inside on_success: plan once it has finished
-            on_success=lambda pre: QTimer.singleShot(0, lambda: self._zdc_upload_plan(df_bytes, pre)),
+            on_success=self._here(lambda pre: QTimer.singleShot(0, lambda: self._zdc_upload_plan(df_bytes, pre))),
         )
 
     def _zdc_upload_plan(self, df_bytes: bytes, pre: dict[str, Any]) -> None:
@@ -1628,7 +1635,7 @@ class EcuScreen(QWidget):
                 self.ws.mark_written(["dflash"])  # the ECU holds this file's datasets, and nothing else was edited
             QTimer.singleShot(0, lambda: self._offer_dtc_clear(res, activate))
 
-        self.runner.run_task(tr("Загрузка параметрии по CAN", "Dataset upload over CAN"), task, on_success=done)
+        self.runner.run_task(tr("Загрузка параметрии по CAN", "Dataset upload over CAN"), task, on_success=self._here(done))
 
     def _offer_dtc_clear(self, res: dict[str, Any], activated: list[int]) -> None:
         active = {f["fsid"] for f in res["features"] if status.swap_live_state(f["status"]).key == "on"}
@@ -1736,7 +1743,7 @@ class EcuScreen(QWidget):
             title = tr("Возврат ключа VAG", "Restoring the VAG key")
         else:
             title = tr("Свой ключ SWaP", "Your SWaP key") if swap else tr("Свой ключ FBL", "Your FBL key")
-        self.runner.run_task(title, task, on_success=done)
+        self.runner.run_task(title, task, on_success=self._here(done))
 
     # ────────────────────────────── certificates ──────────────────────────────
     def _issue_certificate(self) -> None:
@@ -1786,7 +1793,9 @@ class EcuScreen(QWidget):
             holder.append(dlg_res)
             run_dialog(dlg_res)
 
-        self.runner.run_task(tr(f"Подпись сертификата {fec:08X}", f"Signing certificate {fec:08X}"), task, on_success=done)
+        # the runner is still busy inside on_success: show the result (it can open the terminal) once it has finished
+        self.runner.run_task(tr(f"Подпись сертификата {fec:08X}", f"Signing certificate {fec:08X}"), task,
+                             on_success=lambda fsc: QTimer.singleShot(0, lambda: done(fsc)))
 
     def _sign_odx(self) -> None:
         dlg = OdxSignDialog(self._key_file, self)
@@ -1836,7 +1845,7 @@ class EcuScreen(QWidget):
         self.runner.run_task(
             tr("Сброс ошибок блока", "Clearing trouble codes") if clear else tr("Чтение ошибок блока", "Reading trouble codes"),
             lambda rep: can_health_check(port, interface=iface, session_dir=sdir, clear_dtc=clear, reporter=rep),
-            on_success=done,
+            on_success=self._here(done),
         )
 
     def _swap_check(self) -> None:
@@ -1846,7 +1855,7 @@ class EcuScreen(QWidget):
         self.runner.run_task(
             tr("Проверка функций SWaP в блоке", "Checking SWaP features in the ECU"),
             lambda rep: can_swap_status(port, interface=iface, reporter=rep),
-            on_success=self._swap_done,
+            on_success=self._here(self._swap_done),
         )
 
     def _swap_done(self, res: dict[str, Any]) -> None:
@@ -1924,7 +1933,7 @@ class EcuScreen(QWidget):
             else tr("Возврат заводского загрузчика", "Restoring the factory bootloader"),
             lambda rep: can_write_uflash(port, restore_stock=not engineering, interface=iface, session_dir=sdir,
                                          skip_full_backup=have_read, reporter=rep),
-            on_success=lambda _r: self._adopt_uflash(sdir),
+            on_success=self._here(lambda _r: self._adopt_uflash(sdir)),
         )
 
     def _revert(self) -> None:
@@ -2045,6 +2054,7 @@ class EcuScreen(QWidget):
 
         def done(r: dict[str, Any]) -> None:
             flashed = Path(r["flashed"])
+            self._folder = flashed  # the same ECU as it now is: what belongs to it stays
             self.ws.open_folder(flashed, source="can")  # what the ECU now holds; nothing left pending
             self.note.emit(tr(f"Открыты дампы, как они теперь в блоке: {flashed}", f"Opened the dumps as the ECU now holds them: {flashed}"))
             if "swap" in r:
@@ -2055,5 +2065,5 @@ class EcuScreen(QWidget):
         self.runner.run_task(
             tr(f"Запись в блок: {target_names}", f"Writing to ECU: {target_names}"),
             task,
-            on_success=done,
+            on_success=self._here(done),
         )

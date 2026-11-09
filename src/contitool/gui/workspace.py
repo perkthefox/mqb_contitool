@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, Signal
@@ -38,7 +39,7 @@ class Workspace(QObject):
         self.source = "files"  # "can" when created from a CAN backup in this session
         self.original: dict[str, Path] = {}
         self.current: dict[str, Path] = {}
-        self.written: dict[str, Path] = {}
+        self.written: dict[str, bytes] = {}  # kind -> SHA-256 of the file written to the ECU
         self._info: dict[str, DetectedDumpFile] = {}
 
     # ── state ──
@@ -57,7 +58,7 @@ class Workspace(QObject):
 
     def pending(self, kind: str) -> bool:
         """Modified and not yet written to the ECU."""
-        return self.modified(kind) and self.written.get(kind) != self.current[kind]
+        return self.modified(kind) and kind not in self.written
 
     def edit_path(self, kind: str) -> Path:
         assert self.folder is not None
@@ -125,13 +126,15 @@ class Workspace(QObject):
     def commit(self, kind: str, path: Path) -> None:
         """Adopt an edited file produced by a background task (call on the GUI thread)."""
         self.current[kind] = path
+        if kind in self.written and self.written[kind] != _sha256(path):
+            del self.written[kind]  # new content: not in the ECU yet, even under the same file name
         self._info[kind] = detect_dump_file(path)
         self.changed.emit()
 
     def mark_written(self, kinds: list[str]) -> None:
         for k in kinds:
             if k in self.current:
-                self.written[k] = self.current[k]
+                self.written[k] = _sha256(self.current[k])
         self.changed.emit()
 
     def revert(self) -> None:
@@ -144,6 +147,10 @@ class Workspace(QObject):
         self.folder = None
         self.original, self.current, self.written, self._info = {}, {}, {}, {}
         self.changed.emit()
+
+
+def _sha256(path: Path) -> bytes:
+    return hashlib.sha256(path.read_bytes()).digest()
 
 
 def recent_folders() -> list[Path]:

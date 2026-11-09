@@ -1152,6 +1152,7 @@ class DPduBus(can.BusABC):
     def _stopcomm(self, link: int) -> None:
         """STOPCOMM on a send link, waiting up to a second for it like ODIS does. Whatever the VCI answers,
         nothing started on this link is in flight any more afterwards."""
+        spent = self.spent
         try:
             _, cop = self._start(link, COPT_STOPCOMM, b"", 0, 0)
             if cop:
@@ -1161,7 +1162,9 @@ class DPduBus(can.BusABC):
                     self._drain(link)
                     time.sleep(0.001)
         except Exception:  # noqa: BLE001 - closing goes on whatever the VCI says
-            pass
+            # The failure belongs to the link being closed, not to the bus; a receive thread that died meanwhile
+            # (it stores its error before it sets `spent`) still marks it.
+            self.spent = spent or (self._rx_error is not None and not isinstance(self._rx_error, FrameError))
         for cop in [c for c, owner in self._tx_in_flight.items() if owner == link]:
             del self._tx_in_flight[cop]
 
@@ -1225,6 +1228,7 @@ def open_session(channel: str = "", bitrate: int = 500_000) -> DPduBus:
         live.claim()  # which also notices a link that died while it was idle
         if not live.spent:
             return live
+        live.claimed = False  # nobody uses it: close_session may shut it down instead of waiting for it
     close_session()
     bus = DPduBus(channel, bitrate)
     bus.claim()

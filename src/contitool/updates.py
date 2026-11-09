@@ -21,11 +21,11 @@ class Release:
 
 def version_key(version: str) -> tuple[int, ...]:
     """`2.0.1e` -> (2, 0, 1, 5). A letter after a version is its n-th fix (a = 1), so 2.0.1 < 2.0.1a < 2.0.1e < 2.0.2.
-    Anything else gives (), which is never newer."""
-    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)([a-z]?)", version.strip().lower())
+    `2.1` is 2.1.0. Anything else gives (), which is never newer."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)(?:\.(\d+))?([a-z]?)", version.strip().lower())
     if not m:
         return ()
-    return int(m[1]), int(m[2]), int(m[3]), (ord(m[4]) - 96) if m[4] else 0
+    return int(m[1]), int(m[2]), int(m[3] or 0), (ord(m[4]) - 96) if m[4] else 0
 
 
 def _download(assets: list[dict[str, Any]], platform: str) -> str:
@@ -41,7 +41,9 @@ def _download(assets: list[dict[str, Any]], platform: str) -> str:
 
 
 def newer_release(data: dict[str, Any], current: str, platform: str = sys.platform) -> Release | None:
-    """The release GitHub answered with, if it is newer than `current`."""
+    """The release GitHub answered with, if it is newer than `current`. Anything but a JSON object is none."""
+    if not isinstance(data, dict):
+        return None
     tag = str(data.get("tag_name") or "")
     if not version_key(tag) or version_key(tag) <= version_key(current):
         return None

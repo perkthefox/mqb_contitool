@@ -143,6 +143,7 @@ class MainWindow(QMainWindow):
         self.terminal.problem.connect(self.offer_problem_report)
         self._opened_at = time.time()
         self._report_dlg: ProblemReportDialog | None = None
+        self._quit_when_idle = False  # Quit was confirmed during an operation: close once it has ended
         self._unsub = subscribe_lang_change(lambda _l: self.retranslate_ui())
         self.retranslate_ui()
         self._refresh_screen()
@@ -658,6 +659,9 @@ class MainWindow(QMainWindow):
         self._refresh_header()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.runner.is_busy and self._quit_when_idle:
+            event.ignore()
+            return
         if self.runner.is_busy:
             ans = QMessageBox.warning(
                 self,
@@ -672,7 +676,14 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            # the task closes its link and a flash write finishes first; a QThread destroyed while running aborts
+            self._quit_when_idle = True
             self.runner.cancel_current()
+            self.runner.busy_changed.connect(lambda busy: busy or QTimer.singleShot(0, self.close))
+            self.console.note(tr("Программа закроется, как только операция остановится.",
+                                 "ContiTool quits as soon as the operation stops."))
+            event.ignore()
+            return
         self._unsub()
         self.terminal.disconnect_bus()
         for session in list(self.terminal._closing):  # a QThread destroyed while running aborts the process

@@ -140,6 +140,7 @@ from contitool.core.zdc import (
     sync_gateway_coding_for_zdc,
     zdc6_record_be_to_rom_le,
     zdc_crc32_le,
+    zdc_ver_ok,
 )
 
 __all__ = [
@@ -275,4 +276,5 @@ __all__ = [
     "write_dflash_slots",
     "zdc6_record_be_to_rom_le",
     "zdc_crc32_le",
+    "zdc_ver_ok",
 ]

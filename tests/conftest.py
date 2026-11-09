@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+import sys
 import zlib
 
 import pytest
@@ -130,6 +131,16 @@ def _isolated_qsettings(tmp_path_factory: pytest.TempPathFactory) -> None:
 
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
     QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path_factory.mktemp("qsettings")))
+
+
+@pytest.fixture(autouse=True)
+def _runs_in_tmp(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Session folders of a test go to a temp folder, never next to pytest (.venv/bin) or into the repository's
+    contitool_runs with real bench data: storage.app_dir(), behind runs_root() and the GUI's conn.out_dir, takes the
+    folder of the launcher in sys.argv[0]."""
+    launcher = tmp_path_factory.mktemp("app") / "conti_cp_tool.py"
+    launcher.touch()
+    monkeypatch.setattr(sys, "argv", [str(launcher)])
 
 
 @pytest.fixture(autouse=True)

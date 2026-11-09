@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 import dataclasses
 import struct
+from xml.sax.saxutils import escape
 import zlib
 
 from contitool.core.analyzer import analyze_dflash_datasets, check_fec_dataset_support, validate_dflash_bytes
@@ -162,6 +163,11 @@ def _encode_equip_12b(val: bytes | str | None, fallback: bytes) -> bytes:
     return raw.ljust(12, b" ")
 
 
+def zdc_ver_ok(ver: str) -> bool:
+    """F1A1 the passport may hold: 4 ASCII digits other than 0000, or '----'. Anything else read back becomes 0001."""
+    return len(ver) == 4 and ver != "0000" and (ver == "----" or (ver.isascii() and ver.isdigit()))
+
+
 def apply_zdc_passport(
     df: bytes,
     *,
@@ -188,9 +194,8 @@ def apply_zdc_passport(
                 "Dataset number F1A0 must be 1..11 printable ASCII characters",
             )
         )
-    ver_str = (cur.dataset_ver or "0001") if dataset_ver is None else dataset_ver.strip().upper()
-    valid_ver = len(ver_str) == 4 and ver_str != "0000" and (ver_str == "----" or (ver_str.isascii() and ver_str.isdigit()))
-    if not valid_ver:
+    ver_str = (cur.dataset_ver if zdc_ver_ok(cur.dataset_ver) else "0001") if dataset_ver is None else dataset_ver.strip().upper()
+    if not zdc_ver_ok(ver_str):
         raise ValueError(
             tr(
                 "Версия датасета F1A1 должна состоять ровно из 4 цифр (или '----') и не быть '0000' (например '0001')",
@@ -283,9 +288,9 @@ def build_odis_zdc_file(df: bytes, idx: int) -> bytes:
                             f"ZDC #{idx} is empty or has a bad CRC-32 — nothing to export"))
     pp = parse_zdc_passport(df)
     pn = (pp.dataset_pn or "").strip() or ZDC_PLACEHOLDER_PN
-    ver = pp.dataset_ver if (len(pp.dataset_ver) == 4 and pp.dataset_ver != "0000") else "0001"
+    ver = pp.dataset_ver if zdc_ver_ok(pp.dataset_ver) else "0001"
     text = "\r\n".join(_ODIS_FILE_LINES).format(
-        ver=ver, pn=pn, addr=f"0x{ZDC_UDS_UPLOAD_MAP[idx][0]:04X}", hex=export_zdc_block(df, idx).hex().upper())
+        ver=ver, pn=escape(pn, {'"': "&quot;"}), addr=f"0x{ZDC_UDS_UPLOAD_MAP[idx][0]:04X}", hex=export_zdc_block(df, idx).hex().upper())
     return (text + "\r\n").encode("utf-8")
 
 
@@ -334,7 +339,9 @@ def parse_odis_zdc_file(data: bytes | str) -> OdisZdcFile:
         except ValueError:
             return -1
 
-    start, diag = _addr("START_ADDRESS"), _addr("DIAGNOSTIC_ADDRESS")
+    start = _addr("START_ADDRESS")
+    diag_txt = (node.get("DIAGNOSTIC_ADDRESS") or "").strip()
+    diag = _addr("DIAGNOSTIC_ADDRESS") if diag_txt else 0x19  # no address given: the file is the gateway's
     known = _ODIS_ADDR_TO_IDX.get(start)
     if known is None or known[1] != len(payload):
         expect = ", ".join(f"0x{a:04X}/{s} Б" for a, (_i, s) in sorted(_ODIS_ADDR_TO_IDX.items()))
@@ -347,11 +354,11 @@ def parse_odis_zdc_file(data: bytes | str) -> OdisZdcFile:
             )
         )
     idx = known[0]
-    if diag not in (-1, 0x19):
+    if diag != 0x19:
         raise ValueError(
             tr(
-                f"Файл параметризации адресован блоку 0x{diag:02X}, а не шлюзу 0x19.",
-                f"This parameterization file addresses ECU 0x{diag:02X}, not the gateway 0x19.",
+                f"Файл параметризации адресован блоку {diag_txt}, а не шлюзу 0x19.",
+                f"This parameterization file addresses ECU {diag_txt}, not the gateway 0x19.",
             )
         )
     stored = int.from_bytes(payload[-4:], "little")
@@ -375,9 +382,9 @@ def parse_odis_zdc_file(data: bytes | str) -> OdisZdcFile:
         zdc_idx=idx,
         payload=payload,
         dataset_pn=pn,
-        dataset_ver=ver if len(ver) == 4 and ver != "0000" else "0001",
+        dataset_ver=ver if zdc_ver_ok(ver) else "0001",
         start_address=start,
-        diagnostic_address=0x19 if diag == -1 else diag,
+        diagnostic_address=diag,
         header_tag=_ascii_field(payload[:4]),
     )
 
@@ -466,7 +473,7 @@ def import_zdc_block(
                 out[:] = apply_zdc_passport(
                     bytes(out),
                     dataset_pn=dp.dataset_pn or "V03935256AA",
-                    dataset_ver=dp.dataset_ver or "0001",
+                    dataset_ver=dp.dataset_ver if zdc_ver_ok(dp.dataset_ver) else "0001",
                     equip=dp.equip_bytes,
                     clean_pads=True,
                 )
@@ -1509,6 +1516,18 @@ class FpaDataset:
         rotary_inputs = {i for i in range(5) if s036[i] not in (0x00,) and i not in own_inputs}
         rotary_switches = self._vehicle_switches()
         vehicle_mode_button = _VEHICLE_MODE_BUTTON in s036
+        free_inputs = [i for i in range(5) if i not in rotary_inputs]
+        free_switches = [sw for sw in range(4) if sw not in rotary_switches]
+        need = (mode in ("console", "both") and not vehicle_mode_button) + (mode in ("mfl", "both"))
+        if need > min(len(free_inputs), len(free_switches)):  # checked before anything is written
+            raise ValueError(
+                tr(
+                    "Для кнопки нет свободного входа или переключателя: все заняты органами управления автомобиля. "
+                    "Выберите другой режим кнопок.",
+                    "No free input or switch left for the button: the car's own controls use them all. "
+                    "Choose another button mode.",
+                )
+            )
 
         for i in range(5):
             if i in own_inputs:
@@ -1532,8 +1551,6 @@ class FpaDataset:
         c_ring = console_ring if console_ring else def_ring
         m_ring = mfl_ring if mfl_ring else c_ring
 
-        free_inputs = [i for i in range(5) if i not in rotary_inputs]
-        free_switches = [sw for sw in range(4) if sw not in rotary_switches]
         rotary_inputs = {i for i in rotary_inputs if s036[i] == 0x04}  # what the console switch type below means
 
         if mode in ("console", "both") and not vehicle_mode_button:  # the car's own MODE button already is one
@@ -2200,7 +2217,7 @@ def parameterize_dflash_for_fecs(
             out = apply_zdc_passport(
                 out,
                 dataset_pn=pp.dataset_pn or ZDC_PLACEHOLDER_PN,
-                dataset_ver=pp.dataset_ver if (len(pp.dataset_ver) == 4 and pp.dataset_ver != "0000") else "0001",
+                dataset_ver=pp.dataset_ver if zdc_ver_ok(pp.dataset_ver) else "0001",
                 equip=pp.equip_bytes,
                 clean_pads=True,
                 reporter=reporter,
