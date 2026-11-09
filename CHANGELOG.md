@@ -1,5 +1,13 @@
 # Changelog / История изменений
 
+## 2.0.2a — 2026-11-09
+
+### 🇷🇺 Исправлено
+- **Редактор FPA ломал кнопку MODE и режимы полного привода на машинах с 4Motion.** Заводскую кнопку MODE (вход типа `0x05` с кольцами «дорога» и «бездорожье») он не узнавал и при любом сохранении заменял своей. Теперь кнопки и кольца машины не трогаются никогда — меняются только кнопки, которые добавил сам ContiTool (консоль, руль); режим всплывающего окна (S056) сохраняется как в стоке.
+
+### 🇬🇧 Fixed
+- **The FPA editor broke the MODE button and the 4Motion modes on 4Motion cars.** It did not know the car's own MODE button (input type `0x05` with on-road and off-road rings) and replaced it with its own on every save. The car's buttons and rings are now never touched — only the buttons ContiTool adds itself (console, wheel) change; the pop-up mode (S056) stays as in stock.
+
 ## 2.0.2 — 2026-11-09
 
 ### 🇷🇺 Исправлено

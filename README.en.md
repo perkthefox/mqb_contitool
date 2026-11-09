@@ -107,9 +107,9 @@ flowchart LR
 ### Option 1 — Standalone Executables (Recommended)
 
 Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.0.2-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.0.2-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.0.2-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+- **Windows**: extract `ContiTool-v2.0.2a-windows-amd64.zip` and launch **`ContiTool.exe`**.
+- **macOS**: open `ContiTool-v2.0.2a-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
+- **Linux**: extract `ContiTool-v2.0.2a-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
 
 ### Option 2 — Run from Source (`Python 3.12+`)
 

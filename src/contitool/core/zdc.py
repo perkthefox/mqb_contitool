@@ -772,7 +772,13 @@ class FpaButtonConfig:
     popup_timeout_100ms: int     # S020[0] (0 = HMI default)
     decouple_dsg_lever: bool     # S034 != 0
     personalization_pso: bool    # (S013 & 0x04) != 0
-    has_4motion_rotary: bool     # 0x04 present in S036
+    has_4motion_rotary: bool     # a vehicle mode input ContiTool keeps as it is: 0x04 rotary or 0x05 MODE button
+    vehicle_mode_button: bool = False  # S036 0x05: the car's own MODE button (4Motion: on-road and off-road rings)
+
+
+# Input types (S036) ContiTool writes itself; every other input is the car's own and is never touched.
+_OWN_CONSOLE, _OWN_MFL = 0x01, (0xFD, 0xFE, 0xFC)
+_VEHICLE_MODE_BUTTON = 0x05  # e.g. T-Roc 4Motion: switch 0 = off-road ring, switch 1 = on-road ring (S042 01 / 02)
 
 
 class FpaDataset:
@@ -862,9 +868,11 @@ class FpaDataset:
 
     @property
     def has_4motion_rotary(self) -> bool:
+        """4Motion mode inputs of the car's own: the rotary (0x04) or a MODE button with an off-road ring (0x05)."""
         if self.empty:
             return False
-        return 0x04 in self.sec_bytes(36)
+        s036 = self.sec_bytes(36)
+        return 0x04 in s036 or _VEHICLE_MODE_BUTTON in s036
 
     def detected_preset(self) -> str:
         """Infer the closest factory chassis preset (`fwd`, `fwd_dcc`, `awd`, `awd_dcc`) from dataset tables."""
@@ -1222,8 +1230,21 @@ class FpaDataset:
         s028 = self.sec_bytes(28)
         s030 = self.selectable_mask
         order = (5, 1, 2, 3, 6, 7, 4, 8, 9)
-        ring = [s for s in order if 1 <= s028[s] <= 15 and (s030 & (1 << s))]
+        theirs = {slot for sw in self._vehicle_switches() for slot in self._read_switch_ring(sw)}
+        ring = [s for s in order if 1 <= s028[s] <= 15 and (s030 & (1 << s)) and s not in theirs]
         return ring[:8] if ring else [2]
+
+    def _own_inputs(self) -> list[int]:
+        s036 = self.sec_bytes(36)
+        return [i for i in range(5) if s036[i] == _OWN_CONSOLE or s036[i] in _OWN_MFL]
+
+    def _vehicle_switches(self) -> set[int]:
+        """Switches ContiTool did not set up: every configured switch not bound to one of its own inputs."""
+        s040, s042, s043, s045 = self.sec_bytes(40), self.sec_bytes(42), self.sec_bytes(43), self.sec_bytes(45)
+        own = {s040[i] for i in self._own_inputs() if s040[i] < 4}
+        used = {sw for sw in range(4) if s042[sw] or s043[sw] != 0xFF or s045[sw] or self._read_switch_ring(sw)}
+        bound = {s040[i] for i in range(5) if s040[i] < 4}
+        return (used | bound) - own
 
     def _read_switch_ring(self, sw_idx: int) -> list[int]:
         s041 = self.sec_bytes(41)
@@ -1265,7 +1286,7 @@ class FpaDataset:
         s040 = self.sec_bytes(40)
         s057 = self.sec_bytes(57)
 
-        console_inps = [i for i in range(5) if s036[i] == 0x01 and 1 <= s037[i] <= 5 and s040[i] < 4]
+        console_inps = [i for i in range(5) if s036[i] in (_OWN_CONSOLE, _VEHICLE_MODE_BUTTON) and s040[i] < 4]
         mfl_inps = [i for i in range(5) if s036[i] in (0xFD, 0xFE, 0xFC) and 1 <= s037[i] <= 5 and s040[i] < 4]
 
         if console_inps and mfl_inps:
@@ -1297,7 +1318,8 @@ class FpaDataset:
             popup_timeout_100ms=self.sec_bytes(20)[0],
             decouple_dsg_lever=(self.buf[FPA_SEC_OFFS[34]] != 0),
             personalization_pso=bool(self.buf[FPA_SEC_OFFS[13]] & 0x04),
-            has_4motion_rotary=(0x04 in s036),
+            has_4motion_rotary=(0x04 in s036 or _VEHICLE_MODE_BUTTON in s036),
+            vehicle_mode_button=_VEHICLE_MODE_BUTTON in s036,
         )
 
     def configure_buttons(
@@ -1333,15 +1355,16 @@ class FpaDataset:
         s057 = self.sec_bytes(57)
         s058 = self.sec_bytes(58)
 
-        rotary_inputs = {i for i in range(5) if s036[i] == 0x04}
-        rotary_switches = {s040[i] for i in rotary_inputs if s040[i] < 4}
-        for sw in range(4):
-            if s042[sw] == 0x01 or s045[sw] == 0x06:
-                rotary_switches.add(sw)
+        # Only ContiTool's own inputs (console 0x01, wheel 0xFD/FE/FC) and their switches are rebuilt. The car's
+        # own — the 4Motion rotary (0x04), a MODE button with on-road and off-road rings (0x05), anything else —
+        # stay exactly as they are, rings included: wiping a 0x05 button killed MODE and the 4Motion modes.
+        own_inputs = set(self._own_inputs())
+        rotary_inputs = {i for i in range(5) if s036[i] not in (0x00,) and i not in own_inputs}
+        rotary_switches = self._vehicle_switches()
+        vehicle_mode_button = _VEHICLE_MODE_BUTTON in s036
 
-        # Clear all non-rotary inputs & switches first
         for i in range(5):
-            if i not in rotary_inputs:
+            if i in own_inputs:
                 s036[i] = 0x00
                 s037[i] = 0x00
                 s038[i] = 0x00
@@ -1355,6 +1378,8 @@ class FpaDataset:
                 s045[sw] = 0x00
                 self._write_switch_ring(sw, [])
         s057[0], s058[0] = 0x00, 0x00
+        self.set_sec_bytes(36, s036)
+        self.set_sec_bytes(40, s040)  # the default ring below must see the freed switches as free
 
         def_ring = self.default_cycle_ring()
         c_ring = console_ring if console_ring else def_ring
@@ -1362,8 +1387,9 @@ class FpaDataset:
 
         free_inputs = [i for i in range(5) if i not in rotary_inputs]
         free_switches = [sw for sw in range(4) if sw not in rotary_switches]
+        rotary_inputs = {i for i in rotary_inputs if s036[i] == 0x04}  # what the console switch type below means
 
-        if mode in ("console", "both"):
+        if mode in ("console", "both") and not vehicle_mode_button:  # the car's own MODE button already is one
             con_inp = free_inputs.pop(0)
             con_sw = free_switches.pop(0)
             s036[con_inp] = 0x01
@@ -1389,7 +1415,7 @@ class FpaDataset:
             s043[mfl_sw] = 0x02
             s044[mfl_sw] = 0x0002
             # Advertise 0xFA cyclic switch on sw=0 if MFL is the sole switch; keep 0x00 when Console already has 0xFA
-            s045[mfl_sw] = 0xFA if mode == "mfl" else 0x00
+            s045[mfl_sw] = 0xFA if mode == "mfl" and not vehicle_mode_button else 0x00
             s057[0] = mfl_keycode & 0xFF
             s058[0] = 0x02
             self._write_switch_ring(mfl_sw, m_ring)
@@ -1408,8 +1434,9 @@ class FpaDataset:
 
         if led_pwm is not None:
             self.buf[FPA_SEC_OFFS[11]] = max(0, min(15, int(led_pwm)))
-        if mib_popup is not None:
-            self.buf[FPA_SEC_OFFS[56]] = 1 if mib_popup else 0
+        if mib_popup is not None:  # S056 is a mode, not a flag: keep the car's own non-zero value (e.g. 2)
+            cur = self.buf[FPA_SEC_OFFS[56]]
+            self.buf[FPA_SEC_OFFS[56]] = (cur or 1) if mib_popup else 0
             if mib_popup:
                 self.set_sec_u16_be(49, [0x0001])
         if popup_timeout_100ms is not None:

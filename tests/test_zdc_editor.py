@@ -860,3 +860,44 @@ def test_odis_parameterization_file_is_refused_when_it_does_not_fit_this_ecu() -
         parse_odis_zdc_file(_xml(ZDC_NAME=""))
     with pytest.raises(ValueError, match="PARAMETER_DATA"):
         parse_odis_zdc_file("<MESSAGE><RESULT/></MESSAGE>")
+
+
+def test_the_cars_own_mode_button_and_rings_are_never_rewritten(synth_dflash: bytes) -> None:
+    """A 4Motion MODE button (S036 input type 0x05, off-road ring on switch 0, on-road ring on switch 1) is the car's
+    own: saving the editor used to wipe it and build a console button of ours, which killed MODE and the 4Motion
+    modes (user report, 2026-11-09)."""
+    from contitool.core.zdc import FpaDataset, build_fpa_preset_block, fpa_section_slice
+    from contitool.core.zdc_templates import FPA_SHARED_SECTIONS
+
+    fpa = build_fpa_preset_block("awd", existing_zdc4=bytes(synth_dflash[0x1340:0x2440]))
+    # the stock layout from that car
+    fpa.set_sec_bytes(36, bytes([0x05, 0, 0, 0, 0]))
+    fpa.set_sec_bytes(37, bytes([0x04, 0, 0, 0, 0]))
+    fpa.set_sec_bytes(38, bytes([0x01, 0, 0, 0, 0]))
+    fpa.set_sec_bytes(39, bytes([0x03, 0, 0, 0, 0]))
+    fpa.set_sec_bytes(40, bytes([0x00, 0xFF, 0xFF, 0xFF, 0xFF]))
+    fpa.set_sec_bytes(41, bytes.fromhex("08050000e801000004020000090300000007000000000000" + "00" * 8))
+    fpa.set_sec_bytes(42, bytes([0x01, 0x02, 0, 0]))
+    fpa.set_sec_bytes(43, bytes([0x00, 0x02, 0xFF, 0xFF]))
+    fpa.set_sec_u16_be(44, [0x0002, 0x0002, 0, 0])
+    fpa.set_sec_bytes(45, bytes([0xFA, 0, 0, 0]))
+    fpa.buf[fpa_section_slice(56)] = b"\x02"
+    stock = FpaDataset(bytearray(fpa.buf))
+    cfg = stock.button_config()
+    assert cfg.mode == "console" and cfg.vehicle_mode_button and stock.has_4motion_rotary
+
+    def save(f: FpaDataset, **over) -> FpaDataset:
+        out = FpaDataset(bytearray(f.buf))
+        kw = dict(mode=cfg.mode, mfl_keycode=cfg.mfl_keycode, console_ring=cfg.console_ring, mfl_ring=cfg.mfl_ring,
+                  normal_led_off=cfg.normal_led_off, mib_popup=cfg.mib_popup)
+        out.configure_buttons(**(kw | over))
+        return out
+
+    untouched = save(stock)
+    assert [s for s in range(FPA_SHARED_SECTIONS) if stock.sec_bytes(s) != untouched.sec_bytes(s)] == []
+    wheel = save(stock, mode="both", mfl_keycode=0x0C, mfl_ring=[5, 1, 2, 3, 7])
+    for sec in (42, 45):
+        assert wheel.sec_bytes(sec)[:2] == stock.sec_bytes(sec)[:2]  # switches 0 and 1 stay the car's
+    assert wheel.sec_bytes(36)[:2] == bytes([0x05, 0xFD]) and wheel.sec_bytes(40)[:2] == bytes([0x00, 0x02])
+    assert wheel._read_switch_ring(0) == [8, 0xE8, 4, 9] and wheel._read_switch_ring(1) == [5, 1, 2, 3, 7]
+    assert wheel._read_switch_ring(2) == [5, 1, 2, 3, 7]

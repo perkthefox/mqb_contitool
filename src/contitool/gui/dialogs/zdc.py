@@ -773,7 +773,8 @@ class FpaEditorDialog(Dialog):
         self._load_all_from_fpa()
 
     def _load_all_from_fpa(self) -> None:
-        rotary_txt = tr(" · шайба 4Motion сохранена", " · 4Motion rotary kept") if self.fpa.has_4motion_rotary else ""
+        rotary_txt = (tr(" · заводские кнопки 4Motion сохранены", " · factory 4Motion buttons kept")
+                      if self.fpa.button_config().has_4motion_rotary else "")
         self.lbl_schema_info.setText(
             f"{tr('Формат блока:', 'ECU format:')} {self.fpa.schema_tag or '—'}{rotary_txt}"
         )
@@ -1009,7 +1010,8 @@ class FpaEditorDialog(Dialog):
         use_mfl = mode in ("mfl", "both")
         self.sec_wheel.setVisible(use_mfl)
         self.sec_rings.setVisible(use_con or use_mfl)
-        self.box_console_ring.setVisible(use_con)
+        # the car's own MODE button (on-road and off-road rings) is never rewritten: nothing to set up for it
+        self.box_console_ring.setVisible(use_con and not self.fpa.button_config().vehicle_mode_button)
         self.box_mfl_ring.setVisible(use_mfl)
         self.ring_divider.setVisible(use_con and use_mfl)
         self._on_ring_mode_changed()
