@@ -80,11 +80,12 @@ class _T20DiagramCanvas(QWidget):
 
 
 class PinoutCard(Section):
-    """Bench connection reference for the J533 T20 connector."""
+    """Bench connection reference for the J533 T20 connector. `stacked`: the legend goes under the drawing and its
+    lines wrap — for a narrow dialog; otherwise they sit side by side, one line each."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, stacked: bool = False) -> None:
         super().__init__(parent)
-        content = QHBoxLayout()
+        content = QVBoxLayout() if stacked else QHBoxLayout()
         content.setSpacing(20)
 
         self.canvas = _T20DiagramCanvas()
@@ -102,7 +103,8 @@ class PinoutCard(Section):
             num.setStyleSheet(f"color: {PIN_COLORS.get(pin, theme.TEXT)}; font-weight: 600;")
             name = QLabel(sig)
             name.setObjectName("Hint")
-            desc = QLabel()  # one line each: wrapped labels in a grid report a width the grid then ignores
+            desc = QLabel()  # side by side one line each: wrapped labels in a grid report a width the grid ignores
+            desc.setWordWrap(stacked)
             for c, w in enumerate((num, name, desc)):
                 self.grid_pins.addWidget(w, r, c, Qt.AlignmentFlag.AlignTop)
             self._pin_labels.append((num, name, desc))

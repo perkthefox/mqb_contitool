@@ -68,12 +68,15 @@ class SwapActivateDialog(Dialog):
     ) -> None:
         super().__init__(
             parent,
-            tr("Прямая активация функций SWaP (DataFlash)", "Direct SWaP feature activation (DataFlash)"),
             tr(
-                "Отметьте функции, которые должны быть активны в шлюзе. Записи Multi-FSC формируются напрямую "
-                "в DataFlash без генерации RSA-ключей, без сертификатов и без модификации CodeFlash.",
-                "Tick the features that should be active in the gateway. Multi-FSC records are written directly "
-                "into DataFlash without RSA key generation, certificates, or CodeFlash modifications.",
+                "Активация SWaP/FEC в DataFlash",
+                "SWaP/FEC activation in DataFlash",
+            ),
+            tr(
+                "Отметьте FEC, которые должны быть активны в шлюзе. ContiTool запишет их в слоты Multi-FSC в "
+                "DataFlash; ключ RSA, сертификаты и изменение CodeFlash не нужны.",
+                "Tick the FECs that should be active in the gateway. ContiTool writes them into the Multi-FSC "
+                "slots in DataFlash; no RSA key, certificate or CodeFlash change is needed.",
             ),
             width=780,
         )
@@ -101,10 +104,10 @@ class SwapActivateDialog(Dialog):
         if dataset_summary is not None and dataset_summary.has_any_valid_dataset:
             pn = dataset_summary.dataset_pn or "—"
             ver = f" ({dataset_summary.dataset_ver})" if dataset_summary.dataset_ver else ""
-            tag = f" · {dataset_summary.maingw_tag}" if dataset_summary.maingw_tag else ""
+            tag = f" ({dataset_summary.maingw_tag})" if dataset_summary.maingw_tag else ""
             ds_line = tr(
-                f"Текущий датасет ZDC: {pn}{ver}{tag} · поддерживается функций: {len(dataset_summary.supported_fecs)}",
-                f"Current ZDC dataset: {pn}{ver}{tag} · supported features: {len(dataset_summary.supported_fecs)}",
+                f"Текущий датасет ZDC: {pn}{ver}{tag}, поддерживает FEC: {len(dataset_summary.supported_fecs)}",
+                f"Current ZDC dataset: {pn}{ver}{tag}, FECs supported: {len(dataset_summary.supported_fecs)}",
             )
         else:
             ds_line = tr(
@@ -199,8 +202,8 @@ class SwapActivateDialog(Dialog):
         pf_lay.setSpacing(10)
         self.chk_auto_param = QCheckBox(
             tr(
-                "Сразу подготовить параметрию под выбранные функции (рекомендуется)",
-                "Automatically prepare parameterization for selected features (recommended)",
+                "Добавить в параметрию данные для выбранных FEC",
+                "Add data for the selected FECs to the parameterization",
             )
         )
         self.chk_auto_param.setChecked(True)
@@ -211,7 +214,10 @@ class SwapActivateDialog(Dialog):
         pf_grid.setVerticalSpacing(8)
         self.cmb_param_preset = QComboBox()
         self.cmb_param_preset.addItem(
-            tr("Добавить в текущую параметрию (рекомендуется)", "Add into current parameterization (recommended)"),
+            tr(
+                "Добавить в текущую параметрию",
+                "Add to the current parameterization",
+            ),
             "surgical",
         )
         for pkey, pru, pen in FPA_PRESET_CATALOG:
@@ -242,8 +248,8 @@ class SwapActivateDialog(Dialog):
 
         self.chk_param_kl15 = QCheckBox(
             tr(
-                "Запоминать выбранный профиль и спорт-режим коробки после перезапуска зажигания",
-                "Remember selected profile & gearbox Sport mode after engine restart",
+                "Оставлять выбранный профиль после выключения зажигания",
+                "Keep the selected profile after the ignition is switched off",
             )
         )
         pf_lay.addWidget(self.chk_param_kl15)
@@ -345,8 +351,7 @@ class SwapActivateDialog(Dialog):
             button_mode=str(self.cmb_param_btn.currentData() or "keep"),
             mfl_keycode=int(self.cmb_param_mfl_key.currentData() or 0x19),
             mfl_long_press=False,
-            kl15_persist_profiles=kl15,
-            kl15_persist_powertrain=kl15,
+            kl15_persist_profiles=kl15,  # S029 only; the S075 option lives in the profile editor
         )
 
     @property
@@ -376,8 +381,8 @@ class SwapActivateDialog(Dialog):
             self.warn_callout.label.setText(
                 f"{tr(UNSUPPORTED_DATASET_RU, UNSUPPORTED_DATASET_WARNING)}\n"
                 + tr(
-                    f"Выбранные функции ({codes_txt}) ещё не прописаны в параметрии блока — вы можете подготовить параметрию прямо сейчас галочкой ниже.",
-                    f"Selected features ({codes_txt}) are missing from the dataset — leave the option below checked to prepare parameterization automatically.",
+                    f"Для выбранных FEC ({codes_txt}) в параметрии нет данных. Их можно добавить галочкой ниже.",
+                    f"The parameterization has no data for the selected FECs ({codes_txt}). The option below adds it.",
                 )
             )
             self.warn_callout.setVisible(True)
@@ -437,10 +442,10 @@ class RsaKeyDialog(Dialog):
 
         self.lbl_new = hint(
             tr(
-                "Пара сохраняется рядом с дампами в папку ContiTool_keys (.json, .private.pem, .public.pem), "
-                "каждый раз в новый файл. Приватная часть нужна, чтобы подписывать, — не теряйте её.",
-                "The pair is saved next to the dumps in ContiTool_keys (.json, .private.pem, .public.pem), "
-                "each time to a new file. The private part is needed for signing — do not lose it.",
+                "Пара ключей сохраняется в папку ContiTool_keys рядом с дампами (.json, .private.pem, "
+                ".public.pem), каждый раз в новые файлы. Приватный ключ нужен для подписи — сохраните его.",
+                "The key pair is saved in the ContiTool_keys folder next to the dumps (.json, .private.pem, "
+                ".public.pem), in new files each time. The private key is needed to sign — keep it.",
             )
         )
         self.body.addWidget(self.lbl_new)

@@ -248,7 +248,7 @@ def test_unsupported_5q0_and_lear_gateways_are_explained_and_blocked(monkeypatch
     loop.exec()
     for _ in range(5):
         app.processEvents()
-    assert dlg.lbl_check.text().startswith("⚠ ECU answers, but is not supported: 5Q0907530AD · GW MQB High · SW 2227 — ")
+    assert dlg.lbl_check.text().startswith("⚠ ECU answers, but is not supported: 5Q0907530AD, GW MQB High, SW 2227 — ")
     assert "MPC5607B" in dlg.lbl_check.text()
     assert dlg.lbl_check.property("tone") == "warn"
     dlg.close()

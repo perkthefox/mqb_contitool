@@ -87,8 +87,8 @@ def make_dflash_with_zdc(
 
 
 def test_zdc_dataset_analyzer_detects_nc00_and_jc00_fec_support(synth_dflash: bytes) -> None:
-    # 1. NC00 MainGW + MKE: GRA, MKE, and FPA profiles 1, 2, 3, 4, 5, 7, 8 (values 1..15) supported;
-    #    profiles 6 (0), 9 (0), 10 (54 > 15), 11 (59 > 15) unsupported!
+    # 1. NC00 MainGW + MKE: GRA, MKE, and every FPA slot whose S028 ID is 1..0x13 (1, 2, 3, 4, 5, 7, 8) supported;
+    #    slots 6 (0), 9 (0) and the rotary slots 10..12 (0x36/0x3B/0x3A, never offered) unsupported
     df_nc00 = make_dflash_with_zdc(synth_dflash)
     ds = analyze_dflash_datasets(df_nc00)
     assert ds.has_any_valid_dataset is True
@@ -101,11 +101,13 @@ def test_zdc_dataset_analyzer_detects_nc00_and_jc00_fec_support(synth_dflash: by
         0x10001100,
         0x10001200,
         0x10001300,
+        0x10001400,
         0x10001500,
         0x10001700,
         0x10001800,
     }
-    assert check_fec_dataset_support(ds, 0x10001400).supported is False  # Offroad: S030 bit 4 clear in factory NC00
+    # Offroad: S030 bit 4 is clear in factory NC00, but S030 only marks remembered profiles; S028[4] = 4 offers it
+    assert check_fec_dataset_support(ds, 0x10001400).supported is True
     assert check_fec_dataset_support(ds, 0x10001600).supported is False  # Race = 0
     assert check_fec_dataset_support(ds, 0x10001A00).supported is False  # EV = 54 (> 15)
     assert check_fec_dataset_support(ds, 0x10001B00).supported is False  # GTE = 59 (> 15)
@@ -228,7 +230,7 @@ def test_cli_activate_swap_and_inspect_warnings(synth_dflash: bytes, tmp_path: P
     assert rc1 == 0
     assert UNSUPPORTED_DATASET_WARNING not in err1
     assert "DataFlash Multi-FSC" in out1
-    assert len(analyze_dflash_swap(df_sup.read_bytes()).active_fscs) == 8  # NC00 S030 0x1DAF: no Offroad
+    assert len(analyze_dflash_swap(df_sup.read_bytes()).active_fscs) == 9  # GRA, MKE and slots 1..5, 7, 8
 
     # 2. Activate unsupported FeC 10001600 -> emits exact warning on stderr AND activates 0x10001600
     rc2 = main(
@@ -397,14 +399,47 @@ def test_cli_auto_parameterize_accepts_comma_separated_codes(synth_dflash: bytes
     assert {0x10000100, 0x10000300} <= {f.fec_code for f in analyze_dflash_swap(df_out.read_bytes()).active_fscs}
 
 
-def test_zero_profile_mask_means_no_selectable_profile(synth_dflash: bytes) -> None:
-    """S030 = 0 makes the dataset passive: profile FeCs are unsupported, as the FPA editor already says."""
+def test_the_menu_follows_the_profile_ids_not_the_remembered_mask(synth_dflash: bytes) -> None:
+    """The gateway offers slot n when S028[n] holds an ID 1..0x13 (with its FeC); S030 only marks the profiles kept
+    as the user's last one. Clearing S030 changes nothing in the menu, clearing S028 takes the profile out."""
     from contitool.core.zdc import FpaDataset, apply_fpa_dataset
 
     df = make_dflash_with_zdc(synth_dflash)
-    assert check_fec_dataset_support(analyze_dflash_datasets(df), 0x10001100, raw_df=df).supported
     fpa = FpaDataset.from_dflash(df)
     fpa.selectable_mask = 0
     df2 = apply_fpa_dataset(df, fpa)
-    assert FpaDataset.from_dflash(df2).is_passive_base
-    assert not check_fec_dataset_support(analyze_dflash_datasets(df2), 0x10001100, raw_df=df2).supported
+    assert check_fec_dataset_support(analyze_dflash_datasets(df2), 0x10001100, raw_df=df2).supported
+    fpa.set_slot_enabled(1, False)
+    df3 = apply_fpa_dataset(df, fpa)
+    assert not check_fec_dataset_support(analyze_dflash_datasets(df3), 0x10001100, raw_df=df3).supported
+    fpa.set_slot_enabled(1, True)  # back on: the slot gets back what it had
+    assert FpaDataset.from_dflash(apply_fpa_dataset(df, fpa)).sec_bytes(28) == FpaDataset.from_dflash(df).sec_bytes(28)
+
+
+def test_a_profile_taken_out_of_the_menu_is_no_fault(synth_cflash, synth_dflash, tmp_path) -> None:
+    """Profile FeCs already active when the dump was opened stay quiet when their profile is switched off;
+    a FeC switched on afterwards without a profile for it is reported."""
+    from contitool.core.zdc import FpaDataset, apply_fpa_dataset
+    from contitool.gui.app import create_window
+    from contitool.gui.screens import status
+
+    app, win = create_window()
+    df = make_dflash_with_zdc(synth_dflash)
+    df, _ = apply_dflash_swap_fecs(df, enable_fecs=[0x10001100, 0x10001200])
+    folder = tmp_path / "dumps"
+    folder.mkdir()
+    (folder / "Cflash.bin").write_bytes(synth_cflash)
+    (folder / "Dflash.bin").write_bytes(df)
+    win.open_folder(str(folder))
+    fpa = FpaDataset.from_dflash(df)
+    fpa.set_slot_enabled(1, False)  # Comfort out of the menu, its FeC stays
+    edited = apply_fpa_dataset(df, fpa)
+    (tmp_path / "e1.bin").write_bytes(edited)
+    win.ws.commit("dflash", tmp_path / "e1.bin")
+    assert status.unsupported_active_fecs(win.ws) == []
+    fpa.set_slot_enabled(6, False)
+    edited2, _ = apply_dflash_swap_fecs(apply_fpa_dataset(df, fpa), enable_fecs=[0x10001600])  # Race FeC, no Race
+    (tmp_path / "e2.bin").write_bytes(edited2)
+    win.ws.commit("dflash", tmp_path / "e2.bin")
+    assert status.unsupported_active_fecs(win.ws) == [0x10001600]
+    win.close()

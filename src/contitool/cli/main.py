@@ -360,8 +360,7 @@ def cmd_activate_swap(args: argparse.Namespace) -> int:
             fpa_preset=args.fpa_preset,
             button_mode=args.button_mode,
             mfl_keycode=args.mfl_key,
-            kl15_persist_profiles=args.kl15_memory,
-            kl15_persist_powertrain=args.kl15_memory,
+            kl15_persist_profiles=args.kl15_memory,  # S029 only; the S075 pass-through has its own flag
         )
         raw_df, _ = parameterize_dflash_for_fecs(raw_df, sorted(target_set), ap_cfg, reporter=rep)
 
@@ -475,6 +474,7 @@ def cmd_parameterize(args: argparse.Namespace) -> int:
     )
     if fpa_touched:
         cur_fpa = FpaDataset.from_dflash(out_df)
+        loaded_fpa = FpaDataset(bytes(cur_fpa.buf))
         if args.fpa_preset == "erase":
             out_df = erase_zdc_block(out_df, 4, reporter=rep)
             cur_fpa = FpaDataset.from_dflash(out_df)
@@ -503,6 +503,7 @@ def cmd_parameterize(args: argparse.Namespace) -> int:
                 fpa.set_kl15_persistence(
                     persist_profiles=(args.kl15_profiles == "keep") if args.kl15_profiles else None,
                     persist_powertrain=(args.kl15_powertrain == "keep") if args.kl15_powertrain else None,
+                    original=loaded_fpa,  # "reset" puts back what the dump had
                 )
             out_df = apply_fpa_dataset(out_df, fpa, reporter=rep)
         modified = True
@@ -1078,7 +1079,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_asw.add_argument("--fpa-preset", choices=("surgical", "fwd", "fwd_dcc", "awd", "awd_dcc"), default="surgical")
     p_asw.add_argument("--button-mode", choices=("keep", "console", "both", "mfl"), default="keep")
     p_asw.add_argument("--mfl-key", type=lambda x: int(x, 0), default=0x19)
-    p_asw.add_argument("--kl15-memory", action="store_true", help=tr("Не сбрасывать профиль и ДВС/DSG после перезапуска Kl.15", "Retain profile & powertrain mode across Kl.15"))
+    p_asw.add_argument("--kl15-memory", action="store_true", help=tr("Оставлять выбранный профиль после выключения зажигания", "Keep the selected profile after the ignition is off"))
     p_asw.set_defaults(func=cmd_activate_swap)
 
     p_par = _add(

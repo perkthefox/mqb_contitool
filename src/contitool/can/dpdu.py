@@ -267,7 +267,8 @@ class DPduBus(can.BusABC):
         self.channel_key, self.bitrate = channel, bitrate  # what open_session matches a kept-open link against
         self.spent = False  # a VCI or link error happened: this link must not be handed to the next operation
         self.claimed = False
-        self.module_label = ""
+        self.module_label = self.module_vendor = ""
+        self.module_is_vci = False  # a VW VCI, as opposed to another vendor's J2534 driver the VW driver wraps
         if dll is None:
             apis = [a for a in discover_dpdu() if not channel or channel.upper() in a["name"].upper()]
             # The driver the user picked wins over one whose name merely contains it (…_OE vs …_OE_2).
@@ -335,8 +336,8 @@ class DPduBus(can.BusABC):
         tried: list[str] = []
         failure = ERR_FCT_FAILED
         last: BaseException | None = None
-        for hmod, name in self._modules(module_wait):
-            self.hmod, self.module_label = hmod, name
+        for hmod, name, vendor, is_vw in self._modules(module_wait):
+            self.hmod, self.module_label, self.module_vendor, self.module_is_vci = hmod, name, vendor, is_vw
             try:
                 if self._call("PDUModuleConnect", hmod, also_ok=(ERR_FCT_FAILED,)) != 0:
                     raise can.CanOperationError(f"PDUModuleConnect: D-PDU error 0x{ERR_FCT_FAILED:02X}",
@@ -388,7 +389,8 @@ class DPduBus(can.BusABC):
         if self.hmod:
             self._try("PDUModuleDisconnect", self.hmod)
         self.hmod = 0
-        self.module_label = ""
+        self.module_label = self.module_vendor = ""
+        self.module_is_vci = False
         self._nonraw_verified = False
 
     # ------------------------------------------------------------------ fallback for adapters without RawMode
@@ -882,14 +884,26 @@ class DPduBus(can.BusABC):
         return rc
 
     @staticmethod
-    def _label(vendor_module_name: bytes | None) -> str:
-        """`VendorName='X' ModuleName='Y' SerialNumber=…` → "Y", whatever the driver puts around it."""
+    def _label(vendor_module_name: bytes | None, key: str = "ModuleName") -> str:
+        """`VendorName='X' ModuleName='Y' SerialNumber=…` → "Y" (or "X" for key VendorName)."""
         raw = (vendor_module_name or b"").decode("latin-1", "replace")
-        _, mark, tail = raw.partition("ModuleName='")
-        return tail.split("'", 1)[0] if mark else (raw.strip() or "?")
+        _, mark, tail = raw.partition(f"{key}='")
+        return tail.split("'", 1)[0] if mark else ("" if key != "ModuleName" else raw.strip() or "?")
 
-    def _modules(self, wait: float) -> list[tuple[int, str]]:
-        """Ready modules as (hMod, name), VW VCIs first — never just the one the driver happens to list first.
+    @property
+    def j2534_wrapper(self) -> bool:
+        """Another vendor's J2534 driver, which the VW driver reaches through its own local J2534 service. In issue
+        #17 (OpenVCX32 this way) it refused raw CAN and passed on only every fifth frame of a memory stream."""
+        return bool(self.hmod) and not self.module_is_vci
+
+    def describe(self) -> str:
+        """The module actually connected, for the log and the problem report."""
+        kind = tr("VCI VW", "VW VCI") if self.module_is_vci else tr("J2534 через драйвер VW", "J2534 through the VW driver")
+        raw = tr("без raw CAN", "no raw CAN") if self.nonraw else "raw CAN"
+        return f"{self.module_label} ({self.module_vendor or '?'}), {kind}, {raw}"
+
+    def _modules(self, wait: float) -> list[tuple[int, str, str, bool]]:
+        """Ready modules as (hMod, name, vendor, is a VW VCI), VW VCIs first — never just the one the driver happens to list first.
 
         PDUGetModuleIds returns every D-PDU and J2534 driver installed on the PC, in an order that changes between
         calls: a user with 8 modules got them back as 7,5,2,3,1,4,6,8 with the VAS6154A fifth. Connecting the first
@@ -900,16 +914,17 @@ class DPduBus(can.BusABC):
         while True:
             items = C.POINTER(ModuleItem)()
             self._call("PDUGetModuleIds", C.byref(items))
-            vw: list[tuple[int, str]] = []
-            other: list[tuple[int, str]] = []
+            vw: list[tuple[int, str, str, bool]] = []
+            other: list[tuple[int, str, str, bool]] = []
             if items:
                 for i in range(items.contents.NumEntries):
                     m = items.contents.pModuleData[i]
                     if m.ModuleStatus not in MODULE_READY:
                         continue
                     raw = (m.pVendorModuleName or b"").decode("latin-1", "replace")
-                    entry = (m.hMod, self._label(m.pVendorModuleName))
-                    (vw if m.ModuleTypeId == VW_MODULE_TYPE_ID or "Volkswagen" in raw else other).append(entry)
+                    is_vw = m.ModuleTypeId == VW_MODULE_TYPE_ID or "Volkswagen" in raw
+                    entry = (m.hMod, self._label(m.pVendorModuleName), self._label(m.pVendorModuleName, "VendorName"), is_vw)
+                    (vw if is_vw else other).append(entry)
                 self._dll.PDUDestroyItem(items)
             if vw or other:
                 return vw or other
@@ -1194,6 +1209,7 @@ class DPduBus(can.BusABC):
 
 # ------------------------------------------------------------------ the one kept-open link of this process
 _session: DPduBus | None = None
+last_module = ""  # DPduBus.describe() of the last module connected: the problem report names it
 
 
 def open_session(channel: str = "", bitrate: int = 500_000) -> DPduBus:
@@ -1213,6 +1229,8 @@ def open_session(channel: str = "", bitrate: int = 500_000) -> DPduBus:
     bus = DPduBus(channel, bitrate)
     bus.claim()
     _session = bus
+    global last_module
+    last_module = bus.describe()
     return bus
 
 

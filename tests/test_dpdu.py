@@ -991,3 +991,46 @@ def test_a_bus_that_cannot_reopen_after_a_refused_hardware_link_is_marked_spent_
             pass
     assert bus.spent
     bus.shutdown()
+
+
+def test_a_j2534_driver_behind_the_vw_driver_is_named_and_kept_away_from_memory(monkeypatch) -> None:
+    """Issue #17: no VW VCI on the PC, only OpenVCX32 (a VCX's J2534 driver) wrapped by the VW driver. It refused
+    RawMode, and the memory stream lost four frames in five. Name the module, say what to pick instead, and refuse
+    the RAM-Loader before anything is sent instead of failing a read after 20 s."""
+    from contitool.can import j2534, workflows
+    from contitool.report import environment
+
+    set_lang("en")
+    api = FakePduApi()
+    api.modules = [(12, 0x10000001, b"VendorName='OpenVCX' ModuleName='OpenVCX32' J2534 Standard Version='4.04'")]
+    api.rawmode_ok = False
+    monkeypatch.setattr(dpdu, "DPduBus", lambda channel, bitrate: DPduBus(channel, bitrate, dll=api))
+    monkeypatch.setattr(j2534, "discover_j2534", lambda: [j2534.J2534Device("VXDIAG OpenVCX", "VXDIAG", r"C:\x\OpenVCX32.dll", 32)])
+    bus = dpdu.open_session("", 500_000)
+    try:
+        assert bus.j2534_wrapper and bus.nonraw
+        assert bus.describe() == "OpenVCX32 (OpenVCX), J2534 through the VW driver, no raw CAN"
+        assert environment("dpdu")["D-PDU module"] == bus.describe()
+
+        warnings: list[str] = []
+
+        class Rep:
+            def warning(self, msg):
+                warnings.append(msg)
+
+            def __getattr__(self, _name):
+                return lambda *a, **k: None
+
+        can_identify("", interface="dpdu", bus=bus, reporter=Rep())
+        assert len(warnings) == 1 and "not a VAS 6154" in warnings[0] and "32-bit" in warnings[0]
+
+        monkeypatch.setattr(j2534, "discover_j2534", lambda: [j2534.J2534Device("VCX", "OpenVCX", r"C:\x\v64.dll", 64)])
+        assert "Pick the J2534 adapter “VCX” directly" in workflows._j2534_wrapper_problem(bus)
+
+        monkeypatch.setattr(workflows, "_enter_ram_loader_once", lambda *_a: pytest.fail("no RAM-Loader entry"))
+        link = workflows.J533CanLink("", interface="dpdu", bus=bus)
+        with pytest.raises(RuntimeError, match="cannot be read or written"):
+            workflows.enter_ram_loader(link)
+    finally:
+        dpdu.release_session(bus)
+        dpdu.close_session()

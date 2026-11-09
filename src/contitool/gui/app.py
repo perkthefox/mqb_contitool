@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -32,10 +33,39 @@ def create_window() -> tuple[QApplication, MainWindow]:
     return app, win
 
 
+_BUNDLED_DLLS: list[object] = []  # kept loaded for the life of the process
+
+
+def _use_bundled_openssl() -> None:
+    """Windows build: make Qt use the OpenSSL that ships with ContiTool.
+
+    Qt's TLS backend loads OpenSSL by file name (libssl-3-x64.dll), and Windows searches System32 before ContiTool's
+    own _internal folder. A copy of another OpenSSL version left there by other software then breaks the first HTTPS
+    request, the update check ("The procedure entry point CRYPTO_calloc could not be located"). A DLL loaded once by
+    full path is what every later load by name gets, so the bundled pair is loaded first, libcrypto before libssl.
+    A DLL that still cannot be loaded fails quietly instead of stopping the program with a system box."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    sem_failcriticalerrors, sem_noopenfileerrorbox = 0x0001, 0x8000
+    ctypes.windll.kernel32.SetErrorMode(sem_failcriticalerrors | sem_noopenfileerrorbox)
+    base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    for name in ("libcrypto-3-x64.dll", "libssl-3-x64.dll"):
+        dll = base / name if (base / name).is_file() else next(base.rglob(name), base / name)
+        if dll.is_file():
+            try:
+                _BUNDLED_DLLS.append(ctypes.WinDLL(str(dll)))
+            except OSError:
+                pass  # Qt then falls back to Schannel
+
+
 def run_gui() -> int:
     """Launch the ContiTool Desktop GUI event loop."""
     from contitool.gui.dialogs.disclaimer import confirm_disclaimer
     from contitool.report import failure_from_exception
+
+    _use_bundled_openssl()
 
     app, win = create_window()
     win.show()

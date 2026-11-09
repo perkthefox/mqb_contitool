@@ -69,6 +69,7 @@ from contitool.core.constants import (
     ZDC_DATASET_SPECS,
     ZDC_UDS_UPLOAD_MAP,
 )
+from contitool.core.frf import FrfImage, frf_ident_problems, frf_signature_problem
 from contitool.core.patcher import (
     apply_dflash_swap_fecs,
     apply_engineering_patch,
@@ -292,8 +293,10 @@ def _fbl_seed(link: J533CanLink, reporter: OperationReporter) -> bytes:
         reporter.check_cancelled()
         time.sleep(2.0)
         try:
-            _enter_fbl_uds_programming(link, reporter)
-            seed = link.request_uds(b"\x27\x11", 0x67, timeout=2.0)
+            # the ECU is off for a while here: its silence must not take the adapter off its hardware ISO-TP,
+            # or the whole 1.5 MB then goes frame by frame (issue #18: the VNCI gave up at block ~1650)
+            _enter_fbl_uds_programming(link, reporter, resend=False)
+            seed = link.request_uds(b"\x27\x11", 0x67, timeout=2.0, resend=False)
         except (TimeoutError, can.CanError):
             continue  # the ECU is off or still starting
         except RuntimeError as exc:
@@ -420,6 +423,49 @@ def _stage2_and_trigger(
     return _probe_beacon_in_loader(link, reporter)
 
 
+def _j2534_wrapper_bus(link: Any) -> Any:
+    """The D-PDU bus when it runs on another vendor's J2534 driver through the VW driver without raw CAN, else None."""
+    bus = getattr(link, "bus", None)
+    wrapped = getattr(link, "interface", "") == "dpdu" and getattr(bus, "j2534_wrapper", False)
+    return bus if wrapped and getattr(bus, "nonraw", None) else None
+
+
+def _j2534_wrapper_problem(bus: Any) -> str:
+    """Why memory cannot be read this way, and what to pick instead. Only 64-bit J2534 drivers load into ContiTool."""
+    from contitool.can.j2534 import discover_j2534
+
+    keys = {k.lower() for k in (bus.module_vendor, bus.module_label) if len(k) >= 3}
+    dev = next((d for d in discover_j2534()
+                if any(k in f"{d.name} {d.vendor} {Path(d.dll).stem}".lower() for k in keys)), None)
+    head = tr(
+        f"Адаптер «{bus.module_label}» ({bus.module_vendor or '?'}) — не VAS 6154: это драйвер J2534 другого "
+        "производителя, подключённый через драйвер VW D-PDU. Raw CAN через него нет, а из потока памяти доходит "
+        "примерно каждый пятый кадр, поэтому читать и писать память через RAM-Loader так нельзя. Запросы UDS "
+        "через него проходят.",
+        f"Adapter “{bus.module_label}” ({bus.module_vendor or '?'}) is not a VAS 6154: it is another vendor's J2534 "
+        "driver connected through the VW D-PDU driver. It gives no raw CAN, and only about every fifth frame of a "
+        "memory stream gets through, so memory cannot be read or written through the RAM-Loader this way. UDS "
+        "requests do get through.",
+    )
+    if dev is not None and dev.usable:
+        tail = tr(f" Выберите в окне «Подключение» адаптер J2534 «{dev.name}» напрямую, без драйвера VW.",
+                  f" Pick the J2534 adapter “{dev.name}” directly in the Connection window, without the VW driver.")
+    elif dev is not None:
+        tail = tr(f" Его драйвер J2534 «{dev.name}» {dev.bits}-разрядный, а ContiTool работает только с 64-разрядными.",
+                  f" Its J2534 driver “{dev.name}” is {dev.bits}-bit, and ContiTool works only with 64-bit ones.")
+    else:
+        tail = ""
+    return head + tail + tr(" Для чтения памяти подойдёт CANable, candleLight или VAS 6154 / VNCI с raw CAN.",
+                            " A CANable, candleLight or a VAS 6154 / VNCI with raw CAN can read memory.")
+
+
+def _refuse_memory_via_j2534_wrapper(link: Any) -> None:
+    """Before the RAM-Loader: a read through such a link fails after ~20 s of retries and tells the user nothing."""
+    bus = _j2534_wrapper_bus(link)
+    if bus is not None:
+        raise RuntimeError(_j2534_wrapper_problem(bus))
+
+
 def enter_ram_loader(
     link: J533CanLink,
     *,
@@ -427,6 +473,7 @@ def enter_ram_loader(
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
     """Enter factory 0x6F0 RAM-loader over UDS, automatically recovering if already inside loader."""
+    _refuse_memory_via_j2534_wrapper(link)
     try:
         return _enter_ram_loader_once(link, reporter)
     except LINK_ERRORS as first_err:
@@ -548,6 +595,18 @@ SLOW_ADAPTER_HINT = (  # (ru, en): the language can change while the app runs
 )
 
 
+NONRAW_ADAPTER_HINT = (
+    # A VCI without RawMode. Through a wrapped J2534 driver (issue #17) every fifth frame arrived, evenly over the
+    # whole stream, so a shorter read loses the same share; such a link is refused before the RAM-Loader. How a VW
+    # VCI's own plain link copes is not known yet: only that the stream did not come through.
+    "Адаптер не дал raw CAN (RawMode), а через обычный канал D-PDU поток памяти от блока дошёл не целиком. "
+    "Прочитать память этим адаптером не получится. Нужен CANable, candleLight или VAS 6154 / VNCI с raw CAN.",
+    "The adapter refused raw CAN (RawMode), and through the plain D-PDU link the memory stream from the ECU did not "
+    "arrive in full. Memory cannot be read with this adapter. Use a CANable, candleLight or a VAS 6154 / VNCI with "
+    "raw CAN.",
+)
+
+
 def read_memory_area(
     link: J533CanLink,
     start: int,
@@ -587,8 +646,11 @@ def read_memory_area(
                 break
             except LINK_ERRORS as exc:
                 if attempt == AREA_READ_RETRIES:
-                    if link.interface == "slcan" and "stopped after" in str(exc):
-                        reporter.error(tr(*SLOW_ADAPTER_HINT))
+                    if "stopped after" in str(exc):
+                        if link.interface == "slcan":
+                            reporter.error(tr(*SLOW_ADAPTER_HINT))
+                        elif getattr(getattr(link, "bus", None), "nonraw", None):
+                            reporter.error(tr(*NONRAW_ADAPTER_HINT))
                     raise
                 reporter.warning(
                     tr(
@@ -892,6 +954,11 @@ def can_identify(
     result: dict[str, Any] = {"responding": False, "ident": []}
     in_fbl = False
     with J533CanLink(port, interface=interface, bus=bus) as link:
+        if link.interface == "dpdu" and callable(getattr(link.bus, "describe", None)):
+            reporter.info(tr("Модуль D-PDU: ", "D-PDU module: ") + link.bus.describe())
+            if (wrapped := _j2534_wrapper_bus(link)) is not None:
+                result["adapter_warning"] = _j2534_wrapper_problem(wrapped)
+                reporter.warning(result["adapter_warning"])
         reporter.step(1, 2, tr("Проверка связи с блоком (UDS 10 03)", "Checking the link to the ECU (UDS 10 03)"))
         try:
             link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
@@ -951,7 +1018,9 @@ def can_identify(
 # "Status_of_all_existing_FS-IDs_in_the_ECU" (ODIS): [FS-ID 4 B big-endian, status bits] per feature. In the
 # 3Q0907530AR SW 5504 DID table @ 0x1FE7C with at most 75 bytes = 15 features.
 SWAP_STATUS_DID = 0x3C00
-SWAP_STATUS_ACTIVE = 0x7F  # bits 0..6 = certificate, not cancelled, VCRN, validity, configuration, function, signature
+# The gateway's own rule (IsFecActive, 5388 0x7A2E0 / 5504 0x7BA62): bits 0, 1, 2, 3 and 6 = certificate, not
+# cancelled, VCRN, validity, signature. Bits 4/5 (configuration, function) do not take part.
+SWAP_STATUS_ACTIVE = 0x4F
 
 
 def can_swap_status(
@@ -1479,7 +1548,7 @@ def can_write_uflash(
                         reporter=reporter,
                     )
                 else:
-                    reporter.step(3, total_steps, tr("Используется ранее созданный полный бэкап сессии", "Using existing full backup in session"))
+                    reporter.step(3, total_steps, tr("Полное чтение блока уже есть — остальные области не читаются", "A complete read of this ECU is on file — the other areas are not read again"))
 
                 payloads, pages = build_uflash_faci_payloads(candidate)
                 result["payload_sha256"] = _digest(payloads[0])
@@ -1756,7 +1825,7 @@ def can_write_dflash(
                         reporter=reporter,
                     )
                 else:
-                    reporter.step(3, total_steps, tr("Используется ранее созданный полный бэкап сессии", "Using existing full backup in session"))
+                    reporter.step(3, total_steps, tr("Полное чтение блока уже есть — остальные области не читаются", "A complete read of this ECU is on file — the other areas are not read again"))
 
                 selfid_16b = read_memory_bytes(link, SELFID_OFFSET, SELFID_SIZE)
                 payloads = build_dflash_faci_payloads(
@@ -1901,13 +1970,17 @@ def _sync_coding_for_zdc(link: J533CanLink, written_df: bytes, blocks: list[int]
     return info
 
 
-def _enter_fbl_uds_programming(link: J533CanLink, reporter: OperationReporter) -> None:
-    """Enter FBL Programming Session (`10 02`) cleanly whether starting from Application or FBL."""
+def _enter_fbl_uds_programming(link: J533CanLink, reporter: OperationReporter, *, resend: bool = True) -> None:
+    """Enter FBL Programming Session (`10 02`) cleanly whether starting from Application or FBL.
+
+    `resend=False` while the ECU may be switched off: a request it does not answer must not move the link off the
+    adapter's hardware ISO-TP (see J533CanLink.request_uds)."""
+    kw = {} if resend else {"resend": False}
     try:
-        link.request_uds(b"\x10\x03", 0x50, timeout=1.5)
-        link.request_uds(b"\x27\x03", 0x67, timeout=2.0)
-        link.request_uds(bytes.fromhex("2704caffe012"), 0x67, timeout=2.0)
-        link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0)
+        link.request_uds(b"\x10\x03", 0x50, timeout=1.5, **kw)
+        link.request_uds(b"\x27\x03", 0x67, timeout=2.0, **kw)
+        link.request_uds(bytes.fromhex("2704caffe012"), 0x67, timeout=2.0, **kw)
+        link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0, **kw)
     except RuntimeError as exc:
         # The preconditions are best effort, as in the hardware-verified 2.0.1c: in FBL they are refused by design
         # (7F 10 7E, 7F 27 7F/12), and in the application a 27 03 delay (7F 27 37) or a refused 31 01 0203 does not
@@ -1915,7 +1988,7 @@ def _enter_fbl_uds_programming(link: J533CanLink, reporter: OperationReporter) -
         # are not RuntimeError and still end the operation.
         if not (_is_fbl_session_nrc(exc) or _is_fbl_precondition_nrc(exc)):
             reporter.can_log(tr(f"Предусловие отклонено ({exc}) — пробуем 10 02", f"Precondition refused ({exc}) — trying 10 02"))
-    link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True)
+    link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True, **kw)
     time.sleep(1.0)
 
 
@@ -1926,6 +1999,12 @@ def _routine_ok(resp: bytes, label: str) -> None:
 
 def _bcd_byte(val: int) -> int:
     return ((val // 10) << 4) | (val % 10)
+
+
+def _dpdu_frame_by_frame(link: Any) -> bool:
+    """A VAS 6154 / VNCI link that would send UDS frame by frame (no hardware ISO-TP, or it has given way)."""
+    on_dpdu = getattr(link, "interface", "") == "dpdu" or type(getattr(link, "bus", None)).__name__ == "DPduBus"
+    return on_dpdu and not getattr(link, "_hw_uds", False)
 
 
 def _uds_session(link: Any) -> Any:
@@ -1982,21 +2061,6 @@ def _program_application_uds(
             info["hardware_isotp_refused"] = why
             reporter.info(tr(f"Аппаратный ISO-TP адаптера не включился ({why}) — передача идёт программным путём",
                              f"The adapter's hardware ISO-TP did not come up ({why}) — transferring on the software path"))
-            # Said before the erase, not discovered at 50%: this adapter sends one network request per CAN frame,
-            # and a 1.5 MB application needs ~220,000 of them. Every VNCI log so far stops finishing them at
-            # ~125,000 and the adapter restarts its service, so this write is expected to break off partway.
-            # Reopening the link does not help: the VCI counts primitives per module, not per link.
-            if getattr(link, "interface", "") == "dpdu" or type(getattr(link, "bus", None)).__name__ == "DPduBus":
-                reporter.warning(tr(
-                    "Через VAS 6154 / VNCI без аппаратного ISO-TP запись такого объёма обычно обрывается на "
-                    "середине: адаптер перестаёт подтверждать отправку примерно на 125-тысячном кадре и "
-                    "перезапускает свою службу. Обновите прошивку адаптера и драйвер D-PDU; если ISO-TP так и "
-                    "не включится, записывайте этот блок другим адаптером.",
-                    "Through a VAS 6154 / VNCI without hardware ISO-TP a write this large usually breaks off "
-                    "halfway: the adapter stops confirming sends at around the 125,000th frame and restarts its "
-                    "service. Update the adapter firmware and the D-PDU driver; if hardware ISO-TP still does not "
-                    "come up, write this ECU with another adapter.",
-                ))
         reporter.can_log(tr("Вход в сессию программирования FBL (10 02) и авторизация SA2 (27 11/12)…", "Entering FBL Programming Session (10 02) & unlocking SA2 (27 11/12)…"))
         _enter_fbl_uds_programming(link, reporter)
         seed_resp = _fbl_seed(link, reporter)
@@ -2015,6 +2079,20 @@ def _program_application_uds(
         link.request_uds(b"\x2e\xf1\x5a" + fp, 0x6E, timeout=3.0)
         info["fingerprint_written"] = True
 
+        if _dpdu_frame_by_frame(link):
+            # Before the erase, not at 50%: frame by frame a 1.5 MB application is ~220,000 network requests, and
+            # every VNCI log so far (three users, issue #18 among them) stops finishing them at ~125,000 and the
+            # adapter restarts its service. Reopening the link does not help: the VCI counts per module.
+            raise RuntimeError(tr(
+                "Аппаратный ISO-TP адаптера VAS 6154 / VNCI не работает, а без него запись CodeFlash обрывается на "
+                "середине: адаптер перестаёт отправлять примерно на 125-тысячном кадре. Стирание не начиналось. "
+                "Переподключите адаптер и повторите; если ISO-TP так и не заработает, обновите драйвер D-PDU или "
+                "запишите блок другим адаптером.",
+                "The VAS 6154 / VNCI hardware ISO-TP is not working, and without it a CodeFlash write breaks off "
+                "halfway: the adapter stops sending at around the 125,000th frame. The erase has not started. "
+                "Reconnect the adapter and try again; if ISO-TP still does not work, update the D-PDU driver or "
+                "write the ECU with another adapter.",
+            ))
         reporter.can_log(
             tr(
                 "Стирание прикладной области CodeFlash (31 01 FF 00 01 01: 0x0000C000..0x0017FFFF)…",
@@ -2649,9 +2727,10 @@ def can_restore_backup(
                 )
             did_backup = True
         elif "cflash" in writes:
+            # the CodeFlash write right after reads CodeFlash, DataFlash and the bootloader itself: no copy here
             result["uflash_engineering"] = can_write_uflash(
                 port, restore_stock=False, interface=interface, session_dir=out_dir / "uflash_eng",
-                return_to_app=False, reporter=reporter,
+                skip_full_backup=True, return_to_app=False, reporter=reporter,
             )
             result["cflash"] = can_write_cflash(
                 port, files["cflash"], interface=interface, session_dir=out_dir / "cflash",
@@ -2784,6 +2863,95 @@ def can_cure_fbl_fingerprint(
     reporter.success(tr(f"Отпечаток исправлен (F15B: {result['f15b']}) — вход в RAM-Loader снова доступен",
                         f"Fingerprint fixed (F15B: {result['f15b']}) — the RAM-Loader entry is available again"))
     return result
+
+
+FRF_IDENT_DIDS = ("F187", "F189", "F191", "F1A3")
+
+
+def _read_ident_dids(link: J533CanLink) -> dict[str, str]:
+    """F187 / F189 / F191 / F1A3 as text, from the application or the bootloader; what does not answer is left out."""
+    _probe_app_or_fbl(link, attempts=2, allow_fbl=True)
+    out: dict[str, str] = {}
+    for did in FRF_IDENT_DIDS:
+        try:
+            raw = link.request_uds(b"\x22" + bytes.fromhex(did), 0x62, timeout=2.0)[3:]
+        except LINK_ERRORS:
+            continue
+        out[did] = raw.rstrip(b"\x00 ").decode("latin-1").strip()
+    return out
+
+
+def can_flash_frf(
+    port: str,
+    frf: FrfImage,
+    *,
+    interface: str = "slcan",
+    session_dir: Path | None = None,
+    allow_unlisted: bool = False,
+    fbl_modulus: bytes | None = None,
+    fbl_open: bool = False,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Flash an ODIS FRF over UDS the way ODIS does: the application with the FRF's own signature, so the factory
+    bootloader takes it, with no RAM-loader and no engineering bootloader. The tester serial in the fingerprint is
+    zero (FBL_TESTER_SERIAL), so this also opens a RAM-loader entry that an ODIS flash closed.
+
+    The FRF's EXPECTED-IDENTs are checked first: other hardware is refused; a part number or software version
+    ODIS would not flash it onto needs `allow_unlisted`. The signature is checked before anything else against the
+    ECU's bootloader key (`fbl_modulus` from a read of its CodeFlash, the factory key without one; none with the
+    engineering bootloader, `fbl_open`): a signature the bootloader would refuse never reaches the erase."""
+    why = frf_signature_problem(frf, fbl_modulus=fbl_modulus, fbl_open=fbl_open)
+    if why:
+        raise RuntimeError(why)
+    out_dir = session_dir or default_session_dir(None, "frf")
+    result: dict[str, Any] = {"session_dir": str(out_dir), "frf": frf.name, "frf_version": frf.sw_version}
+    try:
+        with J533CanLink(port, interface=interface, log_path=out_dir / "can.jsonl") as link:
+            reporter.step(1, 3, tr("Идентификация блока (F187 / F189 / F191 / F1A3)", "Identifying the ECU (F187 / F189 / F191 / F1A3)"))
+            result["before"] = ecu = _read_ident_dids(link)
+            hard, soft = frf_ident_problems(frf, ecu)
+            result["ident_problems"] = hard + soft
+            if hard or (soft and not allow_unlisted):
+                raise RuntimeError(tr("FRF не для этого блока: ", "The FRF is not for this ECU: ") + "; ".join(hard + soft))
+            reporter.step(2, 3, tr(f"Прошивка {frf.name} по UDS — НЕ ОТКЛЮЧАЙТЕ ПИТАНИЕ!",
+                                   f"Flashing {frf.name} over UDS — DO NOT CUT POWER!"))
+            try:
+                result["uds"] = _program_application_uds(link, frf.app, signature_128b=frf.signature, reporter=reporter)
+            except FblRejectedAppError as exc:
+                raise FblRejectedAppError(tr(
+                    "Загрузчик не принял приложение из FRF с его подписью. Приложение стёрто, блок остался в загрузчике "
+                    "FBL — восстановите его «Залить бэкап…» (CodeFlash этого блока) или прошейте подходящий FRF.",
+                    "The bootloader refused the FRF application with its signature. The application is erased and the ECU "
+                    "stays in its FBL bootloader — restore it with \"Write backup…\" (this ECU's CodeFlash) or flash a "
+                    "matching FRF.",
+                )) from exc
+        time.sleep(3.0)  # the reset that ends the programming
+        with J533CanLink(port, interface=interface, log_path=out_dir / "after.jsonl") as link:
+            reporter.step(3, 3, tr("Проверка: приложение запущено, новая версия", "Checking: application running, new version"))
+            _s, in_fbl = _probe_app_or_fbl(link, attempts=5, allow_fbl=True)
+            if in_fbl:
+                raise RuntimeError(tr("FRF записан, но блок остался в загрузчике FBL",
+                                      "The FRF is written, but the ECU stayed in its FBL bootloader"))
+            result["after"] = after = _read_ident_dids(link)
+        old_v, new_v = ecu.get("F189", "?"), after.get("F189", frf.sw_version)
+        reporter.success(tr(f"FRF записан: ПО {old_v} → {new_v}, приложение запущено",
+                            f"FRF written: software {old_v} → {new_v}, application running"))
+        if old_v != new_v:
+            reporter.warning(tr(
+                "Версия ПО сменилась: параметрия ZDC должна соответствовать новой прошивке, иначе возможна ошибка "
+                "000601 «недостоверный блок данных». Загрузите датасет под эту версию («Импорт файла ODIS» → "
+                "«Записать параметрию по CAN»).",
+                "The software version changed: the ZDC datasets must suit the new firmware, or DTC 000601 "
+                "(implausible dataset) may follow. Upload the dataset for this version (\"Import ODIS file\" → "
+                "\"Write datasets over CAN\").",
+            ))
+        result["complete"] = True
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        raise
+    finally:
+        _write_json(out_dir / "frf_result.json", result)
 
 
 def _finish_restore(

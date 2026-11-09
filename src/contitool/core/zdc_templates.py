@@ -100,6 +100,18 @@ _TEMPLATE_BLOBS_B85: dict[str, str] = {
     "Q-&D&0LfH@~oW<ml3|<0sCXT|RgI%GGPHZr-|m=kC3=`|FQizj?cI>Cwf@7p~vfdRQ1JmdYdJRm*4lGcB!c?H$?9"
     "+VsrqsnahXyx81+Z{T1YjDzuCjj!g~&)=PS9dZ"
 ),
+    # factory FPA dataset of a 2019 Tiguan with 4MOTION Active Control (tag OZ00): the knob's input, switches and slots
+    "FPA_OZ00_4MOTION_AC": (
+    "c-"
+    "rlk%}(Pm5Xb)>kCWhpHi|0Pk1i^RBUGro00%Ct&~6XxWiNZ#2iWK00_Q#OJX|Yr;u379Ep3UL1Z}$@^*4%>&cyL};u"
+    ")vkf1aHDj-esY(c&QhLW1aEfrHcYANKqe>*e;g=f>?}!wT8Y3%GWVvk$BEhxV|Clrsbfkzp6D;1^oRNMj;?*ocUL#P"
+    "m2sA4zhDE|@!*h<{u{OtZ|J1xZ#2bzEGN%0nU(Hr!N9hlG=|XIiU&L_kVO(l(`5wohedd+-"
+    "aZB2tR1l=ZFh*%ErZ(#9VlHIepv6?(i{;WAcXv=t|<tb4S3+%H`iG(MWbGt!jE3A?r_>DXU3SI@fC>8t3uem!?yCr8"
+    "hz*F4NFQg+VGW7V0C+nv!>r2KnEjYDRtkt-EWY3q1oEce1DBCuuE;bI}P8Ey&}!KG*LXqq@MJO5~847yg%=2QM-"
+    "2>Roq9HiNzDVWScI8iQ0#noIQl`|L&XkeSt`ga8khkV6DTj4y}_2*R+Dt5NNSh~f%3MuH)Um%5HY4^6`_Ln5ewsjgy"
+    "+WGkD^ZZ)mw)9&~2<05j-50r^I*ZiZmrph2x1m&DCl8k1;QMXY)#x9-"
+    ";y00!@0=ojVy$np{(9a}^PB5p6N3#E|6#xNub%+Q5vZ^"
+),
     "FPA_JC00_BASE": (
     "c-r%FHZVxxVBlh4WHjPu{KCY*zz)PB3}|2z!zdWWK=D5WFcGO<0E}n|m{`cy%fdmvwcPmSk@CfVrvGrjz)F!{N7E"
     "m*lJRH|jDisa7*PpkNWny8ISwknPz0D6nHU&9euNuG2q2Yz!w?L=QkmHYZ(1T0=gh3K_@r5x@rEWd<%#`2Za_>T1"
@@ -254,7 +266,7 @@ FPA_PROFILE_NAMES: dict[int, tuple[str, str]] = {
     0x08: ("Offroad Individual", "Offroad Individual"),
     0x09: ("Snow / Allroad (Снег)", "Snow / Allroad"),
     0x0A: ("Snow (Снег)", "Snow"),
-    0x0B: ("EV / E-Mode (Электро)", "EV / E-Mode"),
+    0x0B: ("Offroad Individual", "Offroad Individual"),  # Tiguan OZ00: knob position 4, cluster code 0x12
     0x0C: ("GTE / Hybrid (Гибрид)", "GTE / Hybrid"),
     0x14: ("Базовый Normal (без выбора профилей)", "Passive Normal (no FPA)"),
     0x36: ("Шайба 4Motion: Дорога / Снег", "4Motion Rotary: Snow / Onroad"),
@@ -273,7 +285,7 @@ FPA_SLOT_DEFAULTS: dict[int, tuple[int, int, int, int, str, str]] = {
     6: (0x06, 0x10001600, 0x07, 0x0001, "Race / Cupra (Гонка)", "Race / Cupra"),
     7: (0x07, 0x10001700, 0x06, 0x0000, "Individual (Индивидуальный)", "Individual"),
     8: (0x0A, 0x10001800, 0x10, 0x0001, "Snow (Снег)", "Snow"),
-    9: (0x09, 0x10001900, 0x10, 0x0001, "Allroad / Доп. профиль", "Allroad / Extra"),
+    9: (0x0B, 0x10001900, 0x12, 0x0005, "Offroad Individual", "Offroad Individual"),  # as in the Tiguan OZ00
     10: (0x36, 0x00000000, 0x00, 0x0000, "Шайба 4Motion (Снег / Трасса)", "4Motion Rotary (Snow / Onroad)"),
     11: (0x3B, 0x00000000, 0x00, 0x0000, "Шайба 4Motion (Бездорожье)", "4Motion Rotary (Offroad)"),
     12: (0x3A, 0x00000000, 0x06, 0x0005, "Шайба 4Motion (Offroad Индив.)", "4Motion Rotary (Offroad Indiv.)"),

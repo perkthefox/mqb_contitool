@@ -41,7 +41,7 @@
    - Edits are written to copies while original dumps stay untouched; all reads and writes are organized per gateway under `contitool_runs/<part>_<FAZIT>/` (`dumps/base_read` — the unit's first complete dump, `*_flashed` with `manifest.json` — what the ECU holds after a write, `writes/` — operation logs and pre-write backups). The bottom panel shows the state of every dump (`CodeFlash`, `DataFlash`, `Uflash`), exports changed files to any folder, and flashes **all** modified memory regions directly over **Diagnosis CAN** with a single **"Write to ECU"** click (100% replacing a bench programmer).
    - Before writing `CodeFlash` over CAN, ContiTool automatically activates the engineering bootloader via `FACI` if the gateway is still on factory FBL, writes a zero tester serial in `F15A` (so subsequent reads never go silent), and writes modified `CodeFlash` boot blocks (`0x0000..0xBFFF`, e.g. custom `FBL RSA` key, `Block 4`) and `DataFlash` (`64 KB`) directly via RAM `FACI` drivers.
    - **Write a backup back** (including when a gateway is **stuck in its `FBL` bootloader** after an interrupted flash) & **`F15B` fingerprint cure**: you pick the backup files, and ContiTool verifies `FAZIT` / `VCRN` over UDS and refuses a backup of another ECU before the first write command; if a gateway goes silent on Stage 1 due to an older non-zero `F15B` fingerprint, ContiTool automatically offers to cure it with one UDS reflash of its own `CodeFlash`. **Export backup** copies the dumps as read to any folder.
-   - **Guided CAN dataset upload & what the ECU itself accepted**: **"Write datasets over CAN"** checks live `SWaP` features (`22 3C 00`) and coding (`22 06 00`), optionally switches missing `SWaP` features on directly inside the gateway's `DataFlash`, uploads `ZDC` blocks over UDS, and aligns `0x0600` coding bits. The Feature activation page reads `22 3C 00` — which features are active and which were rejected and why.
+   - **Guided CAN dataset upload & what the ECU itself accepted**: **"Write datasets over CAN"** checks live `SWaP` features (`22 3C 00`) and coding (`22 06 00`), optionally switches missing `SWaP` features on directly inside the gateway's `DataFlash`, uploads `ZDC` blocks over UDS, and aligns `0x0600` coding bits. The SWaP/FEC activation page reads `22 3C 00` — which features are active and which were rejected and why.
    - Every operation shows its current step, progress (`%`), byte counter, transfer speed (`KB/s`), elapsed time and `ETA` in the status bar, and ContiTool quietly checks GitHub Releases for newer versions at startup. The log at the bottom is a short summary by default — the operation, its steps and the outcome; "Detailed" shows the full technical log with addresses, UDS and CAN.
    - Live 1-click **Русский ⇄ English** language toggle in the header.
 2. **Full Bench-Programmer Replacement Over Diagnosis CAN (`500 kbit/s` — No ECU Opening Needed)**:
@@ -72,7 +72,7 @@
 | | |
 |:---:|:---:|
 | <img src="assets/screenshots/en_zdc.png" alt="Parameterization" width="100%"><br>**Parameterization** — driving profiles, MKE, start-stop, alternator | <img src="assets/screenshots/en_fpa.png" alt="FPA profile editor" width="100%"><br>**Driving profiles & buttons** — the FPA editor |
-| <img src="assets/screenshots/en_dtc.png" alt="Trouble codes" width="100%"><br>**Trouble codes** — ODIS codes with plain descriptions | <img src="assets/screenshots/en_terminal.png" alt="CAN terminal" width="100%"><br>**CAN terminal** — UDS over ISO-TP with decoded replies |
+| <img src="assets/screenshots/en_dtc.png" alt="DTC memory" width="100%"><br>**DTC memory** — ODIS codes with plain descriptions | <img src="assets/screenshots/en_terminal.png" alt="CAN terminal" width="100%"><br>**CAN terminal** — UDS over ISO-TP with decoded replies |
 | <img src="assets/screenshots/en_connection.png" alt="ECU connection" width="100%"><br>**Connection** — found adapters and the T20 wiring diagram | <img src="assets/screenshots/en_restore.png" alt="Write a backup back" width="100%"><br>**Write a backup back** — only into the same ECU (FAZIT / VCRN) |
 
 ---
@@ -107,9 +107,9 @@ flowchart LR
 ### Option 1 — Standalone Executables (Recommended)
 
 Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.0.2a-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.0.2a-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.0.2a-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+- **Windows**: extract `ContiTool-v2.0.2b-windows-amd64.zip` and launch **`ContiTool.exe`**.
+- **macOS**: open `ContiTool-v2.0.2b-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
+- **Linux**: extract `ContiTool-v2.0.2b-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
 
 ### Option 2 — Run from Source (`Python 3.12+`)
 
@@ -207,7 +207,10 @@ python3 conti_cp_tool.py -l en can turnkey --port COM4 --set 5F=A1B2C3D4E5F60718
 Because they are built on completely different **NXP PowerPC (`MPC5607B` / `MPC5748G` VLE)** microcontrollers with no `Uflash`, `FACI`, or `ICUS0` — even when the part number is identical (`3Q0 907 530 AA` from Lear) or the unit identifies as `EV_GatewConti` (`5Q0` from Continental). ContiTool detects them during link check (`F191` / `F187` / `F1A3` / `F19E` / `F17C`) and stops before sending any loader commands. Only **Continental `3Q0 907 530 xx` gateways on Renesas `RH850/F1L`** are supported.
 
 **A gateway stopped answering on Stage 1 when reading after a flash. Does flashing it via ODIS cure this?**
-**No — ODIS does not cure it; ODIS triggers the exact same problem.** The last `F15B` copy in Stage 1's padding lands bytes `2..5` of the 6-byte tester serial onto FBL's suppress-response flag `0xFEDE0C62` ("do not answer"). Both `ContiTool <= v2.0.1d` (`01 02 03 04 05 06` → `0x03`) and `ODIS` (its own non-zero tester serial → e.g. `0xC8`) left a non-zero byte there, silencing Stage 1 on every subsequent entry. Since `v2.0.1e`, `ContiTool` writes a zero tester serial, and in `v2.0.2` it stops before sending `27 12` on a silent Stage 1 (avoiding `7F 27 37` lockout) and offers **the cure**: one UDS reflash of the gateway's own `CodeFlash` application with a zero serial (bench-verified).
+**Only if ODIS is set to a zero fingerprint — with its usual non-zero one ODIS triggers the exact same problem.** The last `F15B` copy in Stage 1's padding lands bytes `2..5` of the 6-byte tester serial onto FBL's suppress-response flag `0xFEDE0C62` ("do not answer"). Both `ContiTool <= v2.0.1d` (`01 02 03 04 05 06` → `0x03`) and `ODIS` (its own non-zero tester serial → e.g. `0xC8`) left a non-zero byte there, silencing Stage 1 on every subsequent entry. Since `v2.0.1e`, `ContiTool` writes a zero tester serial, and in `v2.0.2` it stops before sending `27 12` on a silent Stage 1 (avoiding `7F 27 37` lockout) and offers **the cure**: one UDS reflash of the gateway's own `CodeFlash` application with a zero serial.
+
+**ContiTool asks for a backup to clear the fingerprint, but I have no backup of this gateway.**
+Flash the gateway's original firmware from its FRF instead: with VCTool or ODIS, or with ContiTool itself (“File → Flash an ODIS FRF…”, or the “FRF file…” button in the cure dialog) — ContiTool always writes a zero fingerprint. If you flash with ODIS or VCTool on an original adapter, first check that their settings carry a zero fingerprint (importer, workshop and tester codes all 0): otherwise they write their own non-zero serial and the `RAM-Loader` entry stays closed.
 
 **How do I recover a gateway stuck in its `FBL` bootloader after an interrupted write?**
 Click **"Write backup…"** on the start screen and select that unit's backup folder. ContiTool recognizes that the gateway is in `FBL`, verifies backup ownership via `22 F1 7C` (`FAZIT`) over UDS without entering `RAM-Loader`, and flashes the application directly. If `FBL` answers `7F 27 37` (security delay), cut `+12 V` for `10` seconds when prompted and ContiTool will resume automatically.

@@ -901,3 +901,87 @@ def test_the_cars_own_mode_button_and_rings_are_never_rewritten(synth_dflash: by
     assert wheel.sec_bytes(36)[:2] == bytes([0x05, 0xFD]) and wheel.sec_bytes(40)[:2] == bytes([0x00, 0x02])
     assert wheel._read_switch_ring(0) == [8, 0xE8, 4, 9] and wheel._read_switch_ring(1) == [5, 1, 2, 3, 7]
     assert wheel._read_switch_ring(2) == [5, 1, 2, 3, 7]
+
+
+def test_the_s075_option_never_turns_sport_into_normal(synth_dflash: bytes) -> None:
+    """S075 filters the modes passed to each system (firmware FUN_bba70). Remembering the profile must not touch it;
+    switching the pass-through off puts back what the dump had, never a fixed Normal."""
+    from contitool.core.zdc import FpaDataset, build_fpa_preset_block
+
+    fpa = build_fpa_preset_block("fwd_dcc")
+    loaded = FpaDataset(bytes(fpa.buf))
+    s075 = bytes(fpa.sec_bytes(75))
+    fpa.set_kl15_persistence(persist_profiles=True)
+    assert bytes(fpa.sec_bytes(75)) == s075
+    fpa.set_kl15_persistence(persist_powertrain=True)
+    assert bytes(fpa.sec_bytes(75)) != s075
+    fpa.set_kl15_persistence(persist_powertrain=False, original=loaded)
+    assert bytes(fpa.sec_bytes(75)) == s075
+    fpa.set_kl15_persistence(persist_powertrain=False)  # without the loaded dataset: nothing to put back, no change
+    assert bytes(fpa.sec_bytes(75)) == s075
+
+
+def test_the_knob_is_added_as_the_factory_tiguan_has_it(synth_dflash: bytes) -> None:
+    """Input/switch layout of the 2019 Tiguan dataset OZ00: positional input (S036 5, type 4) on its own switch with
+    ring Snow / on-road (0xE7 + menu switch) / Offroad / Offroad Individual, the menu switch without input (S045 0xFA);
+    the button setup that runs after it keeps all of that, and the profiles need FeCs 1400/1800/1900."""
+    from contitool.core.zdc import FpaDataset, apply_fpa_dataset, build_fpa_preset_block, fecs_required_by_dataset
+
+    df = bytearray(synth_dflash)
+    df[0x1340:0x2440] = build_fpa_preset_block("fwd").to_sealed_bytes()
+    fpa = FpaDataset.from_dflash(bytes(df))
+    assert not fpa.has_knob
+    fpa.add_4motion_knob()
+    assert fpa.has_knob and (fpa.sec_bytes(28)[8], fpa.sec_bytes(28)[9]) == (0x0A, 0x0B)
+    k = next(i for i in range(5) if fpa.sec_bytes(37)[i] == 0x04)
+    assert fpa.sec_bytes(36)[k] == 0x05
+    knob_sw = fpa.sec_bytes(40)[k]
+    menu_sw = next(sw for sw in range(4) if fpa.sec_bytes(45)[sw] == 0xFA)
+    assert fpa._read_switch_ring(knob_sw) == [8, 0xE7 + menu_sw, 4, 9] and fpa.sec_bytes(45)[knob_sw] == 0x06
+    assert 2 in fpa._read_switch_ring(menu_sw) and 4 not in fpa._read_switch_ring(menu_sw)
+    before = bytes(fpa.buf)
+    fpa.configure_buttons(mode="console")  # what the dialog does next: nothing of the knob may change
+    for sec in (36, 37, 38, 39, 40, 41, 42, 43, 44, 45):
+        assert fpa.sec_bytes(sec) == FpaDataset(before).sec_bytes(sec), sec
+    out = apply_fpa_dataset(bytes(df), fpa)
+    assert {0x10001400, 0x10001800, 0x10001900} <= set(fecs_required_by_dataset(out))
+    fpa.add_4motion_knob()  # a second time changes nothing
+    assert apply_fpa_dataset(bytes(df), fpa) == out
+
+
+def test_switching_a_slot_off_and_on_keeps_its_id_and_knob_positions_stay(synth_dflash: bytes) -> None:
+    from contitool.core.zdc import FpaDataset, build_fpa_preset_block
+
+    fpa = build_fpa_preset_block("fwd_dcc")
+    fpa.set_slot_enabled(5, True, profile_id=0x08)  # a non-default ID
+    fpa.set_slot_enabled(5, False)
+    fpa.set_slot_enabled(5, True)
+    assert fpa.sec_bytes(28)[5] == 0x08
+    fpa.add_4motion_knob()
+    with pytest.raises(ValueError):
+        fpa.set_slot_enabled(8, False)  # Snow is a knob position
+    assert fpa.sec_bytes(28)[8] == 0x0A
+
+
+def test_a_failed_knob_add_leaves_the_dataset_untouched(synth_dflash: bytes) -> None:
+    from contitool.core.zdc import FpaDataset, build_fpa_preset_block
+
+    fpa = build_fpa_preset_block("fwd_dcc")
+    fpa.set_slot_enabled(8, True, profile_id=0x03)  # slot 8 taken by another profile
+    before = bytes(fpa.buf)
+    with pytest.raises(ValueError):
+        fpa.add_4motion_knob()
+    assert bytes(fpa.buf) == before
+    with pytest.raises(ValueError):
+        FpaDataset(b"\xff" * 4352).add_4motion_knob()  # no profiles at all: a clear refusal
+
+
+def test_s075_off_puts_back_a_factory_filter_when_the_dump_already_passed_everything(synth_dflash: bytes) -> None:
+    from contitool.core.zdc import FpaDataset, build_fpa_preset_block
+
+    fpa = build_fpa_preset_block("fwd_dcc")
+    factory = bytes(fpa.sec_bytes(75))
+    fpa.set_kl15_persistence(persist_powertrain=True)
+    loaded = FpaDataset(bytes(fpa.buf))  # a dump written by an older ContiTool with the pass-through on
+    fpa.set_kl15_persistence(persist_powertrain=False, original=loaded)
+    assert bytes(fpa.sec_bytes(75)) == factory

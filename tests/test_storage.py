@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import sys
 
 from contitool import storage
@@ -65,3 +66,24 @@ def test_runs_folder_sits_next_to_the_program(tmp_path: Path, monkeypatch) -> No
     assert storage.runs_root() == tmp_path / "contitool_runs"
     monkeypatch.setattr(sys, "executable", str(tmp_path / "win" / "ContiTool.exe"))
     assert storage.app_dir() == tmp_path / "win"
+
+
+def test_a_full_read_on_file_is_recognised(tmp_path: Path) -> None:
+    unit = tmp_path / "3Q0907530C_TST-SYN01.01.260000001"
+    assert not storage.has_full_read(unit)
+    flashed = unit / "dumps" / "2026-11-09_15-34-12_flashed"  # only what was written: not a full read
+    flashed.mkdir(parents=True)
+    (flashed / "Dflash.bin").write_bytes(b"\0")
+    read = unit / "dumps" / "2026-11-09_15-20-05_read"
+    read.mkdir()
+    for name in storage.AREA_FILES[:2]:
+        (read / name).write_bytes(b"\0")
+    assert not storage.has_full_read(unit)  # Uflash missing
+    (read / "Uflash.bin").write_bytes(b"\0")
+    assert not storage.has_full_read(unit)  # a read that broke off: short files
+    for name, size in storage.AREA_SIZES.items():
+        (read / name).write_bytes(bytes(size))
+    assert storage.has_full_read(unit)
+    other = tmp_path / "unknown"
+    shutil.copytree(unit / "dumps", other / "dumps")
+    assert not storage.has_full_read(other)  # another gateway's read cannot vouch for an unidentified one

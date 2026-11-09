@@ -111,6 +111,35 @@ def keep_as_base(read_dir: Path) -> Path:
     return base
 
 
+AREA_SIZES = {"Cflash.bin": 0x180000, "Dflash.bin": 0x10000, "Uflash.bin": 0x8000}
+
+
+def has_full_read(unit_dir: Path) -> bool:
+    """A complete read of this gateway is on disk (base_read or a later read). A write then reads only the area it
+    writes: the others do not change, and their copy is already here. A read streams into its files, so one that
+    broke off leaves them short: only full-size files count. An unidentified gateway ("unknown") never has one."""
+    dumps = unit_dir / DUMPS
+    if unit_dir.name == "unknown" or not dumps.is_dir():
+        return False
+
+    def complete(d: Path) -> bool:
+        return all((d / n).is_file() and (d / n).stat().st_size == size for n, size in AREA_SIZES.items())
+
+    return any(d.is_dir() and (d.name == BASE_READ or d.name.endswith("_read")) and complete(d) for d in dumps.iterdir())
+
+
+def latest_area(unit_dir: Path, name: str) -> Path | None:
+    """The newest full-size copy of one area (Cflash.bin, ...) the gateway is known to hold: base_read, then the later
+    reads and writes (dumps/<date>_read, <date>_flashed) by date. None for an unidentified gateway or without one."""
+    dumps = unit_dir / DUMPS
+    if unit_dir.name == "unknown" or not dumps.is_dir():
+        return None
+    dirs = sorted((d for d in dumps.iterdir() if d.is_dir() and (d.name == BASE_READ or re.search(r"_(read|flashed)(_\d+)?$", d.name))),
+                  key=lambda d: "" if d.name == BASE_READ else d.name)
+    hits = [d / name for d in dirs if (d / name).is_file() and (d / name).stat().st_size == AREA_SIZES[name]]
+    return hits[-1] if hits else None
+
+
 def changed_ranges(a: bytes, b: bytes, *, merge_gap: int = 16) -> list[tuple[int, int]]:
     """[start, end) byte ranges where `a` and `b` differ (equal lengths); ranges closer than `merge_gap` merge."""
     out: list[tuple[int, int]] = []

@@ -115,7 +115,7 @@ ZDC_PASSPORT_PN_OFF = 0x0010     # DID 0xF1A0 (11 ASCII chars)
 ZDC_PASSPORT_VER_OFF = 0x0020    # DID 0xF1A1 (4 ASCII chars)
 ZDC_PASSPORT_EQUIP_OFF = 0x0028  # DID 0xF1A4 (12 bytes PR / equipment code)
 ZDC_MAINGW_FPA_MAP_OFF = 0x032C        # 13-byte Inst0 FPA profile map (S028: 1..9 -> FeC 0x10001100..1900, 10..12 -> 4Motion rotary)
-ZDC_MAINGW_FPA_MASK_OFF = 0x0345       # 2-byte BE selectable Inst0 FPA slot bitmask (S030) inside ZDC #4 MainGW
+ZDC_MAINGW_FPA_MASK_OFF = 0x0345       # 2-byte BE S030 in ZDC #4: slots kept as the user's last profile (not the menu)
 ZDC_MAINGW_FPA_INST1_MAP_OFF = 0x0D0B  # 7-byte Inst1 EV/Hybrid FPA profile map (S153: 1 -> FeC 0x10001A00, 2 -> FeC 0x10001B00)
 
 ZDC_DATASET_SPECS: tuple[tuple[int, str, int, int, str, str], ...] = (

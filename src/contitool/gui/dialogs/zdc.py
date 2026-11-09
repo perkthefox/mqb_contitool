@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
 )
 
 from contitool.can import can_learn_mfl_button, can_read_gateway_coding, can_write_gateway_coding
+from contitool.core.analyzer import analyze_dflash_swap
+from contitool.core.zdc_templates import FPA_SLOT_DEFAULTS
 from contitool.core import (
     BEM_SUPPLIER_NAMES,
     FPA_PRESET_CATALOG,
@@ -66,60 +68,22 @@ from contitool.i18n import get_lang, tr
 
 # Human-readable descriptions for standard driving profile slots 1..9
 _SLOT_DESCRIPTIONS: dict[int, tuple[str, str, str, str]] = {
-    1: (
-        "Comfort",
-        "Comfort",
-        "Мягкая подвеска DCC и плавные отклики для трассы и неровных дорог",
-        "Soft DCC damping and relaxed responses for cruising",
-    ),
-    2: (
-        "Normal",
-        "Normal",
-        "Стандартный сбалансированный режим на каждый день",
-        "Balanced everyday factory driving mode",
-    ),
-    3: (
-        "Sport",
-        "Sport",
-        "Острый отклик педали газа, руля, подвески и спорт-режим КПП (S)",
-        "Sharper throttle, steering, chassis, and gearbox Sport (S) mode",
-    ),
-    4: (
-        "Offroad",
-        "Offroad",
-        "Внедорожный режим полного привода, ABS/ESC и помощник спуска с горы",
-        "Offroad AWD traction logic, ABS/ESC calibration, and hill descent",
-    ),
-    5: (
-        "Eco",
-        "Eco",
-        "Экономичный режим климата, плавная тяга и движение накатом",
-        "Fuel-saving throttle, climate eco mode, and coasting (freewheeling)",
-    ),
-    6: (
-        "Race / Cupra",
-        "Race / Cupra",
-        "Максимальный спортивный режим (Golf R / Audi S3 / Cupra)",
-        "Maximum performance track mode (Golf R / Audi S3 / Cupra)",
-    ),
-    7: (
-        "Individual",
-        "Individual",
-        "Персональный режим — водитель сам настраивает каждый узел на экране ГУ",
-        "Custom mode — driver picks each subsystem's behaviour on the head unit",
-    ),
-    8: (
-        "Snow",
-        "Snow",
-        "Зимний режим плавного старта и уверенной тяги на снегу и льду",
-        "Winter mode with gentle throttle and snow traction control",
-    ),
-    9: (
-        "Allroad / Доп.",
-        "Allroad / Extra",
-        "Дополнительный вседорожный слот (для некоторых версий шасси)",
-        "Additional all-road profile slot (chassis-specific)",
-    ),
+    1: ("Comfort", "Comfort", "Комфортные настройки систем; с DCC — мягкая подвеска",
+        "Comfort settings of the systems; with DCC, soft damping"),
+    2: ("Normal", "Normal", "Заводской режим по умолчанию", "The factory default mode"),
+    3: ("Sport", "Sport", "Спортивные настройки газа, руля, подвески и коробки (S)",
+        "Sport settings for throttle, steering, suspension and gearbox (S)"),
+    4: ("Offroad", "Offroad", "Для полного привода: режим Offroad у ESC, муфты и помощника спуска",
+        "For AWD: the Offroad mode of ESC, the clutch and hill descent"),
+    5: ("Eco", "Eco", "Экономичные настройки двигателя и климата, движение накатом",
+        "Economical engine and climate settings, coasting"),
+    6: ("Race / Cupra", "Race / Cupra", "Race у Golf R и Cupra. Без своих настроек Race системы получают режим Sport",
+        "Race on the Golf R and Cupra. Without its own Race settings the systems get Sport"),
+    7: ("Individual", "Individual", "Водитель выбирает режим каждой системы на магнитоле",
+        "The driver picks each system's mode on the head unit"),
+    8: ("Snow", "Snow", "Для полного привода (как в Tiguan): режим для снега", "For AWD (as in the Tiguan): the snow mode"),
+    9: ("Offroad Individual", "Offroad Individual", "Для полного привода (как в Tiguan): Offroad с настройками водителя",
+        "For AWD (as in the Tiguan): Offroad with the driver's own settings"),
 }
 
 _WHEEL_QUICK_PAIRS: tuple[tuple[str, tuple[int, int], str, str], ...] = (
@@ -170,16 +134,20 @@ class FpaEditorDialog(Dialog):
             parent,
             tr("Профили вождения и кнопки переключения", "Driving Profiles & Mode Buttons"),
             tr(
-                "Выберите доступные режимы вождения, включите память профиля после перезапуска двигателя "
-                "и настройте переключение кнопкой MODE на консоли и кнопкой на руле.",
-                "Choose available driving modes, keep your selected profile across engine restarts, "
-                "and configure switching via the console MODE button and steering-wheel button.",
+                "Доступные режимы движения, память режима после выключения зажигания, переключение кнопкой MODE и"
+                " кнопкой на руле.",
+                "Available driving modes, keeping the mode after the ignition is switched off, switching with the"
+                " MODE button and a wheel button.",
             ),
             width=920,
         )
         self._df = bytes(df)
         self._conn = conn
         self._runner = runner
+        try:  # which slots the gateway may offer: a profile needs its slot's FEC active
+            self._active_fecs = {f.fec_code for f in analyze_dflash_swap(self._df).active_fscs}
+        except ValueError:
+            self._active_fecs = set()
 
         self._orig_loaded = FpaDataset.from_dflash(self._df)
         self._was_empty = self._orig_loaded.empty or not self._orig_loaded.crc_ok
@@ -258,10 +226,12 @@ class FpaEditorDialog(Dialog):
             rp_lay.addWidget(
                 hint(
                     tr(
-                        "Используйте только если блок взят с другой машины (например, с полного привода на передний) "
-                        "и нужно полностью заменить базовые таблицы агрегатов заводским шаблоном:",
-                        "Use only if the ECU came from a different car (e.g. AWD to FWD) and you want to replace "
-                        "all subsystem tables with a fresh factory template:",
+                        "Шаблон — это датасет другого автомобиля: он целиком заменяет таблицы профилей и список систем-"
+                        "участников. Используйте, только если блок с другой машины (например, с полного привода на "
+                        "передний):",
+                        "A template is another car's dataset: it replaces the profile tables and the list of "
+                        "participating systems as a whole. Use it only if the ECU came from another car (from AWD to FWD,"
+                        " say):",
                     )
                 )
             )
@@ -297,24 +267,28 @@ class FpaEditorDialog(Dialog):
 
         sec_mem = Section()
         sec_mem.set_text(
-            tr("Память профиля после выключения зажигания", "Remember profile after engine restart"),
+            tr("Профиль после выключения зажигания и режимы систем", "Profile after ignition off, and system modes"),
             tr(
-                "По заводским нормам после каждого запуска двигателя коробка DSG, педаль газа и Старт-Стоп "
-                "принудительно сбрасываются обратно в обычный режим Normal. Эти две галочки убирают сброс.",
-                "By factory default, gearbox Sport mode, throttle response, and Start-Stop reset to Normal on every "
-                "ignition restart. Enable both options below to keep your chosen mode.",
+                "Первая галочка: после включения зажигания остаётся выбранный профиль, а не Normal (S029). Вторая: "
+                "силовой агрегат и Старт-Стоп получают и режимы Comfort, Sport и Offroad. С завода шлюз передаёт им "
+                "только те режимы, которые эти блоки принимают (S075), остальные заменяет на «без запроса». Примут "
+                "ли блоки остальные режимы, не проверено.",
+                "First option: after the ignition is switched on the selected profile stays instead of Normal (S029). "
+                "Second: the powertrain and Start-Stop also get the Comfort, Sport and Offroad modes. From the factory "
+                "the gateway passes them only the modes these ECUs accept (S075) and replaces the rest with “no "
+                "request”. Whether the ECUs accept the other modes is not verified.",
             ),
         )
         self.chk_kl15_profiles = QCheckBox(
             tr(
-                "Запоминать выбранный профиль вождения (Comfort, Sport, Eco, Individual…)",
-                "Remember the selected driving profile across ignition restarts",
+                "Оставлять выбранный профиль после выключения зажигания",
+                "Keep the selected profile after the ignition is switched off",
             )
         )
         self.chk_kl15_powertrain = QCheckBox(
             tr(
-                "Не сбрасывать коробку DSG (S), отклик двигателя и Старт-Стоп в обычный режим",
-                "Keep gearbox (S), engine response, and Start-Stop mode after restart",
+                "Передавать Comfort, Sport и Offroad силовому агрегату и Старт-Стоп",
+                "Pass Comfort, Sport and Offroad to the powertrain and Start-Stop",
             )
         )
         self.chk_kl15_profiles.toggled.connect(self._on_kl15_profiles_toggled)
@@ -327,8 +301,8 @@ class FpaEditorDialog(Dialog):
         sec_profs.set_text(
             tr("Доступные профили на экране магнитолы", "Profiles shown on the head-unit screen"),
             tr(
-                "Отметьте галочками режимы, которые должны отображаться на экране автомобиля.",
-                "Tick the driving modes that should appear on the head-unit selection screen.",
+                "Режимы в меню выбора на магнитоле. Профиль появляется, только если для его слота активен FEC (страница «Активация SWaP/FEC»).",
+                "The modes in the head unit's selection menu. A profile appears only if its slot's FEC is active (SWaP/FEC activation page).",
             ),
         )
         self.tbl_slots = QTableWidget(9, 3)
@@ -372,30 +346,49 @@ class FpaEditorDialog(Dialog):
         sec_mode.set_text(
             tr("Чем переключать профили вождения", "Which physical buttons switch profiles"),
             tr(
-                "Можно оставить штатную кнопку MODE возле селектора КПП, добавить переключение кнопкой на руле "
-                "или включить обе кнопки сразу — они работают параллельно и не мешают друг другу.",
-                "Use the console MODE button, a steering-wheel button, or both simultaneously.",
+                "Кнопка MODE у селектора КПП, кнопка на руле или обе сразу.",
+                "The MODE button by the gear selector, a wheel button, or both.",
             ),
         )
         self.cmb_btn_mode = QComboBox()
         for val, ru, en in (
-            ("both", "Кнопка MODE на консоли + кнопка на руле одновременно (рекомендуется)", "Both: Console MODE button + Steering-wheel button (recommended)"),
-            ("console", "Только штатная кнопка MODE на центральной консоли", "Console MODE button only"),
-            ("mfl", "Только кнопка на руле (если кнопки MODE в салоне нет)", "Steering-wheel button only (no console MODE button)"),
-            ("none", "Без физических кнопок (переключение только на экране магнитолы)", "Touchscreen only (no physical buttons)"),
+            ("both", "Кнопка MODE на консоли и кнопка на руле", "Console MODE button and a wheel button"),
+            ("console", "Только кнопка MODE на консоли", "Console MODE button only"),
+            ("mfl", "Только кнопка на руле (если кнопки MODE нет)", "Wheel button only (no MODE button)"),
+            ("none", "Без кнопок, только экран магнитолы", "No buttons, head-unit screen only"),
         ):
             self.cmb_btn_mode.addItem(en if get_lang() == "en" else ru, val)
         self.cmb_btn_mode.currentIndexChanged.connect(lambda _i: self._sync_button_controls())
         sec_mode.body.addWidget(self.cmb_btn_mode)
         lay.addWidget(sec_mode)
 
+        # 1a. The 4MOTION Active Control knob, as the factory dataset of a 2019 Tiguan (OZ00) has it
+        sec_knob = Section()
+        sec_knob.set_text(
+            tr("Шайба 4MOTION Active Control", "4MOTION Active Control knob"),
+            tr(
+                "Как в заводском датасете Tiguan 2019 (OZ00): положения шайбы Snow, On-road, Offroad и Offroad "
+                "Individual; профиль On-road выбирается в меню магнитолы. Шайба заменяет кнопку MODE на консоли, "
+                "кнопка на руле остаётся. Нужны сама шайба (модуль консоли с LIN-кадром 0x0B) и FEC 10001400, "
+                "10001800 и 10001900.",
+                "As in the factory dataset of a 2019 Tiguan (OZ00): knob positions Snow, On-road, Offroad and Offroad "
+                "Individual; the on-road profile is picked in the head-unit menu. The knob replaces the console MODE "
+                "button; a wheel button stays. It needs the knob itself (the console module sending LIN frame 0x0B) "
+                "and FECs 10001400, 10001800 and 10001900.",
+            ),
+        )
+        self.chk_knob = QCheckBox(tr("Добавить шайбу в датасет", "Add the knob to the dataset"))
+        sec_knob.body.addWidget(self.chk_knob)
+        lay.addWidget(sec_knob)
+
+
         # 2. Steering-wheel button picker (ONLY visible when 'mfl' or 'both' is selected!)
         self.sec_wheel = Section()
         self.sec_wheel.set_text(
             tr("Какую кнопку на руле использовать", "Steering-wheel button setup"),
             tr(
-                "Выберите удобную кнопку на руле из списка или нажмите «Определить нажатием по CAN…» и просто нажмите кнопку в машине.",
-                "Pick a steering-wheel button below or click “Detect press over CAN…” and press the button on your wheel.",
+                "Выберите кнопку из списка или нажмите «Определить нажатием по CAN…» и нажмите её в машине.",
+                "Pick the button from the list, or press “Detect over CAN…” and press it in the car.",
             ),
         )
         grid_mfl = QGridLayout()
@@ -447,10 +440,10 @@ class FpaEditorDialog(Dialog):
         self.sec_wheel.body.addWidget(
             hint(
                 tr(
-                    "Подсказка: кнопки круиз-контроля (SET, RES и Travel Assist) подключены к отдельной линии круиза "
-                    "и переключать профили не могут — используйте кнопку Голоса, VIEW, Ассистентов или Обогрева руля.",
-                    "Tip: cruise-control buttons (SET, RES, Travel Assist) use a separate cruise line and cannot switch "
-                    "profiles — choose Voice, VIEW, Assistants, or Steering Heating instead.",
+                    "Кнопки круиз-контроля (SET, RES, Travel Assist) идут по отдельной линии и профили переключать не"
+                    " могут. Подходят кнопки голосового управления, VIEW, ассистентов или обогрева руля.",
+                    "The cruise-control buttons (SET, RES, Travel Assist) use a separate line and cannot switch "
+                    "profiles. The voice, VIEW, assistants or wheel-heating buttons work.",
                 )
             )
         )
@@ -461,10 +454,10 @@ class FpaEditorDialog(Dialog):
         self.sec_rings.set_text(
             tr("Какие профили листают кнопки при нажатии", "Which profiles each button cycles through"),
             tr(
-                "Например, кнопка MODE на консоли может листать все режимы подряд, а кнопка на руле — "
-                "мгновенно переключать только два любимых режима (Normal ↔ Sport, как кнопка M1/M2).",
-                "For example, the console MODE button can cycle all profiles while the steering-wheel button "
-                "toggles instantly between two favourites (like Normal ↔ Sport).",
+                "Например, MODE листает все режимы, а кнопка на руле переключает только два (Normal ↔ Sport, как "
+                "M1/M2).",
+                "For example, MODE steps through every mode while the wheel button toggles just two (Normal ↔ "
+                "Sport, like M1/M2).",
             ),
         )
 
@@ -475,7 +468,10 @@ class FpaEditorDialog(Dialog):
         con_lay.setSpacing(8)
         self.cmb_console_ring_mode = QComboBox()
         self.cmb_console_ring_mode.addItem(
-            tr("Все включённые профили по кругу (рекомендуется)", "All enabled profiles in order (recommended)"),
+            tr(
+                "Все включённые профили по кругу",
+                "All enabled profiles in turn",
+            ),
             "all",
         )
         self.cmb_console_ring_mode.addItem(
@@ -549,21 +545,21 @@ class FpaEditorDialog(Dialog):
         )
         self.chk_decouple_dsg = QCheckBox(
             tr(
-                "Качок селектора КПП D↔S переключает только коробку, не сбивая общий профиль машины",
-                "Pulling the DSG lever D↔S only toggles the gearbox without changing the car's profile",
+                "Селектор D↔S меняет только режим коробки, профиль остаётся прежним",
+                "The D↔S selector changes only the gearbox mode; the profile stays",
             )
         )
         self.chk_pso = QCheckBox(
             tr(
-                "Привязывать выбранный профиль к ключу зажигания (персонализация водителя)",
-                "Link selected profile to the ignition key / driver account",
+                "Запоминать профиль для каждого ключа (персонализация)",
+                "Keep the profile per key (personalisation)",
             )
         )
         for chk in (self.chk_led_off_normal, self.chk_mib_popup, self.chk_decouple_dsg, self.chk_pso):
             sec_comfort.body.addWidget(chk)
 
         # Collapsible fine-tuning (LED brightness & popup timeout)
-        self.btn_more_comfort = button(tr("Тонкая настройка подсветки и окна ▸", "Fine-tune brightness & popup ▸"), "GhostBtn")
+        self.btn_more_comfort = button(tr("Яркость подсветки MODE ▸", "MODE light brightness ▸"), "GhostBtn")
         self.btn_more_comfort.setCheckable(True)
         self.pnl_more_comfort = QWidget()
         more_lay = QHBoxLayout(self.pnl_more_comfort)
@@ -571,13 +567,8 @@ class FpaEditorDialog(Dialog):
         more_lay.setSpacing(12)
         self.spn_led_pwm = QSpinBox()
         self.spn_led_pwm.setRange(0, 15)
-        self.spn_popup_timeout = QSpinBox()
-        self.spn_popup_timeout.setRange(0, 255)
         more_lay.addWidget(QLabel(tr("Яркость подсветки кнопки MODE (0–15):", "MODE LED brightness (0–15):")))
         more_lay.addWidget(self.spn_led_pwm)
-        more_lay.addSpacing(12)
-        more_lay.addWidget(QLabel(tr("Время показа окна на ГУ (0 = стандартно):", "Popup duration (0 = default):")))
-        more_lay.addWidget(self.spn_popup_timeout)
         more_lay.addStretch(1)
         self.pnl_more_comfort.setVisible(False)
         self.btn_more_comfort.toggled.connect(self._toggle_more_comfort)
@@ -609,9 +600,9 @@ class FpaEditorDialog(Dialog):
     def _toggle_more_comfort(self, on: bool) -> None:
         self.pnl_more_comfort.setVisible(on)
         self.btn_more_comfort.setText(
-            tr("Тонкая настройка подсветки и окна ▾", "Fine-tune brightness & popup ▾")
+            tr("Яркость подсветки MODE ▾", "MODE light brightness ▾")
             if on
-            else tr("Тонкая настройка подсветки и окна ▸", "Fine-tune brightness & popup ▸")
+            else tr("Яркость подсветки MODE ▸", "MODE light brightness ▸")
         )
 
     # ── Tab 3: Subsystem Target Matrix ──
@@ -624,10 +615,8 @@ class FpaEditorDialog(Dialog):
         lay.addWidget(
             hint(
                 tr(
-                    "Здесь видно, какую команду шлюз отправляет каждому агрегату автомобиля при выборе профиля. "
-                    "В большинстве случаев заводские настройки шаблона уже оптимальны.",
-                    "Shows which behaviour mode the gateway requests from each vehicle subsystem in every active profile. "
-                    "Template defaults are already optimal for most cars.",
+                    "Какой режим шлюз запрашивает у каждой системы автомобиля при выборе профиля.",
+                    "The mode the gateway requests from each system of the car when a profile is selected.",
                 )
             )
         )
@@ -672,9 +661,10 @@ class FpaEditorDialog(Dialog):
         lay.addWidget(
             hint(
                 tr(
-                    "Чтобы активированные подсистемы работали без ошибок, соответствующие галочки должны быть включены "
-                    "в кодировке гейтвея. Нажмите «Прочитать из блока по CAN», затем «Подобрать биты автоматически».",
-                    "Read the gateway's coding over CAN and click “Auto-match coding bits” so all enabled features match.",
+                    "Системы, участвующие в профилях, должны быть включены в кодировке шлюза. Нажмите «Прочитать из "
+                    "блока по CAN», затем «Подобрать биты автоматически».",
+                    "The systems taking part in the profiles must be enabled in the gateway coding. Press “Read from "
+                    "ECU over CAN”, then “Auto-match coding bits”.",
                 )
             )
         )
@@ -732,25 +722,25 @@ class FpaEditorDialog(Dialog):
             theme.set_tone(self.onboard_frame, "warn")
             self.lbl_onboard.setText(
                 tr(
-                    "Сейчас в этом дампе раздел профилей вождения пуст. "
-                    "Чтобы добавить профили, выберите комплектацию вашего автомобиля ниже (или отметьте нужные режимы галочками):",
-                    "Driving profiles are currently empty in this dump. "
-                    "Pick your car's configuration below (or tick desired modes) to add them:",
+                    "Профилей движения в дампе нет. Выберите комплектацию автомобиля ниже или отметьте нужные режимы:",
+                    "The dump has no driving profiles. Pick the car's equipment below or tick the modes you need:",
                 )
                 if self._was_empty
                 else tr(
-                    "Сейчас в этом дампе профили вождения отсутствуют (записан базовый датасет без выбора режимов). "
-                    "Чтобы добавить профили, выберите комплектацию вашего автомобиля ниже (или отметьте нужные режимы галочками):",
-                    "This dump currently has no driving profiles (passive base dataset without mode selection). "
-                    "Pick your car's configuration below (or tick desired modes) to add them:",
+                    "В дампе записан базовый датасет без профилей движения. Выберите комплектацию автомобиля ниже или"
+                    " отметьте нужные режимы:",
+                    "The dump holds a base dataset without driving profiles. Pick the car's equipment below or tick "
+                    "the modes you need:",
                 )
             )
         else:
             theme.set_tone(self.onboard_frame, "ok")
             self.lbl_onboard.setText(
                 tr(
-                    "Профили вождения подготовлены к записи в дамп — при необходимости скорректируйте галочки и вкладку «Кнопки MODE и руль», затем нажмите «Сохранить настройки».",
-                    "Driving profiles are ready to be written — review the checkboxes and the “MODE & Wheel Buttons” tab, then click “Save settings”.",
+                    "Профили подготовлены. Проверьте галочки и вкладку «Кнопки MODE и руль» и нажмите «Сохранить "
+                    "настройки».",
+                    "The profiles are prepared. Check the ticks and the “MODE & wheel buttons” tab, then press “Save "
+                    "settings”.",
                 )
             )
 
@@ -773,7 +763,12 @@ class FpaEditorDialog(Dialog):
         self._load_all_from_fpa()
 
     def _load_all_from_fpa(self) -> None:
-        rotary_txt = (tr(" · заводские кнопки 4Motion сохранены", " · factory 4Motion buttons kept")
+        has_knob = self.fpa.has_knob
+        self.chk_knob.setChecked(has_knob)
+        self.chk_knob.setEnabled(not has_knob and not self._unconfigured)  # the knob needs profiles to point at
+        self.chk_knob.setText(tr("Шайба уже есть в датасете", "The knob is already in the dataset") if has_knob
+                              else tr("Добавить шайбу в датасет", "Add the knob to the dataset"))
+        rotary_txt = (tr(", заводские кнопки 4Motion сохранены", ", factory 4Motion buttons kept")
                       if self.fpa.button_config().has_4motion_rotary else "")
         self.lbl_schema_info.setText(
             f"{tr('Формат блока:', 'ECU format:')} {self.fpa.schema_tag or '—'}{rotary_txt}"
@@ -781,7 +776,7 @@ class FpaEditorDialog(Dialog):
         ch_ru, ch_en = self.fpa.chassis_summary()
         ch_txt = ch_en if get_lang() == "en" else ch_ru
         self.lbl_detected_base.setText(
-            f"{tr('Прочитано из текущего датасета:', 'Read from current dataset:')}  {ch_txt}"
+            f"{tr('Ближайший шаблон:', 'Closest template:')} {ch_txt}"
         )
         if not self._needs_onboarding:
             det_idx = self.cmb_preset.findData(self.fpa.detected_preset())
@@ -842,8 +837,11 @@ class FpaEditorDialog(Dialog):
                 if self._unconfigured:
                     state_txt = tr("Не в датасете", "Not in dataset")
                     state_col = theme.TEXT_MUTED
+                elif is_on and FPA_SLOT_DEFAULTS[slot_num][1] not in self._active_fecs:
+                    state_txt = tr("Нет FEC", "No FEC")  # the gateway does not offer a slot without its licence
+                    state_col = theme.WARN
                 elif is_on:
-                    state_txt = tr("Включён", "Enabled")
+                    state_txt = tr("В меню", "In the menu")
                     state_col = theme.OK
                 else:
                     state_txt = tr("Выключен", "Off")
@@ -880,14 +878,10 @@ class FpaEditorDialog(Dialog):
             base_preset = "awd_dcc" if slot_i in (4, 8) else "fwd_dcc"
             self._bootstrap_if_needed(base_preset, custom_slots=(2, slot_i))
             return
-        self.fpa.set_slot_enabled(
-            slot_i,
-            en,
-            kl15_persist=self.chk_kl15_profiles.isChecked(),
-        )
+        self.fpa.set_slot_enabled(slot_i, en)  # switching a slot back on brings back what it had
         ch_ru, ch_en = self.fpa.chassis_summary()
         self.lbl_detected_base.setText(
-            f"{tr('Прочитано из текущего датасета:', 'Read from current dataset:')}  {ch_en if get_lang() == 'en' else ch_ru}"
+            f"{tr('Ближайший шаблон:', 'Closest template:')} {ch_en if get_lang() == 'en' else ch_ru}"
         )
         self._populate_slots_table()
         self._update_ring_previews(from_checks=False, is_mfl=False)
@@ -896,19 +890,13 @@ class FpaEditorDialog(Dialog):
         if self._unconfigured and checked:
             self._bootstrap_if_needed("fwd_dcc")
         if not self._unconfigured:
-            self.fpa.set_kl15_persistence(
-                persist_profiles=checked,
-                persist_powertrain=self.chk_kl15_powertrain.isChecked(),
-            )
+            self.fpa.set_kl15_persistence(persist_profiles=checked)
 
     def _on_kl15_powertrain_toggled(self, checked: bool) -> None:
         if self._unconfigured and checked:
             self._bootstrap_if_needed("fwd_dcc")
         if not self._unconfigured:
-            self.fpa.set_kl15_persistence(
-                persist_profiles=self.chk_kl15_profiles.isChecked(),
-                persist_powertrain=checked,
-            )
+            self.fpa.set_kl15_persistence(persist_powertrain=checked, original=self._orig_loaded)
 
     # ── Buttons tab state & ring helpers ──
 
@@ -999,7 +987,6 @@ class FpaEditorDialog(Dialog):
         self.chk_led_off_normal.setChecked(cfg.normal_led_off)
         self.chk_mib_popup.setChecked(cfg.mib_popup)
         self.spn_led_pwm.setValue(cfg.led_pwm)
-        self.spn_popup_timeout.setValue(cfg.popup_timeout_100ms)
         self.chk_decouple_dsg.setChecked(cfg.decouple_dsg_lever)
         self.chk_pso.setChecked(cfg.personalization_pso)
         self._sync_button_controls()
@@ -1061,6 +1048,8 @@ class FpaEditorDialog(Dialog):
         )
 
     def _commit_buttons_to_fpa(self) -> None:
+        if self.chk_knob.isChecked() and not self.fpa.has_knob:
+            self.fpa.add_4motion_knob()  # first: the button setup below keeps the knob and its switches as the car's own
         mode = str(self.cmb_btn_mode.currentData() or "none")
         preset_kc = int(self.cmb_mfl_preset.currentData() or -1)
         if preset_kc > 0:
@@ -1079,7 +1068,7 @@ class FpaEditorDialog(Dialog):
         if mode in ("mfl", "both"):
             for s in m_ring:
                 if 1 <= s <= 9 and not self.fpa.slots()[s - 1].selectable:
-                    self.fpa.set_slot_enabled(s, True, kl15_persist=self.chk_kl15_profiles.isChecked())
+                    self.fpa.set_slot_enabled(s, True)
 
         self.fpa.configure_buttons(
             mode=mode,
@@ -1090,7 +1079,6 @@ class FpaEditorDialog(Dialog):
             normal_led_off=self.chk_led_off_normal.isChecked(),
             led_pwm=self.spn_led_pwm.value(),
             mib_popup=self.chk_mib_popup.isChecked(),
-            popup_timeout_100ms=self.spn_popup_timeout.value(),
             decouple_dsg_lever=self.chk_decouple_dsg.isChecked(),
             personalization_pso=self.chk_pso.isChecked(),
         )
@@ -1122,12 +1110,9 @@ class FpaEditorDialog(Dialog):
                     self,
                     tr("Это кнопка круиз-контроля", "Cruise-control button pressed"),
                     tr(
-                        "Нажатая кнопка (например, Travel Assist, SET или RES) относится к блоку круиз-контроля "
-                        "и технически не может переключать профили вождения.\n\n"
-                        "Пожалуйста, выберите кнопку из другой группы: Голосовое управление, VIEW, Меню ассистентов или Обогрев руля.",
-                        "The pressed button (e.g. Travel Assist, SET, or RES) belongs to the cruise-control cluster "
-                        "and cannot switch driving profiles.\n\n"
-                        "Please pick Voice, VIEW, Assistants menu, or Steering Heating instead.",
+                        "Эта кнопка (Travel Assist, SET или RES) относится к круиз-контролю и переключать профили не "
+                        "может.",
+                        "This button (Travel Assist, SET or RES) belongs to cruise control and cannot switch profiles.",
                     ),
                 )
             else:
@@ -1160,7 +1145,7 @@ class FpaEditorDialog(Dialog):
 
     def _rebuild_matrix_tabs(self) -> None:
         groups = self.fpa.logical_groups()
-        act_slots = [s for s in self.fpa.slots() if s.selectable and 1 <= s.profile_id <= 15]
+        act_slots = [s for s in self.fpa.slots() if s.selectable]
 
         self.tbl_s031.setRowCount(len(groups))
         self.tbl_s031.setColumnCount(len(act_slots))
@@ -1307,7 +1292,11 @@ class FpaEditorDialog(Dialog):
         )
 
     def _on_accept(self) -> None:
-        self._commit_buttons_to_fpa()
+        try:
+            self._commit_buttons_to_fpa()
+        except ValueError as exc:  # no room for the knob: say so and stay in the dialog
+            QMessageBox.warning(self, tr("Шайба 4MOTION Active Control", "4MOTION Active Control knob"), str(exc))
+            return
         self.accept()
 
     def result_dflash(self) -> bytes:
@@ -1329,9 +1318,8 @@ class MkeEditorDialog(Dialog):
             parent,
             tr("Контроль усталости водителя (MKE)", "Driver Alert System (MKE)"),
             tr(
-                "Система оценивает характер подруливаний на трассе и предлагает сделать перерыв на кофе, "
-                "если замечает признаки усталости.",
-                "Monitors steering corrections on highway trips and suggests a coffee break when drowsiness is detected.",
+                "Система следит за подруливаниями и предлагает перерыв, если замечает признаки усталости.",
+                "The system watches steering corrections and suggests a break when it sees signs of fatigue.",
             ),
             width=660,
         )
@@ -1345,10 +1333,10 @@ class MkeEditorDialog(Dialog):
             empty_banner.label.setTextFormat(Qt.TextFormat.PlainText)
             empty_banner.label.setText(
                 tr(
-                    "Сейчас в этом дампе раздел MKE отсутствует. Ниже показаны стандартные заводские значения — "
-                    "они запишутся в дамп только если вы нажмёте «Сохранить настройки».",
-                    "MKE is currently absent in this dump. Standard factory defaults are shown below — "
-                    "they will only be written if you click “Save settings”.",
+                    "Раздела MKE в дампе нет. Ниже — заводские значения; в дамп они попадут после «Сохранить "
+                    "настройки».",
+                    "The dump has no MKE section. The factory values are shown below; they go into the dump with "
+                    "“Save settings”.",
                 )
             )
             self.body.addWidget(empty_banner)
@@ -1462,9 +1450,9 @@ class SsaEditorDialog(Dialog):
             parent,
             tr("Уведомления Старт-Стоп на магнитоле", "Start-Stop Messages on Head Unit"),
             tr(
-                "Настраивает, как автомобиль объясняет на экране магнитолы (в разделе Состояние авто), "
-                "почему двигатель не заглушился на светофоре или запустился сам.",
-                "Controls how Start-Stop status and inhibition reasons are shown on the head-unit vehicle status screen.",
+                "Как магнитола (раздел «Состояние автомобиля») показывает, почему Старт-Стоп не заглушил "
+                "двигатель или запустил его.",
+                "How the head unit (Vehicle status) shows why Start-Stop did not stop the engine or restarted it.",
             ),
             width=660,
         )
@@ -1477,10 +1465,10 @@ class SsaEditorDialog(Dialog):
             empty_banner.label.setTextFormat(Qt.TextFormat.PlainText)
             empty_banner.label.setText(
                 tr(
-                    "Сейчас в этом дампе раздел уведомлений Старт-Стоп отсутствует. Ниже показаны стандартные заводские значения — "
-                    "они запишутся в дамп только если вы нажмёте «Сохранить настройки».",
-                    "Start-Stop status messages are currently absent in this dump. Standard factory defaults are shown below — "
-                    "they will only be written if you click “Save settings”.",
+                    "Раздела уведомлений Старт-Стоп в дампе нет. Ниже — заводские значения; в дамп они попадут после "
+                    "«Сохранить настройки».",
+                    "The dump has no Start-Stop messages section. The factory values are shown below; they go into "
+                    "the dump with “Save settings”.",
                 )
             )
             self.body.addWidget(empty_banner)
@@ -1489,11 +1477,10 @@ class SsaEditorDialog(Dialog):
         note.label.setTextFormat(Qt.TextFormat.PlainText)
         note.label.setText(
             tr(
-                "Совет: здесь настраиваются только информационные подсказки на экране. "
-                "Чтобы сам Старт-Стоп и спорт-режим не сбрасывались после перезапуска двигателя, "
-                "включите память зажигания в разделе «Профили вождения и кнопки».",
-                "Tip: this dialog only controls head-unit status messages. To stop Start-Stop and Sport mode "
-                "from resetting on engine restart, enable ignition memory in “Driving Profiles & Mode Buttons”.",
+                "Здесь настраиваются только сообщения на экране. Чтобы Старт-Стоп и режим коробки не сбрасывались"
+                " после выключения зажигания, включите память в разделе «Профили вождения и кнопки».",
+                "Only the on-screen messages are set here. To keep Start-Stop and the gearbox mode after the "
+                "ignition is off, enable the memory in “Driving profiles & buttons”.",
             )
         )
         self.body.addWidget(note)
@@ -1579,10 +1566,10 @@ class BemEditorDialog(Dialog):
             parent,
             tr("Генератор 14В и умная зарядка (BEM)", "14V Alternator & Smart Charging (BEM)"),
             tr(
-                "При замене генератора на более мощный (например, 180 А или 250 А вместо 140 А) выберите его модель "
-                "из заводского каталога — шлюз будет точно рассчитывать нагрузку и рекуперацию.",
-                "When upgrading the alternator (e.g. 180 A or 250 A instead of 140 A), pick the matching model "
-                "below so the gateway calculates load and smart charging accurately.",
+                "После замены генератора (например, на 180 или 250 А вместо 140 А) выберите его модель из "
+                "заводского каталога: по ней шлюз рассчитывает нагрузку и рекуперацию.",
+                "After an alternator change (to 180 or 250 A instead of 140 A, say) pick its model from the "
+                "factory catalogue: the gateway works out load and recuperation from it.",
             ),
             width=820,
         )
@@ -1594,10 +1581,10 @@ class BemEditorDialog(Dialog):
             empty_banner.label.setTextFormat(Qt.TextFormat.PlainText)
             empty_banner.label.setText(
                 tr(
-                    "Сейчас в этом дампе каталог генераторов 14В (BEM) пуст. Ниже показан заводской набор — "
-                    "он запишется в дамп только если вы нажмёте «Сохранить настройки».",
-                    "The 14V alternator catalog (BEM) is currently empty in this dump. The factory set is shown below — "
-                    "it will only be written if you click “Save settings”.",
+                    "Каталог генераторов 14 В (BEM) в дампе пуст. Ниже — заводской набор; в дамп он попадёт после "
+                    "«Сохранить настройки».",
+                    "The dump's 14 V alternator catalogue (BEM) is empty. The factory set is shown below; it goes "
+                    "into the dump with “Save settings”.",
                 )
             )
             self.body.addWidget(empty_banner)
@@ -1756,10 +1743,10 @@ class ZdcPassportBlocksDialog(Dialog):
             parent,
             tr("Паспорт датасета и перенос разделов", "Dataset Passport & Section Transfer"),
             tr(
-                "Здесь указываются номер и версия датасета (отображаются в диагностике ODIS / Вася Диагност), "
-                "а также можно сохранить или перенести отдельные разделы параметрии из другого дампа без затрагивания ключей CP и SWaP.",
-                "Edit the dataset number & version reported to diagnostic tools, or export/transplant individual "
-                "parameterization sections from another dump without touching CP or SWaP keys.",
+                "Номер и версия датасета, которые показывают ODIS и VCDS, а также сохранение и перенос отдельных "
+                "разделов параметрии из другого дампа. Ключи CP и SWaP не затрагиваются.",
+                "The dataset number and version that ODIS and VCDS show, and saving or transferring single "
+                "dataset sections from another dump. The CP and SWaP keys are not touched.",
             ),
             width=820,
         )

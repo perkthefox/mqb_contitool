@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
+from pathlib import Path
 
 from contitool.core import KNOWN_GATEWAY_FECS, STOCK_FBL_MODULUS, STOCK_SWAP_MODULUS, check_fec_dataset_support
+from contitool.can.workflows import SWAP_STATUS_ACTIVE
+from contitool.core.analyzer import analyze_dflash_swap
 from contitool.gui.workspace import Workspace
 from contitool.i18n import tr
 
@@ -44,7 +48,7 @@ def component_protection(ws: Workspace) -> State:
             tr("заводская", "factory"),
             "ok",
             tr(
-                "Блок работает только со штатно привязанными модулями автомобиля.",
+                "Адаптированы только заводские модули автомобиля.",
                 "The gateway only works with the vehicle's factory-paired modules.",
             ),
             key="stock",
@@ -79,8 +83,8 @@ def engineering(ws: Workspace) -> State:
             tr("выключен", "off"),
             "ok",
             tr(
-                "Расширенная диагностика недоступна — заводское состояние.",
-                "Extended diagnostics unavailable — factory state.",
+                "Заводское состояние: инженерные службы выключены.",
+                "Factory state: the engineering services are off.",
             ),
             key="off",
         )
@@ -175,7 +179,7 @@ _SWAP_CHECKS = (
 
 def swap_live_state(st: int) -> State:
     """What the gateway's own status byte for one feature means; `detail` lists the failed checks."""
-    if st & 0x7F == 0x7F:
+    if st & SWAP_STATUS_ACTIVE == SWAP_STATUS_ACTIVE:  # the gateway's own test (IsFecActive)
         return State(tr("активна", "active"), "ok", key="on")
     if not st & 0x01:
         return State(tr("не активирована", "not activated"), "muted", key="off")
@@ -201,9 +205,34 @@ def swap_live_summary(features: list[dict], ws: Workspace) -> State:
     return State(text, "ok", key="on")
 
 
+def _is_profile_fec(code: int) -> bool:
+    return (code & 0xFFFFF0FF) == 0x10001000
+
+
+def _active_fecs_in(path: Path | None) -> set[int]:
+    try:
+        return set(_active_fecs_cached(str(path), path.stat().st_mtime_ns)) if path else set()
+    except OSError:
+        return set()
+
+
+@functools.lru_cache(maxsize=8)
+def _active_fecs_cached(path: str, _mtime_ns: int) -> frozenset[int]:
+    """The original dump's FeCs; read once per file version, not on every refresh of the screen."""
+    try:
+        return frozenset(f.fec_code for f in analyze_dflash_swap(Path(path).read_bytes()).active_fscs)
+    except (OSError, ValueError):
+        return frozenset()
+
+
 def unsupported_active_fecs(ws: Workspace) -> list[int]:
-    """Active FeC codes in DataFlash that are NOT supported by the currently flashed ZDC dataset."""
-    return [fec for fec, _, _, _, ds_ok in active_features_detailed(ws) if not ds_ok]
+    """Active FeCs the dataset has no data for. A driving-profile FeC counts only if it was switched on after the dump
+    was opened: a profile taken out of the menu keeps its FeC, and the gateway then simply does not offer it."""
+    rows = [fec for fec, _, _, _, ds_ok in active_features_detailed(ws) if not ds_ok]
+    if any(_is_profile_fec(c) for c in rows):
+        before = _active_fecs_in(ws.original.get("dflash"))
+        rows = [c for c in rows if not _is_profile_fec(c) or c not in before]
+    return rows
 
 
 def dataset_state(ws: Workspace) -> State:
@@ -240,8 +269,8 @@ def parameterization(ws: Workspace) -> State:
             tr("пусто", "empty"),
             "warn",
             tr(
-                "В этом дампе ещё не настроена параметрия — вы можете создать её с нуля по готовому шаблону автомобиля.",
-                "No parameterization is stored in this dump yet — you can create one from a ready-made vehicle template.",
+                "Параметрия в этом дампе не настроена. Её можно создать по шаблону автомобиля.",
+                "This dump has no parameterization yet. It can be created from a car template.",
             ),
             key="off",
         )
@@ -251,8 +280,9 @@ def parameterization(ws: Workspace) -> State:
             tr("нужна настройка", "needs setup"),
             "warn",
             tr(
-                f"Часть включённых функций SWaP ({len(unsup)}) ещё не добавлена в параметрию — нажмите кнопку ниже для автоматической настройки.",
-                f"{len(unsup)} enabled SWaP feature(s) are missing from the parameterization — click below to configure automatically.",
+                f"Для части включённых FEC ({len(unsup)}) в параметрии нет данных. Кнопка ниже их добавит.",
+                f"The parameterization has no data for some enabled FECs ({len(unsup)}). The button below adds "
+                "them.",
             ),
             key="warn",
         )
@@ -298,8 +328,10 @@ def passport_rows(ws: Workspace) -> list[tuple[str, str, str]]:
     cf = ws.info("cflash")
     if cf and cf.cflash_info:
         c = cf.cflash_info
+        if c.sw_ver:
+            rows.append((tr("Версия ПО", "Software"), c.sw_ver, "muted"))
         if c.hw_ver:
-            rows.append((tr("Версия ПО", "Software"), c.hw_ver, "muted"))
+            rows.append((tr("Оборудование", "Hardware"), c.hw_ver, "muted"))
         rows.append(
             (
                 tr("Контрольная сумма", "Checksum"),

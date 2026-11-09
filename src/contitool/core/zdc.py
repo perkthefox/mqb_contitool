@@ -772,7 +772,7 @@ class FpaButtonConfig:
     popup_timeout_100ms: int     # S020[0] (0 = HMI default)
     decouple_dsg_lever: bool     # S034 != 0
     personalization_pso: bool    # (S013 & 0x04) != 0
-    has_4motion_rotary: bool     # a vehicle mode input ContiTool keeps as it is: 0x04 rotary or 0x05 MODE button
+    has_4motion_rotary: bool     # a 4Motion input of the car's own (source 4 or 5), kept as it is
     vehicle_mode_button: bool = False  # S036 0x05: the car's own MODE button (4Motion: on-road and off-road rings)
 
 
@@ -788,6 +788,7 @@ class FpaDataset:
         if len(raw_4352) != 4352:
             raise ValueError(f"Expected 4352-byte ZDC #4 block, got {len(raw_4352)} B")
         self.buf = bytearray(raw_4352)
+        self._parked_ids: dict[int, int] = {}  # slot -> the ID it had before it was switched off
 
     @classmethod
     def from_dflash(cls, df: bytes) -> FpaDataset:
@@ -848,6 +849,13 @@ class FpaDataset:
         self.set_sec_u16_be(30, [mask & 0xFFFF])
 
     @property
+    def menu_mask(self) -> int:
+        """Slots the gateway offers the head unit (bit = slot): S028[slot] holds an ID 1..0x13. The slot's FeC must be
+        active as well — that lives in the SWaP area, not here (firmware 5388/5504, FSG-Setup builder)."""
+        s028 = self.sec_bytes(28)
+        return sum(1 << s for s in range(1, 13) if 1 <= s028[s] <= 0x13)
+
+    @property
     def swap_gated_mask(self) -> int:
         return self.sec_u16_be(70)[0]
 
@@ -863,12 +871,13 @@ class FpaDataset:
         s028 = self.sec_bytes(28)
         if s028[2] == 0x14:
             return True
-        active_std = [s for s in range(1, 10) if 1 <= s028[s] <= 15 and (self.selectable_mask & (1 << s))]
+        active_std = [s for s in range(1, 10) if 1 <= s028[s] <= 0x13]
         return len(active_std) <= 1
 
     @property
     def has_4motion_rotary(self) -> bool:
-        """4Motion mode inputs of the car's own: the rotary (0x04) or a MODE button with an off-road ring (0x05)."""
+        """The car's own 4Motion inputs, kept as they are: source 4 (BCM_01 bit 21, the Offroad button of the Tiguan
+        dataset NC00) or source 5 (LIN frame 0x0B, a MODE button with an off-road ring). Firmware 5388/5504."""
         if self.empty:
             return False
         s036 = self.sec_bytes(36)
@@ -879,8 +888,8 @@ class FpaDataset:
         if self.empty:
             return "fwd_dcc"
         s028 = self.sec_bytes(28)
-        s030 = self.selectable_mask
-        if s028[2] == 0x14 or sum(1 for s in range(1, 10) if 1 <= s028[s] <= 15 and (s030 & (1 << s))) <= 1:
+        s030 = self.menu_mask
+        if s028[2] == 0x14 or sum(1 for s in range(1, 10) if s030 & (1 << s)) <= 1:
             return "fwd_dcc"
         is_awd = (
             self.has_4motion_rotary
@@ -898,23 +907,23 @@ class FpaDataset:
         if self.empty:
             return ("не настроена (раздел пуст)", "not configured (empty)")
         s028 = self.sec_bytes(28)
-        s030 = self.selectable_mask
-        if s028[2] == 0x14 or sum(1 for s in range(1, 10) if 1 <= s028[s] <= 15 and (s030 & (1 << s))) <= 1:
-            return ("базовый шлюз без выбора профилей (только Normal)", "passive base without selectable profiles")
-        labels = {
-            "fwd": ("Передний привод (обычная подвеска)", "Front-wheel drive (standard suspension)"),
-            "fwd_dcc": ("Передний привод + адаптивная подвеска DCC", "Front-wheel drive + adaptive DCC"),
-            "awd": ("Полный привод 4Motion (обычная подвеска)", "4Motion AWD (standard suspension)"),
-            "awd_dcc": ("Полный привод 4Motion + адаптивная подвеска DCC", "4Motion AWD + adaptive DCC"),
-        }
-        return labels[self.detected_preset()]
+        s030 = self.menu_mask
+        if s028[2] == 0x14 or sum(1 for s in range(1, 10) if s030 & (1 << s)) <= 1:
+            return ("базовый датасет без профилей движения", "base dataset without driving profiles")
+        ru, en = {
+            "fwd": ("передний привод, обычная подвеска", "front-wheel drive, standard suspension"),
+            "fwd_dcc": ("передний привод, DCC", "front-wheel drive, DCC"),
+            "awd": ("4Motion, обычная подвеска", "4Motion, standard suspension"),
+            "awd_dcc": ("4Motion, DCC", "4Motion, DCC"),
+        }[self.detected_preset()]
+        # a guess from the profiles the dataset holds: it describes the dataset, not the car
+        return (ru, en)
 
     def slots(self) -> list[FpaSlotState]:
         if self.empty:
             return []
         s028 = self.sec_bytes(28)
         s029 = self.sec_bytes(29)
-        s030 = self.selectable_mask
         s070 = self.swap_gated_mask
         s071 = self.sec_bytes(71)
         s074 = self.sec_u16_be(74)
@@ -929,7 +938,7 @@ class FpaDataset:
                     profile_id=pid,
                     name_ru=name_ru,
                     name_en=name_en,
-                    selectable=bool(s030 & (1 << slot)),
+                    selectable=1 <= pid <= 0x13,  # in the head unit's menu (given the slot's FeC)
                     swap_gated=bool(s070 & (1 << slot)),
                     kl15_next_slot=s029[slot - 1],
                     kombi_icon=s071[slot],
@@ -947,10 +956,9 @@ class FpaDataset:
             return False
         s028 = self.sec_bytes(28)
         s029 = self.sec_bytes(29)
-        s030 = self.selectable_mask
         checked = 0
         for slot in range(1, 10):
-            if 1 <= s028[slot] <= 15 and (s030 & (1 << slot)):
+            if 1 <= s028[slot] <= 0x13:
                 checked += 1
                 if s029[slot - 1] != slot:
                     return False
@@ -986,20 +994,24 @@ class FpaDataset:
         *,
         persist_profiles: bool | None = None,
         persist_powertrain: bool | None = None,
+        original: FpaDataset | None = None,
     ) -> None:
-        """Configure Level-1 (`S029`/`S201`/`S154`) and Level-2 (`S075` powertrain nibble) Kl.15 retention."""
+        """`persist_profiles`: the profile after ignition on (S029/S201/S154). `persist_powertrain`: S075 for the
+        powertrain and Start-Stop groups. S075 is the per-group filter of the modes a system is passed (firmware
+        5388/5504, FUN_bba70; anything else becomes 0, "no request"). True passes every mode; False puts back the
+        cells `original` has (the dataset as loaded) and changes nothing without it — never a fixed value, which
+        would make Sport/Eco/Offroad request Normal from the engine and gearbox."""
         if self.empty:
             return
         if persist_profiles is not None:
             s028 = self.sec_bytes(28)
             s029 = self.sec_bytes(29)
             s201 = self.sec_bytes(201)
-            s030 = self.selectable_mask
             for slot in range(1, 13):
                 pid = s028[slot]
-                if pid == 0 and not (s030 & (1 << slot)):
+                if pid == 0:
                     continue
-                if 1 <= pid <= 15:
+                if 1 <= pid <= 0x13:
                     if persist_profiles:
                         s029[slot - 1] = slot
                         s201[slot] = 0x00
@@ -1018,9 +1030,24 @@ class FpaDataset:
         if persist_powertrain is not None:
             s032 = self.sec_bytes(32)
             for i, fg in enumerate(s032):
-                if fg in POWERTRAIN_KL15_SG_IDS:
+                if fg not in POWERTRAIN_KL15_SG_IDS:
+                    continue
+                if persist_powertrain:
                     for v in range(1, 16):
-                        self.set_s075_nibble(v, i, v if persist_powertrain else 2)
+                        self.set_s075_nibble(v, i, v)
+                    continue
+                src = _s075_filter_for(fg, original)
+                if src is not None:
+                    for v in range(1, 16):
+                        self.set_s075_nibble(v, i, src[v])
+
+    def s075_filter(self, group_id: int) -> list[int] | None:
+        """Mode -> value passed for logical group `group_id` (S075), or None when the dataset has no such group."""
+        if self.empty or not self.crc_ok:
+            return None
+        s032 = self.sec_bytes(32)
+        i = next((n for n, g in enumerate(s032) if g == group_id), None)
+        return None if i is None else [self.get_s075_nibble(v, i) for v in range(16)]
 
     def set_slot_kl15_next(self, slot: int, next_slot: int) -> None:
         if not (1 <= slot <= 12):
@@ -1031,6 +1058,28 @@ class FpaDataset:
 
     # ── Active Profiles Manager & Target Matrix (`S031`) / Individual (`S033`) ──
 
+    def _copy_reference_row(self, slot: int, pid: int) -> bool:
+        """Fill `slot`'s S031/S033 rows from a factory dataset that has profile `pid` (OZ00 for Snow 0x0A and Offroad
+        Individual 0x0B, NC00 for Offroad 0x04), mapped onto this car's groups by group ID. False when none has it."""
+        for key in ("FPA_OZ00_4MOTION_AC", "FPA_NC00_AWD_DCC"):
+            ref = FpaDataset(get_zdc_template_bytes(key))
+            r028 = ref.sec_bytes(28)
+            src = next((s for s in range(1, 13) if r028[s] == pid and any(ref.sec_bytes(31)[s * 30 : s * 30 + 30])), None)
+            if src is None or pid not in (0x04, 0x0A, 0x0B):
+                continue
+            s031, s033 = self.sec_bytes(31), self.sec_u16_be(33)
+            r031, r032, r033 = ref.sec_bytes(31), ref.sec_bytes(32), ref.sec_u16_be(33)
+            for j, gid in enumerate(self.sec_bytes(32)):
+                if not gid:
+                    continue
+                i = next((n for n, g in enumerate(r032) if g == gid), None)
+                s031[slot * 30 + j] = r031[src * 30 + i] if i is not None else 0x02
+                s033[(slot - 1) * 30 + j] = r033[(src - 1) * 30 + i] if i is not None else 1 << 2
+            self.set_sec_bytes(31, s031)
+            self.set_sec_u16_be(33, s033)
+            return True
+        return False
+
     def _populate_default_slot_targets(self, slot: int, pid: int) -> None:
         """If `slot`'s row in `S031` / `S033` is completely zero, synthesize valid target requests."""
         s031 = self.sec_bytes(31)
@@ -1040,10 +1089,12 @@ class FpaDataset:
         if any(s031[row_slice]):
             return
 
+        if self._copy_reference_row(slot, pid):
+            return
         # Choose closest donor row already present in this dataset (e.g. Sport=3 for Race=6, Normal=2 otherwise)
         donor_slot = 3 if pid in (3, 6) and any(s031[3 * 30 : 4 * 30]) else 2
         donor_targets = list(s031[donor_slot * 30 : (donor_slot + 1) * 30])
-        indiv_slot = self.buf[FPA_SEC_OFFS[15]] or 7
+        indiv_slot = self._individual_slot()
         indiv_masks = s033[(indiv_slot - 1) * 30 : indiv_slot * 30] if 1 <= indiv_slot <= 12 else [0] * 30
 
         for lidx, fg in enumerate(s032):
@@ -1078,10 +1129,15 @@ class FpaDataset:
         enabled: bool,
         *,
         profile_id: int | None = None,
-        swap_gated: bool | None = None,
         kl15_persist: bool | None = None,
     ) -> None:
-        """Enable or disable FPA profile `slot` (`1..12`), keeping `S028/S029/S030/S070/S071/S073/S074` consistent."""
+        """Put profile `slot` (1..12) into the head unit's menu or take it out.
+
+        The gateway offers a slot when S028[slot] holds an ID 1..0x13 and the slot's FeC is active (firmware 5388/5504,
+        FSG-Setup builder). Off clears S028[slot] only, so switching the slot on again brings back everything it had;
+        on fills S029/S071/S074 and the S031/S033 rows only where they are empty. S030 marks the slots remembered as
+        the user's last profile: set with the slot, as factory datasets have it. S070 (cluster notification triggers)
+        is never touched; S073 gets its factory routing [1, 2] only when it is empty."""
         if not (1 <= slot <= 12):
             raise ValueError(f"FPA slot must be 1..12, got {slot}")
         def_pid, _fec, def_icon, def_flg, _, _ = FPA_SLOT_DEFAULTS[slot]
@@ -1090,22 +1146,13 @@ class FpaDataset:
         s071 = self.sec_bytes(71)
         s073 = self.sec_bytes(73)
         s074 = self.sec_u16_be(74)
-        s030 = self.selectable_mask | 0x0001  # Bit 0 master init bit
-        s070 = self.swap_gated_mask
+        s030 = self.selectable_mask | 0x0001  # bit 0 is set in every factory dataset
 
         if enabled:
-            pid = profile_id if profile_id is not None else (s028[slot] if s028[slot] not in (0, 0x14) else def_pid)
+            parked = self._parked_ids.pop(slot, 0)
+            pid = profile_id if profile_id is not None else (s028[slot] if s028[slot] not in (0, 0x14) else (parked or def_pid))
             s028[slot] = pid & 0xFF
             s030 |= 1 << slot
-            if swap_gated is None:
-                # Slots 1,2,3,5,6 are typically SWaP-gated when enabled via FeC; keep Normal/Comfort/Sport/Eco/Race gated
-                gate = slot in (1, 2, 3, 5, 6) if s070 else True
-            else:
-                gate = swap_gated
-            if gate:
-                s070 |= 1 << slot
-            else:
-                s070 &= ~(1 << slot)
             if s071[slot] == 0:
                 s071[slot] = def_icon
             if s074[slot] == 0:
@@ -1120,16 +1167,19 @@ class FpaDataset:
                 s029[slot - 1] = slot if self.all_active_profiles_persist_kl15 else (7 if pid == 7 else 2)
             self._populate_default_slot_targets(slot, pid)
         else:
+            if slot in self._vehicle_ring_slots():
+                raise ValueError(tr(
+                    f"Слот {slot} — положение шайбы или кнопки самой машины; без него это положение перестанет работать",
+                    f"Slot {slot} is a position of the car's own knob or button; without it that position stops working",
+                ))
+            if s028[slot]:
+                self._parked_ids[slot] = s028[slot]
+            s028[slot] = 0
             s030 &= ~(1 << slot)
-            s070 &= ~(1 << slot)
-            if profile_id == 0:
-                s028[slot] = 0
-                s029[slot - 1] = 0xFF
 
         self.set_sec_bytes(28, s028)
         self.set_sec_bytes(29, s029)
         self.selectable_mask = s030
-        self.swap_gated_mask = s070
         self.set_sec_bytes(71, s071)
         self.set_sec_bytes(73, s073)
         self.set_sec_u16_be(74, s074)
@@ -1208,15 +1258,11 @@ class FpaDataset:
         self.buf[sl.start + slot * 30 + log_idx] = max(0, min(15, int(mode)))
 
     def get_individual_mask(self, log_idx: int) -> int:
-        indiv_slot = self.buf[FPA_SEC_OFFS[15]] or 7
-        if not (1 <= indiv_slot <= 12):
-            indiv_slot = 7
+        indiv_slot = self._individual_slot()
         return self.sec_u16_be(33)[(indiv_slot - 1) * 30 + log_idx]
 
     def set_individual_mask(self, log_idx: int, mask: int) -> None:
-        indiv_slot = self.buf[FPA_SEC_OFFS[15]] or 7
-        if not (1 <= indiv_slot <= 12):
-            indiv_slot = 7
+        indiv_slot = self._individual_slot()
         s033 = self.sec_u16_be(33)
         s033[(indiv_slot - 1) * 30 + log_idx] = mask & 0xFFFF
         self.set_sec_u16_be(33, s033)
@@ -1228,11 +1274,112 @@ class FpaDataset:
         if self.empty:
             return [2]
         s028 = self.sec_bytes(28)
-        s030 = self.selectable_mask
         order = (5, 1, 2, 3, 6, 7, 4, 8, 9)
         theirs = {slot for sw in self._vehicle_switches() for slot in self._read_switch_ring(sw)}
-        ring = [s for s in order if 1 <= s028[s] <= 15 and (s030 & (1 << s)) and s not in theirs]
+        ring = [s for s in order if 1 <= s028[s] <= 0x13 and s not in theirs]
         return ring[:8] if ring else [2]
+
+    def _individual_slot(self) -> int:
+        """The slot holding Individual (ID 7). S015 is the number of personalisation users, not this slot."""
+        s028 = self.sec_bytes(28)
+        return next((s for s in range(1, 13) if s028[s] == 0x07), 7)
+
+    @property
+    def has_knob(self) -> bool:
+        """A positional input (S037 type 4): the 4MOTION Active Control knob, read from LIN frame 0x0B bits 0..3."""
+        s036, s037 = self.sec_bytes(36), self.sec_bytes(37)
+        return any(s036[i] and s037[i] == 0x04 for i in range(5))
+
+    def add_4motion_knob(self) -> None:
+        """Add the 4MOTION Active Control knob the way the factory dataset of a 2019 Tiguan with it (OZ00) has it.
+
+        OZ00 together with the firmware (5388/5504): one positional input (S036 5, S037 type 4: LIN frame 0x0B bits
+        0..3) on its own switch, ring [slot 8 Snow, the on-road profile of the menu switch (0xE7 + its index), slot 4
+        Offroad, slot 9 Offroad Individual], start position 1 (on-road), S045 0x06 told to the head unit. The on-road
+        profiles live on a switch without an input that the head unit drives (S045 0xFA, ring Eco, Comfort, Normal,
+        Sport, Individual as configured, start at Normal). The knob replaces the console MODE button, so ContiTool's
+        own console input goes; wheel buttons stay. Slots 4, 8 and 9 take OZ00's settings mapped onto this car's
+        systems by group ID where they are empty; FeCs 10001400, 10001800 and 10001900 license them. Raises
+        ValueError when slot 8 or 9 holds another profile or there is no free input or two free switches."""
+        if self.has_knob:
+            return
+        if self.empty or not self.menu_mask & 0x3FE:  # no profile in slots 1..9 (the CRC is stale while editing)
+            raise ValueError(tr("Сначала настройте профили движения — в датасете их нет",
+                                "Set up the driving profiles first — the dataset has none"))
+        snapshot = bytes(self.buf)
+        try:
+            self._add_4motion_knob()
+        except ValueError:
+            self.buf[:] = snapshot  # nothing half-done stays behind
+            raise
+
+    def _add_4motion_knob(self) -> None:
+        oz = FpaDataset(get_zdc_template_bytes("FPA_OZ00_4MOTION_AC"))
+        s028 = self.sec_bytes(28)
+        if s028[8] not in (0, 0x0A) or s028[9] not in (0, 0x0B):
+            raise ValueError(tr("Слоты 8 и 9 заняты другими профилями — шайбе нужны Snow и Offroad Individual",
+                                "Slots 8 and 9 hold other profiles — the knob needs Snow and Offroad Individual"))
+        # 1. the knob's profiles: slots 4, 8, 9 as OZ00 has them, per group of this car
+        g_self, g_oz = self.sec_bytes(32), oz.sec_bytes(32)
+        s029, s031, s071, s074, s033 = (self.sec_bytes(29), self.sec_bytes(31), self.sec_bytes(71),
+                                        self.sec_u16_be(74), self.sec_u16_be(33))
+        o029, o031, o071, o074, o033 = oz.sec_bytes(29), oz.sec_bytes(31), oz.sec_bytes(71), oz.sec_u16_be(74), oz.sec_u16_be(33)
+        for slot in (4, 8, 9):
+            if s028[slot]:
+                continue
+            s028[slot], s029[slot - 1], s071[slot], s074[slot] = oz.sec_bytes(28)[slot], o029[slot - 1], o071[slot], o074[slot]
+            for j, gid in enumerate(g_self):
+                if not gid:
+                    continue
+                i = next((n for n, g in enumerate(g_oz) if g == gid), None)
+                s031[slot * 30 + j] = o031[slot * 30 + i] if i is not None else 0x02
+                s033[(slot - 1) * 30 + j] = o033[(slot - 1) * 30 + i] if i is not None else 1 << 2
+        self.set_sec_bytes(28, s028)
+        self.set_sec_bytes(29, s029)
+        self.set_sec_bytes(31, s031)
+        self.set_sec_u16_be(33, s033)
+        self.set_sec_bytes(71, s071)
+        self.set_sec_u16_be(74, s074)
+        # 2. the knob replaces ContiTool's console MODE button
+        s036, s037, s038, s039, s040 = (self.sec_bytes(i) for i in (36, 37, 38, 39, 40))
+        s042, s043, s045, s044 = self.sec_bytes(42), self.sec_bytes(43), self.sec_bytes(45), self.sec_u16_be(44)
+        for i in range(5):
+            if s036[i] == _OWN_CONSOLE:
+                sw = s040[i]
+                s036[i] = s037[i] = s038[i] = s039[i] = 0x00
+                s040[i] = 0xFF
+                if sw < 4:
+                    s042[sw], s043[sw], s044[sw], s045[sw] = 0x00, 0xFF, 0x0000, 0x00
+                    self._write_switch_ring(sw, [])
+        taken = {s040[i] for i in range(5) if s036[i] and s040[i] < 4}
+        taken |= {sw for sw in range(4) if self._read_switch_ring(sw) or s042[sw] or s043[sw] != 0xFF or s045[sw]}
+        free_in = [i for i in range(5) if s036[i] == 0]
+        free_sw = [sw for sw in range(4) if sw not in taken]
+        if not free_in or len(free_sw) < 2:
+            raise ValueError(tr("Нет свободного входа или двух свободных переключателей для шайбы",
+                                "No free input or two free switches for the knob"))
+        k, sw_knob, sw_menu = free_in[0], free_sw[0], free_sw[1]
+        o036, o037, o038, o039, o040 = (oz.sec_bytes(i) for i in (36, 37, 38, 39, 40))
+        o042, o043, o045, o044 = oz.sec_bytes(42), oz.sec_bytes(43), oz.sec_bytes(45), oz.sec_u16_be(44)
+        src = next(i for i in range(5) if o037[i] == 0x04)
+        oz_knob, oz_menu = o040[src], next(sw for sw in range(4) if o045[sw] == 0xFA)
+        s036[k], s037[k], s038[k], s039[k], s040[k] = o036[src], o037[src], o038[src], o039[src], sw_knob
+        for src_sw, dst in ((oz_knob, sw_knob), (oz_menu, sw_menu)):
+            s042[dst], s043[dst], s044[dst], s045[dst] = o042[src_sw], o043[src_sw], o044[src_sw], o045[src_sw]
+        for i, data in ((36, s036), (37, s037), (38, s038), (39, s039), (40, s040), (42, s042), (43, s043), (45, s045)):
+            self.set_sec_bytes(i, data)
+        self.set_sec_u16_be(44, s044)
+        menu_ring = [s for s in oz._read_switch_ring(oz_menu) if 1 <= self.sec_bytes(28)[s] <= 0x13]
+        self._write_switch_ring(sw_menu, menu_ring)
+        if 2 in menu_ring:
+            s042[sw_menu] = menu_ring.index(2)  # start at Normal, as OZ00 does
+            self.set_sec_bytes(42, s042)
+        ref = 0xE7 + oz_menu  # OZ00's reference to its menu switch, moved to ours
+        self._write_switch_ring(sw_knob, [0xE7 + sw_menu if v == ref else v for v in oz._read_switch_ring(oz_knob)])
+
+    def _vehicle_ring_slots(self) -> set[int]:
+        """Slots reached through the car's own inputs (knob, a 0x05 MODE button, the Offroad button)."""
+        return {v for sw in self._vehicle_switches() for v in self._read_switch_ring(sw) if 1 <= v <= 12}
 
     def _own_inputs(self) -> list[int]:
         s036 = self.sec_bytes(36)
@@ -1510,7 +1657,7 @@ def apply_fpa_dataset(
     out = bytearray(df)
     out[0x1340:0x2440] = sealed
     crc_val, = struct.unpack_from("<I", sealed, 0x10FC)
-    active_names = [s.name for s in fpa.slots() if s.selectable and 1 <= s.profile_id <= 15]
+    active_names = [s.name for s in fpa.slots() if s.selectable]
     reporter.info(
         tr(
             f"Записан датасет FPA [{fpa.schema_tag}] (CRC-32=0x{crc_val:08X}, профилей: {len(active_names)})",
@@ -1671,16 +1818,35 @@ def analyze_gateway_coding_consistency(
     return GatewayCodingReport(master_gates=gates, paco_ecus=paco_list, warnings=warnings)
 
 
+def _passes_everything(row: list[int]) -> bool:
+    return all(row[v] == v for v in range(1, 16))
+
+
+def _s075_filter_for(group_id: int, original: FpaDataset | None) -> list[int] | None:
+    """The filter to put back for `group_id`: the loaded dataset's own when it is a real filter; when that one already
+    passes every mode (an older ContiTool's option), the factory one of the reference datasets (PC00 and NC00 match
+    the Golf JD00 for the powertrain and Start-Stop groups). Nothing without the loaded dataset."""
+    if original is None:
+        return None
+    own = original.s075_filter(group_id)
+    if own is not None and not _passes_everything(own):
+        return own
+    for key in ("FPA_PC00_FWD_DCC", "FPA_NC00_AWD_DCC", "FPA_OZ00_4MOTION_AC"):
+        ref = FpaDataset(get_zdc_template_bytes(key)).s075_filter(group_id)
+        if ref is not None and not _passes_everything(ref):
+            return ref
+    return None
+
+
 def fecs_required_by_dataset(df: bytes) -> list[int]:
     """SWaP features the datasets in `df` rely on: MKE (0x10000300) when ZDC #1 holds a dataset, and the feature code of
-    every selectable FPA profile (slots 1..9) the dataset gates behind SWaP (S070) — the same pairing
-    parameterize_dflash_for_fecs makes when it enables a profile for a feature."""
+    every FPA profile in the menu (slots 1..9): the gateway offers a slot to the head unit only with its FeC active."""
     out: list[int] = []
     if check_fec_dataset_support(df, 0x10000300).supported:
         out.append(0x10000300)
     fpa = FpaDataset.from_dflash(df)
     if fpa.crc_ok and not fpa.is_passive_base:
-        out += [s.fec_code for s in fpa.slots() if 1 <= s.slot <= 9 and s.selectable and s.swap_gated and s.fec_code]
+        out += [s.fec_code for s in fpa.slots() if 1 <= s.slot <= 9 and s.selectable and s.fec_code]
     return out
 
 
@@ -1976,7 +2142,7 @@ def parameterize_dflash_for_fecs(
                 slot = (fec_code - 0x10001000) >> 8
                 if 1 <= slot <= 9:
                     s028_val = fpa.sec_bytes(28)[slot]
-                    if not (1 <= s028_val <= 15 and bool(fpa.selectable_mask & (1 << slot))):
+                    if not 1 <= s028_val <= 0x13:
                         fpa.set_slot_enabled(slot, True)
                 elif slot in (10, 11):
                     inst1_slot = slot - 9

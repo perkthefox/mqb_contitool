@@ -45,12 +45,12 @@ class CpBindDialog(Dialog):
     def __init__(self, slots: list[SlotState], parent: QWidget | None = None) -> None:
         super().__init__(
             parent,
-            tr("Привязать модуль", "Bind a module"),
+            tr("Адаптация модулей", "Module adaptation"),
             tr(
-                "Отметьте блоки, которые нужно привязать к этому шлюзу, и укажите их ключ IKA. "
-                "Заводские блоки продолжат работать как прежде.",
-                "Tick the ECUs to bind to this gateway and enter their IKA key. "
-                "Factory ECUs keep working as before.",
+                "Отметьте модули, которые нужно адаптировать к этому шлюзу, и укажите ключ IKA каждого — его нужно "
+                "знать заранее (из дампа модуля) или сгенерировать и записать в модуль. Заводские модули не меняются.",
+                "Tick the modules to adapt to this gateway and enter each one's IKA key — known in advance (from the "
+                "module's dump) or generated and written into the module. The factory modules do not change.",
             ),
             width=760,
         )
@@ -60,7 +60,7 @@ class CpBindDialog(Dialog):
         states = {st.spec.slot: st for st in slots}
 
         # 1. ECUs
-        self.body.addWidget(group_label(tr("1. БЛОКИ", "1. ECUs")))
+        self.body.addWidget(group_label(tr("1. МОДУЛИ", "1. ECUs")))
         self.tbl = QTableWidget(len(SLAVE_SLOTS), 3)
         self.tbl.setHorizontalHeaderLabels([tr("Адрес", "Addr"), tr("Блок", "ECU"), tr("Сейчас в банке", "Bank now")])
         self.tbl.verticalHeader().setVisible(False)
@@ -106,7 +106,7 @@ class CpBindDialog(Dialog):
         btn_gen = button(tr("Сгенерировать", "Generate"), slot=self._generate)
         btn_gen.setToolTip(
             tr(
-                "Случайный ключ: тот же ключ нужно записать в слот IKA привязываемого блока.",
+                "Случайный ключ: тот же ключ нужно записать в слот IKA адаптируемого модуля.",
                 "Random key: the same key must be written into the IKA slot of the bound ECU.",
             )
         )
@@ -123,7 +123,7 @@ class CpBindDialog(Dialog):
         self.body.addWidget(
             hint(
                 tr(
-                    "16 байт (32 hex-символа). Это открытый ключ из слота IKA привязываемого блока — "
+                    "16 байт (32 hex-символа). Это открытый ключ из слота IKA адаптируемого модуля — "
                     "из его дампа или сгенерированный и записанный в оба блока.",
                     "16 bytes (32 hex characters). The plaintext key from the bound ECU's IKA slot — "
                     "read from its dump, or generated and written into both ECUs.",
@@ -159,7 +159,7 @@ class CpBindDialog(Dialog):
         self.btn_clear.setToolTip(
             tr("Вернуть отмеченные банки в заводское состояние FF..FF", "Return the ticked banks to factory FF..FF")
         )
-        self.btn_ok = button(tr("Привязать", "Bind"), "PrimaryBtn", slot=self._bind)
+        self.btn_ok = button(tr("Адаптировать", "Adapt"), "PrimaryBtn", slot=self._bind)
         self.finish(self.btn_clear, ok=self.btn_ok)
         self._sync()
 
@@ -206,7 +206,7 @@ class CpBindDialog(Dialog):
         key, allowed = self._parsed_key()
         self.btn_ok.setEnabled(bool(banks) and key is not None and allowed)
         self.btn_ok.setText(
-            tr(f"Привязать ({len(banks)})", f"Bind ({len(banks)})") if banks else tr("Привязать", "Bind")
+            tr(f"Адаптировать ({len(banks)})", f"Adapt ({len(banks)})") if banks else tr("Адаптировать", "Adapt")
         )
         self.btn_clear.setEnabled(bool(banks))
 

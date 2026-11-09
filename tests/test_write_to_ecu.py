@@ -102,6 +102,88 @@ def test_coding_follows_codeflash_when_both_are_written(synth_cflash, synth_dfla
     win.close()
 
 
+@pytest.mark.parametrize(("at", "datasets"), [(0x1400, True), (0xC100, False), (0x0010, False), ("erase_mke", False)])
+def test_a_datasets_only_edit_is_written_as_datasets_over_uds(
+    at: int, datasets: bool, synth_cflash, synth_dflash, tmp_path: Path, monkeypatch
+) -> None:
+    """Edits inside the ZDC area (0x0000..0x303F) go in the standard way, over UDS; anything else through the
+    RAM-Loader with “Write to ECU”."""
+    from contitool.gui.app import create_window
+    from contitool.gui.screens import ecu
+
+    set_lang("en")
+    app, win = create_window()
+    folder = tmp_path / "dumps"
+    folder.mkdir()
+    original = bytearray(synth_dflash)
+    original[0x0100:0x0200] = b"\x11" * 0x100  # an MKE dataset to erase
+    synth_dflash = bytes(original)
+    for name, raw in (("Cflash.bin", synth_cflash), ("Dflash.bin", synth_dflash)):
+        (folder / name).write_bytes(raw)
+    win.open_folder(str(folder))
+    edited = bytearray(synth_dflash)
+    if at == "erase_mke":  # an erased block: the UDS upload would skip it, so it is a RAM-Loader write
+        edited[0x0100:0x0200] = b"\xff" * 0x100
+    else:  # 0x0010: the passport, not a dataset block
+        edited[at] ^= 0xFF
+    (tmp_path / "dflash_edit.bin").write_bytes(edited)
+    win.ws.commit("dflash", tmp_path / "dflash_edit.bin")
+    app.processEvents()
+    scr = win.ecu_screen
+    routed: list[str] = []
+    monkeypatch.setattr(ecu.EcuScreen, "_upload_zdc_over_can", lambda self: routed.append("uds"))
+    monkeypatch.setattr(ecu.EcuScreen, "_write_to_ecu", lambda self: routed.append("ram-loader"))
+    assert scr._dataset_only_edit() is datasets
+    assert scr.btn_write.text() == ("Write datasets over CAN…" if datasets else "Write to ECU")
+    scr._write_pending()
+    assert routed == ["uds" if datasets else "ram-loader"]
+    win.close()
+
+
+@pytest.mark.parametrize("have_read", [True, False])
+def test_a_dataflash_write_reads_the_rest_only_for_a_gateway_never_read(
+    have_read: bool, synth_cflash, synth_dflash, tmp_path: Path, monkeypatch
+) -> None:
+    """The area being written is always read first; CodeFlash and the bootloader only when no complete read of this
+    gateway is on disk yet."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from contitool import storage
+    from contitool.gui.app import create_window
+    from contitool.gui.screens import ecu
+
+    set_lang("en")
+    app, win = create_window()
+    folder = tmp_path / "dumps"
+    folder.mkdir()
+    for name, raw in (("Cflash.bin", synth_cflash), ("Dflash.bin", synth_dflash)):
+        (folder / name).write_bytes(raw)
+    win.open_folder(str(folder))
+    edited = bytearray(synth_dflash)
+    edited[0x1400] ^= 0xFF
+    (tmp_path / "dflash_edit.bin").write_bytes(edited)
+    win.ws.commit("dflash", tmp_path / "dflash_edit.bin")
+    app.processEvents()
+
+    win.conn.out_dir = tmp_path / "runs"
+    if have_read:
+        base = win.conn.out_dir / storage.unit_of_cflash(synth_cflash) / "dumps" / "base_read"
+        base.mkdir(parents=True)
+        for name, size in storage.AREA_SIZES.items():
+            (base / name).write_bytes(bytes(size))
+    seen: dict[str, bool] = {}
+    monkeypatch.setattr(ecu, "ensure_ready", lambda *_a: True)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(ecu, "can_write_dflash", lambda *a, **k: seen.update(skip=k["skip_full_backup"]) or {})
+    win.ecu_screen._write_to_ecu()
+    loop = QEventLoop()
+    win.runner.operation_finished.connect(lambda *_: loop.quit())
+    QTimer.singleShot(8000, loop.quit)
+    loop.exec()
+    assert seen == {"skip": have_read}
+    win.close()
+
+
 @pytest.mark.parametrize(
     ("at", "value", "ok"),
     [

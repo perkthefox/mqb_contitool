@@ -89,6 +89,17 @@ def test_uflash_roundtrip_and_truncated_dflash_guard(synth_uflash: bytes, tmp_pa
     assert not det.valid
     assert det.kind == "truncated_dflash"
 
+    # another bootloader build (no RSA check where ours have it) is still a bootloader, and it cannot be patched
+    other_fbl = bytearray(synth_uflash)
+    other_fbl[0x3424:0x3434] = bytes(16)
+    other_fbl[0x7000:0x7012] = b"SH850T01xxxxxxV200"
+    p_fbl = tmp_path / "Uflash.bin"
+    p_fbl.write_bytes(other_fbl)
+    det = detect_dump_file(p_fbl)
+    assert (det.kind, det.valid, det.uflash_info.signature_found) == ("uflash", True, False)
+    with pytest.raises(ValueError):
+        apply_uflash_rsa_patch(bytes(other_fbl))
+
 
 def test_turnkey_cp_binding_and_key_guardrails(synth_cflash: bytes, synth_dflash: bytes) -> None:
     # Suspicious keys must raise STOP warnings

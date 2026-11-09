@@ -60,6 +60,10 @@ def environment(interface: str = "", port: str = "", adapter: str = "") -> dict[
         from contitool.can.dpdu import discover_dpdu
 
         env["D-PDU"] = ", ".join(f"{a['name']} {a['version'] or '?'}" for a in discover_dpdu()) or "-"
+        from contitool.can import dpdu
+
+        if dpdu.last_module:
+            env["D-PDU module"] = dpdu.last_module
     except Exception:  # noqa: BLE001
         env["D-PDU"] = "-"
     return env

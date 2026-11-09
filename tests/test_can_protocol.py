@@ -279,6 +279,49 @@ def test_a_stream_that_stops_midway_names_the_lost_bytes_and_a_slow_slcan(monkey
     assert len(errors) == 1 and "loses frames" in errors[0]
 
 
+def test_a_dpdu_adapter_without_raw_can_is_named_when_the_stream_breaks(tmp_path: Path, monkeypatch) -> None:
+    """Issue #17: a VCX that refused RawMode passes on about one frame in five of the memory stream. Say that this
+    adapter cannot read memory instead of a bare timeout."""
+    import types
+
+    import pytest
+
+    from contitool.can import workflows
+    from contitool.i18n import set_lang
+
+    set_lang("en")
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+
+    class FifthFrameLink:
+        interface, LOADER_RX_ID = "dpdu", 0x6F1
+        bus = types.SimpleNamespace(nonraw={0x710: 1, 0x6F0: 2})
+
+        def send_loader_payload(self, payload, **_k):
+            self.left = 8192 // 5
+
+        def receive_frame(self, _ident, timeout):
+            if self.left:
+                self.left -= 1
+                return can.Message(arbitration_id=0x6F1, data=bytes(8))
+            raise TimeoutError("no frame")
+
+        def drain_rx(self, max_frames=0):
+            pass
+
+    errors: list[str] = []
+
+    class Rep:
+        def error(self, msg):
+            errors.append(msg)
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    with pytest.raises(TimeoutError, match="stopped after 13104/65536"):
+        workflows.read_memory_area(FifthFrameLink(), 0, 0x10000, tmp_path / "Cflash.bin", reporter=Rep())
+    assert len(errors) == 1 and "refused raw CAN" in errors[0]
+
+
 def test_gateway_stuck_in_fbl_after_interrupted_flash_recovers_cleanly(monkeypatch) -> None:
     """After EraseMemory + mid-flash disconnect, the ECU boots into FBL where `10 03` returns `7F 10 7E`.
     Link check, RAM-loader entry, and pre-flash resets must succeed, while strict post-flash check still fails."""
@@ -595,3 +638,44 @@ def test_cancel_waits_for_a_write_and_a_cancelled_read_hands_the_gateway_back(mo
     with pytest.raises(OperationCancelledError):
         workflows.can_backup("fake", session_dir=tmp_path, areas=("dflash",))
     assert resets == ["reset"]
+
+
+def test_a_switched_off_ecu_does_not_take_the_adapter_off_its_hardware_isotp(monkeypatch) -> None:
+    """Issue #18: while waiting for the power cycle (NRC 0x37) every request goes unanswered. Those requests must
+    not move the link to the frame-by-frame path (resend=False), or the VNCI gives up halfway through the write."""
+    import can
+
+    from contitool.can import workflows
+    from contitool.can.transport import UdsNegativeResponse
+
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    calls: list[tuple[str, bool]] = []
+    state = {"phase": "locked", "off_polls": 0}
+
+    class Link:
+        def request_uds(self, req, sid=None, *, timeout=2.0, allow_pending=True, resend=True):
+            calls.append((bytes(req[:2]).hex(), resend))
+            if req[:2] == b"\x27\x11":
+                if state["phase"] == "locked":
+                    raise UdsNegativeResponse(0x27, 0x37, b"\x7f\x27\x37")
+                if state["phase"] == "off":
+                    raise can.CanOperationError("D-PDU UDS protocol error (0x105)")
+                return b"\x67\x11\x00\x00\x12\x34"
+            if req[:1] == b"\x11":
+                return b"\x51\x01"
+            if state["phase"] == "off":
+                state["off_polls"] += 1
+                if state["off_polls"] > 3:
+                    state["phase"] = "on"
+                raise can.CanOperationError("D-PDU UDS protocol error (0x105)")
+            return b"\x50\x02" if req[:1] == b"\x10" else b"\x67\x04" if req[:1] == b"\x27" else b"\x71\x01\x02\x03"
+
+    class Rep(workflows.NULL_REPORTER.__class__):
+        def warning(self, msg):
+            state["phase"] = "off"  # the user switches the ECU off when asked
+            state["prompt_at"] = len(calls)
+
+    seed = workflows._fbl_seed(Link(), Rep())
+    assert seed == b"\x67\x11\x00\x00\x12\x34"
+    after_prompt = calls[state["prompt_at"] :]
+    assert state["off_polls"] > 3 and after_prompt and all(not resend for _req, resend in after_prompt)

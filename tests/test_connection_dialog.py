@@ -47,7 +47,7 @@ def test_found_adapter_is_preselected_checked_and_saved(monkeypatch) -> None:
     loop.exec()
     for _ in range(5):
         app.processEvents()
-    assert dlg.lbl_check.text() == "✓ ECU answers: 3Q0907530AA · SW 5366"
+    assert dlg.lbl_check.text() == "✓ ECU answers: 3Q0907530AA, SW 5366"
 
     dlg.chk_120ohm.setChecked(True)
     assert dlg.btn_ok.isEnabled()
@@ -182,4 +182,36 @@ def test_unverified_dpdu_driver_needs_an_explicit_go_ahead(monkeypatch) -> None:
     _scanned(app, dlg)
     assert not dlg.chk_driver.isVisibleTo(dlg) and dlg.btn_ok.isEnabled()  # a supported driver asks nothing
     dlg.done(0)
+    win.close()
+
+
+def test_dialog_keeps_its_size_and_never_scrolls_sideways(monkeypatch) -> None:
+    """Long texts wrap and the folder path is shortened: opening the wiring diagram scrolls down, nothing widens."""
+    set_lang("ru")
+    app, win = create_window()
+    monkeypatch.setattr(connection, "discover_adapters", lambda: FOUND)
+    dlg = connection.ConnectionDialog(win.conn, win)
+    _scanned(app, dlg)
+    dlg.show()
+    app.processEvents()
+    size = dlg.size()
+    dlg._toggle_pinout(True)
+    app.processEvents()
+    assert dlg.size() == size
+    assert dlg._scroll.widget().minimumSizeHint().width() <= dlg._scroll.viewport().width()
+    assert dlg._scroll.widget().width() <= dlg._scroll.viewport().width()
+    dlg.close()
+    win.close()
+
+
+def test_a_link_check_through_a_wrapped_j2534_driver_shows_the_warning(monkeypatch) -> None:
+    """Issue #17: the ECU answers through a J2534 driver behind the VW driver, but memory cannot be read that way."""
+    set_lang("en")
+    app, win = create_window()
+    monkeypatch.setattr(connection, "discover_adapters", lambda: FOUND)
+    dlg = connection.ConnectionDialog(win.conn, win)
+    _scanned(app, dlg)
+    dlg._check_ok({"responding": True, "ident": [{"did": "F187", "value": "3Q0907530AG"}],
+                   "adapter_warning": "Adapter “OpenVCX32” (OpenVCX) is not a VAS 6154"})
+    assert dlg.lbl_check.text() == "⚠ ECU answers: 3Q0907530AG\nAdapter “OpenVCX32” (OpenVCX) is not a VAS 6154"
     win.close()

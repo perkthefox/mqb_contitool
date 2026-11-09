@@ -67,11 +67,11 @@ class GuideDialog(Dialog):
         ika = _text()
         ika.setText(
             tr(
-                "Привязку проверяет сам модуль — мультимедиа, приборная панель, усилитель и другие. "
+                "Адаптацию проверяет сам модуль — магнитола, приборная панель, усилитель и другие. "
                 "Он сравнивает ответ шлюза со своим 16-байтным ключом <b>IKA</b>, поэтому ключ должен совпадать "
                 "с обеих сторон.<br><br>"
-                "<b>Ключ донора.</b> Прочитайте открытый ключ IKA из дампа самого модуля и укажите его при привязке.<br>"
-                "<b>Своя пара.</b> Нажмите «Сгенерировать» в окне привязки и запишите один и тот же ключ "
+                "<b>Ключ донора.</b> Прочитайте открытый ключ IKA из дампа самого модуля и укажите его при адаптации.<br>"
+                "<b>Своя пара.</b> Нажмите «Сгенерировать» в окне адаптации и запишите один и тот же ключ "
                 "и в шлюз, и в слот IKA модуля.<br><br>"
                 "Не подходят 16 нулей (<code>00..00</code>) и строка <code>000000000000000000000000000000E5</code> — "
                 "это заголовок зашифрованного контейнера, а не ключ.",
@@ -94,15 +94,15 @@ class GuideDialog(Dialog):
                 "1. Подключите блок по схеме выше и настройте адаптер.<br>"
                 "2. Считайте блок — ContiTool сохранит полную копию памяти и откроет её.<br>"
                 "3. Внесите нужные изменения: они пишутся в копии файлов, оригинал бэкапа не трогается.<br>"
-                "4. Нажмите «Записать в блок». Перед записью снимается резервная копия, после — побайтовая проверка чтением.<br><br>"
+                "4. Нажмите «Записать в блок». Каждая записываемая область сначала читается из блока, после записи — проверяется чтением.<br><br>"
                 "Все три области памяти (<b>CodeFlash</b> включая область загрузчика, <b>DataFlash</b> 64 КБ и <b>Uflash</b> 32 КБ) "
-                "читаются и записываются напрямую по CAN — внешний программатор не требуется.",
+                "читаются и записываются по CAN, программатор не нужен.",
                 "1. Wire the ECU as shown above and set up the adapter.<br>"
                 "2. Read the ECU — ContiTool saves a full memory copy and opens it.<br>"
                 "3. Make your changes: they go into copies of the files, the backup itself is never touched.<br>"
-                "4. Click “Write to ECU”. A backup is taken first, and the result is verified byte by byte.<br><br>"
+                "4. Click “Write to ECU”. Each area to be written is read from the ECU first and verified by reading it back after.<br><br>"
                 "All three memory regions (<b>CodeFlash</b> including boot blocks, <b>DataFlash</b> 64 KB, and <b>Uflash</b> 32 KB) "
-                "are read and written directly over CAN — no external programmer is needed.",
+                "are read and written over CAN; no programmer is needed.",
             )
         )
         body.addWidget(order)

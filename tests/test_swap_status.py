@@ -78,7 +78,7 @@ def test_writing_a_swap_patch_shows_what_the_ecu_accepted(
     texts = [lbl.text() for lbl in screen.page_area.widget().findChildren(QLabel)]
     assert "✕  The ECU did not accept: Driving Profile FPA 6 — Race / Cupra" in texts
     assert "the certificate is for another ECU (VCRN)" in texts
-    assert texts.count("active") == 1 and "NOT ACTIVATED (1) — SUPPORTED, NO CERTIFICATE" in texts and "Check again" in screen.actions["swap_check"].text()
+    assert texts.count("active") == 1 and "NOT ACTIVATED (1): SUPPORTED BY THE ECU, NO CERTIFICATE" in texts and "Check again" in screen.actions["swap_check"].text()
 
     set_lang("ru")  # the list follows a language switch
     app.processEvents()
@@ -86,3 +86,4 @@ def test_writing_a_swap_patch_shows_what_the_ecu_accepted(
     assert "активна" in texts and "сертификат выпущен для другого блока (VCRN)" in texts
     set_lang("en")
     win.close()
+

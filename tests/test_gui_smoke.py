@@ -138,11 +138,11 @@ def test_language_switch_updates_every_visible_screen(synth_cflash, synth_dflash
     folder = _dump_folder(tmp_path, synth_cflash, synth_dflash, synth_uflash)
     win.open_folder(str(folder))
     app.processEvents()
-    assert win.ecu_screen.nav_rows["cp"].lbl_name.text() == "Module pairing"
+    assert win.ecu_screen.nav_rows["cp"].lbl_name.text() == "IKA/CP adaptation"
 
     win._lang_buttons["ru"].click()
     app.processEvents()
-    assert win.ecu_screen.nav_rows["cp"].lbl_name.text() == "Привязка модулей"
+    assert win.ecu_screen.nav_rows["cp"].lbl_name.text() == "Адаптация IKA/CP"
     win.close()
 
 
@@ -360,3 +360,22 @@ def test_short_log_lists_steps_and_outcome(synth_cflash, synth_dflash, synth_ufl
     assert "0x0000C21C" not in short  # technical detail stays in the detailed view
     assert "0x0000C21C" in win.console.txt_full.toPlainText()
     win.close()
+
+
+def test_windows_build_loads_its_own_openssl_first(tmp_path, monkeypatch) -> None:
+    """Qt loads libssl-3-x64.dll by name; the bundled pair is loaded by full path first, libcrypto before libssl."""
+    import ctypes
+    import sys
+
+    from contitool.gui import app as app_mod
+
+    for name in ("libcrypto-3-x64.dll", "libssl-3-x64.dll"):
+        (tmp_path / name).write_bytes(b"")
+    loaded: list[str] = []
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    monkeypatch.setattr(ctypes, "windll", type("W", (), {"kernel32": type("K", (), {"SetErrorMode": staticmethod(lambda m: 0)})})(), raising=False)
+    monkeypatch.setattr(ctypes, "WinDLL", lambda path: loaded.append(path) or object(), raising=False)
+    monkeypatch.setattr(app_mod, "_BUNDLED_DLLS", [])
+    app_mod._use_bundled_openssl()
+    assert loaded == [str(tmp_path / "libcrypto-3-x64.dll"), str(tmp_path / "libssl-3-x64.dll")]

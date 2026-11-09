@@ -292,6 +292,7 @@ class CflashSummary:
     fazit: str = ""
     hw_pn: str = ""
     hw_ver: str = ""
+    sw_ver: str = ""  # F189 as the application answers it
     fbl_c000: int = 0
     fbl_c100: int = 0
     fbl_ok: bool = True
@@ -454,6 +455,7 @@ def analyze_cflash(raw: bytes) -> CflashSummary:
         res.fbl_rsa_exp_ok = bytes(prefix[FBL_EXP_OFFSET : FBL_EXP_OFFSET + 128]) == ((b"\x00" * 127) + b"\x03")
 
     app_ro = bytes(app)
+    res.sw_ver = app_sw_version(app_ro)
     hits = find_kschutz_hook_sites(app_ro)
     if len(hits) == 1:
         off = hits[0]
@@ -739,10 +741,8 @@ def check_fec_dataset_support(
                 )
             mapped = summary.fpa_profile_map.get(prof_idx, 0)
             if prof_idx <= 9:
-                # S030 is a per-slot enable mask (bit = slot; factory JC00 0x0005, PC00 0x00BF, NC00 0x1DAF) and the
-                # coordinator tests (mask >> slot) & 1: 0 selects nothing, the same rule as FpaDataset.
-                mask_ok = bool(summary.fpa_selectable_mask & (1 << prof_idx))
-                slot_ok = 1 <= mapped <= 15 and mask_ok
+                # the head unit is offered slot n when S028[n] holds an ID 1..0x13 (and the FeC is active)
+                slot_ok = 1 <= mapped <= 0x13
             else:
                 slot_ok = 1 <= mapped <= 0x3F
             if slot_ok:
@@ -765,6 +765,19 @@ def check_fec_dataset_support(
         reason_ru=f"Код FeC 0x{fec_u32:08X} отсутствует в таблице функций датасета {ds_label}",
         reason_en=f"FeC 0x{fec_u32:08X} is not configured in dataset {ds_label}",
     )
+
+
+FBL_LIBRARY_ID = b"SH850T01"  # Renesas flash library ID string inside every J533 bootloader build seen
+
+
+def app_sw_version(app: bytes) -> str:
+    """F189 of the application: its DID table holds `89 F1 | flags | length 4 | pointer` (little-endian, absolute)."""
+    for m in re.finditer(rb"\x89\xf1..\x04\x00\x00\x00", app, re.DOTALL):
+        ptr = int.from_bytes(app[m.end() : m.end() + 4], "little") - APP_BASE
+        val = app[ptr : ptr + 4] if 0 <= ptr <= len(app) - 4 else b""
+        if val.isdigit():
+            return val.decode()
+    return ""
 
 
 def analyze_uflash(uf: bytes) -> UflashSummary:
@@ -888,8 +901,14 @@ def detect_dump_file(path: Path) -> DetectedDumpFile:
             return DetectedDumpFile(path=path, kind="dflash", valid=False, summary_text=str(exc))
     if sz == UFLASH_SIZE:
         uinfo = analyze_uflash(raw)
-        if uinfo.signature_found:
-            state = tr("Инженерный RSA-Free", "Engineering RSA-Free") if uinfo.rsa_bypassed else tr("Заводской RSA", "Stock RSA")
+        # Every FBL build carries the Renesas flash library's ID; only the builds we know have the RSA check at
+        # UFLASH_RSA_CMP_OFFSET. Another build (HW 518, say) is still a bootloader, not a cut DataFlash.
+        if uinfo.signature_found or FBL_LIBRARY_ID in raw:
+            state = (
+                tr("сборка не распознана", "unrecognised build") if not uinfo.signature_found
+                else tr("Инженерный RSA-Free", "Engineering RSA-Free") if uinfo.rsa_bypassed
+                else tr("Заводской RSA", "Stock RSA")
+            )
             return DetectedDumpFile(
                 path=path,
                 kind="uflash",

@@ -1,5 +1,51 @@
 # Changelog / История изменений
 
+## 2.0.2b — 2026-11-10
+
+### 🇷🇺 Добавлено
+- **Прошивка FRF ODIS по UDS** («Файл → Прошить FRF ODIS…»). Приложение из FRF идёт с его собственной подписью, поэтому его принимает и заводской загрузчик — без RAM-Loader и без инженерного загрузчика, как у ODIS. Подпись FRF ContiTool сначала проверяет сам ключом загрузчика этого блока (из его последнего чтения, без чтения — заводским; если ключ в блоке заменён своим, FRF ODIS он не примет): с неверной подписью FRF не прошивается и блок не стирается. Затем сверяет номер детали, версию ПО и оборудование блока со списками допуска FRF: на другое оборудование не прошивает, а то, на что ODIS не стал бы лить, — только после подтверждения. Серийник тестера в отпечатке пишется нулевым.
+- **Лечение закрытого входа в RAM-Loader без бэкапа:** в окне лечения можно выбрать FRF вместо CodeFlash этого блока.
+- FRF длиннее 727 369 Б (например, 3Q0907530BF 5585) ContiTool пока не расшифровывает и говорит об этом сразу.
+
+### 🇷🇺 Изменено
+- **Шайба 4MOTION Active Control.** В редакторе профилей шайбу можно добавить так, как она настроена в заводском датасете Tiguan 2019: положения Snow, On-road, Offroad и Offroad Individual. Шайба заменяет кнопку MODE на консоли. Нужны сама шайба и FEC 10001400, 10001800, 10001900.
+- Слот 9 профилей теперь Offroad Individual (ID 0x0B), как в Tiguan; раньше там был неподтверждённый ID 0x09.
+- **Меньше лишних чтений перед записью.** Перед записью читается только та область, которая пишется, после — проверка чтением. Полная копия памяти снимается, только если этот блок ещё ни разу не читался целиком: остальные области запись не меняет, а их копия уже лежит в папке блока. Запись DataFlash или загрузчика стала примерно на минуту короче.
+- **Окно «Подключение к блоку»** больше не меняет размер и не прокручивается вбок: длинные строки переносятся, путь к папке сокращается.
+- **Изменена только параметрия — пишется штатно.** Если в DataFlash правились только датасеты, панель изменённых дампов предлагает «Записать параметрию по CAN» (UDS, с проверкой SWaP и кодировки) вместо записи всего DataFlash через RAM-Loader.
+- **Страница «Параметрирование»:** запись по CAN, экспорт, импорт ODIS и паспорт собраны в один блок наверху, проверка кнопки руля — в блоке профилей.
+
+### 🇷🇺 Исправлено
+- **Windows: 2.0.2 и 2.0.2a не запускались** с ошибкой «The procedure entry point CRYPTO_calloc could not be located … libssl-3-x64.dll», если другая программа оставила в System32 несовместимую копию OpenSSL. Её подхватывала проверка обновлений через Qt. Теперь ContiTool при запуске загружает свою копию OpenSSL, и чужая из System32 не используется.
+- **Редактор профилей движения переделан по прошивке шлюза.** Магнитола получает профиль, если в слоте записан его ID и для слота активен FEC. Раньше выключение профиля в редакторе меняло только маску запоминаемых профилей (S030), и профиль в меню оставался; заодно редактор ставил биты в S070, которые на самом деле включают показ смены профиля на приборной панели. Теперь выключение убирает профиль из меню, повторное включение возвращает слот как был, S070 не трогается. Для профилей, выключенных намеренно, ContiTool больше не просит «настроить параметрию под включённые функции».
+- Слот Individual определяется по ID профиля, а не по S015 (это число пользователей персонализации).
+- Статус FEC в блоке (`22 3C 00`) считается по тому же правилу, что и в шлюзе.
+- Загрузчик другой сборки (например, у блоков с оборудованием 518) принимался за обрезанный DataFlash, и блок показывался «Uflash — нет». Теперь он определяется как загрузчик со статусом «сборка не распознана»; менять его ContiTool по-прежнему не берётся.
+- **VAS 6154 / VNCI: запись CodeFlash обрывалась на середине** (#18). Пока программа ждала, что питание блока выключат и включат (NRC 0x37), запросы без ответа переводили адаптер с аппаратного ISO-TP на передачу по одному кадру, а так VCI перестаёт отправлять примерно на 125-тысячном кадре. Теперь ожидание не трогает аппаратный ISO-TP. Если он всё же не работает, запись отказывается до стирания.
+- **Адаптер J2534 под видом VAS 6154** (#17). Драйвер VW D-PDU подключает и чужие драйверы J2534 (например, OpenVCX32 у VCX). Через такой драйвер raw CAN нет, и из потока памяти доходит примерно каждый пятый кадр, поэтому чтение падало через 20 секунд с ошибкой «Stream … stopped». Теперь журнал и отчёт о проблеме называют модуль D-PDU, к которому подключились. Проверка связи предупреждает, что это не VAS 6154, а вход в RAM-Loader отказывается сразу, до каких-либо действий с блоком. Если тот же адаптер установлен и как J2534 с 64-разрядным драйвером, программа предлагает выбрать его напрямую; 32-разрядные драйверы J2534 ContiTool не загружает.
+
+### 🇬🇧 Added
+- **Flashing an ODIS FRF over UDS** ("File → Flash an ODIS FRF…"). The application from the FRF goes in with the FRF's own signature, so the factory bootloader takes it too — no RAM-Loader and no engineering bootloader, as with ODIS. ContiTool first verifies the FRF's signature itself with this ECU's bootloader key (from its latest read, the factory key without one; a bootloader whose key was replaced with your own will not take an ODIS FRF): an FRF with a bad signature is refused before anything is erased. Then it checks the ECU's part number, software version and hardware against the FRF's lists: it never flashes other hardware, and what ODIS would not flash only after a confirmation. The tester serial in the fingerprint is written as zero.
+- **A closed RAM-Loader entry cured without a backup:** the cure dialog takes an FRF instead of this ECU's CodeFlash.
+- FRFs longer than 727,369 B (3Q0907530BF 5585, for one) cannot be decrypted yet; ContiTool says so straight away.
+
+### 🇬🇧 Changed
+- **4MOTION Active Control knob.** The profile editor can add the knob as the factory dataset of a 2019 Tiguan has it: positions Snow, On-road, Offroad and Offroad Individual. The knob replaces the console MODE button. It needs the knob itself and FECs 10001400, 10001800, 10001900.
+- Profile slot 9 is now Offroad Individual (ID 0x0B), as in the Tiguan; it used to be an unconfirmed ID 0x09.
+- **Fewer redundant reads before a write.** A write reads only the area it writes, then reads it back to verify. A full memory copy is taken only for a gateway that was never read completely: the other areas do not change, and their copy is already in the gateway's folder. A DataFlash or bootloader write is about a minute shorter.
+- **The ECU connection dialog** keeps its size and never scrolls sideways: long lines wrap, the folder path is shortened.
+- **Only the datasets changed — written the standard way.** When only datasets were edited in DataFlash, the changed-dumps bar offers “Write datasets over CAN” (UDS, with the SWaP and coding check) instead of writing the whole DataFlash through the RAM-Loader.
+- **Parameterization page:** write over CAN, export, ODIS import and passport sit together in one block at the top; the wheel-button test moved into the profiles block.
+
+### 🇬🇧 Fixed
+- **Windows: 2.0.2 and 2.0.2a did not start** with “The procedure entry point CRYPTO_calloc could not be located … libssl-3-x64.dll” when another program had left an incompatible OpenSSL copy in System32. The update check through Qt picked it up. ContiTool now loads its own OpenSSL at start, so the copy in System32 is never used.
+- **The driving-profile editor now follows the gateway firmware.** The head unit is offered a profile when its slot holds the profile ID and the slot's FEC is active. Switching a profile off used to change only the remembered-profile mask (S030), so the profile stayed in the menu, and the editor also set S070 bits, which really turn on the cluster's profile-change pop-up. Now switching off takes the profile out of the menu, switching it on again restores the slot as it was, and S070 is left alone. ContiTool no longer asks to “configure the datasets for enabled features” for profiles switched off on purpose.
+- The Individual slot is found by its profile ID, not by S015 (the number of personalisation users).
+- The FEC status read from the ECU (`22 3C 00`) uses the gateway's own rule.
+- A bootloader of another build (ECUs with hardware 518, for one) was taken for a cut DataFlash and the ECU showed “Uflash — missing”. It is now recognised as a bootloader of an unrecognised build; ContiTool still refuses to modify it.
+- **VAS 6154 / VNCI: a CodeFlash write broke off halfway** (#18). While the program waited for the ECU to be switched off and on (NRC 0x37), the unanswered requests moved the adapter off its hardware ISO-TP to sending frame by frame, and that way the VCI stops sending at around the 125,000th frame. The wait now leaves the hardware ISO-TP alone. If it does not work anyway, the write is refused before the erase.
+- **A J2534 adapter posing as a VAS 6154** (#17). The VW D-PDU driver also connects other vendors' J2534 drivers (OpenVCX32 of a VCX, for one). Through such a driver there is no raw CAN and only about every fifth frame of a memory stream gets through, so a read failed after 20 seconds with “Stream … stopped”. The log and the problem report now name the D-PDU module actually connected. The link check warns that it is not a VAS 6154, and the RAM-Loader entry is refused at once, before anything is done to the ECU. If the same adapter is installed as a J2534 device with a 64-bit driver, the program suggests picking it directly; ContiTool does not load 32-bit J2534 drivers.
+
 ## 2.0.2a — 2026-11-09
 
 ### 🇷🇺 Исправлено

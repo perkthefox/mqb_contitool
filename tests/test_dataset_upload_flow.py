@@ -21,9 +21,10 @@ def _with_fpa(df: bytes) -> bytes:
     return bytes(out)
 
 
-def test_required_features_are_the_gated_selectable_profiles(synth_dflash: bytes) -> None:
+def test_every_profile_in_the_menu_needs_its_slots_feature(synth_dflash: bytes) -> None:
+    """The gateway offers a slot to the head unit only with that slot's FeC active (FSG-Setup builder, 5388/5504)."""
     need = fecs_required_by_dataset(_with_fpa(synth_dflash))
-    assert {NORMAL, SPORT, ECO} <= set(need) and 0x10001700 not in need  # Individual is not SWaP-gated
+    assert set(need) == {NORMAL, SPORT, ECO, 0x10001700}  # the "fwd" preset: Normal, Sport, Eco, Individual
 
 
 def test_missing_swap_is_activated_before_the_upload(synth_dflash: bytes, tmp_path: Path, monkeypatch) -> None:
@@ -72,5 +73,5 @@ def test_missing_swap_is_activated_before_the_upload(synth_dflash: bytes, tmp_pa
     win.ecu_screen._upload_zdc_over_can()
     loop.exec()
     app.processEvents()
-    assert calls == [("status",), ("activate", sorted({SPORT, NORMAL, ECO} - {MKE})), ("upload",), ("status",), ("dtc", True)]
+    assert calls == [("status",), ("activate", sorted({SPORT, NORMAL, ECO, 0x10001700} - {MKE})), ("upload",), ("status",), ("dtc", True)]
     win.close()
