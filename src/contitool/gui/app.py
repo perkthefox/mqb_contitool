@@ -41,6 +41,8 @@ def run_gui() -> int:
     win.show()
     if not confirm_disclaimer(win):
         return 0
+    if getattr(sys, "frozen", False):  # a release build; one run from source is its own newest version
+        win.updates.check(manual=False)
     reporting = False
 
     def excepthook(exc_type, exc, tb) -> None:  # noqa: ANN001 - any error Qt slots let through: offer a report
@@ -50,7 +52,7 @@ def run_gui() -> int:
             return
         reporting = True
         try:
-            win.offer_problem_report(failure_from_exception(exc_type, exc, tb))
+            win.offer_problem_report(failure_from_exception(exc_type, exc, tb, win.runner.started_at or win._opened_at))
         finally:
             reporting = False
 

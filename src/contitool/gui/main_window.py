@@ -25,7 +25,13 @@ from PySide6.QtWidgets import (
 )
 
 from contitool import __version__
-from contitool.can import can_backup, can_identify, can_restore_backup, default_session_dir, unsupported_ecu_reason
+from contitool.can import (
+    can_backup,
+    can_cure_fbl_fingerprint,
+    can_identify,
+    can_restore_backup,
+    unsupported_ecu_reason,
+)
 from contitool.cli.formatting import (
     Style,
     format_cflash_report,
@@ -55,10 +61,14 @@ from contitool.gui import theme
 from contitool.gui.theme import build_app_icon, dot_icon, mono_font
 from contitool.gui.widgets.execution_panel import ExecutionPanel
 from contitool.gui.widgets.page import Callout, Dialog, TextResultDialog, button, hint, run_dialog
+from contitool.gui.update_check import UpdateChecker
 from contitool.gui.worker import OperationRunner
 from contitool.gui.workspace import NAMES, Workspace
 from contitool.i18n import get_lang, set_lang, subscribe_lang_change, tr
 from contitool.report import Failure
+from contitool.storage import keep_as_base, new_session, unit_of_cflash, unit_of_ident
+
+CURE_TITLE = ("Исправление отпечатка программирования", "Fixing the programming fingerprint")
 
 
 class MainWindow(QMainWindow):
@@ -217,10 +227,13 @@ class MainWindow(QMainWindow):
         self.menu_help = mb.addMenu("")
         self.act_guide = act(self.show_guide, QKeySequence.StandardKey.HelpContents)
         self.act_problem = act(self.report_problem)
+        self.updates = UpdateChecker(self)
+        self.act_updates = act(lambda: self.updates.check(manual=True))
         self.act_about = act(self.show_about)
         self.act_about.setMenuRole(QAction.MenuRole.AboutRole)
         self.menu_help.addAction(self.act_guide)
         self.menu_help.addAction(self.act_problem)
+        self.menu_help.addAction(self.act_updates)
         self.menu_help.addAction(self.act_about)
 
     def _refresh_header(self) -> None:
@@ -351,21 +364,23 @@ class MainWindow(QMainWindow):
             if dlg.restore_chosen:
                 self.restore_backup()
             else:
-                self._backup_over_can()
+                self._backup_over_can(ident)
 
-    def _backup_over_can(self) -> None:
+    def _backup_over_can(self, ident: dict[str, Any]) -> None:
+        """Into the gateway's own dumps/ folder; its first complete read becomes its base_read (storage.py)."""
         port, iface = self.conn.port, self.conn.interface
-        sdir = default_session_dir(self.conn.out_dir, "backup")
+        sdir = new_session(self.conn.out_dir, unit_of_ident(ident.get("ident") or []), "read", dumps=True)
+
+        def task(rep: Any) -> dict[str, Any]:
+            res = can_backup(port, interface=iface, session_dir=sdir, reporter=rep)
+            res["session_dir"] = str(keep_as_base(sdir))
+            return res
 
         def done(res: dict[str, Any]) -> None:
             folder = Path(str(res.get("session_dir", sdir)))
             self._report_missing(self.ws.open_folder(folder, source="can"), folder)
 
-        self.runner.run_task(
-            tr("Чтение памяти блока", "Reading the ECU memory"),
-            lambda rep: can_backup(port, interface=iface, session_dir=sdir, reporter=rep),
-            on_success=done,
-        )
+        self.runner.run_task(tr("Чтение памяти блока", "Reading the ECU memory"), task, on_success=done)
 
     def _adapter_in_use(self) -> str:
         if self.runner.is_busy:
@@ -385,7 +400,8 @@ class MainWindow(QMainWindow):
             return
         files, kinds = dict(dlg.files), dlg.kinds
         port, iface = self.conn.port, self.conn.interface
-        sdir = default_session_dir(self.conn.out_dir, "restore")
+        cf = files.get("cflash")
+        sdir = new_session(self.conn.out_dir, unit_of_cflash(cf.read_bytes() if cf else None), "restore")
         names = ", ".join(NAMES[k] for k in kinds)
         self.runner.run_task(
             tr(f"Заливка бэкапа в блок: {names}", f"Writing the backup to the ECU: {names}"),
@@ -417,8 +433,49 @@ class MainWindow(QMainWindow):
         run_dialog(GuideDialog(self))
 
     def _on_operation_finished(self, ok: bool, _summary: str, _target: object) -> None:
-        if not ok and not self.runner.was_cancelled and self.runner.last_failure is not None:
-            self.offer_problem_report(self.runner.last_failure)
+        failure = self.runner.last_failure
+        if ok or self.runner.was_cancelled or failure is None:
+            return
+        if "Stage1SilentError" in failure.traceback and failure.title not in CURE_TITLE:
+            QTimer.singleShot(0, self.offer_fingerprint_cure)  # a known cause with a cure: no report needed
+        else:
+            self.offer_problem_report(failure)
+
+    def offer_fingerprint_cure(self) -> None:
+        """Stage 1 of the RAM-loader entry went silent: offer the cure, one UDS reprogram of this ECU's application."""
+        if QMessageBox.question(
+            self,
+            tr("Вход в RAM-Loader закрыт", "RAM-Loader entry closed"),
+            tr(
+                "В последнем отпечатке программирования этого блока ненулевой серийник тестера — так пишут ContiTool "
+                "до 2.0.1e и ODIS, — и загрузчик не пускает в RAM-Loader. Исправляет это одна перепрошивка "
+                "приложения по UDS с нулевым серийником; RAM-Loader для неё не нужен.\n\n"
+                "Нужен файл CodeFlash этого блока: бэкап, снятый ContiTool, или файл, который вы в него записывали "
+                "(проверяется по FAZIT). Приложение будет стёрто и записано заново — несколько минут, питание "
+                "не отключать.\n\nВыбрать файл и перепрошить?",
+                "This gateway's last programming fingerprint carries a non-zero tester serial — ContiTool before "
+                "2.0.1e and ODIS both write one — and the bootloader keeps the RAM-Loader closed. One reflash of the "
+                "application over UDS with a zero serial fixes it; it needs no RAM-Loader.\n\n"
+                "It takes this ECU's CodeFlash file: a backup ContiTool took, or the file you wrote into it (checked "
+                "against FAZIT). The application is erased and written again — a few minutes, keep the power on."
+                "\n\nChoose the file and reflash?",
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("CodeFlash этого блока", "This ECU's CodeFlash"), str(self.ws.folder or self.conn.out_dir),
+            "Binary (*.bin *.raw);;All Files (*)",
+        )
+        if not path or not ensure_ready(self.conn, self):
+            return
+        port, iface = self.conn.port, self.conn.interface
+        sdir = new_session(self.conn.out_dir, unit_of_cflash(Path(path).read_bytes()), "fingerprint")
+        self.runner.run_task(
+            tr(*CURE_TITLE),
+            lambda rep: can_cure_fbl_fingerprint(port, Path(path), interface=iface, session_dir=sdir, reporter=rep),
+        )
 
     def report_problem(self) -> None:
         """Help menu: about the last failed operation, or everything since the last operation started."""
@@ -429,7 +486,9 @@ class MainWindow(QMainWindow):
         """Non-blocking: the log and the screen stay usable while the offer is open; a newer failure replaces it."""
         if self._report_dlg is not None:
             self._report_dlg.close()
-        dlg = ProblemReportDialog(self, failure, self.conn, self.console.txt_full.toPlainText())
+        dumps = {f"loaded/{p.name}": p for p in self.ws.original.values()}
+        dumps.update({f"edited/{p.name}": p for k, p in self.ws.current.items() if self.ws.modified(k)})
+        dlg = ProblemReportDialog(self, failure, self.conn, self.console.txt_full.toPlainText(), dumps)
         dlg.setModal(False)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.destroyed.connect(lambda *_a, d=dlg: setattr(self, "_report_dlg", None) if self._report_dlg is d else None)
@@ -507,6 +566,7 @@ class MainWindow(QMainWindow):
         self.menu_help.setTitle(tr("Справка", "Help"))
         self.act_guide.setText(tr("Памятка по стенду", "Bench guide"))
         self.act_problem.setText(tr("Сообщить о проблеме…", "Report a problem…"))
+        self.act_updates.setText(tr("Проверить обновления…", "Check for updates…"))
         self.act_about.setText(tr("О программе", "About ContiTool"))
         self._refresh_header()
 

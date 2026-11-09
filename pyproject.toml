@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contitool"
-# pip needs PEP 440; the version users see is contitool.__version__ ("2.0.1e"). a/b/c only passed by
+# pip needs PEP 440; the version users see is contitool.__version__ ("2.0.2"). a/b/c only passed by
 # chance (pip reads them as alpha/beta/rc); "d", "e" have no such meaning, so the n-th 2.0.1 fix is post<n>.
-version = "2.0.1.post5"
+version = "2.0.2"
 description = "ContiTool — Desktop GUI Studio & CLI for Continental VAG MQB Gateway J533 (Renesas RH850/F1L)"
 readme = "README.md"
 # PolyForm Noncommercial 1.0.0 plus the Additional Terms at the top of LICENSE, so not the bare SPDX id

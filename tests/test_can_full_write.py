@@ -813,9 +813,10 @@ def test_dflash_faci_stub_executes_cleanly_on_rh850_simulator(
     assert mcu.wdta_kicks[0xFFED1000] == 8
     assert bytes(mcu.dflash) == bytes(target_df)
 
-    # Trailing 0xFFFFFFFF words in block 0x0100 and all 16 words in erased block 0x0200 MUST remain blank!
-    assert all(mcu.dflash_word_programmed[w] for w in range(0x0100 // 4, 0x010C // 4))
-    assert not any(mcu.dflash_word_programmed[w] for w in range(0x010C // 4, 0x0140 // 4))
+    # 0x0100 is ZDC #1, which the gateway copies with a plain CPU read: an erased word there reads noise and fails
+    # the dataset CRC (bench 2026-11-09, DTC 000401), so a data-bearing ZDC block is programmed whole, its trailing
+    # 0xFFFFFFFF words included. A block that is all 0xFF (0x0200) stays blank, as the factory leaves it.
+    assert all(mcu.dflash_word_programmed[w] for w in range(0x0100 // 4, 0x0140 // 4))
     assert not any(mcu.dflash_word_programmed[w] for w in range(0x0200 // 4, 0x0240 // 4))
 
 

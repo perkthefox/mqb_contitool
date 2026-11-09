@@ -43,6 +43,7 @@ def fake_ecu(monkeypatch: pytest.MonkeyPatch):
         return {}
 
     monkeypatch.setattr(workflows, "J533CanLink", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(workflows, "_ecu_fazit_over_uds", lambda _l: (workflows._fazit(ecu["cflash"][0xA240:0xA257]), False))
     monkeypatch.setattr(workflows, "enter_ram_loader", lambda *a, **k: {})
     monkeypatch.setattr(workflows, "_reset_to_application", lambda *a, **k: {})
     monkeypatch.setattr(workflows, "read_memory_area", read_area)
@@ -71,7 +72,8 @@ def test_restore_writes_own_backup_bootloader_last(fake_ecu, synth_cflash, synth
     ecu.update(cflash=synth_cflash, dflash=synth_dflash)
     files = _backup(tmp_path, synth_cflash, synth_dflash, synth_uflash)
     res = can_restore_backup("fake", files, ["cflash", "dflash", "uflash"], session_dir=tmp_path / "run")
-    assert res["ecu"] == {"fazit": "TST-SYN01.01.260000001", "vcrn": "1122334455"}
+    # FAZIT over UDS settles it; VCRN is read (through the RAM-loader) only when it is needed
+    assert res["ecu"] == {"fazit": "TST-SYN01.01.260000001", "vcrn": ""}
     assert calls == ["uflash_eng", "cflash", "dflash", "uflash:Uflash.bin"]
 
 
@@ -185,3 +187,76 @@ def test_failed_codeflash_restore_keeps_the_engineering_bootloader_and_says_so(
                            reporter=OperationReporter(on_log=lambda e: logs.append(e.message)))
     assert calls == ["uflash_eng", "cflash"]  # no stock bootloader over a half-written application
     assert any("engineering bootloader stays" in m for m in logs)
+
+
+@pytest.mark.parametrize(("writes", "must_run"), [(["cflash"], True), (["dflash"], False), (["cflash", "dflash", "uflash"], True)])
+def test_a_gateway_stuck_in_its_bootloader_is_never_asked_for_an_application_mid_restore(
+    monkeypatch, synth_cflash, synth_dflash, synth_uflash, tmp_path, writes, must_run
+) -> None:
+    """Restoring a gateway *because* it is stuck in FBL: there is no application until CodeFlash is written.
+
+    2.0.1e's engineering-bootloader step reset the gateway and demanded the application ("10 03 answers, F197 /
+    0600 do not") on such a unit, which can never pass. And every reset out of the RAM-loader means another
+    entry, whose `27 11` the bootloader then refuses for ~2 minutes. So every step stays in the loader, and the
+    application is looked at once, at the very end — required only when this restore wrote CodeFlash."""
+    steps: list[tuple[str, dict]] = []
+    resets: list[dict] = []
+    ecu = {"cflash": synth_cflash, "dflash": synth_dflash}
+
+    def read_area(_link, start, end, path, **_kw):
+        base, img = (DFLASH_ADDR_START, ecu["dflash"]) if start >= DFLASH_ADDR_START else (CFLASH_ADDR_START, ecu["cflash"])
+        path.write_bytes(img[start - base : end - base])
+        return {}
+
+    def step(name):
+        def run(*_a, **kw):
+            steps.append((name, kw))
+            return {"write_performed": True} if name == "uflash" and kw.get("input_uflash") is None else {}
+        return run
+
+    monkeypatch.setattr(workflows, "J533CanLink", lambda *a, **k: contextlib.nullcontext())
+    # FAZIT answers over UDS in FBL too, so the owner check needs no RAM-loader entry
+    monkeypatch.setattr(workflows, "_ecu_fazit_over_uds", lambda _l: (workflows._fazit(ecu["cflash"][0xA240:0xA257]), True))
+    monkeypatch.setattr(workflows, "enter_ram_loader", lambda *a, **k: pytest.fail("owner check entered the RAM-loader"))
+    monkeypatch.setattr(workflows, "_reset_to_application", lambda *a, **k: resets.append(k) or {"in_fbl": not must_run})
+    monkeypatch.setattr(workflows, "read_memory_area", read_area)
+    monkeypatch.setattr(workflows, "can_write_cflash", step("cflash"))
+    monkeypatch.setattr(workflows, "can_write_dflash", step("dflash"))
+    monkeypatch.setattr(workflows, "can_write_uflash", step("uflash"))
+
+    files = _backup(tmp_path, synth_cflash, synth_dflash, synth_uflash)
+    res = can_restore_backup("fake", files, writes, session_dir=tmp_path / "run")
+
+    assert steps, "the restore wrote nothing"
+    if "cflash" in writes:
+        assert steps[0][0] == "cflash"  # first thing written: no engineering-bootloader step (RAM-loader) before it
+    assert all(kw.get("return_to_app") is False for _name, kw in steps), steps  # no step leaves the loader
+    assert len(resets) == 1  # the gateway is restarted once, after the whole chain
+    assert resets[0]["allow_fbl"] is (not must_run)  # the app is required only if CodeFlash went in
+    assert res["app_was_down"] is True
+
+
+def test_fingerprint_cure_checks_the_owner_and_falls_back_to_the_restore(fake_ecu, synth_cflash, tmp_path, monkeypatch) -> None:
+    """Silent stage 1: this ECU's application goes in once more over UDS; a factory FBL hands over to the restore."""
+    set_lang("en")
+    ecu, calls = fake_ecu
+    ecu.update(cflash=synth_cflash)
+
+    def refused(*_a, **_k):
+        raise workflows.FblRejectedAppError("71 01 02 02 01")
+
+    monkeypatch.setattr(workflows, "_restore_app_over_uds", refused)
+    monkeypatch.setattr(workflows, "can_restore_backup",
+                        lambda _p, files, writes, **k: calls.append(("restore", writes, k["factory_fbl"])) or {})
+    mine = tmp_path / "Cflash.bin"
+    mine.write_bytes(synth_cflash)
+    res = workflows.can_cure_fbl_fingerprint("fake", mine, session_dir=tmp_path / "run")
+    assert calls == [("restore", ["cflash"], True)] and "restore" in res  # no second UDS attempt for the refusal
+
+    other = bytearray(synth_cflash)
+    other[0xA240:0xA243] = b"ABC"  # another ECU's FAZIT
+    theirs = tmp_path / "Cflash_other.bin"
+    theirs.write_bytes(other)
+    with pytest.raises(RuntimeError, match="another ECU"):
+        workflows.can_cure_fbl_fingerprint("fake", theirs, session_dir=tmp_path / "run2")
+    assert calls == [("restore", ["cflash"], True)]

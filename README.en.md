@@ -38,16 +38,16 @@
 1. **One working screen built around a single ECU (`GUI`)**:
    - The gateway is opened once — read over CAN or loaded from a folder of dumps — and the whole interface then describes that ECU: part number, checksum, `VIN`, `VCRN`, and one line per feature with its current state.
    - On the left, the ECU's functions with their state; on the right, the selected function's page: what it does, step-by-step actions (e.g. for SWaP: your key → certificate → sending it to the ECU) and the list of enabled features by name.
-   - Edits are written to copies (a `ContiTool_edited` folder); the original dumps are never modified. The bottom panel shows the state of every dump (`CodeFlash`, `DataFlash`, `Uflash`), exports changed files to any folder, and flashes **all** modified memory regions directly over **Diagnosis CAN** with a single **"Write to ECU"** click (100% replacing a bench programmer).
-   - Before writing `CodeFlash` over CAN, ContiTool automatically activates the engineering bootloader via `FACI` if the gateway is still on factory FBL, and writes modified `CodeFlash` boot blocks (`0x0000..0xBFFF`, e.g. custom `FBL RSA` key) and `DataFlash` (`64 KB`) directly via RAM `FACI` drivers.
-   - **Write a backup back**: you pick the backup files, and ContiTool first reads `FAZIT` and `VCRN` from the ECU and refuses a backup of another ECU — before the first write command. **Export backup** copies the dumps as read to a folder of your choice.
-   - **What the ECU itself accepted**: the Feature activation page reads the gateway's own answer (`22 3C 00`) — which features are active, which were rejected and why (`VCRN`, signature, validity). It runs automatically after a SWaP write.
-   - Every operation shows its current step, progress (`%`), byte counter, transfer speed (`KB/s`), elapsed time and `ETA` in the status bar. The log at the bottom is a short summary by default — the operation, its steps and the outcome; "Detailed" shows the full technical log with addresses, UDS and CAN.
+   - Edits are written to copies while original dumps stay untouched; all reads and writes are organized per gateway under `contitool_runs/<part>_<FAZIT>/` (`dumps/base_read` — the unit's first complete dump, `*_flashed` with `manifest.json` — what the ECU holds after a write, `writes/` — operation logs and pre-write backups). The bottom panel shows the state of every dump (`CodeFlash`, `DataFlash`, `Uflash`), exports changed files to any folder, and flashes **all** modified memory regions directly over **Diagnosis CAN** with a single **"Write to ECU"** click (100% replacing a bench programmer).
+   - Before writing `CodeFlash` over CAN, ContiTool automatically activates the engineering bootloader via `FACI` if the gateway is still on factory FBL, writes a zero tester serial in `F15A` (so subsequent reads never go silent), and writes modified `CodeFlash` boot blocks (`0x0000..0xBFFF`, e.g. custom `FBL RSA` key, `Block 4`) and `DataFlash` (`64 KB`) directly via RAM `FACI` drivers.
+   - **Write a backup back** (including when a gateway is **stuck in its `FBL` bootloader** after an interrupted flash) & **`F15B` fingerprint cure**: you pick the backup files, and ContiTool verifies `FAZIT` / `VCRN` over UDS and refuses a backup of another ECU before the first write command; if a gateway goes silent on Stage 1 due to an older non-zero `F15B` fingerprint, ContiTool automatically offers to cure it with one UDS reflash of its own `CodeFlash`. **Export backup** copies the dumps as read to any folder.
+   - **Guided CAN dataset upload & what the ECU itself accepted**: **"Write datasets over CAN"** checks live `SWaP` features (`22 3C 00`) and coding (`22 06 00`), optionally switches missing `SWaP` features on directly inside the gateway's `DataFlash`, uploads `ZDC` blocks over UDS, and aligns `0x0600` coding bits. The Feature activation page reads `22 3C 00` — which features are active and which were rejected and why.
+   - Every operation shows its current step, progress (`%`), byte counter, transfer speed (`KB/s`), elapsed time and `ETA` in the status bar, and ContiTool quietly checks GitHub Releases for newer versions at startup. The log at the bottom is a short summary by default — the operation, its steps and the outcome; "Detailed" shows the full technical log with addresses, UDS and CAN.
    - Live 1-click **Русский ⇄ English** language toggle in the header.
 2. **Full Bench-Programmer Replacement Over Diagnosis CAN (`500 kbit/s` — No ECU Opening Needed)**:
-   - Automatic adapter discovery for `CANable` / `SLCAN`, `SocketCAN`, `PCAN`, `Vector`, `Kvaser` and, on Windows, `J2534 PassThru` (Tactrix, Mongoose…) plus `VAS 6154` / `VNCI 6154A` through the ODIS D-PDU driver with a one-click link check, built-in **20-pin J533 `T20`** wiring diagram, and a CAN termination confirmation (`VAS 6154` / `VNCI` and `J2534` adapters terminate the bus themselves). While an operation runs, no second link to the adapter is opened. The installed D-PDU driver is used; versions `27.2` and `31.0` / `31.1` run as is, others only after an explicit confirmation (on connect the driver reflashes the VCI to its own version). Memory reads need a native USB adapter: serial SLCAN clones (CH340 etc.) lose frames.
-   - Full read-only CAN backup of **`Cflash.bin` (`1.5 MB`)** + **`Uflash.bin` (`32 KB`)** + **`Dflash.bin` (`64 KB`)** with `SHA-256` manifests, plus arbitrary physical address range reading (`can read-mem` — flash, `Local RAM`, MMIO registers).
-   - Direct differential CAN writing of **`DataFlash.bin` (`64 KB`, `0xFF200000..0xFF20FFFF`)** via a native RAM `FACI` driver (`FENTRYR = 0xAA80`, `64`-byte blocks, `4`-byte word programming preserving valid `R_FDL` hardware `ECC`, `ICUSB 0xF800..0xFFFF` guard, and full `64 KB` readback verification).
+   - Automatic adapter discovery for `CANable` / `SLCAN`, `SocketCAN`, `PCAN`, `Vector`, `Kvaser` and, on Windows, `J2534 PassThru` (Tactrix, Mongoose…) plus `VAS 6154` / `VNCI 6154A` through the ODIS D-PDU driver (using adapter-managed hardware `ISO-TP` for UDS flashing) with a one-click link check, automatic detection/rejection of unsupported `5Q0` and `Lear` (`PowerPC`) gateways, built-in **20-pin J533 `T20`** wiring diagram, and CAN termination confirmation (`VAS 6154` / `VNCI` and `J2534` adapters terminate the bus themselves). While an operation runs, no second link to the adapter is opened. The installed D-PDU driver is used; versions `27.2` and `31.0` / `31.1` run as is, others only after an explicit confirmation (on connect the driver reflashes the VCI to its own version). Memory reads need a native USB adapter: serial SLCAN clones (CH340 etc.) lose frames.
+   - Full read-only CAN backup of **`Cflash.bin` (`1.5 MB` in `~61 s` via batched `FED_READER`)** + **`Uflash.bin` (`32 KB`)** + **`Dflash.bin` (`64 KB`, deterministic `FACI Blank Check` read)** with `SHA-256` manifests, plus arbitrary physical address range reading (`can read-mem` — flash, `Local RAM`, MMIO registers).
+   - Direct differential CAN writing of **`DataFlash.bin` (`64 KB`, `0xFF200000..0xFF20FFFF`)** via a native RAM `FACI` driver (`FENTRYR = 0xAA80`, `64`-byte blocks, full 16-word programming of `ZDC < 0x3040` preventing `DTC 000401`, `R_FDL` hardware `ECC` preservation, `ICUSB 0xF800..0xFFFF` guard, automatic `0x0600` coding sync, and full `64 KB` readback verification).
    - Atomic RAM `FACI` programming of the **`Uflash` (`32 KB`)** bootloader with automatic pre-backup, full `32 KB` readback verification, and live `RSA` status probe.
    - Complete **`CodeFlash.bin` (`1.5 MB`)** programming: boot blocks `0x00000000..0x0000BFFF` (including `Sector 5` with `FBL RSA` modulus at `0x0000A2F7` and automatic preservation of the MCU's 128-bit `SELFID` at `0x0000AB00`) are written via `FACI`, and `FD_0DATA` is flashed via standard UDS (or pure `--raw-faci`) with full `1.5 MB` readback verification, Application health check (`10 03` / `3E 00`), and `DTC` reading/clearing.
    - **CAN terminal**: send your own CAN frames (11/29-bit) or UDS requests over ISO-TP (replies are reassembled, `7F xx 78` is handled, negative response codes are decoded), with a live traffic table, ID filter, pause, copy, save to file, and command history.
@@ -89,7 +89,7 @@ flowchart LR
 
 1. **Closed-Unit CAN Read & Write Without Opening the ECU or Using a Bench Programmer ([full breakdown in `docs/can-read-write.en.md`](docs/can-read-write.en.md))**:
    - Although production `RH850/F1L` silicon is serial read-locked, entering `Uflash.bin` (`ProgrammingSession 10 02`) is supported on every stock gateway. Inside `Uflash`, ContiTool uses two calibrated multi-DID `0x22` passes to point the active `Renesas FCL` descriptor (`0xFEDE0C68`) at **`0x0100120E`** — Stage 2 of Continental's built-in **`CAN RAM-Loader` (`0x6F0 / 0x6F1`)**.
-   - From RAM, a 28-byte reader stub streams `Cflash`, `Uflash`, `Dflash`, or any custom physical address range (`can read-mem`) without entering flash `P/E` mode.
+   - From RAM, the watchdog-fed `FED_READER` streams `Cflash` (`1.5 MB` in `~61 s`) and `Uflash` (`32 KB`), while `DFLASH_READER_STUB` reads `DataFlash` (`64 KB`) deterministically via hardware `FACI Blank Check` without floating-gate noise on erased words.
    - For flash programming, self-contained RH850 `FACI` RAM drivers service hardware watchdogs (`WDTA0` + `WDTA1`) and load the MCU's 128-bit `SELFID` directly from `Cflash + 0xAB00`:
      - **`Uflash` (`32 KB`)** is reprogrammed atomically from RAM with the 4-byte `+0x342A` patch and verified by full readback;
      - **`DataFlash` (`64 KB`, `0xFF200000..0xFF20FFFF`)** is reprogrammed differentially in 64-byte blocks (`FENTRYR = 0xAA80`) using 4-byte word writes that preserve valid `R_FDL` hardware `ECC` and guard the `ICUSB` system tail (`0xF800..0xFFFF`);
@@ -107,9 +107,9 @@ flowchart LR
 ### Option 1 — Standalone Executables (Recommended)
 
 Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.0.1e-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.0.1e-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.0.1e-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+- **Windows**: extract `ContiTool-v2.0.2-windows-amd64.zip` and launch **`ContiTool.exe`**.
+- **macOS**: open `ContiTool-v2.0.2-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
+- **Linux**: extract `ContiTool-v2.0.2-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
 
 ### Option 2 — Run from Source (`Python 3.12+`)
 
@@ -203,6 +203,15 @@ python3 conti_cp_tool.py -l en can turnkey --port COM4 --set 5F=A1B2C3D4E5F60718
 
 ## FAQ
 
+**Why does ContiTool refuse `5Q0 907 530` gateways or `Lear` `3Q0 907 530` units?**
+Because they are built on completely different **NXP PowerPC (`MPC5607B` / `MPC5748G` VLE)** microcontrollers with no `Uflash`, `FACI`, or `ICUS0` — even when the part number is identical (`3Q0 907 530 AA` from Lear) or the unit identifies as `EV_GatewConti` (`5Q0` from Continental). ContiTool detects them during link check (`F191` / `F187` / `F1A3` / `F19E` / `F17C`) and stops before sending any loader commands. Only **Continental `3Q0 907 530 xx` gateways on Renesas `RH850/F1L`** are supported.
+
+**A gateway stopped answering on Stage 1 when reading after a flash. Does flashing it via ODIS cure this?**
+**No — ODIS does not cure it; ODIS triggers the exact same problem.** The last `F15B` copy in Stage 1's padding lands bytes `2..5` of the 6-byte tester serial onto FBL's suppress-response flag `0xFEDE0C62` ("do not answer"). Both `ContiTool <= v2.0.1d` (`01 02 03 04 05 06` → `0x03`) and `ODIS` (its own non-zero tester serial → e.g. `0xC8`) left a non-zero byte there, silencing Stage 1 on every subsequent entry. Since `v2.0.1e`, `ContiTool` writes a zero tester serial, and in `v2.0.2` it stops before sending `27 12` on a silent Stage 1 (avoiding `7F 27 37` lockout) and offers **the cure**: one UDS reflash of the gateway's own `CodeFlash` application with a zero serial (bench-verified).
+
+**How do I recover a gateway stuck in its `FBL` bootloader after an interrupted write?**
+Click **"Write backup…"** on the start screen and select that unit's backup folder. ContiTool recognizes that the gateway is in `FBL`, verifies backup ownership via `22 F1 7C` (`FAZIT`) over UDS without entering `RAM-Loader`, and flashes the application directly. If `FBL` answers `7F 27 37` (security delay), cut `+12 V` for `10` seconds when prompted and ContiTool will resume automatically.
+
 **The VNCI does not connect although the driver is supported.**
 Reconnect the adapter or press “Check link” a few times. On connect the D-PDU driver itself reflashes the adapter to its own version (about 30 seconds), and ContiTool takes that for a CAN link error. If that does not help, restart the computer.
 
@@ -227,7 +236,7 @@ ContiTool reads memory through RawMode on pins 6/14. Some adapters do not provid
 Copy the installed driver's folder into `dpdu/` next to ContiTool — it is found automatically and listed first. No registry entry and no administrator rights needed; it must be the 64-bit build. ContiTool ships no driver itself: the files are Volkswagen's, so bring your own copy.
 
 **How do I report a problem?**
-After an error ContiTool offers a report itself (or Help → Report a problem…): it collects an archive with the program, operation and D-PDU driver logs and opens a new [GitHub issue](https://github.com/perkthefox/mqb_contitool/issues) with the text filled in — just drag the archive into it. Please do not message the author directly.
+After an error ContiTool offers a report itself (or Help → Report a problem…): it collects an archive with the program, operation and D-PDU driver logs (`*.bin` memory dumps are excluded by default unless you tick the optional checkbox to attach them) and opens a new [GitHub issue](https://github.com/perkthefox/mqb_contitool/issues) with the text filled in — just drag the archive into it. Please do not message the author directly.
 
 ## Deep Technical Documentation (`docs/`)
 

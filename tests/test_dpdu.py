@@ -628,6 +628,9 @@ class UdsCapablePduApi(FakePduApi):
             "CP_P2Star": 0x47,
             "CP_RC78CompletionTimeout": 0x48,
             "CP_RC78Handling": 0x49,
+            # the rest with their MDF_VW ids (as ODIS's driver log prints them)
+            "CP_CanTransmissionTime": 1, "CP_ModifyTiming": 11, "CP_RC21CompletionTimeout": 18,
+            "CP_RC21Handling": 19, "CP_Br": 49, "CP_CanMaxNumWaitFrames": 58,
             "CP_CanPhysReqFormat": 0x1C,
             "CP_CanRespUSDTId": 0x1D,
             "CP_CanRespUSDTFormat": 0x1E,
@@ -726,7 +729,12 @@ class UdsCapablePduApi(FakePduApi):
         req = bytes(data[:size])
         req_sid = req[0]
         exp0, exp1 = c.pExpectedResponseArray[0], c.pExpectedResponseArray[1]
-        assert exp0.ResponseType == 0 and exp0.pPatternData[0] == ((req_sid + 0x40) & 0xFF)
+        from contitool.can.transport import positive_prefix
+
+        # as ODIS matches on this VCI: SID + 0x40 and the echoed DID / routine / block counter (76 <seq>)
+        n = exp0.NumMaskPatternBytes
+        assert exp0.ResponseType == 0 and bytes(exp0.pPatternData[:n]) == positive_prefix(req)
+        assert bytes(exp0.pMaskData[:n]) == b"\xff" * n
         assert exp1.ResponseType == 1 and exp1.pPatternData[0] == 0x7F and exp1.pPatternData[1] == req_sid
 
         from contitool.can.payloads import fbl_sa2
@@ -809,10 +817,12 @@ def test_uds_application_flash_uses_one_isotp_primitive_per_514b_block_and_resto
         urid = next(iter(api.uds_urid.values()))
         assert urid[0x1A] == 0x710 and urid[0x1D] == 0x77A
         assert urid[0x1C] == urid[0x1E] == 5 and urid[0x1B] == 0xFFFFFFFF  # the rest stays as the driver has it
-        # the last frame of every block is padded like the verified software path pads ConsecutiveFrames
+        # the link as ODIS sets it for its own flash on this VCI (PDUAPI_VW_#48); the filler stays the driver's
         uds_link = next(iter(api.uds_urid))
-        assert api.params[uds_link][api.objects["CP_CanFillerByte"]] == 0x00
-        assert api.params[uds_link][api.objects["CP_CanFillerByteHandling"]] == 1
+        prm = api.params[uds_link]
+        assert api.objects["CP_CanFillerByte"] not in prm and prm[api.objects["CP_CanFillerByteHandling"]] == 1
+        assert prm[api.objects["CP_RC78Handling"]] == 1 and prm[api.objects["CP_RC21Handling"]] == 1
+        assert prm[api.objects["CP_Br"]] == 0 and prm[api.objects["CP_ModifyTiming"]] == 1
         # After _program_application_uds exits, RawMode (0x6F0/0x6F1 + monitor) is immediately live again
         assert not bus.spent and bus.h_rx and bus.h_tx
         api._result((0x6F1).to_bytes(4, "big") + b"\x84\x00\x00\x00\x00", b"\x00\x00\x00\x00")

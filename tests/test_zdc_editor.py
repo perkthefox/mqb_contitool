@@ -169,11 +169,12 @@ def test_bem_21_rom_models_zero_diff_on_both_2222_and_0101(synth_dflash: bytes) 
 
 
 def test_fpa_presets_kl15_memory_simultaneous_buttons_and_coding(synth_dflash: bytes) -> None:
-    # 1. Schema preservation on older 'JC00' gateway
+    # 1. A preset keeps its own identity: the tag names a dataset (vehicle configuration), not a firmware schema,
+    # so relabelling the PC00 donor as the gateway's JC00 would only hide that it is another vehicle's data
     jc_fpa = build_fpa_preset_block("fwd_dcc", target_schema="JC00")
     df_jc = apply_fpa_dataset(synth_dflash, jc_fpa)
     parsed_jc = FpaDataset.from_dflash(df_jc)
-    assert parsed_jc.crc_ok and parsed_jc.schema_tag == "JC00" and parsed_jc.header_s005 == 0x08
+    assert parsed_jc.crc_ok and parsed_jc.schema_tag == "PC00" and parsed_jc.header_s005 == 0x0B
 
     # 2. 4Motion AWD preset ('NC00'): preserves 4Motion rotary knob (0x04) when enabling Console MODE + MFL simultaneously!
     awd = build_fpa_preset_block("awd_dcc")
@@ -377,15 +378,17 @@ class FakeZdcGateway:
         elif sid == 0x11:
             self._reply(bytes([0x51, req[1]]))
         elif sid == 0x27:
-            if req[1] == 0x01:
-                self._reply(b"\x67\x01\x12\x34\x56\x78")
-            elif req[1] == 0x02:
+            if req[1] == 0x03:  # the login code is level 3; the gateway has no level 1 (7F 27 12)
+                self._reply(b"\x67\x03\x12\x34\x56\x78")
+            elif req[1] == 0x04:
                 expected = (0x12345678 + 20103) & 0xFFFFFFFF
                 if int.from_bytes(req[2:6], "big") == expected:
                     self.unlocked = True
-                    self._reply(b"\x67\x02")
+                    self._reply(b"\x67\x04")
                 else:
                     self._reply(b"\x7f\x27\x35")
+            else:
+                self._reply(b"\x7f\x27\x12")
         elif sid == 0x22:
             did = int.from_bytes(req[1:3], "big")
             if did == 0x1F07:
@@ -584,7 +587,9 @@ def test_gui_parameterization_page_dialogs_and_swap_integration(
         assert fpa_chk.button_config().mfl_ring == [2, 3]
 
         # 2) Passive base JC00 dump (V03935293BA-style): 0 profiles on open, preserves JC00 when configured
-        passive_jc00 = build_fpa_preset_block("fwd_dcc", target_schema="JC00")
+        from contitool.core.zdc_templates import get_zdc_template_bytes
+
+        passive_jc00 = FpaDataset(get_zdc_template_bytes("FPA_JC00_BASE"))
         s028_p = passive_jc00.sec_bytes(28)
         s028_p[2] = 0x14
         passive_jc00.set_sec_bytes(28, s028_p)
@@ -608,7 +613,7 @@ def test_gui_parameterization_page_dialogs_and_swap_integration(
         fpa_jc_saved = FpaDataset.from_dflash(dlg_jc.result_dflash())
         dlg_jc.close()
         assert fpa_jc_saved.crc_ok and not fpa_jc_saved.is_passive_base
-        assert fpa_jc_saved.schema_tag == "JC00"
+        assert fpa_jc_saved.schema_tag == "PC00"  # the preset replaced the passive dataset, under its own tag
         assert {s.slot for s in fpa_jc_saved.slots() if s.selectable} == {1, 2, 3, 5, 7}
 
         # Re-open on populated dump: auto-detects chassis and keeps destructive reset panel collapsed
@@ -773,3 +778,85 @@ def test_live_can_work_never_runs_on_the_gui_thread(synth_dflash: bytes, monkeyp
     dlg._read_coding_live()
     assert called == [] and "Wait until" in shown[0]
     win.close()
+
+
+def test_odis_parameterization_file_is_written_with_the_passport_it_belongs_to(synth_dflash: bytes) -> None:
+    """ODIS hands out a vehicle's own dataset with its identity (ZDC_NAME / ZDC_VERSION) in one file.
+
+    The importer writes the block where it lives (DataFlash 0x1340, not the ODX address 0x0B80) and stamps the
+    passport from the same file. The payload below is made up, not a real vehicle's dataset.
+    """
+    import struct
+    import zlib
+
+    from contitool.core.zdc import (
+        FpaDataset,
+        OdisZdcFile,
+        apply_odis_zdc_file,
+        parse_odis_zdc_file,
+        parse_zdc_passport,
+    )
+
+    from contitool.core.zdc import fpa_section_slice
+
+    body = bytearray((b"QQ00" + bytes(range(1, 256)) * 18)[:4352])
+    body[0x0346] = 0xBF  # S030 selectable mask, as a 4-profile dataset carries
+    body[fpa_section_slice(28)] = bytes([0, 1, 2, 3, 4, 5, 0, 7, 0, 0, 0, 0, 0])
+    struct.pack_into("<I", body, 0x10FC, zlib.crc32(bytes(body[:0x10FC])) & 0xFFFFFFFF)
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?><MESSAGE><RESULT><RESPONSE><DATA>'
+        '<PARAMETER_DATA ZDC_VERSION="0002" LOGIN="20103" DIAGNOSTIC_ADDRESS="0x19" '
+        'START_ADDRESS="0x0B80" DSD_TYPE="1" ZDC_NAME="V09999999ZZ">' + bytes(body).hex().upper()
+        + "</PARAMETER_DATA></DATA></RESPONSE></RESULT></MESSAGE>"
+    )
+
+    parsed = parse_odis_zdc_file(xml)
+    assert isinstance(parsed, OdisZdcFile)
+    assert parsed.zdc_idx == 4 and parsed.start_address == 0x0B80  # the ODX address, not the DataFlash offset
+    assert parsed.dataset_pn == "V09999999ZZ" and parsed.dataset_ver == "0002"
+    assert parsed.header_tag == "QQ00" and len(parsed.payload) == 4352
+
+    out = apply_odis_zdc_file(synth_dflash, parsed)
+    # The block really goes to DataFlash 0x1340 — the only place a 4352-byte dataset lives
+    assert out[0x1340:0x2440] == bytes(body)
+    fpa = FpaDataset.from_dflash(out)
+    assert fpa.crc_ok and fpa.schema_tag == "QQ00" and not fpa.is_passive_base
+    # and the passport now names that very dataset, so the ECU's cross-check sees a real pairing
+    pp = parse_zdc_passport(out)
+    assert pp.dataset_pn == "V09999999ZZ" and pp.dataset_ver == "0002" and pp.crc_ok
+    # nothing outside the block and the passport moved
+    assert all(a == b for i, (a, b) in enumerate(zip(synth_dflash, out)) if not (0x1340 <= i < 0x2440 or i < 0x80))
+
+
+def test_odis_parameterization_file_is_refused_when_it_does_not_fit_this_ecu() -> None:
+    """A file for another ECU, another block or with a broken CRC must be refused, not half-written."""
+    import struct
+    import zlib
+
+    from contitool.core.zdc import parse_odis_zdc_file
+
+    good = bytearray(b"QQ00" + bytes(4348))
+    struct.pack_into("<I", good, 0x10FC, zlib.crc32(bytes(good[:0x10FC])) & 0xFFFFFFFF)
+
+    def _xml(**attrs: str) -> str:
+        payload = attrs.pop("payload", bytes(good).hex())
+        base = {"START_ADDRESS": "0x0B80", "DIAGNOSTIC_ADDRESS": "0x19", "ZDC_NAME": "V09999999ZZ",
+                "ZDC_VERSION": "0001"}
+        base.update(attrs)
+        tags = " ".join(f'{k}="{v}"' for k, v in base.items())
+        return f"<MESSAGE><PARAMETER_DATA {tags}>{payload}</PARAMETER_DATA></MESSAGE>"
+
+    assert parse_odis_zdc_file(_xml()).zdc_idx == 4  # the control: this one is accepted
+
+    with pytest.raises(ValueError, match="0x1A|gateway 0x19|шлюзу 0x19"):
+        parse_odis_zdc_file(_xml(DIAGNOSTIC_ADDRESS="0x1A"))
+    with pytest.raises(ValueError, match="ZDC|блок"):
+        parse_odis_zdc_file(_xml(START_ADDRESS="0x1234"))
+    with pytest.raises(ValueError, match="CRC"):
+        bad = bytearray(good)
+        bad[0x20] ^= 0xFF
+        parse_odis_zdc_file(_xml(payload=bytes(bad).hex()))
+    with pytest.raises(ValueError, match="ZDC_NAME"):
+        parse_odis_zdc_file(_xml(ZDC_NAME=""))
+    with pytest.raises(ValueError, match="PARAMETER_DATA"):
+        parse_odis_zdc_file("<MESSAGE><RESULT/></MESSAGE>")

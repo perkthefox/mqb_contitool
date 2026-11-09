@@ -31,6 +31,7 @@ from typing import Any
 
 import can
 
+from contitool.can.transport import positive_prefix
 from contitool.i18n import tr
 
 U32, S32, U8 = C.c_uint32, C.c_int32, C.c_uint8
@@ -74,6 +75,7 @@ RX_QUEUE_MAX = 50_000
 
 CLOSE_WAIT = 3.0  # how long close_session waits for a running operation to hand the link back
 PDU_ID_UNDEF = 0xFFFFFFFE
+COP_TIME_UNDEF = 0xFFFFFFFF  # CopCtrlData.Time on the UDS link, as ODIS fills it (the RawMode links keep 0)
 OBJT_PROTOCOL, OBJT_BUSTYPE, OBJT_COMPARAM, OBJT_PINTYPE = 0x8021, 0x8022, 0x8024, 0x8025
 # Fallback for adapters whose firmware refuses RawMode: one link per request/response id pair, described the way
 # ODIS describes its own (bus + protocol + pins, resource PDU_ID_UNDEF) with the ids set in the URID table.
@@ -539,7 +541,7 @@ class DPduBus(can.BusABC):
 
         Not `_start` + `_drain`: those treat a refusal or an error event as a dead adapter, while here it only
         means this link variant does not work and the caller moves on."""
-        ctrl = CopCtrl(0, 0, 0, 0, FlagData(4, (U8 * 4)(0, 0, 0, 0)))
+        ctrl = CopCtrl(COP_TIME_UNDEF, 0, 0, 0, FlagData(4, (U8 * 4)(0, 0, 0, 0)))
         cop = U32(0)
         if self._try("PDUStartComPrimitive", self.hmod, hcll, cop_type, 0, None, C.byref(ctrl), None,
                      C.byref(cop)) != 0 or not cop.value:
@@ -629,23 +631,27 @@ class DPduBus(can.BusABC):
                 v = U32(self.bitrate)
                 p = ParamItem(IT_PARAM, CP_BAUDRATE, PT_UNUM32, 5, C.cast(C.pointer(v), C.c_void_p))
                 self._try("PDUSetComParam", self.hmod, hcll, C.byref(p))
+            # The rest as ODIS sets this very link for its own flash of the gateway on this VCI (PDUAPI_VW_#48,
+            # 2026-11-08: 10 02 .. 34 / 36 x 2975 / 37 at hardware ISO-TP). The filler byte stays the driver's 0x55,
+            # as there. All times in microseconds.
             self._set_named_u32(hcll, "CP_CanFillerByteHandling", 1)
-            self._set_named_u32(hcll, "CP_CanFillerByte", 0x00)  # as send_uds pads ConsecutiveFrames
             self._set_named_u32(hcll, "CP_TesterPresentHandling", 0)
             self._set_named_u32(hcll, "CP_BlockSize", 0)
             self._set_named_u32(hcll, "CP_StMin", 0)
-            # Without CP_ModifyTiming the VCI keeps the MDF's own P2/P2*, whatever we set below. ODIS-E sets it
-            # to 1 on this link before its own timing (same driver log), so our 2.5 s / 6 s really take effect.
-            self._set_named_u32(hcll, "CP_ModifyTiming", 1)
-            self._set_named_u32(hcll, "CP_CanMaxNumWaitFrames", 0x0F)  # as ODIS-E; the default 0xFF never ends
+            self._set_named_u32(hcll, "CP_Br", 0)  # our FlowControl at once (driver default 10 ms)
+            self._set_named_u32(hcll, "CP_CanTransmissionTime", 150_000)
+            self._set_named_u32(hcll, "CP_ModifyTiming", 1)  # take P2 / P2* from the ECU's `50 xx 00 32 01 F4`
+            self._set_named_u32(hcll, "CP_CanMaxNumWaitFrames", 0x0F)  # the default 0xFF never ends
+            # Until the first `50 xx` the VCI uses these; ours are wider than ODIS's 0.2 s / 5.15 s on purpose:
+            # the FBL repeats `7F xx 78` every ~2.5 s, and request_uds bounds every wait itself.
             if not self._set_named_u32(hcll, "CP_P2Max", 2_500_000):
                 self._set_named_u32(hcll, "CP_P2Max", 500_000)
             if not self._set_named_u32(hcll, "CP_P2Star", 6_000_000):
                 self._set_named_u32(hcll, "CP_P2Star", 5_000_000)
-            if not self._set_named_u32(hcll, "CP_RC78CompletionTimeout", 150_000_000):
-                self._set_named_u32(hcll, "CP_RC78CompletionTimeout", 30_000_000)
-            if not self._set_named_u32(hcll, "CP_RC78Handling", 2):
-                self._set_named_u32(hcll, "CP_RC78Handling", 1)
+            self._set_named_u32(hcll, "CP_RC78Handling", 1)  # ODIS: 1 (the driver's default for this link is 2)
+            self._set_named_u32(hcll, "CP_RC78CompletionTimeout", 150_000_000)  # above our longest request, 120 s
+            self._set_named_u32(hcll, "CP_RC21Handling", 1)  # busyRepeatRequest: the VCI repeats, as for ODIS
+            self._set_named_u32(hcll, "CP_RC21CompletionTimeout", 60_000_000)
             self._set_uds_urid(hcll, tx_id, rx_id)
             if (rc := self._try("PDUConnect", self.hmod, hcll)) != 0:
                 self.uds_refusal = f"PDUConnect 0x{rc:X}"
@@ -744,17 +750,18 @@ class DPduBus(can.BusABC):
         req_sid = payload[0]
         self._drain_uds_leftovers(hcll)
 
-        pos_mask, pos_pat = (U8 * 1)(0xFF), (U8 * 1)((req_sid + 0x40) & 0xFF)
+        want = positive_prefix(payload)
+        pos_mask, pos_pat = (U8 * len(want))(*([0xFF] * len(want))), (U8 * len(want))(*want)
         neg_mask, neg_pat = (U8 * 2)(0xFF, 0xFF), (U8 * 2)(0x7F, req_sid)
         exps = (ExpResp * 2)(
-            ExpResp(0, 1, 1, pos_mask, pos_pat, 0, None),
+            ExpResp(0, 1, len(want), pos_mask, pos_pat, 0, None),
             ExpResp(1, 2, 2, neg_mask, neg_pat, 0, None),
         )
         tx = (U8 * 4)(0, 0, 0, 0)
         deadline = time.monotonic() + timeout
 
         def start_primitive(send_cycles: int, tx_bytes: bytes) -> int:
-            ctrl = CopCtrl(0, send_cycles, 1, 0, FlagData(4, tx), 2, C.cast(exps, C.POINTER(ExpResp)))
+            ctrl = CopCtrl(COP_TIME_UNDEF, send_cycles, 1, 0, FlagData(4, tx), 2, C.cast(exps, C.POINTER(ExpResp)))
             buf = (U8 * len(tx_bytes)).from_buffer_copy(tx_bytes) if tx_bytes else None
             hcop_out = U32(0)
             self._call("PDUStartComPrimitive", self.hmod, hcll, COPT_SENDRECV, len(tx_bytes), buf, C.byref(ctrl),

@@ -6,7 +6,11 @@ import base64
 from functools import lru_cache
 import zlib
 
-# 217-section byte offsets & element counts inside ZDC #4 (MultiKo / FPA, 4352 B @ 0x1340)
+# ZDC #4 (MultiKo / FPA, 4352 B @ 0x1340) section table as compiled into firmware 5463 / 5504 (217 sections).
+# The table belongs to the firmware build, not to the dataset tag: 5366 has 207 sections + a CRC entry,
+# 5388/5389 have 214, 5463/5504 have 217, and S000..S205 are identical in all of them. From S206 on
+# each build differs (5366 keeps a 517-byte zero reserve there), so only S000..S205 may be edited.
+FPA_SHARED_SECTIONS = 206
 FPA_SEC_OFFS: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 15, 16, 18, 19, 20, 21, 22, 23, 38, 518, 534, 598,
  662, 722, 782, 812, 825, 837, 839, 1229, 1259, 1979, 1980, 1981, 1986, 1991, 1996, 2001, 2006,
  2038, 2042, 2046, 2054, 2058, 2060, 2061, 2062, 2064, 2065, 2066, 2067, 2068, 2069, 2070, 2071,

@@ -35,6 +35,7 @@ from contitool.core.zdc_templates import (
     FPA_SEC_CNTS,
     FPA_SEC_OFFS,
     FPA_SG_CATALOG,
+    FPA_SHARED_SECTIONS,
     FPA_SLOT_DEFAULTS,
     FPA_TARGET_MODE_NAMES,
     MFL_KEYCODE_PRESETS,
@@ -212,6 +213,202 @@ def apply_zdc_passport(
         )
     )
     return bytes(out)
+
+
+@dataclasses.dataclass(frozen=True)
+class OdisZdcFile:
+    """One ZDC dataset exactly as ODIS hands it out, with the identity that belongs to it."""
+
+    zdc_idx: int
+    payload: bytes
+    dataset_pn: str
+    dataset_ver: str
+    start_address: int
+    diagnostic_address: int
+    header_tag: str
+
+
+ODIS_ZDC_FILE_MAX_BYTES = 8 * 1024 * 1024  # a 4352-byte block as hex plus metadata is ~10 KB
+# Written into the passport only when the unit has no dataset number of its own. It is a label served over UDS;
+# the firmware never compares it with the dataset content.
+ZDC_PLACEHOLDER_PN = "V03935256AA"
+_ODIS_ADDR_TO_IDX = {addr: (idx, size) for idx, (addr, size) in ZDC_UDS_UPLOAD_MAP.items()}
+
+
+def populated_zdc_blocks(df: bytes) -> list[int]:
+    """ZDC blocks of `df` that hold a dataset with a valid CRC-32: what an upload or an export carries."""
+    out = []
+    for idx in sorted(ZDC_UDS_UPLOAD_MAP):
+        payload = export_zdc_block(df, idx)
+        if any(b != 0xFF for b in payload) and int.from_bytes(payload[-4:], "little") == zdc_crc32_le(payload[:-4]):
+            out.append(idx)
+    return out
+
+
+# A parameterization file as ODIS writes it (GetParametrizeData, arbeits_datei_*.xml): CRLF, one space per level,
+# the block as one line of upper-case hex. The ODIS_EXPLORER part is ODIS's own, copied as it is.
+_ODIS_FILE_LINES = (
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<MESSAGE VERSION="1.1" DTD="XMLMSG">',
+    " <RESULT>",
+    '  <RESPONSE VERSION="1.4.7.1" ID="0" NAME="GetParametrizeData" DTD="RepairHints">',
+    "   <DATA>",
+    "    <REQUEST_ID>000000000</REQUEST_ID>",
+    '    <PARAMETER_DATA LOGIN_IND="" ZDC_VERSION="{ver}" LOGIN="20103" SESSIONNAME="" DIAGNOSTIC_ADDRESS="0x19" '
+    'PR_IDX="" START_ADDRESS="{addr}" DSD_TYPE="1" ZDC_NAME="{pn}" FILENAME="">{hex}</PARAMETER_DATA>',
+    "   </DATA>",
+    "  </RESPONSE>",
+    " </RESULT>",
+    ' <ODIS_EXPLORER VERSION="3">',
+    '  <DATASETS DESCRIPTION="">',
+    '   <DATASET ID_DATAMAPS="1" DESCRIPTION="" INDEX="0" DIAGNOSTIC_ADDRESS="0x19" START_ADDRESS="{addr}"/>',
+    "  </DATASETS>",
+    "  <DATAMAPS_LIST>",
+    *(line for i, nxt in ((0, 9), (1, 8), (2, 7), (3, 6)) for line in (
+        f'   <DATAMAPS ID="{i}" NAME="">', f'    <GROUPS ID_NEXT="{nxt}">', '     <GROUP ID="0" NAME="Maps tree"/>',
+        "    </GROUPS>", "   </DATAMAPS>")),
+    "  </DATAMAPS_LIST>",
+    '  <LABELSETS ID_NEXT="1"/>',
+    " </ODIS_EXPLORER>",
+    "</MESSAGE>",
+)
+
+
+def build_odis_zdc_file(df: bytes, idx: int) -> bytes:
+    """ZDC block `idx` of `df` as an ODIS parameterization file — what parse_odis_zdc_file reads back: the block with
+    its CRC-32, its ODX address, diagnostic address 0x19, and the dataset number and version from the passport (the
+    placeholder number and 0001 when the passport is blank)."""
+    if idx not in populated_zdc_blocks(df):
+        raise ValueError(tr(f"Блок ZDC #{idx} пуст или с неверной CRC-32 — экспортировать нечего",
+                            f"ZDC #{idx} is empty or has a bad CRC-32 — nothing to export"))
+    pp = parse_zdc_passport(df)
+    pn = (pp.dataset_pn or "").strip() or ZDC_PLACEHOLDER_PN
+    ver = pp.dataset_ver if (len(pp.dataset_ver) == 4 and pp.dataset_ver != "0000") else "0001"
+    text = "\r\n".join(_ODIS_FILE_LINES).format(
+        ver=ver, pn=pn, addr=f"0x{ZDC_UDS_UPLOAD_MAP[idx][0]:04X}", hex=export_zdc_block(df, idx).hex().upper())
+    return (text + "\r\n").encode("utf-8")
+
+
+def parse_odis_zdc_file(data: bytes | str) -> OdisZdcFile:
+    """Read an ODIS parameterization file (`GetParametrizeData`, the `arbeits_datei_*.xml` work file).
+
+    It is the vehicle's own dataset with its own identity: the block content, its part number (`ZDC_NAME` ->
+    `DID 0xF1A0`) and its version (`ZDC_VERSION` -> `DID 0xF1A1`). The firmware does not compare the passport
+    with the content (no dataset carries its own part number); the passport is what UDS reports.
+
+    `START_ADDRESS` is the block's ODX address (`ZDC_UDS_UPLOAD_MAP`, e.g. `0x0B80` for the FPA block #4), not
+    a DataFlash offset — the FPA block really lives at DataFlash `0x1340`."""
+    import xml.etree.ElementTree as ET  # noqa: PLC0415 - only this one reader needs it
+
+    raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+    if len(raw) > ODIS_ZDC_FILE_MAX_BYTES:
+        raise ValueError(
+            tr(
+                f"Файл параметризации слишком велик: {len(raw):,} Б (ожидается не больше {ODIS_ZDC_FILE_MAX_BYTES:,} Б)",
+                f"Parameterization file is too large: {len(raw):,} B (expected at most {ODIS_ZDC_FILE_MAX_BYTES:,} B)",
+            )
+        )
+    try:
+        root = ET.fromstring(raw)  # noqa: S314 - a local file the user picked; no entities are resolved
+    except ET.ParseError as exc:
+        raise ValueError(tr(f"Это не XML-файл параметризации ODIS: {exc}", f"Not an ODIS parameterization XML file: {exc}")) from exc
+
+    node = next((el for el in root.iter() if el.tag.rpartition("}")[2] == "PARAMETER_DATA"), None)
+    if node is None or not (node.text or "").strip():
+        raise ValueError(
+            tr(
+                "В файле нет элемента PARAMETER_DATA с данными датасета.",
+                "The file has no PARAMETER_DATA element carrying a dataset.",
+            )
+        )
+    hex_text = "".join((node.text or "").split())
+    try:
+        payload = bytes.fromhex(hex_text)
+    except ValueError as exc:
+        raise ValueError(tr(f"Данные датасета не шестнадцатеричные: {exc}", f"The dataset payload is not hexadecimal: {exc}")) from exc
+
+    def _addr(name: str) -> int:
+        txt = (node.get(name) or "").strip()
+        try:
+            return int(txt, 16) if txt.lower().startswith("0x") else int(txt or "0")
+        except ValueError:
+            return -1
+
+    start, diag = _addr("START_ADDRESS"), _addr("DIAGNOSTIC_ADDRESS")
+    known = _ODIS_ADDR_TO_IDX.get(start)
+    if known is None or known[1] != len(payload):
+        expect = ", ".join(f"0x{a:04X}/{s} Б" for a, (_i, s) in sorted(_ODIS_ADDR_TO_IDX.items()))
+        raise ValueError(
+            tr(
+                f"Файл не для шлюза J533: адрес 0x{start:04X} и длина {len(payload)} Б не совпадают ни с одним "
+                f"блоком ZDC ({expect}).",
+                f"Not a J533 gateway file: address 0x{start:04X} with {len(payload)} B matches no ZDC block "
+                f"({expect}).",
+            )
+        )
+    idx = known[0]
+    if diag not in (-1, 0x19):
+        raise ValueError(
+            tr(
+                f"Файл параметризации адресован блоку 0x{diag:02X}, а не шлюзу 0x19.",
+                f"This parameterization file addresses ECU 0x{diag:02X}, not the gateway 0x19.",
+            )
+        )
+    stored = int.from_bytes(payload[-4:], "little")
+    if zdc_crc32_le(payload[:-4]) != stored:
+        raise ValueError(
+            tr(
+                f"Не сходится CRC-32 датасета в файле (в файле 0x{stored:08X}, расчёт 0x{zdc_crc32_le(payload[:-4]):08X}).",
+                f"The dataset CRC-32 in the file does not match (file 0x{stored:08X}, calculated 0x{zdc_crc32_le(payload[:-4]):08X}).",
+            )
+        )
+    pn = (node.get("ZDC_NAME") or "").strip().upper()
+    ver = (node.get("ZDC_VERSION") or "").strip().upper()
+    if not pn or len(pn) > 11 or not all(32 <= ord(c) <= 126 for c in pn):
+        raise ValueError(
+            tr(
+                f"В файле нет пригодного номера датасета ZDC_NAME (получено {pn!r}).",
+                f"The file carries no usable ZDC_NAME dataset number (got {pn!r}).",
+            )
+        )
+    return OdisZdcFile(
+        zdc_idx=idx,
+        payload=payload,
+        dataset_pn=pn,
+        dataset_ver=ver if len(ver) == 4 and ver != "0000" else "0001",
+        start_address=start,
+        diagnostic_address=0x19 if diag == -1 else diag,
+        header_tag=_ascii_field(payload[:4]),
+    )
+
+
+def apply_odis_zdc_file(
+    df: bytes,
+    parsed: OdisZdcFile,
+    *,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> bytes:
+    """Write an ODIS dataset into its ZDC block and stamp the passport that belongs to that very dataset."""
+    validate_dflash_bytes(df)
+    had = parse_zdc_passport(df)
+    out = import_zdc_block(df, parsed.zdc_idx, parsed.payload, fix_crc=False, reporter=reporter)
+    out = apply_zdc_passport(
+        out,
+        dataset_pn=parsed.dataset_pn,
+        dataset_ver=parsed.dataset_ver,
+        equip=had.equip_bytes,
+        clean_pads=True,
+        reporter=reporter,
+    )
+    reporter.success(
+        tr(
+            f"Датасет из файла ODIS записан в ZDC #{parsed.zdc_idx} "
+            f"(схема {parsed.header_tag or '—'}, {parsed.dataset_pn}/{parsed.dataset_ver}) вместе со своим паспортом",
+            f"Wrote the ODIS dataset into ZDC #{parsed.zdc_idx} "
+            f"(schema {parsed.header_tag or '—'}, {parsed.dataset_pn}/{parsed.dataset_ver}) together with its own passport",
+        )
+    )
+    return out
 
 
 def _block_alloc_and_uds_len(idx: int) -> tuple[int, int, int, str]:
@@ -535,9 +732,9 @@ def apply_ssa_config(
 
 
 def fpa_section_slice(sec_id: int) -> slice:
-    start = FPA_SEC_OFFS[sec_id]
-    end = FPA_SEC_OFFS[sec_id + 1] if sec_id < 216 else 0x0FF4
-    return slice(start, end)
+    if not 0 <= sec_id < FPA_SHARED_SECTIONS:
+        raise ValueError(f"S{sec_id:03d} differs between firmware builds; only S000..S{FPA_SHARED_SECTIONS - 1:03d} share one layout")
+    return slice(FPA_SEC_OFFS[sec_id], FPA_SEC_OFFS[sec_id + 1])
 
 
 @dataclasses.dataclass
@@ -1135,7 +1332,6 @@ class FpaDataset:
         s045 = self.sec_bytes(45)
         s057 = self.sec_bytes(57)
         s058 = self.sec_bytes(58)
-        s213 = self.sec_bytes(213)
 
         rotary_inputs = {i for i in range(5) if s036[i] == 0x04}
         rotary_switches = {s040[i] for i in rotary_inputs if s040[i] < 4}
@@ -1157,7 +1353,6 @@ class FpaDataset:
                 s043[sw] = 0xFF
                 s044[sw] = 0x0000
                 s045[sw] = 0x00
-                s213[sw] = 0x00
                 self._write_switch_ring(sw, [])
         s057[0], s058[0] = 0x00, 0x00
 
@@ -1180,7 +1375,6 @@ class FpaDataset:
             s043[con_sw] = 0x02
             s044[con_sw] = 0x0002
             s045[con_sw] = 0xFA
-            s213[con_sw] = 0x00
             self._write_switch_ring(con_sw, c_ring)
 
         if mode in ("mfl", "both"):
@@ -1196,7 +1390,6 @@ class FpaDataset:
             s044[mfl_sw] = 0x0002
             # Advertise 0xFA cyclic switch on sw=0 if MFL is the sole switch; keep 0x00 when Console already has 0xFA
             s045[mfl_sw] = 0xFA if mode == "mfl" else 0x00
-            s213[mfl_sw] = 0x00
             s057[0] = mfl_keycode & 0xFF
             s058[0] = 0x02
             self._write_switch_ring(mfl_sw, m_ring)
@@ -1212,8 +1405,6 @@ class FpaDataset:
         self.set_sec_bytes(45, s045)
         self.set_sec_bytes(57, s057)
         self.set_sec_bytes(58, s058)
-        if self.schema_tag != "JC00":
-            self.set_sec_bytes(213, s213)
 
         if led_pwm is not None:
             self.buf[FPA_SEC_OFFS[11]] = max(0, min(15, int(led_pwm)))
@@ -1232,11 +1423,7 @@ class FpaDataset:
             self.buf[FPA_SEC_OFFS[13]] = (cur_s013 | 0x04) if personalization_pso else (cur_s013 & ~0x04)
 
     def to_sealed_bytes(self) -> bytes:
-        """Preserve `'JC00'` zero tail when `schema_tag == 'JC00'` and seal LE `CRC-32` at `+0x10FC`."""
-        if self.schema_tag == "JC00":
-            self.buf[0x0004] = 0x64
-            self.buf[0x0005] = 0x08
-            self.buf[FPA_SEC_OFFS[206] : 0x0FF4] = b"\x00" * (0x0FF4 - FPA_SEC_OFFS[206])
+        """Seal the LE `CRC-32` at `+0x10FC`; every other byte stays exactly as edited."""
         return seal_zdc_block_crc(self.buf, uds_len=4352)
 
 
@@ -1254,27 +1441,17 @@ def build_fpa_preset_block(
     target_schema: str | None = None,
     existing_zdc4: bytes | None = None,
 ) -> FpaDataset:
-    """Build a complete `FpaDataset` from a factory chassis preset while preserving the ECU's schema tag (`JC00`/`PC00`/`NC00`)."""
+    """Build an `FpaDataset` from a built-in chassis preset.
+
+    The presets are whole datasets of two other gateways (`PC00` from a 3Q0907530AL, `NC00` from a 3Q0907530AR),
+    so the result keeps their own tag and model-year byte: the tag names a dataset, not a firmware schema, and
+    relabelling it would only hide that this is another vehicle's data."""
+    del target_schema, existing_zdc4  # ponytail: callers still pass these; drop them with the GUI/CLI schema picker
     if preset not in ("fwd", "fwd_dcc", "awd", "awd_dcc"):
         raise ValueError(f"Unknown FPA preset '{preset}' (expected fwd, fwd_dcc, awd, awd_dcc)")
 
-    detected_schema = target_schema or ""
-    if not detected_schema and existing_zdc4 and len(existing_zdc4) == 4352 and not all(b == 0xFF for b in existing_zdc4):
-        tag = _ascii_field(existing_zdc4[0:4])
-        if tag in ("JC00", "PC00", "NC00"):
-            detected_schema = tag
-    if not detected_schema:
-        detected_schema = "NC00" if preset.startswith("awd") else "PC00"
-
     tpl_key = "FPA_NC00_AWD_DCC" if preset.startswith("awd") else "FPA_PC00_FWD_DCC"
     fpa = FpaDataset(get_zdc_template_bytes(tpl_key))
-
-    # Apply target firmware schema header so older 5366 ('JC00') and newer 5388/5504 ('PC00'/'NC00') both accept it
-    fpa.buf[0x0000:0x0004] = detected_schema.encode("ascii")
-    fpa.buf[0x0004] = 0x64
-    fpa.buf[0x0005] = 0x08 if detected_schema == "JC00" else 0x0B
-    if detected_schema == "JC00":
-        fpa.buf[FPA_SEC_OFFS[206] : 0x0FF4] = b"\x00" * (0x0FF4 - FPA_SEC_OFFS[206])
 
     if preset == "fwd":
         fpa.set_slot_enabled(1, False)  # Comfort off without DCC
@@ -1467,8 +1644,26 @@ def analyze_gateway_coding_consistency(
     return GatewayCodingReport(master_gates=gates, paco_ecus=paco_list, warnings=warnings)
 
 
-def sync_gateway_coding_for_zdc(df: bytes, coding30: bytes) -> bytes:
-    """Update master ZDC enable bits in 30-byte Gateway Long Coding (`DID 0x0600`) to match `DataFlash` ZDC blocks."""
+def fecs_required_by_dataset(df: bytes) -> list[int]:
+    """SWaP features the datasets in `df` rely on: MKE (0x10000300) when ZDC #1 holds a dataset, and the feature code of
+    every selectable FPA profile (slots 1..9) the dataset gates behind SWaP (S070) — the same pairing
+    parameterize_dflash_for_fecs makes when it enables a profile for a feature."""
+    out: list[int] = []
+    if check_fec_dataset_support(df, 0x10000300).supported:
+        out.append(0x10000300)
+    fpa = FpaDataset.from_dflash(df)
+    if fpa.crc_ok and not fpa.is_passive_base:
+        out += [s.fec_code for s in fpa.slots() if 1 <= s.slot <= 9 and s.selectable and s.swap_gated and s.fec_code]
+    return out
+
+
+def sync_gateway_coding_for_zdc(df: bytes, coding30: bytes, blocks: Iterable[int] | None = None) -> bytes:
+    """Update master ZDC enable bits in 30-byte Gateway Long Coding (`DID 0x0600`) to match `DataFlash` ZDC blocks.
+
+    `blocks` limits it to those ZDC indexes (the ones just written): bits of blocks nobody touched stay as coded.
+    Each bit decides whether the gateway loads its block at all (firmware 5366 table 0x0001E550, e.g. block #4 ->
+    byte 8 bit 0); a dataset written with its bit clear is never used — confirmed on the bench 2026-11-09: an
+    active FPA dataset with byte 8 bit 0 clear stayed unused, setting the bit made the gateway accept it."""
     if len(coding30) != 30:
         raise ValueError(tr(f"Кодировка 0x0600 должна быть ровно 30 байт, получено {len(coding30)} Б", f"Gateway coding 0x0600 must be 30 bytes, got {len(coding30)} B"))
     ds = analyze_dflash_datasets(df)
@@ -1476,7 +1671,10 @@ def sync_gateway_coding_for_zdc(df: bytes, coding30: bytes) -> bytes:
     fpa = FpaDataset.from_dflash(df)
     out = bytearray(coding30)
 
+    only = None if blocks is None else set(blocks)
     for zidx, _label, b_idx, bit_idx in _MASTER_ZDC_CODING_GATES:
+        if only is not None and zidx not in only:
+            continue
         present = (by_idx[4].crc_ok and not fpa.is_passive_base) if zidx == 4 else by_idx[zidx].crc_ok
         mask = 1 << bit_idx
         if present:
@@ -1808,7 +2006,7 @@ def parameterize_dflash_for_fecs(
         if pp.empty or not pp.crc_ok:
             out = apply_zdc_passport(
                 out,
-                dataset_pn=pp.dataset_pn or "V03935256AA",
+                dataset_pn=pp.dataset_pn or ZDC_PLACEHOLDER_PN,
                 dataset_ver=pp.dataset_ver if (len(pp.dataset_ver) == 4 and pp.dataset_ver != "0000") else "0001",
                 equip=pp.equip_bytes,
                 clean_pads=True,
@@ -1843,10 +2041,13 @@ __all__ = [
     "ZDC_REGION_END",
     "ZdcAutoParamConfig",
     "ZdcPassport",
+    "OdisZdcFile",
+    "ZDC_PLACEHOLDER_PN",
     "analyze_gateway_coding_consistency",
     "apply_fpa_dataset",
     "apply_mke_config",
     "apply_ssa_config",
+    "apply_odis_zdc_file",
     "apply_zdc_passport",
     "build_fpa_preset_block",
     "erase_zdc_block",
@@ -1859,10 +2060,14 @@ __all__ = [
     "parse_bem_block",
     "parse_mke_block",
     "parse_ssa_block",
+    "parse_odis_zdc_file",
     "parse_zdc_passport",
     "replace_bem_slot_from_rom",
     "rom_le_to_zdc6_record_be",
     "seal_zdc_block_crc",
+    "build_odis_zdc_file",
+    "fecs_required_by_dataset",
+    "populated_zdc_blocks",
     "sync_gateway_coding_for_zdc",
     "zdc6_record_be_to_rom_le",
     "zdc_crc32_le",

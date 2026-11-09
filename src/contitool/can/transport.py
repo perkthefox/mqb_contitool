@@ -38,6 +38,18 @@ class UnexpectedUdsResponse(RuntimeError):
     """An answer arrived, but not to this request (wrong SID) — e.g. a late reply to an earlier one."""
 
 
+ECHO_BYTES = {0x22: 2, 0x2E: 2, 0x31: 3, 0x36: 1}  # DID, DID, sub-function + routine id, block sequence counter
+
+
+def positive_prefix(req: bytes) -> bytes:
+    """What a positive answer to `req` starts with: SID + 0x40 and the bytes it echoes back.
+
+    The adapters' own ISO-TP paths match on this, as ODIS does on the same VCI (its flash, PDUAPI_VW_#48:
+    `76 <seq>`, `71 01 FF 00`, `6E F1 5A`, `62 <DID>`), so a late answer to an earlier request — a `76` for the
+    previous block — is never taken for this one."""
+    return bytes([(req[0] + 0x40) & 0xFF]) + bytes(req[1 : 1 + ECHO_BYTES.get(req[0], 0)])
+
+
 def _checked_response(req_sid: int, resp: bytes, expected_sid: int | None) -> bytes:
     if len(resp) >= 3 and resp[0] == 0x7F and resp[1] == req_sid:
         raise UdsNegativeResponse(req_sid, resp[2], resp)

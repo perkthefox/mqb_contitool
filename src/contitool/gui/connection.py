@@ -7,11 +7,11 @@ from pathlib import Path
 import time
 from typing import Any
 
-from PySide6.QtCore import QObject, QSettings, Qt, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFileDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -24,13 +24,13 @@ from PySide6.QtWidgets import (
 
 from contitool.can import SUPPORTED_CAN_INTERFACES, FoundAdapter, can_identify, discover_adapters, unsupported_ecu_reason
 from contitool.can import dpdu
-from contitool.core import clean_user_path
 from contitool.gui.theme import set_tone
 from contitool.gui.widgets.page import Dialog, button, group_label, hint, row, run_dialog
 from contitool.gui.widgets.pinout_card import PinoutCard
 from contitool.gui.worker import OperationWorker
 from contitool.i18n import tr
 from contitool.report import Failure
+from contitool.storage import runs_root
 
 
 BUILTIN_TERMINATION = ("dpdu", "j2534")  # VAS 6154 / VNCI and J2534 pass-thru adapters terminate CAN themselves
@@ -47,7 +47,7 @@ class CanConnection(QObject):
         self.interface = str(s.value("can/interface", "slcan"))
         self.port = str(s.value("can/port", ""))
         self.title = str(s.value("can/title", ""))
-        self.out_dir = Path(str(s.value("can/out_dir", Path.cwd() / "contitool_runs")))
+        self.out_dir = runs_root()  # always next to the program (storage.py); no longer a setting
         self.wiring_confirmed = False  # asked again every session on purpose
         self.in_use: Callable[[], str] = lambda: ""  # set by the main window: why the adapter is taken right now
 
@@ -72,7 +72,6 @@ class CanConnection(QObject):
         s.setValue("can/interface", interface)
         s.setValue("can/port", port)
         s.setValue("can/title", title)
-        s.setValue("can/out_dir", str(out_dir))
         self.changed.emit()
 
     def adapter_name(self) -> str:
@@ -202,8 +201,8 @@ class ConnectionDialog(Dialog):
         self.out_dir = conn.out_dir
         self.lbl_outdir = QLabel()
         self.lbl_outdir.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.body.addLayout(row(hint(tr("Папка для бэкапов:", "Backup folder:")), self.lbl_outdir, 1,
-                                button(tr("Изменить…", "Change…"), "GhostBtn", slot=self._browse_outdir)))
+        self.body.addLayout(row(hint(tr("Папка с дампами и сессиями:", "Dumps and sessions folder:")), self.lbl_outdir, 1,
+                                button(tr("Открыть", "Open"), "GhostBtn", slot=self._open_outdir)))
         self._show_outdir()
 
         self.btn_ok = button(tr("Готово", "Done"), "PrimaryBtn", slot=self._save)
@@ -412,11 +411,9 @@ class ConnectionDialog(Dialog):
         self.lbl_outdir.setText(str(self.out_dir))
         self.lbl_outdir.setToolTip(str(self.out_dir))
 
-    def _browse_outdir(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, tr("Папка для бэкапов", "Backup folder"), str(self.out_dir))
-        if chosen:
-            self.out_dir = clean_user_path(chosen)
-            self._show_outdir()
+    def _open_outdir(self) -> None:
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.out_dir)))
 
     def _save(self) -> None:
         iface, port, title = self.selection()

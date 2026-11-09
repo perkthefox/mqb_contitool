@@ -281,7 +281,8 @@ def test_writing_codeflash_activates_the_engineering_bootloader_first(
     assert [c[0] for c in calls] == ["uflash", "cflash"]
     assert calls[0][1]["restore_stock"] is False
     assert not win.ws.pending("cflash")
-    assert win.ecu_screen.change_state("cflash")[0] == "written"
+    # what the ECU now holds is loaded as the dump set: nothing is pending or changed any more
+    assert win.ws.folder.name.endswith("_flashed") and win.ws.folder.parent.name == "dumps" and win.ecu_screen.change_state("cflash")[0] == "unchanged"
     win.close()
 
 
@@ -329,7 +330,8 @@ def test_writing_dataflash_over_can_without_bench_programmer(
     assert len(calls) == 1 and calls[0][0] == "dflash"
     assert calls[0][1].read_bytes() == df_edited
     assert not win.ws.pending("dflash")
-    assert win.ecu_screen.change_state("dflash")[0] == "written"
+    # what the ECU now holds is loaded as the dump set: nothing is pending or changed any more
+    assert win.ws.folder.name.endswith("_flashed") and win.ws.folder.parent.name == "dumps" and win.ecu_screen.change_state("dflash")[0] == "unchanged"
     win.close()
 
 

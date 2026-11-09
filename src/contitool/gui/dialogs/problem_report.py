@@ -2,29 +2,34 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QWidget
+from PySide6.QtWidgets import QApplication, QCheckBox, QFileDialog, QLabel, QWidget
 
 from contitool.gui.connection import CanConnection
 from contitool.gui.theme import set_tone
 from contitool.gui.widgets.page import Callout, Dialog, button, hint
 from contitool.i18n import tr
-from contitool.report import Failure, build_report_zip, environment, issue_body, issue_url
+from contitool.report import GITHUB_ATTACH_LIMIT, Failure, build_report_zip, environment, issue_body, issue_url
 
 
 class ProblemReportDialog(Dialog):
-    def __init__(self, parent: QWidget | None, failure: Failure, conn: CanConnection, log_text: str = "") -> None:
+    def __init__(
+        self, parent: QWidget | None, failure: Failure, conn: CanConnection, log_text: str = "",
+        dumps: dict[str, Path] | None = None,
+    ) -> None:
         what = failure.title or "ContiTool"
         super().__init__(
             parent,
             tr("Что-то пошло не так", "Something went wrong"),
             tr(f"«{what}» — ошибка:", f"“{what}” failed:") if failure.message else "",
         )
-        self.failure, self.conn, self.log_text = failure, conn, log_text
+        self.failure, self.conn, self.log_text, self.dumps = failure, conn, log_text, dumps or {}
         self.report_path: Path | None = None
         if failure.message:
             err = QLabel(failure.message.strip())
@@ -48,6 +53,17 @@ class ProblemReportDialog(Dialog):
             "Please do not message the author directly: use GitHub Issues only.",
         ))
         self.body.addWidget(note)
+        self.chk_dumps = QCheckBox(tr("Приложить дампы памяти", "Attach the memory dumps"))
+        self.body.addWidget(self.chk_dumps)
+        dumps_note = hint(tr(
+            "Загруженные в программе дампы и дампы этой операции (бэкапы перед записью, сверки). В них VIN, FAZIT, "
+            "VCRN и данные SWaP — в публичном issue их увидит любой. Прикладывайте, только если без них не разобраться.",
+            "The dumps loaded in the program and this operation's dumps (backups before a write, readbacks). They "
+            "carry VIN, FAZIT, VCRN and SWaP data — anyone can see them in a public issue. Attach them only when the "
+            "problem cannot be understood without.",
+        ))
+        dumps_note.setWordWrap(True)
+        self.body.addWidget(dumps_note)
         self.lbl_status = hint()
         self.lbl_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_status.hide()
@@ -76,19 +92,27 @@ class ProblemReportDialog(Dialog):
         env = self._env()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            self.report_path = build_report_zip(dest, self.failure, env, self.log_text, self.conn.out_dir)
+            self.report_path = build_report_zip(dest, self.failure, env, self.log_text, self.conn.out_dir,
+                                                dumps=self.dumps if self.chk_dumps.isChecked() else None)
         except OSError as exc:
             self._status(tr(f"Не удалось сохранить архив: {exc}", f"Could not save the archive: {exc}"), "err")
             return None
         finally:
             QApplication.restoreOverrideCursor()
-        self._status(tr(
-            f"Архив сохранён: {dest}<br>Перетащите его в описание issue на открывшейся странице GitHub.",
-            f"Archive saved: {dest}<br>Drag it into the issue description on the GitHub page that opened.",
-        ), "ok")
+        size = dest.stat().st_size
+        if size > GITHUB_ATTACH_LIMIT:
+            self._status(tr(
+                f"Архив сохранён: {dest}<br>Он {size / 2**20:.0f} МБ, а GitHub принимает до 25 МБ — создайте отчёт без дампов.",
+                f"Archive saved: {dest}<br>It is {size / 2**20:.0f} MB and GitHub takes up to 25 MB — create the report without dumps.",
+            ), "warn")
+        else:
+            self._status(tr(
+                f"Архив сохранён и выделен в папке: {dest}<br>Перетащите его в описание issue на открывшейся странице GitHub.",
+                f"Archive saved and selected in its folder: {dest}<br>Drag it into the issue description on the GitHub page that opened.",
+            ), "ok")
         if open_browser:
             QDesktopServices.openUrl(QUrl(issue_url(self.failure, env, self.log_text)))
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(dest.parent)))
+            _reveal(dest)
         return self.report_path
 
     def _status(self, text: str, tone: str = "") -> None:
@@ -96,3 +120,17 @@ class ProblemReportDialog(Dialog):
         set_tone(self.lbl_status, tone)
         self.lbl_status.show()
         self.fit_height()
+
+
+def _reveal(path: Path) -> None:
+    """Open the file's folder with the file selected, ready to drag into the browser."""
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", f"/select,{path}"])  # noqa: S603, S607
+            return
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)])  # noqa: S603, S607
+            return
+    except OSError:
+        pass
+    QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))

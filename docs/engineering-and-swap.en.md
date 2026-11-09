@@ -29,15 +29,17 @@ On Diagnosis CAN (`500 kbit/s`, Tester **`0x710`** → Gateway **`0x77A`**), fou
 | :---: | :---: | :--- | :--- |
 | `10 03` | `50 03 ...` | `ExtendedDiagnosticSession` | Long Coding (`0x0600`), installation list (`0x04A3`), `LIN` / `BEM` / `Wake-up` tests |
 | **`10 40`** | `50 40 ...` | **`EOLSession` (VW End-Of-Line)** | `ZDC` dataset upload (`0x34 / 0x36`), `SWaP FSC` activation (`0x3C01` + `0xC001`), `KSCHUTZ` sync (`0x0567`) |
-| **`10 4F`** | `50 4F ...` | **`DevelopmentSession`** | Continental developer session & Level 2 `SecurityAccess` (`27 03 / 27 04`) |
+| **`10 4F`** | `50 4F ...` | **`DevelopmentSession`** | Continental developer session & `27 03 / 27 04` `SecurityAccess` |
 | `10 02` | `50 02 ...` | `ProgrammingSession` | Software reset into `Uflash.bin` FBL (`0xFEDFFFF0 = 0xA5430911`) |
 
-### Application `SecurityAccess` (`CodeFlash`)
+### Application `SecurityAccess` (`CodeFlash`) — `Level 3` (`27 03 / 27 04`)
 
-1. **`Level 1` (`27 01` → `27 02`, open VAG login `20103 = 0x00004E87`):**
+Subfunction `27 01 / 27 02` **does not exist** on the Continental `J533` gateway (it returns `7F 27 12` `subFunctionNotSupported`). All application-level authentication — including `ODIS` itself — runs on **`Level 3` (`27 03` → `27 04`)**, which accepts two key derivations:
+
+1. **Open VAG Login `20103` (`0x00004E87`)** — used by `ODIS` and `ContiTool` for `ZDC` dataset upload, `SWaP FSC` activation, and EOL routines in `10 40`:
    - Formula: `Key = (uint32_be(Seed) + 0x00004E87) & 0xFFFFFFFF`
-   - Example (`Seed = 12 34 56 78`): `27 02 12 34 A4 FF` → `67 02`.
-2. **`Level 2` (`27 03` → `27 04`, Superuser Level `0xCAFFE012`):**
+   - Example (`Seed = 12 34 56 78`): `27 04 12 34 A4 FF` → `67 04` (if `Seed == 00 00 00 00`, access is already unlocked and `27 04` is skipped).
+2. **Continental Engineering Access (`0xCAFFE012`)** — unlocks programming preconditions (`31 01 02 03`) and developer services:
    - Accepts either dynamic `Key = (uint32_be(Seed) + 0xCAFFE012) & 0xFFFFFFFF` or the **seed-independent static master key `CA FF E0 12`** (`27 04 CA FF E0 12` → `67 04`).
 
 ### `Uflash` FBL `VAG SA2` Algorithm (`10 02` → `27 11 / 27 12`)
@@ -139,24 +141,44 @@ The application's `ZDC` upload handler (`0x0003E552` / `0x0003D558`) performs **
 | `5` | `0x00003E00` | `0x012E` (`302` B) | `0x1200 .. 0x132D` | Subsystem calibration table |
 | `6` | `0x00001C80` | `0x0C00` (`3072` B) | `0x2440 .. 0x303F` | **`BEM`** — battery, LIN alternator & `Start-Stop` curves |
 
-OBD UDS sequence (`0x710` → `0x77A`):
-`10 40` → `27 01` / `27 02 <Seed + 0x4E87>` → *(opt. `2E F1 A0`, `2E F1 A1`)* → `34 00 44 <Addr_BE32> <Len_BE32>` → `36 01 ...` → `37` → **`31 01 02 EF`** (`CheckMemory`) → **`31 01 03 00`**.
+Standard UDS upload sequence (`0x710` → `0x77A`, `can_upload_zdc_datasets`):
+
+1. **Authentication & Workshop Fingerprint**: `10 40` → `27 03` / `27 04 <Seed + 0x00004E87>` (login `20103`) → `2E F1 98 <6-byte tester ID>` → `2E F1 99 <UTC BCD YY MM DD>`.
+2. **Indivisible Per-Block Transfer & `CheckMemory` (`uninterruptible`)**:
+   - `RequestDownload`: `34 00 44 <Addr_BE32> <Len_BE32>` → reply `74 20 04 00` (`maxNumberOfBlockLength = 1,024` B).
+   - `TransferData`: `36 <seq> <data>` **strictly in full-size `maxNumberOfBlockLength - 2` (`1,022`-byte) blocks** up to the final chunk (matching `ODIS-E`: `1022 + 1022 + ...`). Sending artificially short `240`-byte chunks after `74 10 FE` is rejected by the gateway with **`7F 36 31` (`requestOutOfRange`)** and leaves the dataset half-erased!
+   - `RequestTransferExit`: `37` → `77`.
+   - **Immediate Per-Block `CheckMemory` right after `37`**: start `31 01 02 EF 03 10 00` and poll **`31 03 02 EF`** until completion (`71 03 02 EF 02 FF FF` = **`CRC PASS`**, `00 00` = `CRC-32` failure). This clears the gateway's transfer-complete latch (omitting it makes the next `34` fail with `7F 34 22`).
+3. **Sealing Dataset Passport & Automatic `0x0600` Coding Sync**:
+   - writes `2E F1 A0` (`11` B ASCII dataset part number), `2E F1 A1` (`4` B ASCII version), and `2E F1 A4` (`12` B equipment mask);
+   - automatically reads `22 06 00` (`30` bytes), sets the enable bits for every uploaded dataset in `2E 06 00` (without which gateway firmware ignores the uploaded dataset on boot!), and restarts the gateway via `11 02`.
+
+> [!IMPORTANT]
+> When editing **`FPA` (`#2`)** presets, the dataset's header tag and year bytes must stay untouched (modifying only shared profile sections and recalculating the trailing `CRC-32`), otherwise the gateway raises **`DTC 000601` (`Dataset implausible`)**.
+
+### Guided `SWaP` & Coding Preparation When Writing Datasets Over CAN (`v2.0.2`)
+
+Uploading a `ZDC` table alone is not enough when the underlying feature is gated by `SWaP`: `MKE` requires `0x10000300`, and `FPA` hides any driving profile whose `0x10000100..0x1000010B` code is inactive. In the **"Write datasets over CAN"** dialog, `ContiTool` guides the whole sequence step by step:
+1. Reads the gateway's live accepted `SWaP` features (`22 3C 00`) and Long Coding (`22 06 00`), showing which `SWaP` codes the dataset relies on and which `0x0600` bytes change.
+2. When required `SWaP` codes are inactive and the user chooses to enable them, runs **`can_activate_swap`**: reads the gateway's own `DataFlash` via `RAM-Loader`, patches only the `Multi-FSC` records while preserving the unit's `VIN` and existing datasets (`apply_dflash_swap_fecs`), and writes the modified blocks back via `DFLASH_FACI_STUB`.
+3. Uploads `ZDC` blocks over UDS (`can_upload_zdc_datasets`), aligns `0x0600`, re-verifies `22 3C 00`, and offers to clear `DTC`s.
 
 ### Key Service `DIDs (0x2E)` & `RoutineControl (0x31)` RIDs
 
 | Service + ID | Session / Security | Function |
 | :---: | :---: | :--- |
-| `2E 04 FC` / `2E 04 FE` | `10 40` + `SA1` | `Production Mode` — factory power-check bitmasks with auto-decrement counter |
+| `2E 04 FC` / `2E 04 FE` | `10 40` + `27 03/04 (20103)` | `Production Mode` — factory power-check bitmasks with auto-decrement counter |
 | `2E 09 28` | `10 03` / `10 40` | `Transport Mode` — shipping power-saving mode |
-| `2E 06 00` / `2E 04 A3` | `10 03` / `10 40` | `Long Coding` & Gateway installation list (`Verbauliste` in `95640`) |
+| `2E 06 00` / `2E 04 A3` | `10 03` / `10 40` | `Long Coding` (`30` B, preceded by `F198`/`F199`) & Gateway installation list (`Verbauliste` in `95640`) |
+| `22 1F 07` / `22 1F 19` | `10 03` | Live `LIN` frame monitor for steering-wheel `MFL_01` and cruise-control `GRA_Neu` buttons (`can_learn_mfl_button`) |
 | `31 01 02 03` | `10 03` / `10 40` | `CheckProgrammingPreconditions` prior to `10 02` |
 | `31 01 03 06` | `10 40` / `10 4F` | Native `ICUS0` challenge-response unlock for `Feature 0x80/0x81/0x83` |
 | `31 01 03 B0` / `05 C7` | `10 03` / `10 40` | Reset `BEM` battery statistics & communication fault counters |
 | `31 01 04 B5` / `04 B6` | `10 03` / `10 40` | Start & poll `LIN` slave bus diagnostic test |
 | `31 01 04 75` | `10 03` / `10 40` | Hold CAN subnetworks awake (`Partial Networking`) |
-| `31 01 05 67` | `10 40` + `SA1` | `KSCHUTZ` (`CP`) service status synchronization |
+| `31 01 05 67` | `10 40` + `27 03/04 (20103)` | `KSCHUTZ` (`CP`) service status synchronization |
 | `31 01 06 65` / `06 91` | `10 03` / `10 40` | Physical `Wake-up` line test / forced bus sleep |
-| `31 01 10 27` | `10 40` + `SA1` | Factory EOL CAN/LIN transceiver self-test |
+| `31 01 10 27` | `10 40` + `27 03/04 (20103)` | Factory EOL CAN/LIN transceiver self-test |
 
 ---
 
@@ -194,7 +216,7 @@ Each certificate comprises a **43-byte signed body (`0x00..0x2A`)** and a **128-
 #### Five-Step OBD `FSC` Activation Sequence (`0x710` → `0x77A`)
 
 1. `10 40` — enter `EOLSession` (`31 01 C0 01` is rejected in `10 03`).
-2. `27 01` → `27 02 <Seed + 0x00004E87>` — unlock `SecurityAccess Level 1` (login `20103`).
+2. `27 03` → `27 04 <Seed + 0x00004E87>` — unlock `SecurityAccess Level 3` (open login `20103`).
 3. *(Optional)* read `VCRN` via `22 3C 03`.
 4. `2E 3C 01 <171-byte FSC>` — stage certificate into RAM buffer `0xFEDF590D`.
 5. **`31 01 C0 01`** *(strictly 4 bytes with zero inline parameters — appending `FSC` bytes to `31 01` returns `7F 31 13`!)* → poll **`31 03 C0 01`** (delete an installed `FeC`: `31 01 C0 02 <4B FeC>`).

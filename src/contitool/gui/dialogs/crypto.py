@@ -394,9 +394,7 @@ class SwapActivateDialog(Dialog):
             self.warn_callout.setVisible(False)
             self.param_frame.setVisible(False)
 
-        sh = self.sizeHint()
-        if self.height() < sh.height():
-            self.resize(max(self.width(), self._min_width), sh.height())
+        self.fit_height()
 
         sel_cnt = len(self.selected_fecs)
         self.btn_ok.setText(

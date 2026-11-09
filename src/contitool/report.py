@@ -21,7 +21,9 @@ ISSUES_URL = f"{ISSUES_PAGE}/new"
 CAN_LOG_HEAD, CAN_LOG_TAIL = 300, 5000  # lines of a session can.jsonl: how it started and how it ended
 DRIVER_LOG_BUDGET = 40 * 1024 * 1024  # uncompressed; the D-PDU driver rotates 8 MB files, a backup writes dozens
 DRIVER_LOG_TAIL = 8 * 1024 * 1024  # a single log bigger than this goes in as its tail, never whole
-URL_BODY_LIMIT = 6000  # browsers and GitHub cut longer query strings
+DUMP_BUDGET = 40 * 1024 * 1024  # uncompressed *.bin of the operation when dumps go in: a few full sets at most
+GITHUB_ATTACH_LIMIT = 25 * 1024 * 1024  # what GitHub takes as one issue attachment
+URL_LIMIT = 7500  # characters of the whole URL, encoded: GitHub refuses a new-issue URL much over 8 KB
 
 _VIN = re.compile(r"\b([A-HJ-NPR-Z0-9]{11})[A-HJ-NPR-Z0-9]{6}\b")
 _FAZIT = re.compile(r"\b([A-Z0-9]{3}-[A-Z0-9]{3}\d{2}\.\d{2}\.\d{2})\d{8}\b")
@@ -93,14 +95,15 @@ def driver_logs(since: float, dirs: list[Path] | None = None, *, fallback: bool 
     return sorted(picked, key=lambda p: p.stat().st_mtime)
 
 
-def session_files(out_dir: Path, since: float) -> list[Path]:
-    """Files ContiTool wrote during the operation (logs, JSON results): never memory dumps (*.bin), never archives
-    (*.zip — the report itself is saved into the same folder by default)."""
+def session_files(out_dir: Path, since: float, *, with_dumps: bool = False) -> list[Path]:
+    """Files ContiTool wrote during the operation (logs, JSON results); memory dumps (*.bin) only `with_dumps`, never
+    archives (*.zip — the report itself is saved into the same folder by default)."""
     if not out_dir.is_dir():
         return []
+    skip = (".zip",) if with_dumps else (".bin", ".zip")
     return sorted(
         p for p in out_dir.rglob("*")
-        if p.is_file() and p.suffix.lower() not in (".bin", ".zip") and p.stat().st_mtime >= since - 5
+        if p.is_file() and p.suffix.lower() not in skip and p.stat().st_mtime >= since - 5
     )
 
 
@@ -142,13 +145,24 @@ def issue_body(failure: Failure, env: dict[str, str], log_text: str) -> str:
 
 def issue_url(failure: Failure, env: dict[str, str], log_text: str) -> str:
     """The repository's problem form, filled in field by field (GitHub prefills a form field from the query
-    parameter named after its id). The log is cut from the top when the URL would get too long."""
+    parameter named after its id).
+
+    The length is measured on the encoded URL: a Cyrillic letter takes six characters there, and a Russian log
+    once made a 12.5 KB URL that GitHub would not open. Too long, the log loses lines from the top, then the
+    error is shortened from its end."""
     title = mask_ids(f"[{__version__}] {failure.title or 'ContiTool'}: {failure.message.strip().splitlines()[0][:100] if failure.message.strip() else '-'}")
     fields = {k: mask_ids(v) for k, v in _issue_fields(failure, env, log_text).items()}
-    over = sum(len(v) for v in fields.values()) - URL_BODY_LIMIT
-    if over > 0:
-        fields["log"] = "…\n" + fields["log"][over + 2:]
-    return f"{ISSUES_URL}?{urllib.parse.urlencode({'template': ISSUE_FORM, 'title': title, **fields})}"
+
+    def url() -> str:
+        return f"{ISSUES_URL}?{urllib.parse.urlencode({'template': ISSUE_FORM, 'title': title, **fields})}"
+
+    lines = fields["log"].splitlines()
+    while len(url()) > URL_LIMIT and lines:
+        lines.pop(0)
+        fields["log"] = "…\n" + "\n".join(lines) if lines else "…"
+    while len(url()) > URL_LIMIT and len(fields["error"]) > 80:
+        fields["error"] = fields["error"][: len(fields["error"]) * 3 // 4].rstrip() + " …"
+    return url()
 
 
 def build_report_zip(
@@ -159,29 +173,45 @@ def build_report_zip(
     out_dir: Path,
     *,
     driver_dirs: list[Path] | None = None,
+    dumps: dict[str, Path] | None = None,
 ) -> Path:
-    """Write the report archive; returns its path."""
+    """Write the report archive; returns its path.
+
+    `dumps` (None = no dumps at all): the dumps loaded in the program, by name inside dumps/ — with them also the
+    memory dumps the operation itself wrote (backups before a write, readbacks), up to DUMP_BUDGET."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     readme = tr(
         "Отчёт ContiTool о проблеме.\n\n"
         "issue.md — текст для GitHub Issues; contitool_log.txt — журнал программы; traceback.txt — технические детали;\n"
         "sessions/ — файлы операции (без дампов памяти *.bin; can.jsonl — начало и конец); driver_logs/ — журналы драйвера D-PDU.\n\n"
         "Внимание: сырые журналы (can.jsonl, driver_logs) могут содержать идентификаторы блока и автомобиля.\n"
-        "Просмотрите архив перед публикацией.\n",
+        "Просмотрите архив перед публикацией.\n"
+        + ("\ndumps/ — дампы памяти, загруженные в программе; в sessions/ — дампы этой операции. В них VIN, FAZIT, VCRN "
+           "и данные SWaP.\n" if dumps is not None else ""),
         "ContiTool problem report.\n\n"
         "issue.md — text for GitHub Issues; contitool_log.txt — program log; traceback.txt — technical details;\n"
         "sessions/ — files of the operation (no *.bin memory dumps; can.jsonl — start and end); driver_logs/ — D-PDU driver logs.\n\n"
         "Note: raw logs (can.jsonl, driver_logs) may contain ECU and vehicle identifiers.\n"
-        "Review the archive before publishing it.\n",
+        "Review the archive before publishing it.\n"
+        + ("\ndumps/ — the memory dumps loaded in the program; sessions/ also holds this operation's dumps. They carry "
+           "VIN, FAZIT, VCRN and SWaP data.\n" if dumps is not None else ""),
     )
     with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         z.writestr("README.txt", readme)
         z.writestr("issue.md", issue_body(failure, env, log_text))
         z.writestr("contitool_log.txt", mask_ids(log_text))
         z.writestr("traceback.txt", mask_ids(failure.traceback or failure.message))
-        for p in session_files(out_dir, failure.started):
+        for name, p in (dumps or {}).items():
+            if p.is_file():
+                z.write(p, f"dumps/{name}")
+        budget = DUMP_BUDGET
+        for p in session_files(out_dir, failure.started, with_dumps=dumps is not None):
             arc = "sessions/" + p.relative_to(out_dir).as_posix()
-            if p.name == "can.jsonl":
+            if p.suffix.lower() == ".bin":
+                if p.stat().st_size <= budget:
+                    z.write(p, arc)
+                    budget -= p.stat().st_size
+            elif p.name == "can.jsonl":
                 z.writestr(arc, _can_log_excerpt(p))
             elif p.stat().st_size <= 20 * 1024 * 1024:
                 z.write(p, arc)
@@ -201,6 +231,8 @@ def build_report_zip(
     return dest
 
 
-def failure_from_exception(exc_type: type[BaseException], exc: BaseException, tb: object) -> Failure:
+def failure_from_exception(exc_type: type[BaseException], exc: BaseException, tb: object, started: float) -> Failure:
+    """`started` picks the session and driver logs: with 0 every file ever written to the output folder went in."""
     text = "".join(tb_mod.format_exception(exc_type, exc, tb))  # type: ignore[arg-type]
-    return Failure(tr("Внутренняя ошибка ContiTool", "ContiTool internal error"), f"{exc_type.__name__}: {exc}", text)
+    return Failure(tr("Внутренняя ошибка ContiTool", "ContiTool internal error"), f"{exc_type.__name__}: {exc}", text,
+                   started=started)

@@ -52,6 +52,56 @@ def test_engineering_bootloader_only_for_application_changes(
     win.close()
 
 
+def test_coding_follows_codeflash_when_both_are_written(synth_cflash, synth_dflash, tmp_path: Path, monkeypatch) -> None:
+    """DataFlash goes first without the application; the coding for its ZDC blocks is due after CodeFlash."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from contitool.gui.app import create_window
+    from contitool.gui.screens import ecu
+
+    set_lang("en")
+    app, win = create_window()
+    folder = tmp_path / "dumps"
+    folder.mkdir()
+    for name, raw in (("Cflash.bin", synth_cflash), ("Dflash.bin", synth_dflash)):
+        (folder / name).write_bytes(raw)
+    win.open_folder(str(folder))
+    for kind, raw, at in (("cflash", synth_cflash, FBL_MOD_OFFSET), ("dflash", synth_dflash, 0x1400)):
+        edited = bytearray(raw)
+        edited[at] ^= 0xFF
+        (tmp_path / f"{kind}_edit.bin").write_bytes(edited)
+        win.ws.commit(kind, tmp_path / f"{kind}_edit.bin")
+    app.processEvents()
+
+    calls: list[tuple] = []
+    win.conn.out_dir = tmp_path / "runs"
+    monkeypatch.setattr(ecu, "ensure_ready", lambda *_a: True)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    readback = bytearray(synth_dflash)
+    readback[0x7C00] ^= 0x5A  # the ECU's own NvM moved on since the backup: the readback, not the file, is the truth
+
+    def write_dflash(*_a, **k):
+        calls.append(("dflash", k["return_to_app"]))
+        k["session_dir"].mkdir(parents=True, exist_ok=True)
+        (k["session_dir"] / "Dflash_readback.bin").write_bytes(readback)
+        return {"zdc_blocks_written": [4]}
+
+    monkeypatch.setattr(ecu, "can_write_dflash", write_dflash)
+    monkeypatch.setattr(ecu, "can_write_cflash", lambda *a, **k: calls.append(("cflash",)) or {})
+    monkeypatch.setattr(ecu, "can_sync_zdc_coding", lambda _p, _df, blocks, **k: calls.append(("coding", blocks)) or {})
+    win.ecu_screen._write_to_ecu()
+    loop = QEventLoop()
+    win.runner.operation_finished.connect(lambda *_: loop.quit())
+    QTimer.singleShot(8000, loop.quit)
+    loop.exec()
+    assert calls == [("dflash", False), ("cflash",), ("coding", [4])]
+    # what the ECU now holds is the loaded dump set: the readback where an area was written, nothing pending
+    assert win.ws.folder.name.endswith("_flashed") and win.ws.folder.parent.name == "dumps" and not any(win.ws.pending(k) or win.ws.modified(k) for k in ("cflash", "dflash"))
+    assert win.ws.path("dflash").read_bytes() == readback
+    assert win.ws.path("cflash").read_bytes() == (tmp_path / "cflash_edit.bin").read_bytes()  # no readback: the file
+    win.close()
+
+
 @pytest.mark.parametrize(
     ("at", "value", "ok"),
     [
@@ -90,6 +140,10 @@ def test_codeflash_readback_follows_the_fbl_validity_rule(
     monkeypatch.setattr(workflows, "_reset_to_application", lambda *a, **k: {})
     monkeypatch.setattr(workflows, "_program_application_uds", program_app)
     monkeypatch.setattr(workflows, "read_memory_area", read_area)
+    monkeypatch.setattr(workflows, "_ecu_stuck_in_fbl", lambda *a, **k: False)
+    # block 4 (the FBL's programming record) goes in after the download, as the image has it
+    monkeypatch.setattr(workflows, "_program_cflash_blocks_in_loader",
+                        lambda _l, img, _b, **_k: ecu_img.__setitem__(slice(0x8000, 0xA000), img[0x8000:0xA000]) or [])
     run = lambda: workflows.can_write_cflash(  # noqa: E731
         "fake", bytes(candidate), ignore_input_crc=True, session_dir=tmp_path / "cf", return_to_app=False
     )
@@ -149,12 +203,13 @@ def test_reads_are_cut_at_dataflash_limits_and_into_4kb_requests(monkeypatch) ->
 
 
 def test_zdc_transfer_blocks_follow_the_ecus_limit() -> None:
-    from contitool.can.workflows import ZDC_UPLOAD_CHUNK_SIZE, _transfer_chunk
+    from contitool.can.workflows import _transfer_chunk
 
-    assert _transfer_chunk(bytes.fromhex("742000fc"), ZDC_UPLOAD_CHUNK_SIZE) == 0xF0  # the simulator's answer
-    assert _transfer_chunk(bytes.fromhex("74200082"), ZDC_UPLOAD_CHUNK_SIZE) == 0x80  # a variant that caps at 130 B
+    assert _transfer_chunk(bytes.fromhex("74200400")) == 0x3FE  # ODIS log: 1022-B blocks
+    assert _transfer_chunk(bytes.fromhex("7410fe")) == 0xFC  # bench gateway: 252-B blocks, nothing smaller
+    assert _transfer_chunk(bytes.fromhex("74200082")) == 0x80  # a variant that caps at 130 B
     with pytest.raises(RuntimeError, match="Malformed"):
-        _transfer_chunk(b"\x74", ZDC_UPLOAD_CHUNK_SIZE)
+        _transfer_chunk(b"\x74")
 
 
 def test_faci_block_packets_respect_the_page_cap() -> None:

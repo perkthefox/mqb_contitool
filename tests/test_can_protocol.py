@@ -186,16 +186,6 @@ class _SilentStage1(_MockGatewayBus):
         super().send(message, timeout)
 
 
-def test_a_silent_stage1_does_not_stop_the_loader_entry() -> None:
-    """Stage 1 is there for its overrun (0xFEDE0C69 = 05), which happens whether or not the answer goes out:
-    stage 2 is never answered either. A gateway flashed by 2.0.1d stays silent at stage 1 and must still enter."""
-    with J533CanLink("mock", bus=_SilentStage1()) as link:
-        info = enter_ram_loader(link)
-    assert info["loader_ready"] is True and info["beacon"] == BEACON_ASCII.decode("ascii")
-    assert info["stage1_response"] == "suppressed" and "stage1_length" not in info
-    assert info["f15b"] == F15B_AFTER_201D.hex(" ")  # the record that explains the silence goes into the result
-
-
 def test_a_silent_stage1_with_no_loader_after_it_is_named_not_a_bare_timeout() -> None:
     """Issue #1: UDS works but the entry fails after a silent stage 1 — say which step, and carry F15B."""
     import pytest
@@ -542,3 +532,66 @@ def test_a_refused_precondition_does_not_stop_the_fbl_entry_the_10_02_answer_dec
     monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
     workflows._enter_fbl_uds_programming(DelayedLink(), NULL_REPORTER)
     assert sent[-1] == b"\x10\x02"
+
+
+def test_a_silent_stage1_never_spends_a_securityaccess_attempt_on_the_trigger() -> None:
+    """The trigger is a `27 12` with a deliberately wrong key: it only works because the staged overrun diverts
+    the bootloader before the key is checked, and the attempt is recorded first. After three the bootloader locks
+    SecurityAccess behind its timer (NRC 0x37, handler 0x01002F08, NvM-backed counter at 0xFEDE0AEE), which an
+    `11 01` reset does not clear. 2.0.1e sent the trigger even when stage 1 stayed silent — i.e. when there is no
+    evidence the overrun landed — and locked a user's gateway out. So: no answer to stage 1, no trigger."""
+    import pytest
+
+    from contitool.i18n import set_lang
+
+    set_lang("en")
+    _, _, trigger = build_service_loader_uds_steps()
+
+    class CountingSilentStage1(_SilentStage1):
+        def __init__(self) -> None:
+            super().__init__()
+            self.loader = False
+            self.triggers = 0
+
+        def _handle_uds(self, req: bytes) -> None:
+            if req == trigger:
+                self.triggers += 1
+            super()._handle_uds(req)
+
+    bus = CountingSilentStage1()
+    with J533CanLink("mock", bus=bus) as link, pytest.raises(TimeoutError) as err:
+        enter_ram_loader(link)
+    assert "did not answer stage 1" in str(err.value)
+    assert bus.triggers == 0, "a silent stage 1 must not spend a key attempt on the trigger"
+
+
+def test_cancel_waits_for_a_write_and_a_cancelled_read_hands_the_gateway_back(monkeypatch, tmp_path) -> None:
+    """A cancel during a flash write takes effect once the write is done; after a cancelled read the gateway is
+    reset to its application instead of being left in the RAM-loader."""
+    import contextlib
+
+    import pytest
+
+    from contitool.can import workflows
+    from contitool.progress import OperationCancelledError, OperationReporter
+
+    rep = OperationReporter()
+    done: list[str] = []
+    with pytest.raises(OperationCancelledError), rep.uninterruptible():
+        rep.cancel()
+        rep.progress(1, 2)  # a checkpoint inside the write: must not stop it
+        done.append("write finished")
+    assert done == ["write finished"]
+
+    resets: list[str] = []
+
+    def cancelled_read(*_a, **_k):
+        raise OperationCancelledError("cancelled")
+
+    monkeypatch.setattr(workflows, "J533CanLink", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(workflows, "enter_ram_loader", lambda *a, **k: {})
+    monkeypatch.setattr(workflows, "read_memory_area", cancelled_read)
+    monkeypatch.setattr(workflows, "_reset_to_application", lambda *a, **k: resets.append("reset") or {})
+    with pytest.raises(OperationCancelledError):
+        workflows.can_backup("fake", session_dir=tmp_path, areas=("dflash",))
+    assert resets == ["reset"]

@@ -8,7 +8,8 @@ import shutil
 import time
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -25,14 +26,16 @@ from PySide6.QtWidgets import (
 )
 
 from contitool.can import (
+    can_activate_swap,
     can_health_check,
     can_learn_mfl_button,
+    can_read_gateway_coding,
     can_swap_status,
     can_upload_zdc_datasets,
+    can_sync_zdc_coding,
     can_write_cflash,
     can_write_dflash,
     can_write_uflash,
-    default_session_dir,
 )
 from contitool.core import (
     CFLASH_SIZE,
@@ -42,27 +45,35 @@ from contitool.core import (
     STOCK_SWAP_MODULUS,
     UNSUPPORTED_DATASET_RU,
     UNSUPPORTED_DATASET_WARNING,
+    ZDC_UDS_UPLOAD_MAP,
     ZdcAutoParamConfig,
     apply_cflash_rsa_modulus,
     apply_dflash_swap_fecs,
     apply_dflash_swap_rsa_modulus,
     apply_engineering_patch,
+    apply_odis_zdc_file,
     bind_cp_turnkey,
+    build_odis_zdc_file,
     build_signed_fsc,
     clear_dflash_slots,
+    export_zdc_block,
+    fecs_required_by_dataset,
     generate_rsa1024_e3_keypair,
     load_rsa1024_key_material,
     parameterize_dflash_for_fecs,
+    populated_zdc_blocks,
     parse_bem_block,
     parse_mke_block,
+    parse_odis_zdc_file,
     parse_ssa_block,
     parse_zdc_passport,
     save_rsa1024_keypair_bundle,
     sign_fbl_odx_application,
     split_cflash_or_app,
+    sync_gateway_coding_for_zdc,
 )
 from contitool.core import dtc
-from contitool.core.constants import DFLASH_FSC_BASE_OFF, DFLASH_FSC_STRIDE, DFLASH_SWAP_NVM_OFF, FBL_MOD_OFFSET
+from contitool.core.constants import DFLASH_FSC_BASE_OFF, DFLASH_FSC_STRIDE, DFLASH_SWAP_NVM_OFF, FBL_MOD_OFFSET, ZDC_DATASET_SPECS
 from contitool.gui.connection import CanConnection, ensure_ready
 from contitool.gui.dialogs.cp import CpBindDialog
 from contitool.gui.dialogs.crypto import FscDialog, OdxSignDialog, RsaKeyDialog, SwapActivateDialog
@@ -92,6 +103,7 @@ from contitool.gui.widgets.page import (
 )
 from contitool.gui.worker import OperationRunner
 from contitool.gui.workspace import CANDIDATES, KINDS, NAMES, Workspace
+from contitool.storage import AREA_FILES, new_session, record_flashed, unit_of_cflash
 from contitool.i18n import subscribe_lang_change, tr
 
 GROUPS = (("main", ("cp", "eng", "swap", "zdc", "dtc")), ("service", ("boot",)))
@@ -986,6 +998,19 @@ class EcuScreen(QWidget):
             ),
             self._btn("zdc_passport", tr("Паспорт и разделы…", "Passport & sections…"), self._open_passport_editor, "", ok_df, tip_df),
         )
+        self._block(
+            lay,
+            tr("Экспорт и импорт параметрии", "Dataset export & import"),
+            None,
+            tr(
+                "Экспорт сохраняет каждый заполненный блок ZDC файлом параметрии ODIS (.xml) и как есть (.bin), плюс всю "
+                "область параметрии. Импорт берёт датасет из файла ODIS вместе с его номером и версией.",
+                "Export saves every populated ZDC block as an ODIS parameterization file (.xml) and as it is (.bin), plus "
+                "the whole dataset area. Import takes a dataset from an ODIS file together with its number and version.",
+            ),
+            self._btn("zdc_export", tr("Экспорт параметрии…", "Export datasets…"), self._export_zdc, "", ok_df, tip_df),
+            self._btn("zdc_import_odis", tr("Импорт файла ODIS…", "Import ODIS file…"), self._import_odis_zdc, "", ok_df, tip_df),
+        )
 
     def _page_dtc(self, lay: QVBoxLayout) -> None:
         self._head(lay, "dtc")
@@ -1401,30 +1426,153 @@ class EcuScreen(QWidget):
             new_df = dlg.result_dflash()
             self._edit(tr("Обновление паспорта и блоков ZDC", "Updating ZDC passport & blocks"), "dflash", lambda _r, _rep: new_df)
 
+    def _export_zdc(self) -> None:
+        src = self.ws.path("dflash")
+        if src is None:
+            return
+        df = src.read_bytes()
+        blocks = populated_zdc_blocks(df)
+        if not blocks:
+            QMessageBox.information(self, tr("Экспорт параметрии", "Dataset export"),
+                                    tr("В DataFlash нет заполненных блоков ZDC.", "DataFlash holds no populated ZDC blocks."))
+            return
+        chosen = QFileDialog.getExistingDirectory(
+            self, tr("Куда сохранить параметрию", "Where to save the datasets"), str(self.ws.folder or Path.home()))
+        if not chosen:
+            return
+        dest, n = Path(chosen) / f"ZDC_{self.ws.part_number or 'J533'}_{time.strftime('%Y-%m-%d_%H-%M')}", 2
+        while dest.exists():
+            dest, n = Path(chosen) / f"ZDC_{self.ws.part_number or 'J533'}_{time.strftime('%Y-%m-%d_%H-%M')}_{n}", n + 1
+        dest.mkdir(parents=True)
+        codes = {spec[0]: spec[1] for spec in ZDC_DATASET_SPECS}
+        for idx in blocks:
+            name = f"ZDC{idx}_{codes.get(idx, 'BLOCK')}"
+            (dest / f"{name}.xml").write_bytes(build_odis_zdc_file(df, idx))
+            (dest / f"{name}.bin").write_bytes(export_zdc_block(df, idx))
+        (dest / "ZDC_area_0000-303F.bin").write_bytes(df[:0x3040])  # passport and all blocks, as DataFlash holds them
+        self.note.emit(tr(f"Параметрия сохранена ({len(blocks)} бл.): {dest}", f"Datasets saved ({len(blocks)} blocks): {dest}"))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(dest)))
+
+    def _import_odis_zdc(self) -> None:
+        src, _ = QFileDialog.getOpenFileName(
+            self, tr("Файл параметрии ODIS", "ODIS parameterization file"), str(self.ws.folder or Path.home()),
+            "ODIS XML (*.xml);;All files (*)")
+        if not src:
+            return
+        try:
+            parsed = parse_odis_zdc_file(Path(src).read_bytes())
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, tr("Импорт файла ODIS", "ODIS file import"), str(exc))
+            return
+        self._edit(
+            tr(f"Импорт параметрии ODIS в ZDC #{parsed.zdc_idx} ({parsed.dataset_pn})",
+               f"Importing the ODIS dataset into ZDC #{parsed.zdc_idx} ({parsed.dataset_pn})"),
+            "dflash",
+            lambda raw, rep: apply_odis_zdc_file(raw, parsed, reporter=rep),
+        )
+
     def _upload_zdc_over_can(self) -> None:
+        """Datasets into the gateway the way a workshop does it: first see which SWaP features and coding the ECU
+        has, switch on what the datasets need, upload them over the gateway's own UDS, align the coding, then offer
+        to clear the trouble codes."""
         src = self.ws.path("dflash")
         if src is None or not ensure_ready(self.conn, self):
             return
-        if QMessageBox.question(
-            self,
-            tr("Загрузка параметрии ZDC по CAN", "Upload ZDC Parameterization over CAN"),
-            tr(
-                "Записать заполненные блоки параметрии ZDC и паспорт датасета напрямую в шлюз по штатному UDS (10 40 + код 20103)?\n\n"
-                "Бут-режим и модификация загрузчика не требуются.",
-                "Upload populated ZDC blocks and dataset passport directly to the gateway via standard UDS (10 40 + code 20103)?\n\n"
-                "Neither boot mode nor an engineering bootloader is required.",
-            ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        port, iface = self.conn.port, self.conn.interface
-        sdir = default_session_dir(self.conn.out_dir, "zdc_upload")
         df_bytes = src.read_bytes()
+        port, iface = self.conn.port, self.conn.interface
+
+        def precheck(rep: Any) -> dict[str, Any]:
+            features = can_swap_status(port, interface=iface, reporter=rep)["features"]
+            return {"features": features, **can_read_gateway_coding(port, interface=iface, reporter=rep)}
+
         self.runner.run_task(
-            tr("Прямая загрузка параметрии ZDC по CAN", "Uploading ZDC parameterization over CAN"),
-            lambda rep: can_upload_zdc_datasets(port, df_bytes, interface=iface, session_dir=sdir, reporter=rep),
+            tr("Проверка блока перед загрузкой параметрии", "Checking the ECU before the dataset upload"),
+            precheck,
+            # the runner is still busy inside on_success: plan once it has finished
+            on_success=lambda pre: QTimer.singleShot(0, lambda: self._zdc_upload_plan(df_bytes, pre)),
         )
+
+    def _zdc_upload_plan(self, df_bytes: bytes, pre: dict[str, Any]) -> None:
+        self._swap_live, self._swap_at = list(pre["features"]), time.strftime("%H:%M")
+        active = {f["fsid"] for f in pre["features"] if status.swap_live_state(f["status"]).key == "on"}
+        required = fecs_required_by_dataset(df_bytes)
+        missing = [c for c in required if c not in active]
+        blocks = [i for i in sorted(ZDC_UDS_UPLOAD_MAP) if any(b != 0xFF for b in export_zdc_block(df_bytes, i))]
+        coding = bytes(pre["coding"])
+        want = sync_gateway_coding_for_zdc(df_bytes, coding, blocks=blocks)
+        diff = [i for i in range(len(want)) if want[i] != coding[i]]
+        lines = []
+        if missing:
+            names = "\n".join(f"• {status.fec_name(c)}" for c in missing)
+            lines.append(tr(
+                f"Датасет требует функций SWaP, которые в блоке не активны:\n{names}\n\nШтатной команды для этого "
+                "нет: активировать их можно только записью области SWaP в DataFlash через RAM-Loader (остальной "
+                "DataFlash не меняется).",
+                f"The dataset needs SWaP features the ECU does not have active:\n{names}\n\nThere is no standard "
+                "command for that: they can only be switched on by writing the SWaP area of DataFlash through the "
+                "RAM-Loader (the rest of DataFlash stays as it is).",
+            ))
+        elif required:
+            lines.append(tr("Все функции SWaP, которых требует датасет, в блоке активны.",
+                            "Every SWaP feature the dataset needs is active in the ECU."))
+        blk = ", ".join(f"ZDC #{i}" for i in blocks)
+        lines.append(tr(f"Параметрия ({blk}) — штатно по UDS (10 40, код 20103).",
+                        f"Datasets ({blk}) — the standard way, over UDS (10 40, code 20103)."))
+        if diff:
+            ch = ", ".join(f"{i}: {coding[i]:02X} → {want[i]:02X}" for i in diff)
+            lines.append(tr(f"Кодировка 0x0600 после загрузки, байт {ch}.", f"Coding 0x0600 after the upload, byte {ch}."))
+        else:
+            lines.append(tr("Кодировка 0x0600 уже подходит.", "Coding 0x0600 already fits."))
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(tr("Загрузка параметрии по CAN", "Dataset upload over CAN"))
+        box.setText("\n\n".join(lines))
+        act = box.addButton(tr("Активировать SWaP и загрузить", "Activate SWaP and upload"), QMessageBox.ButtonRole.AcceptRole) if missing else None
+        only = box.addButton(tr("Только загрузить", "Upload only") if missing else tr("Загрузить", "Upload"),
+                             QMessageBox.ButtonRole.ActionRole if missing else QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(tr("Отмена", "Cancel"), QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is not None and clicked in (act, only):
+            self._zdc_upload_run(df_bytes, missing if clicked is act else [])
+        else:
+            self.refresh()
+
+    def _zdc_upload_run(self, df_bytes: bytes, activate: list[int]) -> None:
+        port, iface = self.conn.port, self.conn.interface
+        sdir = self._session("zdc_upload")
+
+        def task(rep: Any) -> dict[str, Any]:
+            out: dict[str, Any] = {"session_dir": str(sdir)}
+            if activate:
+                out["swap"] = can_activate_swap(port, activate, interface=iface, session_dir=sdir / "swap", reporter=rep)
+            out["upload"] = can_upload_zdc_datasets(port, df_bytes, interface=iface, session_dir=sdir / "upload", reporter=rep)
+            out["features"] = can_swap_status(port, interface=iface, reporter=rep)["features"]  # did the ECU take them?
+            return out
+
+        def done(res: dict[str, Any]) -> None:
+            self._swap_live, self._swap_at = list(res["features"]), time.strftime("%H:%M")
+            QTimer.singleShot(0, lambda: self._offer_dtc_clear(res, activate))
+
+        self.runner.run_task(tr("Загрузка параметрии по CAN", "Dataset upload over CAN"), task, on_success=done)
+
+    def _offer_dtc_clear(self, res: dict[str, Any], activated: list[int]) -> None:
+        active = {f["fsid"] for f in res["features"] if status.swap_live_state(f["status"]).key == "on"}
+        refused = [c for c in activated if c not in active]
+        text = tr("Параметрия загружена.", "The datasets are uploaded.")
+        if refused:
+            text += tr(f"\n\nБлок не принял SWaP: {', '.join(status.fec_name(c) for c in refused)} — подробности на "
+                       "странице «Активация функций».",
+                       f"\n\nThe ECU did not accept SWaP: {', '.join(status.fec_name(c) for c in refused)} — details on "
+                       "the Feature activation page.")
+        elif activated:
+            text += tr(" Функции SWaP активны в блоке.", " The SWaP features are active in the ECU.")
+        text += tr("\n\nСтереть ошибки в блоке? После смены параметрии старые записи обычно уже неактуальны.",
+                   "\n\nClear the trouble codes in the ECU? After a dataset change the old entries are usually stale.")
+        if QMessageBox.question(self, tr("Загрузка параметрии по CAN", "Dataset upload over CAN"), text) == QMessageBox.StandardButton.Yes:
+            self._dtc_run(clear=True)
+        else:
+            self.refresh()
 
     def _test_mfl_button_live(self) -> None:
         if not ensure_ready(self.conn, self):
@@ -1603,7 +1751,7 @@ class EcuScreen(QWidget):
         if not ensure_ready(self.conn, self):
             return
         port, iface = self.conn.port, self.conn.interface
-        sdir = default_session_dir(self.conn.out_dir, "dtc")
+        sdir = self._session("dtc")
 
         def done(res: dict[str, Any]) -> None:
             self._dtc = list(res.get("dtc_records") or [])
@@ -1644,6 +1792,24 @@ class EcuScreen(QWidget):
         except OSError:
             return False
 
+    def _session(self, kind: str) -> Path:
+        """A writes/ session in the folder of the gateway the loaded dumps belong to (storage.py)."""
+        cf = self.ws.original.get("cflash")
+        return new_session(self.conn.out_dir, unit_of_cflash(cf.read_bytes() if cf else None), kind)
+
+    @staticmethod
+    def _record_flashed(unit_dir: Path, sdir: Path, now_files: dict[str, Path | None], base_files: dict[str, Path]) -> Path:
+        """What the ECU holds after the write, as the gateway's dumps/<date>_flashed: for each area written its readback
+        (what the ECU answered, verified against what was meant), the loaded file for the rest. A bootloader that went
+        in on the way (the engineering one) shows up the same way."""
+        files: dict[str, Path] = {}
+        for kind, name in zip(KINDS, AREA_FILES):
+            rb = sdir / kind / name.replace(".bin", "_readback.bin")
+            src = rb if rb.is_file() else now_files.get(kind)
+            if src is not None:
+                files[name] = src
+        return record_flashed(unit_dir, files, sdir, base_files)
+
     def _adopt_uflash(self, session_dir: Path) -> None:
         """After a bootloader write, show the Uflash actually read back from the ECU."""
         rb = session_dir / "Uflash_readback.bin"
@@ -1674,7 +1840,7 @@ class EcuScreen(QWidget):
         ) != QMessageBox.StandardButton.Yes:
             return
         port, iface = self.conn.port, self.conn.interface
-        sdir = default_session_dir(self.conn.out_dir, "bootloader")
+        sdir = self._session("bootloader")
         self.runner.run_task(
             tr("Активация инженерного загрузчика", "Activating the engineering bootloader")
             if engineering
@@ -1722,7 +1888,10 @@ class EcuScreen(QWidget):
             return
 
         port, iface = self.conn.port, self.conn.interface
-        sdir = default_session_dir(self.conn.out_dir, "write")
+        sdir = self._session("write")
+        unit_dir = sdir.parent.parent
+        now_files = {k: self.ws.path(k) for k in KINDS}  # what each area is if this write does not touch it
+        base_files = {CANDIDATES[k][0]: p for k, p in self.ws.original.items()}
         cf_path = self.ws.path("cflash") if "cflash" in pending_kinds else None
         df_path = self.ws.path("dflash") if "dflash" in pending_kinds else None
         cf_orig = self.ws.original.get("cflash")
@@ -1767,8 +1936,21 @@ class EcuScreen(QWidget):
                     cf_path,
                     interface=iface,
                     session_dir=sdir / "cflash",
+                    skip_backup=did_backup,  # the bootloader or DataFlash step took the full backup already
                     reporter=rep,
                 )
+                zdc_blocks = out.get("dflash", {}).get("zdc_blocks_written")
+                if zdc_blocks:  # DataFlash went first without the application; its coding is due now
+                    try:
+                        out["auto_coding"] = can_sync_zdc_coding(port, df_path.read_bytes(), zdc_blocks, interface=iface, reporter=rep)
+                    except Exception as exc:  # noqa: BLE001 — both areas are written and verified; only the coding is left
+                        rep.warning(tr(
+                            f"Запись прошла, но кодировку 0x0600 под датасеты ZDC {zdc_blocks} согласовать не удалось ({exc}). "
+                            "Без неё датасеты не используются — повторите запись DataFlash или включите их в кодировке.",
+                            f"The write succeeded but coding 0x0600 for ZDC datasets {zdc_blocks} could not be aligned ({exc}). "
+                            "Without it the datasets are not used — write DataFlash again or enable them in the coding.",
+                        ))
+            out["flashed"] = str(self._record_flashed(unit_dir, sdir, now_files, base_files))
             if check_swap:
                 try:
                     out["swap"] = can_swap_status(port, interface=iface, reporter=rep)
@@ -1782,8 +1964,9 @@ class EcuScreen(QWidget):
             return out
 
         def done(r: dict[str, Any]) -> None:
-            self.ws.mark_written(pending_kinds)
-            self._adopt_uflash(sdir / "uflash")
+            flashed = Path(r["flashed"])
+            self.ws.open_folder(flashed, source="can")  # what the ECU now holds; nothing left pending
+            self.note.emit(tr(f"Открыты дампы, как они теперь в блоке: {flashed}", f"Opened the dumps as the ECU now holds them: {flashed}"))
             if "swap" in r:
                 self._swap_done(r["swap"])
 

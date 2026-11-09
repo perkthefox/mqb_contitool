@@ -228,6 +228,9 @@ def test_a_late_answer_to_an_earlier_request_is_never_returned_as_this_one() -> 
                 self._push(b"\x7e\x00")
             elif req == b"\x10\x03":
                 self._push(b"\x50\x03\x00\x32\x01\xf4")
+            elif req[:2] == b"\x36\x02":  # block 1's answer came late: it sits in front of block 2's
+                self._push(b"\x76\x01")
+                self._push(b"\x76\x02")
             return 0
 
         def PassThruReadMsgs(self, chan, buf, n, _timeout) -> int:  # noqa: N802
@@ -244,6 +247,7 @@ def test_a_late_answer_to_an_earlier_request_is_never_returned_as_this_one() -> 
     with J533CanLink("fake.dll", bus=bus) as link, link.uds_session() as active:
         assert active is True
         assert link.request_uds(b"\x10\x03", 0x50, timeout=2.0).startswith(b"\x50\x03")
+        assert link.request_uds(b"\x36\x02" + bytes(512), 0x76, timeout=2.0) == b"\x76\x02"  # not 76 01
     bus.shutdown()
 
 

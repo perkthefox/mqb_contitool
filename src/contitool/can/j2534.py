@@ -18,6 +18,7 @@ from typing import Any
 
 import can
 
+from contitool.can.transport import positive_prefix
 from contitool.i18n import tr
 
 PROTOCOL_CAN = 5
@@ -322,7 +323,7 @@ class J2534Bus(can.BusABC):
         payload = bytes(req)
         if not payload:
             raise ValueError("Empty UDS payload")
-        req_sid = payload[0]
+        req_sid, want = payload[0], positive_prefix(payload)
         self._drain_uds_rx()  # a late answer to an earlier request must not be read as the answer to this one
         raw_tx = self._uds_tx_id.to_bytes(4, "big") + payload
         out = PassThruMsg(PROTOCOL_ISO15765, 0, ISO15765_FRAME_PAD, 0, len(raw_tx))
@@ -354,8 +355,8 @@ class J2534Bus(can.BusABC):
                     continue
                 if len(resp) >= 2 and resp[0] == 0x7F and resp[1] != req_sid:
                     continue  # a refusal of some earlier request
-                if resp[0] != 0x7F and resp[0] != ((req_sid + 0x40) & 0xFF):
-                    continue  # an answer to some earlier request
+                if resp[0] != 0x7F and not resp.startswith(want):
+                    continue  # an answer to some earlier request (a 76 of the previous block, say)
                 if allow_pending and len(resp) >= 3 and resp[0] == 0x7F and resp[2] == 0x78:
                     slice_end = min(deadline, time.monotonic() + _P2_STAR_WAIT)
                     continue

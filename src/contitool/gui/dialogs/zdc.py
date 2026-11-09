@@ -1428,7 +1428,7 @@ class MkeEditorDialog(Dialog):
             if on
             else tr("Дополнительные настройки чувствительности ▸", "Advanced sensitivity settings ▸")
         )
-        self.adjustSize()
+        self.fit_height()
 
     def _load_preset(self, variant: str) -> None:
         self._erased = False

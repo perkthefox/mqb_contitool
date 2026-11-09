@@ -258,15 +258,36 @@ def build_uflash_one_shot_payload(uflash_32k: bytes) -> tuple[bytes, int]:
     return payload, pages
 
 
-def dflash_active_word_count(block_64b: bytes) -> int:
+# The ZDC passport and datasets (DataFlash 0x0000..0x303F) are not read through R_FDL: the gateway copies them to
+# RAM with a plain CPU read (firmware 5366 copy loop 0x0007EE04) and checks their CRC there. An erased cell reads
+# back as noise, not 0xFF, so every word of a data-bearing block there must be programmed — 0xFFFFFFFF included.
+# Seen on the bench 2026-11-09: a FPA dataset written with its trailing FF word left blank read 2 noise bytes, the
+# CRC failed in the gateway and it reported ZDC #4 invalid (DTC 000401), while the blank-check readback "matched".
+DFLASH_MEMCPY_END = 0x3040
+
+
+def dflash_active_word_count(block_64b: bytes, offset: int | None = None) -> int:
     """Return number of 4-byte words (0..16) to program after erasing a 64-byte DataFlash block.
 
     Preserves valid hardware ECC over active records (including interior 0xFFFFFFFF words) while
-    leaving trailing 0xFF padding genuinely blank (BCST == 0) as required by R_FDL / Fls_Read.
+    leaving trailing 0xFF padding genuinely blank (BCST == 0) as required by R_FDL / Fls_Read — except in the ZDC
+    area (`offset` < DFLASH_MEMCPY_END), read by plain memcpy, where a block holding data is programmed whole.
     """
     if len(block_64b) != DFLASH_BLOCK_SIZE:
         raise ValueError(f"Expected 64-byte DataFlash block, got {len(block_64b)}")
+    if dflash_needs_full_program(block_64b, offset):
+        return DFLASH_BLOCK_SIZE // 4
     return (len(block_64b.rstrip(b"\xff")) + 3) // 4
+
+
+def dflash_needs_full_program(block_64b: bytes, offset: int | None) -> bool:
+    """A data-bearing block of the memcpy-read ZDC area whose trailing 0xFF words an R_FDL-style write leaves blank."""
+    return (
+        offset is not None
+        and offset < DFLASH_MEMCPY_END
+        and block_64b != b"\xff" * DFLASH_BLOCK_SIZE
+        and block_64b.endswith(b"\xff\xff\xff\xff")
+    )
 
 
 def _normalize_flid(flid_16b: bytes | None) -> bytes:
@@ -304,7 +325,7 @@ def build_dflash_faci_payloads(
         if offset in seen_offsets:
             raise ValueError(f"Duplicate DataFlash block offset 0x{offset:04X}")
         seen_offsets.add(offset)
-        words = dflash_active_word_count(block_data)
+        words = dflash_active_word_count(block_data, offset)
         normalized.append((offset, words, bytes(block_data)))
 
     payloads: list[bytes] = []

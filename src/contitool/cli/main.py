@@ -1166,7 +1166,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="input",
         help=tr("Входной дамп для write-uflash / write-dflash / write-cflash", "Input dump for write-uflash / write-dflash / write-cflash"),
     )
-    p_can.add_argument("-o", "--output-dir", help=tr("Папка для сохранения бэкапов и отчётов (по умолчанию ./contitool_runs)", "Base output directory (default: ./contitool_runs)"))
+    p_can.add_argument("-o", "--output-dir", help=tr("Папка для сохранения бэкапов и отчётов (по умолчанию contitool_runs рядом с программой)", "Base output directory (default: contitool_runs next to the program)"))
     p_can.add_argument("--address", type=lambda x: int(x, 0), help=tr("Начальный адрес для read-mem (напр. 0xFF200000)", "Start address for read-mem (e.g. 0xFF200000)"))
     p_can.add_argument("--length", type=lambda x: int(x, 0), help=tr("Длина в байтах для read-mem (напр. 0x10000)", "Byte length for read-mem (e.g. 0x10000)"))
     p_can.add_argument("--out-file", help=tr("Путь к выходному файлу для read-mem", "Output file path for read-mem"))

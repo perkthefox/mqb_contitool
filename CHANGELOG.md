@@ -1,24 +1,68 @@
 # Changelog / История изменений
 
+## 2.0.2 — 2026-11-09
+
+### 🇷🇺 Исправлено
+- **Заливка бэкапа на блок, застрявший в загрузчике.** Приложение пишется сразу по UDS — без RAM-Loader и без бэкапа нерабочего блока; владелец сверяется по FAZIT; сброс один, в конце. На `7F 27 37` — сброс, затем просьба передёрнуть питание, дальше без участия.
+- **Сверка после заливки** сравнивает с бэкапом всё записанное, включая запись программирования загрузчика (блок 4).
+- **Отмена** больше не запускает повтор, не прерывает запись на середине и после отменённого чтения возвращает блок в приложение.
+- **000401 после записи DataFlash:** блоки ZDC программируются целиком.
+- **000601 после пресета FPA:** пресет больше не меняет метку и год датасета.
+- **Запись параметрии по CAN:** вход `27 03/04` вместо несуществующего `27 01`, блоки передачи полного размера.
+- **Кодировка 0x0600** согласуется с записанными датасетами, в том числе когда CodeFlash и DataFlash пишутся вместе.
+- **Аппаратный ISO-TP VAS 6154 / VNCI** настроен как у ODIS: ответ принимается только с эхом запроса (`76 <блок>`, `71 01 FF00`…), `7F xx 78` и `7F xx 21` обрабатывает адаптер. J2534 тоже сверяет эхо.
+- **«Сообщить о проблеме»:** ссылка на заполненное issue укладывается в лимит GitHub; отчёт о внутренней ошибке берёт файлы только последней операции.
+- Диалоги прокручиваются на небольших экранах; журнал не пишет «прошит», если записывать было нечего.
+
+### 🇷🇺 Добавлено
+- **Лечение молчащего этапа 1 входа в RAM-Loader.** Причина — ненулевой серийник тестера в отпечатке программирования (его пишут ContiTool до 2.0.1e и ODIS). ContiTool предлагает одну перепрошивку приложения по UDS с нулевым серийником из CodeFlash этого блока.
+- **«Записать параметрию по CAN» готовит блок:** показывает недостающие функции SWaP и изменения кодировки, активирует SWaP, загружает датасет по UDS, согласует кодировку, предлагает стереть ошибки.
+- **Папки по шлюзам:** `contitool_runs` рядом с программой, в нём `<деталь>_<FAZIT>/dumps` (`base_read`, повторные чтения, `…_flashed` с манифестом изменений) и `writes`.
+- **После «Записать в блок»** открыты дампы в том виде, в каком они теперь в блоке.
+- **Экспорт и импорт параметрии:** каждый заполненный блок ZDC — файлом параметрии ODIS (`.xml`, байт в байт как его пишет ODIS) и `.bin`, плюс вся область параметрии; импорт файла ODIS в DataFlash вместе с номером и версией датасета.
+- **Проверка обновлений** — раз в сутки и из меню «Справка».
+- **Дампы в отчёте о проблеме** — по галочке; архив выделяется в папке, чтобы перетащить его в issue.
+
+### 🇬🇧 Fixed
+- **Writing a backup to a gateway stuck in its bootloader.** The application goes in over UDS at once — no RAM-Loader, no backup of a dead unit; the owner is checked by FAZIT; one reset, at the end. On `7F 27 37`: a reset, then a request to power-cycle, after which it carries on by itself.
+- **The check after a restore** compares everything written with the backup, the bootloader's programming record (block 4) included.
+- **Cancel** no longer starts a retry, never stops a write halfway, and after a cancelled read hands the gateway back to its application.
+- **000401 after a DataFlash write:** ZDC blocks are programmed in full.
+- **000601 after an FPA preset:** the preset no longer changes the dataset's tag and year.
+- **Writing datasets over CAN:** login `27 03/04` instead of the non-existent `27 01`, full-size transfer blocks.
+- **Coding 0x0600** is aligned with the written datasets, also when CodeFlash and DataFlash are written together.
+- **VAS 6154 / VNCI hardware ISO-TP** is set up as ODIS sets it: an answer counts only when it echoes the request (`76 <block>`, `71 01 FF00`…); `7F xx 78` and `7F xx 21` are handled by the adapter. J2534 checks the echo too.
+- **"Report a problem":** the prefilled issue link stays within GitHub's limit; an internal-error report takes only the last operation's files.
+- Dialogs scroll on small screens; the log no longer says "programmed" when nothing was written.
+
+### 🇬🇧 Added
+- **Cure for a silent stage 1 of the RAM-Loader entry.** The cause is a non-zero tester serial in the programming fingerprint (written by ContiTool before 2.0.1e and by ODIS). ContiTool offers one reflash of the application over UDS with a zero serial, from this ECU's CodeFlash.
+- **"Write datasets over CAN" prepares the ECU:** shows the missing SWaP features and the coding changes, activates the SWaP, uploads the datasets over UDS, aligns the coding, offers to clear the trouble codes.
+- **Per-gateway folders:** `contitool_runs` next to the program, holding `<part>_<FAZIT>/dumps` (`base_read`, later reads, `…_flashed` with a manifest of changes) and `writes`.
+- **After "Write to ECU"** the loaded dumps are what the ECU now holds.
+- **Dataset export and import:** every populated ZDC block as an ODIS parameterization file (`.xml`, byte for byte as ODIS writes it) and as `.bin`, plus the whole dataset area; an ODIS file imports into DataFlash with its dataset number and version.
+- **Update check** — once a day and from the Help menu.
+- **Dumps in a problem report** — when ticked; the archive is selected in its folder, ready to drag into the issue.
+
 ## 2.0.1e — 2026-11-09
 
 По отчётам на 2.0.1d: после записи CodeFlash блок замолкал на входе в RAM-Loader, а запись через VAS 6154 / VNCI обрывалась на середине.
 From the 2.0.1d reports: after a CodeFlash write the gateway went silent on the RAM-Loader entry, and writing through a VAS 6154 / VNCI broke off halfway.
 
 ### 🇷🇺 Исправлено
-- **После записи CodeFlash через ContiTool блок переставал отвечать на входе в RAM-Loader** — и сверка записанного, чтение и следующая запись на нём не проходили. Причина — наш отпечаток программирования: в `2E F15A` ContiTool до 2.0.1d писал серийник тестера `01 02 03 04 05 06`. Загрузчик хранит отпечаток последней записью F15B, а ответ на подготовительное чтение входа выходит за его буфер и кладёт байты этой записи на служебные ячейки, в том числе на флаг «не отвечать». Отсюда и «перепрошивка через ODIS лечит»: ODIS перезаписывает отпечаток. Теперь серийник нулевой, как в заводской записи.
-- **Блоки, уже прошитые старой версией, больше не останавливают вход.** Ответ на подготовительное чтение для входа не нужен: второй такой запрос загрузчик не подтверждает никогда, и вход при этом работает. Если первый промолчал, ContiTool продолжает вход и записывает F15B блока в отчёт. Следующая запись CodeFlash заменит отпечаток на правильный.
+- **После записи CodeFlash через ContiTool блок переставал отвечать на входе в RAM-Loader** — и сверка записанного, чтение и следующая запись на нём не проходили. Причина — наш отпечаток программирования: в `2E F15A` ContiTool до 2.0.1d писал серийник тестера `01 02 03 04 05 06`. Загрузчик хранит отпечаток последней записью F15B, а ответ на подготовительное чтение входа выходит за его буфер и кладёт байты этой записи на служебные ячейки, в том числе на флаг «не отвечать». Теперь серийник нулевой, как в заводской записи. *(Поправка: «перепрошивка через ODIS лечит» неверно — ODIS пишет свой серийник и с ненулевым тоже закрывает вход; см. 2.0.2.)*
+- **Блоки, уже прошитые старой версией, вход по-прежнему не пускают.** Без ответа на первое подготовительное чтение вход не срабатывает, поэтому ContiTool останавливается до отправки ключа и записывает F15B блока в отчёт. *(Поправка: ODIS такой блок не лечит; лечение — одна перепрошивка приложения по UDS с нулевым серийником, см. 2.0.2.)*
 - **Объяснение молчания из 2.0.1d было неверным.** Байт, который мы считали проверочным, во всех рабочих журналах равен нулю. Пересборка запроса под блок удалена.
 - **Аппаратный ISO-TP адаптера не включался вообще никогда — из-за нашей ошибки.** Номер объекта, равный нулю, проверялся как «драйвер не знает такого имени», а в MDF Volkswagen нулями пронумерованы как раз шина `ISO_11898_2_DWCAN` и контакт `HI`. Поэтому ContiTool каждый раз решал, что драйвер не поддерживает ISO-TP, и писал старым путём: по одному обращению к адаптеру на каждый кадр CAN. Отсюда и 0,9 КБ/с, и обрыв записи на середине — VAS 6154 / VNCI перестаёт подтверждать отправку примерно на 125-тысячном кадре и перезапускает свою службу, а записи приложения нужно около 220 тысяч. Переоткрытие канала это не лечило: адаптер считает обращения на модуль, а не на канал.
-- **Настройки UDS-канала выровнены по ODIS.** Флаг создания канала `0x40` и `CP_ModifyTiming=1` — как в журнале драйвера собственной сессии ODIS-E на этом же адаптере; без второго адаптер игнорировал наши таймауты P2/P2*.
+- **Настройки UDS-канала выровнены по ODIS.** Флаг создания канала `0x40` и `CP_ModifyTiming=1` — как в журнале драйвера собственной сессии ODIS-E на этом же адаптере.
 - **Видно, почему запись идёт без ISO-TP адаптера.** Если аппаратный ISO-TP не включился, причина (например, «3E 00: нет ответа» или какого объекта не хватает) пишется в журнал и в результат записи. Перед записью большого объёма без ISO-TP ContiTool предупреждает, что такая запись у этого адаптера обычно обрывается на середине.
 
 ### 🇬🇧 Fixed
-- **After a CodeFlash write through ContiTool the gateway stopped answering on the RAM-Loader entry** — so verifying the write, reading and the next write on it all failed. The cause was our programming fingerprint: up to 2.0.1d ContiTool wrote the tester serial `01 02 03 04 05 06` in `2E F15A`. The bootloader keeps the fingerprint as the last F15B record, and the answer to the entry's staging read overruns its buffer and lands bytes of that record on its state cells, the suppress-response flag among them. That is also why "a reflash through ODIS cures it": ODIS rewrites the fingerprint. The serial is now zero, as in the factory record.
-- **Gateways already flashed by an older version no longer stop the entry.** The entry does not need the answer to the staging read: the bootloader never confirms the second one either, and the entry works all the same. When the first goes unanswered, ContiTool carries on and puts the gateway's F15B into the report. The next CodeFlash write replaces the fingerprint with a correct one.
+- **After a CodeFlash write through ContiTool the gateway stopped answering on the RAM-Loader entry** — so verifying the write, reading and the next write on it all failed. The cause was our programming fingerprint: up to 2.0.1d ContiTool wrote the tester serial `01 02 03 04 05 06` in `2E F15A`. The bootloader keeps the fingerprint as the last F15B record, and the answer to the entry's staging read overruns its buffer and lands bytes of that record on its state cells, the suppress-response flag among them. The serial is now zero, as in the factory record. *(Correction: "a reflash through ODIS cures it" is wrong — ODIS writes a serial of its own, and a non-zero one closes the entry too; see 2.0.2.)*
+- **Gateways already flashed by an older version still refuse the entry.** Without the answer to the first staging read the entry does not work, so ContiTool stops before sending the key and puts the gateway's F15B into the report. *(Correction: ODIS does not cure such a gateway; the cure is one reflash of the application over UDS with a zero serial, see 2.0.2.)*
 - **The 2.0.1d explanation of the silence was wrong.** The byte we took for a gate is zero on every working log. Rebuilding the request for the gateway is gone.
 - **The adapter's hardware ISO-TP never came up at all — because of a bug of ours.** An object id of zero was tested as "this driver does not know the name", and the Volkswagen MDF numbers exactly the `ISO_11898_2_DWCAN` bus and the `HI` pin zero. So ContiTool decided every time that the driver had no ISO-TP and wrote the old way: one request to the adapter per CAN frame. That is where the 0.9 KB/s and the write breaking off halfway came from — a VAS 6154 / VNCI stops confirming sends at around the 125,000th frame and restarts its service, while an application write needs some 220,000. Reopening the link did not help: the adapter counts requests per module, not per link.
-- **The UDS link settings now match ODIS.** Link-create flag `0x40` and `CP_ModifyTiming=1`, as in the driver log of ODIS-E's own session on this very adapter; without the latter the adapter ignored our P2/P2* timeouts.
+- **The UDS link settings now match ODIS.** Link-create flag `0x40` and `CP_ModifyTiming=1`, as in the driver log of ODIS-E's own session on this very adapter.
 - **It shows why a write runs without the adapter's ISO-TP.** When the hardware ISO-TP does not come up, the reason (e.g. "3E 00: no answer", or which object is missing) goes into the log and the write result. Before a large write without ISO-TP, ContiTool warns that such a write usually breaks off partway on this adapter.
 
 ## 2.0.1d — 2026-11-09

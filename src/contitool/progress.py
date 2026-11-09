@@ -7,17 +7,25 @@ transfer speeds, ETAs, and structured logs without ever freezing the screen.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+import contextlib
 import dataclasses
 import threading
 import time
 from typing import Literal
 
+from contitool.i18n import tr
+
 LogLevel = Literal["info", "success", "warning", "error", "step", "can"]
 
 
-class OperationCancelledError(RuntimeError):
-    """Raised when the user requests cancellation of a running operation."""
+class OperationCancelledError(BaseException):
+    """Raised when the user requests cancellation of a running operation.
+
+    A BaseException, like KeyboardInterrupt, on purpose: the CAN code treats `RuntimeError` / `Exception` as "the
+    link failed" and answers with a retry, a reset or a fallback path. As a RuntimeError, "Cancel" was taken for a
+    link failure — the RAM-loader entry, for one, went on to its second attempt. Cleanup still runs in `finally`;
+    the GUI worker catches this by name."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,6 +77,8 @@ class OperationReporter:
         self._cancel_event = cancel_event or threading.Event()
         self._started_at = time.monotonic()
         self._stage_started_at = self._started_at
+        self._writing = 0  # > 0 while a flash write runs: see uninterruptible()
+        self._cancel_deferred = False
 
     def cancel(self) -> None:
         """Request cooperative cancellation at the next safe checkpoint."""
@@ -79,8 +89,30 @@ class OperationReporter:
         return self._cancel_event.is_set()
 
     def check_cancelled(self) -> None:
-        if self._cancel_event.is_set():
-            raise OperationCancelledError("Операция остановлена пользователем / Operation cancelled by user")
+        if not self._cancel_event.is_set():
+            return
+        if self._writing:
+            if not self._cancel_deferred:
+                self._cancel_deferred = True
+                self.warning(tr("Идёт запись — прервать её на середине нельзя. Операция остановится, как только "
+                                "запись закончится.",
+                                "A write is in progress and cannot be stopped halfway. The operation stops as soon "
+                                "as the write is done."))
+            return
+        raise OperationCancelledError("Операция остановлена пользователем / Operation cancelled by user")
+
+    @contextlib.contextmanager
+    def uninterruptible(self) -> Iterator[None]:
+        """A flash write: a cancel request waits until it is done, then takes effect.
+
+        Stopped halfway, a write leaves the ECU worse than either end: an erased application keeps it in its
+        bootloader, a half-written boot area pairs new blocks with old ones."""
+        self._writing += 1
+        try:
+            yield
+        finally:
+            self._writing -= 1
+        self.check_cancelled()
 
     def reset_stage_timer(self) -> None:
         self._stage_started_at = time.monotonic()

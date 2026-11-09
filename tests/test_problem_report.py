@@ -56,7 +56,12 @@ def test_report_zip_holds_logs_but_no_dumps_and_masks_ids(tmp_path: Path) -> Non
         assert VIN not in text and FAZIT not in text and "WVWZZZAUZNW******" in text
 
     url = report.issue_url(failure, env, log)
-    assert url.startswith(report.ISSUES_URL) and len(url) < 3 * report.URL_BODY_LIMIT
+    assert url.startswith(report.ISSUES_URL) and len(url) <= report.URL_LIMIT
+    # a Russian log takes six URL characters per letter: still within the limit, the newest lines kept
+    ru_log = "\n".join(f"12:{i:02d}:00 CAN   Чтение памяти: прочитано {i} блоков из 384 — сверка" for i in range(60))
+    ru = report.issue_url(report.Failure("Чтение памяти блока", "Блок не ответил на этапе 1. " * 40), env, ru_log)
+    ru_query = urllib.parse.parse_qs(urllib.parse.urlsplit(ru).query)
+    assert len(ru) <= report.URL_LIMIT and ru_query["log"][0].endswith("прочитано 59 блоков из 384 — сверка")
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
     assert query["title"][0].startswith(f"[{__version__}] Reading the ECU memory: No CAN frame")
     assert query["template"] == [report.ISSUE_FORM]
@@ -103,6 +108,24 @@ def test_failed_operation_offers_a_report(tmp_path: Path) -> None:
     win.runner.was_cancelled = True  # a cancelled operation is not a problem to report
     win._on_operation_finished(False, "", None)
     assert win._report_dlg is None
+    win.close()
+
+
+def test_a_silent_stage_1_offers_the_fingerprint_cure_not_a_report() -> None:
+    from contitool.can.workflows import Stage1SilentError
+    from contitool.gui.app import create_window
+
+    set_lang("en")
+    app, win = create_window()
+    offered: list[str] = []
+    win.offer_fingerprint_cure = lambda: offered.append("cure")
+    loop = QEventLoop()
+    win.runner.operation_finished.connect(lambda *_a: loop.quit())
+    QTimer.singleShot(5000, loop.quit)
+    win.runner.run_task("Reading the ECU memory", lambda _rep: (_ for _ in ()).throw(Stage1SilentError("stage 1 silent")))
+    loop.exec()
+    app.processEvents()
+    assert offered == ["cure"] and win._report_dlg is None
     win.close()
 
 
@@ -184,3 +207,27 @@ def test_driver_logs_come_from_the_driver_the_operation_ran_on(tmp_path: Path) -
     with zipfile.ZipFile(dest) as z:
         logs = [n for n in z.namelist() if n.startswith("driver_logs/")]
     assert logs == ["driver_logs/VW_D_PDU_API_OS/PDUAPI_VW_#3.log"]
+
+
+def test_dumps_go_in_only_when_asked(tmp_path: Path) -> None:
+    """Dumps carry VIN / FAZIT / VCRN: none by default; asked for, the loaded ones and the operation's own."""
+    started = time.time()
+    runs = tmp_path / "runs" / "PN_FZ" / "writes" / "2026-11-09_17-00-00_write" / "dflash" / "backup"
+    runs.mkdir(parents=True)
+    (runs / "Dflash_before.bin").write_bytes(b"\x01" * 64)
+    (runs.parent / "dflash_write_result.json").write_text("{}")
+    loaded = tmp_path / "Cflash.bin"
+    loaded.write_bytes(b"\x02" * 64)
+    failure = report.Failure("Writing to ECU: DataFlash", "boom", "tb", started)
+    env = report.environment("slcan", "x", "y")
+
+    plain = report.build_report_zip(tmp_path / "plain.zip", failure, env, "log\n", tmp_path / "runs", driver_dirs=[])
+    with zipfile.ZipFile(plain) as z:
+        assert not any(n.endswith(".bin") for n in z.namelist())
+    full = report.build_report_zip(tmp_path / "full.zip", failure, env, "log\n", tmp_path / "runs", driver_dirs=[],
+                                   dumps={"loaded/Cflash.bin": loaded})
+    with zipfile.ZipFile(full) as z:
+        names = set(z.namelist())
+        assert "dumps/loaded/Cflash.bin" in names
+        assert "sessions/PN_FZ/writes/2026-11-09_17-00-00_write/dflash/backup/Dflash_before.bin" in names
+        assert "VIN" in z.read("README.txt").decode()
