@@ -20,6 +20,12 @@ From the 2.0.1b and 2.0.1c reports: slow VNCI writes that broke off halfway, gat
 - **Блок в загрузчике виден сразу.** «Проверить связь» показывает «Блок отвечает (в режиме загрузчика FBL)», а «Считать блок» на таком блоке предупреждает, что основная прошивка не запущена, и предлагает залить бэкап.
 - **Напоминание обновить прошивку VAS 6154 / VNCI** — в окне подключения при выборе адаптера и в FAQ.
 - Аппаратный ISO15765 для прошивки через адаптеры J2534 и отправка Consecutive Frame пачкой.
+- **«Создать отчёт…» открывает форму issue «Проблема» уже заполненной** — операция, ошибка, окружение и журнал разложены по полям; остаётся описать, что делали, и перетащить архив.
+
+### 🇷🇺 Лицензия и репозиторий
+- **У ContiTool появилась лицензия:** PolyForm Noncommercial 1.0.0 с дополнительными условиями. Код открыт; бесплатно для личного и некоммерческого использования и для платного ремонта и диагностики; продавать программу, копии и доступ к ней нельзя; доработанные версии — только с открытым исходником на тех же условиях и с указанием автора. Подробно — в `LICENSE` и README.
+- Тексты лицензий ContiTool и сторонних компонентов (Qt / PySide6 и python-can под LGPL-3.0 и др., `THIRD_PARTY_NOTICES.md`) теперь лежат в каждой сборке.
+- В репозитории: формы issue («Проблема», «Предложение»), Discussions для вопросов, `CONTRIBUTING.md`, `SECURITY.md` с приватной отправкой уязвимостей и правила поведения.
 
 ### 🇬🇧 Fixed
 - **Writing CodeFlash through a VAS 6154 / VNCI ran at 0.9 KB/s and broke off with "the VCI send queue is full".** Every CAN frame was a separate round trip to the VCI over the network (~7 ms), so a 514-byte block took 74 of them and nearly all the time went on reaching the adapter rather than writing. The whole programming session now runs on one link through the VCI's own ISO-TP, as ODIS does: one request per block, with the adapter cutting the frames and handling Flow Control itself. ZDC datasets are uploaded the same way. Should the adapter's ISO-TP fail on a request, that request goes again on the regular path and the write carries on — the gateway is not left erased.
@@ -36,6 +42,12 @@ From the 2.0.1b and 2.0.1c reports: slow VNCI writes that broke off halfway, gat
 - **A gateway in the bootloader shows at once.** "Check link" reports "ECU answers (in FBL bootloader mode)", and "Read ECU" on such a gateway warns that the main firmware is not running and offers to write a backup.
 - **A reminder to update the VAS 6154 / VNCI firmware** — in the connection dialog when that adapter is chosen, and in the FAQ.
 - Hardware ISO15765 for flashing through J2534 adapters, and Consecutive Frames sent in batches.
+- **"Create report…" opens the "Problem" issue form already filled in** — operation, error, environment and log each in their own field; describe what you did and drag the archive in.
+
+### 🇬🇧 License & repository
+- **ContiTool now has a license:** the PolyForm Noncommercial 1.0.0 with Additional Terms. The code is open; it is free for personal and noncommercial use and for paid repair and diagnostics; selling the program, copies of it or access to it is not allowed; changed versions only with their source open under the same terms and with the author credited. Details in `LICENSE` and the README.
+- The license texts of ContiTool and of the bundled components (Qt / PySide6 and python-can under the LGPL-3.0, and others — `THIRD_PARTY_NOTICES.md`) now ship in every build.
+- In the repository: issue forms ("Problem", "Feature request"), Discussions for questions, `CONTRIBUTING.md`, `SECURITY.md` with private vulnerability reporting, and a code of conduct.
 
 ## 2.0.1c — 2026-11-09
 

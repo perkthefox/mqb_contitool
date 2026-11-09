@@ -6,7 +6,8 @@
 [![Russian README](https://img.shields.io/badge/lang-%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9-2563EB?style=for-the-badge)](README.md)
 [![GUI + CLI](https://img.shields.io/badge/Desktop%20GUI%20%2B%20CLI-Windows%20%7C%20macOS%20%7C%20Linux-0EA5E9?style=for-the-badge)](#quick-start)
 [![MCU RH850/F1L](https://img.shields.io/badge/MCU-Renesas%20RH850%2FF1L%20(64KB%20DFlash)-0284C7?style=for-the-badge)](#the-64-kb-dataflash-rule-for-bench-programmers)
-[![Not For Sale](https://img.shields.io/badge/Status-FREE%20%E2%80%A2%20NOT%20FOR%20SALE-D97706?style=for-the-badge)](#intended-use--terms)
+[![Free](https://img.shields.io/badge/Status-FREE-D97706?style=for-the-badge)](#intended-use--terms)
+[![License PolyForm NC](https://img.shields.io/badge/License-PolyForm%20Noncommercial-16A34A?style=for-the-badge)](#license)
 
 [![Website](https://img.shields.io/badge/Web-vwhacking.antonperk.com-181717?style=flat-square&logo=googlechrome&logoColor=00D8FF)](https://vwhacking.antonperk.com)
 [![Drive2](https://img.shields.io/badge/Drive2-PerkTheFox-E31E24?style=flat-square&logo=rss&logoColor=white)](https://www.drive2.ru/users/perkthefox/)
@@ -27,8 +28,8 @@
 - **Scope & Intended Use**: **ContiTool** is a cross-platform Desktop GUI (**Qt 6 / PySide6**) and command-line (**CLI**) bench utility for automotive electronics technicians, independent workshops, and **VAG MQB** owners servicing **Continental J533 Gateways (`3Q0 907 530 xx`, Renesas `RH850/F1L`)**: full flash backup over CAN, ECU repair/replacement, **Component Protection** module adaptation, and **SWaP / FeC** certificate management.
 - **Do NOT use this program** if you do not know why you “need” it, cannot work with ODIS or VCTool, or have any, even the slightest doubt that the adapter, the wiring or the power supply is sound. Cheap Chinese adapters are not considered safe, even if the program “gets along” with them.
 - **Do not connect it to a working car.** Work with the gateway removed, on a bench, with a regulated power supply. In a car the gateway connects all the modules: while it sits in its bootloader, or if a write fails, the modules stop seeing each other — the car may not start or drive. Besides, the car's voltage sags during a long write, and any dip or dropout during a write leads to a brick. If you connect to a car anyway, it is your risk: the author takes no responsibility for a damaged ECU. Do not message the author about it — open a [GitHub issue](https://github.com/perkthefox/mqb_contitool/issues) and wait for an answer.
-- **FREE COMMUNITY TOOL — STRICTLY NOT FOR SALE!** Selling this software, bundling it into paid packages, or charging for access to it is strictly prohibited.
-- Provided **"AS IS"** without warranty of any kind, solely for authorized bench diagnostics, repair, and engineering research on owner-controlled hardware. The author (`PerkTheFox`) assumes zero liability for any direct or indirect damage. **Always save a verified full backup of all memory regions (`Cflash.bin` `1.5 MB`, `Uflash.bin` `32 KB`, `Dflash.bin` `64 KB`) before writing!**
+- **FREE COMMUNITY TOOL.** ContiTool is free and always available on [GitHub](https://github.com/perkthefox/mqb_contitool/releases); its [license](#license) forbids selling it. **If someone sold it to you, you were cheated.**
+- Provided **"AS IS"** without warranty of any kind and intended for authorized bench diagnostics, repair, and engineering research on owner-controlled hardware. The author (`PerkTheFox`) assumes zero liability for any direct or indirect damage. **Always save a verified full backup of all memory regions (`Cflash.bin` `1.5 MB`, `Uflash.bin` `32 KB`, `Dflash.bin` `64 KB`) before writing!**
 
 ---
 
@@ -257,12 +258,29 @@ Concrete, byte-accurate engineering documentation without noisy debug logs lives
 └── tests/                        # Unit, protocol & headless GUI smoke tests (pytest)
 ```
 
+## Contributing & Feedback
+
+- **A bug or a failed operation** — open an [issue](https://github.com/perkthefox/mqb_contitool/issues/new/choose) with the "Problem" form. Easiest from the program: after an error press **"Create report…"** — it saves an archive with the logs and opens the form already filled in.
+- **Questions** ("how to connect", "which adapter") — in [Discussions](https://github.com/perkthefox/mqb_contitool/discussions). Please do not use direct messages.
+- **Code changes** — see [`CONTRIBUTING.md`](CONTRIBUTING.md). A vulnerability in ContiTool itself — [`SECURITY.md`](SECURITY.md).
+
+## License
+
+ContiTool © 2026 PerkTheFox is licensed under the **[PolyForm Noncommercial 1.0.0 with Additional Terms](LICENSE)**. In short (only the text of `LICENSE` is legally binding):
+
+- **the code is open** — read it, study it and change it;
+- **free** for personal and noncommercial use, and **for paid repair and diagnostics**: a workshop may use it on customers' cars;
+- **no selling** — not the program, not copies, not access to it, not as part of a paid bundle;
+- **changed versions** may only be distributed with their source open under the same terms and with the authorship line (`Required Notice`) kept.
+
+Third-party components of the release builds (Qt / PySide6 and python-can under the LGPL-3.0, and others) are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
 ---
 
 <div align="center">
 
 **Made by PerkTheFox**  
 [vwhacking.antonperk.com](https://vwhacking.antonperk.com) • [Drive2: perkthefox](https://www.drive2.ru/users/perkthefox/) • [Telegram: @perkthefox](https://t.me/perkthefox)  
-*Free for the VAG research community — Not for commercial sale.*
+*Free for the VAG research community. If someone sold it to you, you were cheated.*
 
 </div>

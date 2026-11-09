@@ -1,0 +1,20 @@
+name: Предложение / Feature request
+description: Новая возможность или поддержка другого блока, адаптера, версии ПО. A new feature, or support for another ECU, adapter or software version.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу это решает / What problem it solves
+      description: Что сейчас не получается сделать. What you cannot do today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Как это могло бы работать / How it could work
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Блок и адаптер / ECU and adapter
+      description: Номер детали, версия ПО, адаптер — если предложение про конкретное железо. Part number, software version, adapter — if this is about specific hardware.

@@ -1,0 +1,10 @@
+# Blank issues stay on: ContiTool 2.0.1a–2.0.1d open `issues/new?title=…&body=…` without a template,
+# and those links must keep working.
+blank_issues_enabled: true
+contact_links:
+  - name: Вопрос / Question
+    url: https://github.com/perkthefox/mqb_contitool/discussions
+    about: Как подключить, какой адаптер или драйвер выбрать — в Discussions. How to connect, which adapter or driver — ask in Discussions.
+  - name: Частые вопросы / FAQ
+    url: https://github.com/perkthefox/mqb_contitool#частые-вопросы-faq
+    about: Ответы на самое частое — в README. The most common answers are in the README.

@@ -112,27 +112,43 @@ def _can_log_excerpt(path: Path) -> str:
     return "\n".join(lines[:CAN_LOG_HEAD] + [f'{{"skipped_lines": {skipped}}}'] + lines[-CAN_LOG_TAIL:]) + "\n"
 
 
-def issue_body(failure: Failure, env: dict[str, str], log_text: str) -> str:
+ISSUE_FORM = "problem.yml"  # .github/ISSUE_TEMPLATE/problem.yml: the keys of _issue_fields are its field ids
+
+
+def _issue_fields(failure: Failure, env: dict[str, str], log_text: str) -> dict[str, str]:
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(failure.finished))
-    tail = "\n".join(log_text.strip().splitlines()[-30:])
+    return {
+        "operation": f"{failure.title or '-'} ({when})",
+        "error": failure.message.strip() or "-",
+        "environment": "".join(f"- {k}: {v}\n" for k, v in env.items()),
+        "log": "\n".join(log_text.strip().splitlines()[-30:]) or "-",
+    }
+
+
+def issue_body(failure: Failure, env: dict[str, str], log_text: str) -> str:
+    """The issue as Markdown, for issue.md in the archive and the "copy text" button."""
+    f = _issue_fields(failure, env, log_text)
     return mask_ids(
         "### Что случилось / What happened\n"
         "<!-- Опишите, что делали и что ожидали. Describe what you did and what you expected. -->\n\n"
-        f"### Операция / Operation\n{failure.title or '-'} ({when})\n\n"
-        f"### Ошибка / Error\n```\n{failure.message.strip() or '-'}\n```\n\n"
-        "### Окружение / Environment\n" + "".join(f"- {k}: {v}\n" for k, v in env.items()) + "\n"
-        f"### Последние строки журнала / Last log lines\n```\n{tail or '-'}\n```\n\n"
+        f"### Операция / Operation\n{f['operation']}\n\n"
+        f"### Ошибка / Error\n```\n{f['error']}\n```\n\n"
+        f"### Окружение / Environment\n{f['environment']}\n"
+        f"### Последние строки журнала / Last log lines\n```\n{f['log']}\n```\n\n"
         "### Архив / Archive\n"
         "<!-- Перетащите сюда архив contitool_report_*.zip. Drag the contitool_report_*.zip here. -->\n"
     )
 
 
 def issue_url(failure: Failure, env: dict[str, str], log_text: str) -> str:
+    """The repository's problem form, filled in field by field (GitHub prefills a form field from the query
+    parameter named after its id). The log is cut from the top when the URL would get too long."""
     title = mask_ids(f"[{__version__}] {failure.title or 'ContiTool'}: {failure.message.strip().splitlines()[0][:100] if failure.message.strip() else '-'}")
-    body = issue_body(failure, env, log_text)
-    if len(body) > URL_BODY_LIMIT:
-        body = body[:URL_BODY_LIMIT] + "\n…\n"
-    return f"{ISSUES_URL}?{urllib.parse.urlencode({'title': title, 'body': body})}"
+    fields = {k: mask_ids(v) for k, v in _issue_fields(failure, env, log_text).items()}
+    over = sum(len(v) for v in fields.values()) - URL_BODY_LIMIT
+    if over > 0:
+        fields["log"] = "…\n" + fields["log"][over + 2:]
+    return f"{ISSUES_URL}?{urllib.parse.urlencode({'template': ISSUE_FORM, 'title': title, **fields})}"
 
 
 def build_report_zip(

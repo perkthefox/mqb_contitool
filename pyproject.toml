@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]  # 77: SPDX `license` and `license-files` (PEP 639)
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,9 @@ name = "contitool"
 version = "2.0.1.post4"
 description = "ContiTool — Desktop GUI Studio & CLI for Continental VAG MQB Gateway J533 (Renesas RH850/F1L)"
 readme = "README.md"
+# PolyForm Noncommercial 1.0.0 plus the Additional Terms at the top of LICENSE, so not the bare SPDX id
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0-ContiTool"
+license-files = ["LICENSE", "LICENSES/*", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.12"
 authors = [
     { name = "PerkTheFox", email = "noreply@antonperk.com" }
@@ -27,6 +30,9 @@ dev = [
 
 [project.urls]
 Homepage = "https://vwhacking.antonperk.com"
+Repository = "https://github.com/perkthefox/mqb_contitool"
+Issues = "https://github.com/perkthefox/mqb_contitool/issues"
+Changelog = "https://github.com/perkthefox/mqb_contitool/blob/main/CHANGELOG.md"
 Telegram = "https://t.me/perkthefox"
 Drive2 = "https://www.drive2.ru/users/perkthefox/"
 

@@ -59,7 +59,22 @@ def test_report_zip_holds_logs_but_no_dumps_and_masks_ids(tmp_path: Path) -> Non
     assert url.startswith(report.ISSUES_URL) and len(url) < 3 * report.URL_BODY_LIMIT
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
     assert query["title"][0].startswith(f"[{__version__}] Reading the ECU memory: No CAN frame")
-    assert "VAS 6154 / VNCI" in query["body"][0] and VIN not in query["body"][0]
+    assert query["template"] == [report.ISSUE_FORM]
+    assert "VAS 6154 / VNCI" in query["environment"][0]
+    assert "No CAN frame from 0x6F1" in query["error"][0]
+    assert not any(VIN in v[0] or FAZIT in v[0] for v in query.values())  # masked in every field, the log too
+
+
+def test_the_report_link_fills_fields_the_issue_form_really_has() -> None:
+    """GitHub prefills a form field from the query parameter named after its id; a renamed field in
+    .github/ISSUE_TEMPLATE/problem.yml would silently drop that part of every report."""
+    import re
+
+    form = (Path(__file__).resolve().parents[1] / ".github/ISSUE_TEMPLATE" / report.ISSUE_FORM).read_text("utf-8")
+    ids = set(re.findall(r"^\s+id: (\S+)$", form, re.M))
+    failure = report.Failure("Writing to ECU: CodeFlash", "boom", "Traceback …", time.time())
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(report.issue_url(failure, {"OS": "x"}, "log\n")).query)
+    assert set(query) - {"template", "title"} <= ids
 
 
 def test_failed_operation_offers_a_report(tmp_path: Path) -> None:

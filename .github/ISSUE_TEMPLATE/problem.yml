@@ -1,0 +1,61 @@
+name: Проблема / Problem
+description: Ошибка в программе или операция, которая не прошла. Something failed or behaves wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Проще всего — из самой программы.** После ошибки нажмите «Создать отчёт…»: ContiTool сохранит архив с журналами и откроет эту форму уже заполненной. Останется описать, что делали, и перетащить архив.
+        **Easiest from the program itself.** After an error press "Create report…": ContiTool saves an archive with the logs and opens this form already filled in. Describe what you did and drag the archive in.
+
+        Пишите здесь, а не в личные сообщения. Please report here, not in direct messages.
+  - type: textarea
+    id: what
+    attributes:
+      label: Что случилось / What happened
+      description: Что делали и что ожидали. What you did and what you expected.
+    validations:
+      required: true
+  - type: input
+    id: operation
+    attributes:
+      label: Операция / Operation
+      placeholder: "Writing to ECU: CodeFlash (2026-11-09 02:28:34)"
+  - type: textarea
+    id: error
+    attributes:
+      label: Ошибка / Error
+      description: Текст ошибки из программы. The error text as ContiTool showed it.
+      render: text
+  - type: textarea
+    id: environment
+    attributes:
+      label: Окружение / Environment
+      description: Версия ContiTool, ОС, адаптер и драйвер, блок (номер детали, версия ПО). ContiTool version, OS, adapter and driver, ECU part number and software version.
+      placeholder: |
+        - ContiTool: 2.0.1d
+        - OS: Windows 10
+        - Adapter: VAS 6154 / VNCI · dpdu · VW_D_PDU_API_OE
+        - ECU: 3Q0907530AR, SW 5502
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Последние строки журнала / Last log lines
+      render: text
+  - type: textarea
+    id: archive
+    attributes:
+      label: Архив / Archive
+      description: |
+        Перетащите сюда contitool_report_*.zip. В сырых журналах могут быть идентификаторы блока и автомобиля — просмотрите архив перед публикацией.
+        Drag the contitool_report_*.zip here. Raw logs may contain ECU and vehicle identifiers — review the archive before publishing it.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Перед отправкой / Before submitting
+      options:
+        - label: Я поискал среди открытых и закрытых issues. I searched open and closed issues.
+          required: true
+        - label: Блок подключён на столе, а не в машине. The ECU is on a bench, not in a car.

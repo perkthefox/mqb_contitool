@@ -22,6 +22,10 @@ sys.path.insert(0, str(SRC_DIR))
 
 from contitool import __version__  # noqa: E402
 
+# Shipped in every archive: ContiTool's license and the licenses of what the build bundles (Qt and python-can are
+# LGPL-3.0, which must travel with them together with the GPL-3.0 it builds on).
+LEGAL_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSES")
+
 
 def _generate_icons(icon_dir: Path) -> Path | None:
     """Render PNG/ICO/ICNS icons headlessly via PySide6 QPainter so zero external image libs are required."""
@@ -117,6 +121,8 @@ def build() -> None:
         "--collect-submodules=can.interfaces",
         "--hidden-import=serial.tools.list_ports",
     ]
+    # inside the bundle, so they are part of what PyInstaller signs on macOS
+    pyi_args += [f"--add-data={ROOT_DIR / name}{os.pathsep}{name if name == 'LICENSES' else '.'}" for name in LEGAL_FILES]
     if sys_name == "Darwin":
         pyi_args.append("--osx-bundle-identifier=com.perkthefox.contitool")
     if icon_path is not None and icon_path.suffix in (".ico", ".icns"):
@@ -156,15 +162,27 @@ def build() -> None:
         app_folder = dist_dir / "ContiTool"
         if not app_folder.exists():
             raise RuntimeError(f"Expected Windows build folder not found: {app_folder}")
+        _copy_legal_files(app_folder)
         zip_out = rel_dir / f"ContiTool-v{__version__}-windows-{arch}.zip"
         _zip_directory(app_folder, zip_out, arc_prefix="ContiTool")
         print(f"[build] Created Windows ZIP: {zip_out}")
 
     else:
         app_folder = dist_dir / "ContiTool"
+        _copy_legal_files(app_folder)
         archive_base = rel_dir / f"ContiTool-v{__version__}-linux-{arch}"
         tar_out = shutil.make_archive(str(archive_base), "gztar", root_dir=dist_dir, base_dir="ContiTool")
         print(f"[build] Created Linux archive: {tar_out}")
+
+
+def _copy_legal_files(app_folder: Path) -> None:
+    """Next to the executable as well, where users look — the copies inside `_internal/` are easy to miss."""
+    for name in LEGAL_FILES:
+        src = ROOT_DIR / name
+        if src.is_dir():
+            shutil.copytree(src, app_folder / name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, app_folder / name)
 
 
 if __name__ == "__main__":
