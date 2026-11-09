@@ -19,8 +19,9 @@ IDENT = {0xF187: b"3Q0907530AA", 0xF191: b"3Q0907530C ", 0xF189: b"5366", 0xF197
 class FakeGateway:
     """Answers UDS on 0x710 -> 0x77A with ISO-TP framing; unknown identifiers get 7F 22 31."""
 
-    def __init__(self, answers: bool = True) -> None:
+    def __init__(self, answers: bool = True, ident_map: dict[int, bytes] | None = None) -> None:
         self.answers, self.rx = answers, []
+        self.ident_map = IDENT if ident_map is None else ident_map
 
     def _reply(self, payload: bytes) -> None:
         if len(payload) <= 7:
@@ -39,7 +40,7 @@ class FakeGateway:
             self._reply(b"\x50\x03\x00\x32\x01\xf4")
         elif req[0] == 0x22:
             did = int.from_bytes(req[1:3], "big")
-            self._reply(b"\x62" + req[1:3] + IDENT[did] if did in IDENT else b"\x7f\x22\x31")
+            self._reply(b"\x62" + req[1:3] + self.ident_map[did] if did in self.ident_map else b"\x7f\x22\x31")
 
     def recv(self, timeout: float | None = None) -> can.Message | None:
         if self.rx:
@@ -174,4 +175,102 @@ def test_fbl_ecu_warns_and_offers_to_write_backup(monkeypatch) -> None:
     win.start_screen.btn_restore.click()
     app.processEvents()
     assert actions == ["restore", "restore"]
+    win.close()
+
+
+def test_unsupported_5q0_and_lear_gateways_are_explained_and_blocked(monkeypatch) -> None:
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    from contitool.can import FoundAdapter, unsupported_ecu_reason
+    from contitool.gui import connection, main_window
+    from contitool.gui.app import create_window
+
+    set_lang("en")
+    # 1. Continental 5Q0907530AD SW 2227 (NXP MPC5607B PowerPC VLE)
+    conti_5q0 = can_identify(
+        "fake",
+        bus=FakeGateway(
+            ident_map={
+                0xF187: b"5Q0907530AD",
+                0xF191: b"5Q0907530M ",
+                0xF189: b"2227",
+                0xF1A3: b"212",
+                0xF197: b"GW MQB High\x00\x00",
+                0xF19E: b"EV_GatewConti\x00",
+            }
+        ),
+    )
+    assert "Continental 5Q0" in conti_5q0["unsupported"] and "MPC5607B" in conti_5q0["unsupported"]
+
+    # 2. Lear 3Q0907530AA SW 4368 (shares 3Q0 part number, but NXP MPC5748G PowerPC VLE)
+    lear_3q0 = can_identify(
+        "fake",
+        bus=FakeGateway(
+            ident_map={
+                0xF187: b"3Q0907530AA",
+                0xF191: b"3Q0907530G ",
+                0xF189: b"4368",
+                0xF1A3: b"438",
+                0xF19E: b"EV_GatewLear\x00",
+            }
+        ),
+    )
+    assert "Lear" in lear_3q0["unsupported"] and "PowerPC" in lear_3q0["unsupported"]
+
+    # 3. MQB-Evo 5WA / MQB-A0 2Q0 are rejected, while pre-series V03825216G and erased-FBL hex are allowed
+    assert unsupported_ecu_reason([{"did": "F187", "value": "5WA907530J"}]) is not None
+    assert unsupported_ecu_reason([{"did": "F187", "value": "2Q0907530E"}]) is not None
+    assert unsupported_ecu_reason([{"did": "F187", "value": "V03825216G"}, {"did": "F189", "value": "5185"}]) is None
+    assert unsupported_ecu_reason([{"did": "F187", "value": "FF" * 11}]) is None
+
+    # 4. GUI: StartScreen no longer claims 5Q0; ConnectionDialog warns; EcuFoundDialog blocks reading
+    app, win = create_window()
+    assert "5Q0" not in win.start_screen.lbl_sub.text()
+    assert "3Q0 907 530" in win.start_screen.lbl_sub.text()
+    set_lang("ru")
+    assert "5Q0" not in win.start_screen.lbl_sub.text()
+    set_lang("en")
+
+    monkeypatch.setattr(
+        connection,
+        "discover_adapters",
+        lambda: [FoundAdapter("slcan", "/dev/cu.usbmodem1101", "CANable2", "SLCAN")],
+    )
+    monkeypatch.setattr(connection, "can_identify", lambda port, **k: conti_5q0)
+    dlg = connection.ConnectionDialog(win.conn, win)
+    while dlg._scan is not None:
+        dlg._scan.wait(3000)
+        app.processEvents()
+    loop = QEventLoop()
+    dlg._check_link()
+    dlg._check.finished.connect(loop.quit)
+    QTimer.singleShot(3000, loop.quit)
+    loop.exec()
+    for _ in range(5):
+        app.processEvents()
+    assert dlg.lbl_check.text().startswith("⚠ ECU answers, but is not supported: 5Q0907530AD · GW MQB High · SW 2227 — ")
+    assert "MPC5607B" in dlg.lbl_check.text()
+    assert dlg.lbl_check.property("tone") == "warn"
+    dlg.close()
+
+    backups: list[str] = []
+    monkeypatch.setattr(main_window, "ensure_ready", lambda *_a: True)
+    monkeypatch.setattr(main_window, "can_identify", lambda *a, **k: conti_5q0)
+    monkeypatch.setattr(main_window, "can_backup", lambda *a, **k: backups.append("backup") or {})
+
+    def inspect_unsupported_dialog(self) -> int:
+        assert self.windowTitle() == "Unsupported ECU"
+        assert self.btn_ok is None
+        return 1  # even if forced to 1, _confirm_read must refuse to start can_backup
+
+    monkeypatch.setattr(main_window.EcuFoundDialog, "exec", inspect_unsupported_dialog)
+    loop2 = QEventLoop()
+    win.runner.operation_finished.connect(loop2.quit)
+    win.read_over_can()
+    QTimer.singleShot(5000, loop2.quit)
+    loop2.exec()
+    win.runner.operation_finished.disconnect(loop2.quit)
+    for _ in range(20):
+        app.processEvents()
+    assert backups == []
     win.close()

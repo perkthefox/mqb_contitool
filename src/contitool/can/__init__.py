@@ -60,6 +60,7 @@ from contitool.can.workflows import (
     read_memory_area,
     read_memory_bytes,
     run_rsa_probe,
+    unsupported_ecu_reason,
 )
 
 __all__ = [
@@ -124,5 +125,6 @@ __all__ = [
     "read_memory_area",
     "read_memory_bytes",
     "run_rsa_probe",
+    "unsupported_ecu_reason",
     "verify_payload_self_tests",
 ]

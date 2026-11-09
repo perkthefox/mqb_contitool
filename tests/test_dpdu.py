@@ -75,7 +75,8 @@ class FakePduApi:
         self.nonraw_ok = True  # False: it refuses the ODIS-style link as well
         self.nonraw_silent = False  # True: the links open but carry nothing — the guess was wrong
         self.nonraw_links: dict[int, dict[str, int]] = {}  # link -> ids written into its URID table
-        self.objects = {"ISO_11898_2_DWCAN": 0x10, "ISO_11898_RAW": 0x11, "HI": 0x20, "LOW": 0x21,
+        # Numbered as the VW MDF really numbers them: the bus type and the HI pin are 0 (bench run 2026-11-08).
+        self.objects = {"ISO_11898_2_DWCAN": 0, "ISO_11898_RAW": 0x11, "HI": 0, "LOW": 1,
                         "CP_CanPhysReqId": 0x1A, "CP_CanRespUUDTId": 0x1B}
 
     def PDUConstruct(self, *_a) -> int:  # noqa: N802 (D-PDU names)
@@ -99,9 +100,13 @@ class FakePduApi:
 
     # ---- the ODIS-style fallback an adapter without RawMode has to offer
     def PDUGetObjectId(self, _kind, name, out) -> int:  # noqa: N802
-        oid = self.objects.get(name.decode(), 0)
+        # As the driver does: a name this MDF knows succeeds, whatever its id. The VW MDF numbers
+        # ISO_11898_2_DWCAN and the HI pin 0, so refusing id 0 here would hide exactly that case.
+        oid = self.objects.get(name.decode())
+        if oid is None:
+            return 0x62  # PDU_ERR_ID_NOT_SUPPORTED
         out._obj.value = oid
-        return 0 if oid else 0x62  # PDU_ERR_ID_NOT_SUPPORTED
+        return 0
 
     def PDUGetUniqueRespIdTable(self, _hmod, hcll, out) -> int:  # noqa: N802
         vals = (C.c_uint32 * 2)(0, 0)

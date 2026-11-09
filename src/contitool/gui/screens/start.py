@@ -134,8 +134,8 @@ class StartScreen(QWidget):
         self.lbl_title.setText(tr("Открыть блок", "Open an ECU"))
         self.lbl_sub.setText(
             tr(
-                "Шлюз VAG MQB J533 · 3Q0 / 5Q0 907 530 · Renesas RH850/F1L",
-                "VAG MQB J533 gateway · 3Q0 / 5Q0 907 530 · Renesas RH850/F1L",
+                "Шлюз VAG MQB J533 · 3Q0 907 530 · Renesas RH850/F1L",
+                "VAG MQB J533 gateway · 3Q0 907 530 · Renesas RH850/F1L",
             )
         )
         self.tile_can.set_text(

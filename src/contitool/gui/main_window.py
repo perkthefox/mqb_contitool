@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from contitool import __version__
-from contitool.can import can_backup, can_identify, can_restore_backup, default_session_dir
+from contitool.can import can_backup, can_identify, can_restore_backup, default_session_dir, unsupported_ecu_reason
 from contitool.cli.formatting import (
     Style,
     format_cflash_report,
@@ -347,7 +347,7 @@ class MainWindow(QMainWindow):
 
     def _confirm_read(self, ident: dict[str, Any]) -> None:
         dlg = EcuFoundDialog(ident, self.conn, self)
-        if run_dialog(dlg):
+        if run_dialog(dlg) and not dlg.unsupported:
             if dlg.restore_chosen:
                 self.restore_backup()
             else:
@@ -537,19 +537,29 @@ class EcuFoundDialog(Dialog):
     """The ECU that answered on CAN, before its memory is read."""
 
     def __init__(self, ident: dict[str, Any], conn: CanConnection, parent: QWidget | None = None) -> None:
-        in_fbl = bool(ident.get("in_fbl"))
+        unsupported = str(ident.get("unsupported") or unsupported_ecu_reason(ident.get("ident", [])) or "")
+        in_fbl = bool(ident.get("in_fbl")) and not unsupported
+        self.unsupported = unsupported
         self.restore_chosen = False
-        super().__init__(
-            parent,
-            tr("Блок в режиме загрузчика (FBL)", "ECU in bootloader mode (FBL)")
-            if in_fbl
-            else tr("Блок на связи", "ECU found"),
-            tr(
+        if unsupported:
+            title = tr("Блок не поддерживается", "Unsupported ECU")
+            subtitle = tr(
+                f"На {conn.display()} ответил шлюз неподдерживаемой аппаратной платформы.",
+                f"An unsupported gateway hardware platform answered on {conn.display()}.",
+            )
+        elif in_fbl:
+            title = tr("Блок в режиме загрузчика (FBL)", "ECU in bootloader mode (FBL)")
+            subtitle = tr(
                 f"Ответил блок на {conn.display()}. Проверьте, что это нужный блок.",
                 f"An ECU answered on {conn.display()}. Check that it is the one you want.",
-            ),
-            width=620,
-        )
+            )
+        else:
+            title = tr("Блок на связи", "ECU found")
+            subtitle = tr(
+                f"Ответил блок на {conn.display()}. Проверьте, что это нужный блок.",
+                f"An ECU answered on {conn.display()}. Check that it is the one you want.",
+            )
+        super().__init__(parent, title, subtitle, width=620)
         grid = QGridLayout()
         grid.setHorizontalSpacing(18)
         grid.setVerticalSpacing(5)
@@ -565,7 +575,13 @@ class EcuFoundDialog(Dialog):
         grid.setColumnStretch(1, 1)
         if ident.get("ident"):
             self.body.addLayout(grid)
-        if in_fbl:
+        if unsupported:
+            err = Callout("err")
+            err.label.setText(unsupported)
+            self.body.addWidget(err)
+            self.btn_ok = None
+            self.finish(cancel_text=tr("Закрыть", "Close"))
+        elif in_fbl:
             warn = Callout("warn")
             warn.label.setText(
                 tr(

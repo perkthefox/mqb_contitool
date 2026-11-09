@@ -397,15 +397,18 @@ class DPduBus(can.BusABC):
         except Exception:  # noqa: BLE001 - a missing export is simply "this driver cannot do it"
             return -1
 
-    def _object_id(self, kind: int, name: str) -> int:
-        """Ask the driver for an object id by name — the numbers differ between MDFs, so never hardcode them."""
+    def _object_id(self, kind: int, name: str) -> int | None:
+        """Ask the driver for an object id by name — the numbers differ between MDFs, so never hardcode them.
+
+        None means this MDF does not know the name. It must not be 0: the VW MDF numbers `ISO_11898_2_DWCAN` and
+        the `HI` pin 0, and reading those as "unknown" kept the hardware ISO-TP link from ever being created."""
         out = U32(0)
-        return out.value if self._try("PDUGetObjectId", kind, name.encode(), C.byref(out)) == 0 else 0
+        return out.value if self._try("PDUGetObjectId", kind, name.encode(), C.byref(out)) == 0 else None
 
     def _patch_urid(self, hcll: int, want: dict[str, int]) -> None:
         """Ids live in the unique-response table: read it, set the named UNUM32 params, write it back."""
-        by_id = {self._object_id(OBJT_COMPARAM, name): value for name, value in want.items()}
-        by_id.pop(0, None)  # a param this MDF does not know
+        # A param this MDF does not know is left out; one whose id is 0 is not, 0 being a valid ComParam id.
+        by_id = {pid: value for name, value in want.items() if (pid := self._object_id(OBJT_COMPARAM, name)) is not None}
         table = C.POINTER(UridTable)()
         if not by_id or self._try("PDUGetUniqueRespIdTable", self.hmod, hcll, C.byref(table)) != 0 or not table:
             return
@@ -431,9 +434,10 @@ class DPduBus(can.BusABC):
         session that half works. The diagnostic pair is required; without the loader pair everything except
         reading and writing memory still runs."""
         bus, proto = self._object_id(OBJT_BUSTYPE, NONRAW_BUS), self._object_id(OBJT_PROTOCOL, NONRAW_PROTOCOL)
-        if not (bus and proto):
+        pin_ids = [self._object_id(OBJT_PINTYPE, t) for _, t in NONRAW_PINS]
+        if bus is None or proto is None or any(p is None for p in pin_ids):
             return False
-        pins = (PinData * len(NONRAW_PINS))(*(PinData(n, self._object_id(OBJT_PINTYPE, t)) for n, t in NONRAW_PINS))
+        pins = (PinData * len(NONRAW_PINS))(*(PinData(n, pid) for (n, _), pid in zip(NONRAW_PINS, pin_ids)))
         for phys, resp in NONRAW_PAIRS:
             rsc = RscData(bus, proto, len(pins), C.cast(pins, C.POINTER(PinData)))
             h, flag = U32(0), (U8 * 4)(0, 0, 0, 0)  # no 0x80: this link is exactly what RawMode is not
@@ -492,7 +496,7 @@ class DPduBus(can.BusABC):
     def _set_named_u32(self, hcll: int, name: str, value: int, cls: int = 2) -> bool:
         """Set a named UNUM32 ComParam via PDUGetComParam -> PDUSetComParam so MDF class/type always match."""
         pid = self._object_id(OBJT_COMPARAM, name)
-        if not pid:
+        if pid is None:
             return False
         item = C.POINTER(ParamItem)()
         if self._try("PDUGetComParam", self.hmod, hcll, pid, C.byref(item)) == 0 and item:
@@ -602,7 +606,10 @@ class DPduBus(can.BusABC):
         pins = (PinData * 2)(PinData(6, hi), PinData(14, low))
         for proto in protos:
             rsc = RscData(bus, proto, 2, C.cast(pins, C.POINTER(PinData)))
-            h, flag = U32(0), (U8 * 4)(0, 0, 0, 0)
+            # 0x40 (ChecksumMode, RawMode off) is what ODIS-E creates this very link with on this VCI — see the
+            # driver log of its own session (PDUAPI_VW_#42, CllCreateFlag=0x40 0x00 0x00 0x00). The raw links keep
+            # their hardware-verified 0x80 / 0x80000001.
+            h, flag = U32(0), (U8 * 4)(0x40, 0, 0, 0)
             rc = self._try("PDUCreateComLogicalLink", self.hmod, C.byref(rsc), PDU_ID_UNDEF, None, C.byref(h),
                            C.byref(FlagData(4, flag)))
             if rc != 0 or not h.value:
@@ -627,6 +634,10 @@ class DPduBus(can.BusABC):
             self._set_named_u32(hcll, "CP_TesterPresentHandling", 0)
             self._set_named_u32(hcll, "CP_BlockSize", 0)
             self._set_named_u32(hcll, "CP_StMin", 0)
+            # Without CP_ModifyTiming the VCI keeps the MDF's own P2/P2*, whatever we set below. ODIS-E sets it
+            # to 1 on this link before its own timing (same driver log), so our 2.5 s / 6 s really take effect.
+            self._set_named_u32(hcll, "CP_ModifyTiming", 1)
+            self._set_named_u32(hcll, "CP_CanMaxNumWaitFrames", 0x0F)  # as ODIS-E; the default 0xFF never ends
             if not self._set_named_u32(hcll, "CP_P2Max", 2_500_000):
                 self._set_named_u32(hcll, "CP_P2Max", 500_000)
             if not self._set_named_u32(hcll, "CP_P2Star", 6_000_000):
@@ -670,9 +681,10 @@ class DPduBus(can.BusABC):
             return
         bus = self._object_id(OBJT_BUSTYPE, NONRAW_BUS)
         hi, low = self._object_id(OBJT_PINTYPE, "HI"), self._object_id(OBJT_PINTYPE, "LOW")
-        protos = [p for name in UDS_PROTOCOLS if (p := self._object_id(OBJT_PROTOCOL, name))]
-        if not (bus and hi and low and protos):
-            self.uds_refusal = f"driver lacks {NONRAW_BUS} / pins / {', '.join(UDS_PROTOCOLS)}"
+        protos = [p for name in UDS_PROTOCOLS if (p := self._object_id(OBJT_PROTOCOL, name)) is not None]
+        missing = [n for n, v in ((NONRAW_BUS, bus), ("pin HI", hi), ("pin LOW", low)) if v is None]
+        if missing or not protos:
+            self.uds_refusal = "driver lacks " + ", ".join(missing or [" / ".join(UDS_PROTOCOLS)])
             yield False
             return
         self._pause_raw()

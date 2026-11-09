@@ -694,6 +694,71 @@ ECU_IDENT_DIDS: tuple[tuple[int, str, str], ...] = (
 )
 
 
+def _is_vag_part_number(value: str) -> bool:
+    return 9 <= len(value) <= 12 and value.isalnum() and any(c.isalpha() for c in value[:3]) and value[3:9].isdigit()
+
+
+def unsupported_ecu_reason(ident: list[dict[str, str]]) -> str | None:
+    """Explain why an identified gateway is not a supported Continental 3Q0 RH850/F1L unit, or None if supported."""
+    vals = {item["did"]: item["value"].strip() for item in ident}
+    part = "".join(vals.get("F187", "").split()).upper()
+    hw_part = "".join(vals.get("F191", "").split()).upper()
+    sw_ver = vals.get("F189", "").strip().upper()
+    hw_ver = vals.get("F1A3", "").strip().upper()
+    fazit = vals.get("F17C", "").strip().upper()
+    odx_var = vals.get("F19E", "").strip()
+
+    # 1. Lear MQB Gen 1 (5Q0, MPC5607B) & Gen 2 (3Q0, MPC5748G) — shares 3Q0907530* part numbers with Continental!
+    is_lear = (
+        "lear" in odx_var.lower()
+        or fazit.startswith(("LG", "LCE"))
+        or (len(hw_ver) == 3 and hw_ver.isdigit() and hw_ver[0] in ("1", "4"))
+        or hw_ver.startswith(("X2", "H4"))
+        or (len(sw_ver) == 4 and ((sw_ver.isdigit() and sw_ver[0] in ("1", "4")) or sw_ver.startswith(("1A", "1B", "91"))))
+    )
+    if is_lear:
+        return tr(
+            "Это шлюз производства Lear на процессоре NXP PowerPC (MPC5607B / MPC5748G). "
+            "ContiTool поддерживает только шлюзы Continental 3Q0 907 530 на базе Renesas RH850/F1L (HW 5xx / SW 5xxx).",
+            "This is a Lear gateway based on NXP PowerPC (MPC5607B / MPC5748G). "
+            "ContiTool only supports Continental 3Q0 907 530 gateways based on Renesas RH850/F1L (HW 5xx / SW 5xxx).",
+        )
+
+    # 2. First-generation MQB gateways (5Q0 / 8V0 / 5QE / 8S0, or early HW 2xx / SW 2xxx) on NXP MPC5607B PowerPC
+    is_conti_gen1 = (
+        "conti" in odx_var.lower()
+        or fazit.startswith("SJ8")
+        or (len(hw_ver) == 3 and hw_ver.isdigit() and hw_ver.startswith("2"))
+        or (len(sw_ver) == 4 and sw_ver.isdigit() and sw_ver.startswith("2"))
+    )
+    is_gen1_part = any(p.startswith(("5Q0", "8V0", "5QE", "8S0")) for p in (part, hw_part) if p)
+    if is_gen1_part or (len(hw_ver) == 3 and hw_ver.isdigit() and hw_ver.startswith("2")) or (
+        len(sw_ver) == 4 and sw_ver.isdigit() and sw_ver.startswith("2")
+    ):
+        if is_conti_gen1:
+            return tr(
+                "Это ранний шлюз Continental поколения 5Q0 (HW 2xx / SW 2xxx) на процессоре NXP PowerPC (MPC5607B), "
+                "а не Renesas RH850/F1L. ContiTool поддерживает только поколение 3Q0 907 530 на базе Renesas RH850/F1L (HW 5xx / SW 5xxx).",
+                "This is a first-generation Continental 5Q0 gateway (HW 2xx / SW 2xxx) based on NXP PowerPC (MPC5607B), "
+                "not Renesas RH850/F1L. ContiTool only supports 3Q0 907 530 gateways based on Renesas RH850/F1L (HW 5xx / SW 5xxx).",
+            )
+        return tr(
+            "Это шлюз первого поколения MQB (5Q0 / 8V0) на процессоре NXP PowerPC (MPC5607B), а не Renesas RH850/F1L. "
+            "ContiTool поддерживает только шлюзы Continental 3Q0 907 530 на базе Renesas RH850/F1L (HW 5xx / SW 5xxx).",
+            "This is a first-generation MQB gateway (5Q0 / 8V0) based on NXP PowerPC (MPC5607B), not Renesas RH850/F1L. "
+            "ContiTool only supports Continental 3Q0 907 530 gateways based on Renesas RH850/F1L (HW 5xx / SW 5xxx).",
+        )
+
+    # 3. Other VAG gateway/ECU families (e.g. MQB-A0 2Q0 907 530, MQB-Evo 5WA 907 530)
+    if any(_is_vag_part_number(p) and not p.startswith(("3Q0", "V03")) for p in (part, hw_part) if p):
+        return tr(
+            "Этот блок не относится к линейке Continental 3Q0 907 530 на процессоре Renesas RH850/F1L и не поддерживается программой.",
+            "This ECU is not a Continental 3Q0 907 530 gateway based on Renesas RH850/F1L and is not supported.",
+        )
+
+    return None
+
+
 def can_identify(
     port: str,
     *,
@@ -748,6 +813,10 @@ def can_identify(
                         result["app_valid"] = False
             except LINK_ERRORS:
                 pass
+        unsupported = unsupported_ecu_reason(result["ident"])
+        if unsupported:
+            result["unsupported"] = unsupported
+            reporter.warning(unsupported)
         if in_fbl:
             result["in_fbl"] = True
             reporter.warning(
@@ -1714,6 +1783,21 @@ def _program_application_uds(
             info["hardware_isotp_refused"] = why
             reporter.info(tr(f"Аппаратный ISO-TP адаптера не включился ({why}) — передача идёт программным путём",
                              f"The adapter's hardware ISO-TP did not come up ({why}) — transferring on the software path"))
+            # Said before the erase, not discovered at 50%: this adapter sends one network request per CAN frame,
+            # and a 1.5 MB application needs ~220,000 of them. Every VNCI log so far stops finishing them at
+            # ~125,000 and the adapter restarts its service, so this write is expected to break off partway.
+            # Reopening the link does not help: the VCI counts primitives per module, not per link.
+            if getattr(link, "interface", "") == "dpdu" or type(getattr(link, "bus", None)).__name__ == "DPduBus":
+                reporter.warning(tr(
+                    "Через VAS 6154 / VNCI без аппаратного ISO-TP запись такого объёма обычно обрывается на "
+                    "середине: адаптер перестаёт подтверждать отправку примерно на 125-тысячном кадре и "
+                    "перезапускает свою службу. Обновите прошивку адаптера и драйвер D-PDU; если ISO-TP так и "
+                    "не включится, записывайте этот блок другим адаптером.",
+                    "Through a VAS 6154 / VNCI without hardware ISO-TP a write this large usually breaks off "
+                    "halfway: the adapter stops confirming sends at around the 125,000th frame and restarts its "
+                    "service. Update the adapter firmware and the D-PDU driver; if hardware ISO-TP still does not "
+                    "come up, write this ECU with another adapter.",
+                ))
         reporter.can_log(tr("Вход в сессию программирования FBL (10 02) и авторизация SA2 (27 11/12)…", "Entering FBL Programming Session (10 02) & unlocking SA2 (27 11/12)…"))
         _enter_fbl_uds_programming(link, reporter)
         seed_resp = link.request_uds(b"\x27\x11", 0x67, timeout=3.0)
