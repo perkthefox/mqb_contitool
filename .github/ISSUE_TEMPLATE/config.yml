@@ -1,4 +1,4 @@
-# Blank issues stay on: ContiTool 2.0.1a–2.0.1d open `issues/new?title=…&body=…` without a template,
+# Blank issues stay on: ContiTool 2.0.1a–2.0.1c open `issues/new?title=…&body=…` without a template,
 # and those links must keep working.
 blank_issues_enabled: true
 contact_links:

@@ -295,6 +295,7 @@ class DPduBus(can.BusABC):
         self._tx_in_flight: dict[int, int] = {}
         self._tx_cop_count = 0
         self.hmod = self.h_rx = self.h_tx = self._mon_cop = self._uds_link = 0
+        self.uds_refusal = ""  # why the last uds_session() stayed on RawMode: goes into the flash result
         self._nonraw_verified = False  # the fixed-id fallback answered a 10 03 on this module
         self._tx_started = False
         self.nonraw: dict[int, int] = {}  # CAN id we send on -> its link, when the adapter refused RawMode
@@ -607,10 +608,12 @@ class DPduBus(can.BusABC):
             if rc != 0 or not h.value:
                 rid = self._find_resource_id(rsc)
                 if not rid:
+                    self.uds_refusal = f"PDUCreateComLogicalLink 0x{rc:X}, no resource id"
                     continue
                 rc = self._try("PDUCreateComLogicalLink", self.hmod, None, rid, None, C.byref(h),
                                C.byref(FlagData(4, flag)))
                 if rc != 0 or not h.value:
+                    self.uds_refusal = f"PDUCreateComLogicalLink by resource id 0x{rc:X}"
                     continue
             hcll = h.value
             self._links.append(hcll)
@@ -633,16 +636,19 @@ class DPduBus(can.BusABC):
             if not self._set_named_u32(hcll, "CP_RC78Handling", 2):
                 self._set_named_u32(hcll, "CP_RC78Handling", 1)
             self._set_uds_urid(hcll, tx_id, rx_id)
-            if self._try("PDUConnect", self.hmod, hcll) != 0:
+            if (rc := self._try("PDUConnect", self.hmod, hcll)) != 0:
+                self.uds_refusal = f"PDUConnect 0x{rc:X}"
                 self._close_uds_link()
                 continue
             self._uds_control(hcll, COPT_STARTCOMM, 1.0)
             try:
                 probe = self.request_uds(b"\x3e\x00", timeout=1.5, allow_pending=True)
                 if probe and (probe[0] == 0x7E or (len(probe) >= 3 and probe[:2] == b"\x7f\x3e")):
+                    self.uds_refusal = ""
                     return True
-            except (can.CanError, TimeoutError):
-                pass
+                self.uds_refusal = f"3E 00 answered {(probe or b'').hex(' ')}"
+            except (can.CanError, TimeoutError) as exc:
+                self.uds_refusal = f"3E 00: {exc}"
             self.spent = False
             self._close_uds_link()
         return False
@@ -659,19 +665,22 @@ class DPduBus(can.BusABC):
             yield True
             return
         if not self.hmod:
+            self.uds_refusal = "no D-PDU module"
             yield False
             return
         bus = self._object_id(OBJT_BUSTYPE, NONRAW_BUS)
         hi, low = self._object_id(OBJT_PINTYPE, "HI"), self._object_id(OBJT_PINTYPE, "LOW")
         protos = [p for name in UDS_PROTOCOLS if (p := self._object_id(OBJT_PROTOCOL, name))]
         if not (bus and hi and low and protos):
+            self.uds_refusal = f"driver lacks {NONRAW_BUS} / pins / {', '.join(UDS_PROTOCOLS)}"
             yield False
             return
         self._pause_raw()
         opened = False
         try:
             opened = self._open_uds_link(bus, protos, hi, low, tx_id, rx_id)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self.uds_refusal = f"{type(exc).__name__}: {exc}"
             self.spent = False
             self._close_uds_link()
             opened = False

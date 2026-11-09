@@ -27,8 +27,8 @@ from contitool.can.payloads import (
     EXPECTED_RSA_PROBE_SHA256,
     LOADER_RESET_PAYLOAD,
     RSA_PROBE_PAYLOAD,
-    STAGE1_GATE_INDEX,
-    STAGE1_MEASURE_DIDS,
+    FBL_TESTER_SERIAL,
+    STAGE1_OVERRUN,
     STAGE1_TOTAL,
     build_cflash_faci_block_payloads,
     build_dflash_faci_payloads,
@@ -37,11 +37,8 @@ from contitool.can.payloads import (
     build_reader_payload,
     build_service_loader_uds_steps,
     build_uflash_faci_payloads,
-    build_stage1_did_list,
     cflash_block_ranges,
     fbl_sa2,
-    plan_stage1_dids,
-    simulate_stage1_response,
     verify_payload_self_tests,
 )
 from contitool.can.transport import TRANSPORT_ERRORS, J533CanLink, UdsNegativeResponse
@@ -156,62 +153,34 @@ def _probe_beacon_in_loader(link: J533CanLink, reporter: OperationReporter) -> s
 
 
 STAGE1_SILENT = (  # (ru, en): the language can change while the app runs
-    "Блок не ответил на шаге входа в заводской RAM-Loader (multi-DID, этап 1). На предыдущие запросы он ответил, "
-    "значит связь есть, но чтение памяти по CAN на этом блоке не получилось. Сообщите о проблеме и приложите отчёт.",
-    "The ECU did not answer a step of the factory RAM-Loader entry (multi-DID, stage 1). It answered the requests "
-    "before it, so the link works, but reading memory over CAN did not succeed on this ECU. Please report it with the archive.",
+    "Блок не ответил на этапе 1 входа в заводской RAM-Loader (multi-DID), и вход без этого ответа тоже не удался. "
+    "На предыдущие запросы он ответил, значит связь есть. Сообщите о проблеме и приложите отчёт.",
+    "The ECU did not answer stage 1 of the factory RAM-Loader entry (multi-DID), and the entry did not succeed "
+    "without that answer either. It answered the requests before it, so the link works. Please report it with "
+    "the archive.",
 )
 
 
-def _read_dids(link: J533CanLink, dids: tuple[int, ...]) -> dict[int, bytes]:
-    """What each DID actually answers, read one at a time. A DID the ECU refuses is simply left out."""
-    out: dict[int, bytes] = {}
-    for did in dids:
-        try:
-            resp = link.request_uds(bytes([0x22, did >> 8, did & 0xFF]), 0x62, timeout=1.0)
-        except LINK_ERRORS:
-            continue
-        # A late answer to the previous DID also starts with 0x62; taking it would plan around the wrong length.
-        if len(resp) >= 3 and resp[1:3] == did.to_bytes(2, "big"):
-            out[did] = resp[3:]  # drop 0x62 and the 2-byte DID echo
-    return out
+def _note_silent_stage1(link: J533CanLink, reporter: OperationReporter, info: dict[str, Any]) -> None:
+    """Stage 1 went unanswered. It is there for its overrun, which happened all the same (payloads.STAGE1_TOTAL),
+    so the entry carries on. F15B is read for the record: its last record is what decides the answer.
 
-
-def _stage1_replan(link: J533CanLink, reporter: OperationReporter, info: dict[str, Any]) -> bytes:
-    """The staging stayed silent: read this gateway's DIDs and lay the request out so its answer gets through.
-
-    The answer overruns the bootloader's 330-byte buffer by eight bytes onto a state block, and one of those
-    bytes is read back through a gate that returns without answering unless it is 1..3 or 0x80..0xFF; two more
-    must stay zero (STAGE1_STATE_OK). Which bytes land there depends on which DID covers those offsets, so
-    reading the DIDs first makes the layout computable instead of guessed. The readings go into the result
-    either way, so a failure still carries its explanation.
-
-    The extra reads sit between `27 11` and the trigger. That is safe: the seed state (0xFEDE0AF3 = 3) is written
-    only by the 27 handler itself and by the attempt-delay timer, which only moves 1 -> 2 — a 22 never touches it
-    and it does not expire (bench AA Uflash 0x01002F08..0x010031B4)."""
-    reporter.info(tr("Блок не ответил — читаем его DID по одному и пересобираем запрос под него…",
-                     "The ECU did not answer — reading its DIDs one by one to lay the request out for it…"))
-    values = _read_dids(link, STAGE1_MEASURE_DIDS)
-    info["did_lengths"] = {f"{did:04X}": len(v) for did, v in sorted(values.items())}
-    reporter.info(", ".join(f"{did:04X}={len(v)}" for did, v in sorted(values.items())))
-
-    known = simulate_stage1_response(build_stage1_did_list(), values)
-    if len(known) > STAGE1_GATE_INDEX:
-        info["stage1_gate_byte"] = f"{known[STAGE1_GATE_INDEX]:02X}"
-    plan = plan_stage1_dids(values)
-    if plan is None:
-        raise TimeoutError(tr(*STAGE1_SILENT) + tr(
-            f" Прочитанные длины: {info['did_lengths']}. Раскладка под этот блок не подбирается.",
-            f" DID lengths read: {info['did_lengths']}. No layout fits this gateway."))
-    info["stage1_replanned"] = [f"{did:04X}" for did in plan]
-    reporter.info(tr(f"Пересобрали запрос под этот блок ({len(plan)} DID) и пробуем ещё раз…",
-                     f"Rebuilt the request for this gateway ({len(plan)} DIDs) and retrying…"))
+    The read sits between `27 11` and the trigger. That is safe: the seed state (0xFEDE0AF3 = 3) is written only
+    by the 27 handler itself and by the attempt-delay timer, which only moves 1 -> 2 — a 22 never touches it and
+    it does not expire (bench AA Uflash 0x01002F08..0x010031B4). Its short answer stays inside the buffer."""
+    info["stage1_response"] = "suppressed"
+    reporter.info(tr(
+        "Блок не ответил на этап 1 — так бывает, если в отпечатке программирования (F15B) записан ненулевой "
+        "серийник тестера. Этот ответ для входа не нужен, продолжаем…",
+        "The ECU did not answer stage 1 — this happens when the programming fingerprint (F15B) carries a non-zero "
+        "tester serial. The entry does not need that answer, continuing…",
+    ))
     try:
-        return link.request_uds(build_service_loader_uds_steps(plan)[0], 0x62, timeout=3.0)
-    except TimeoutError:
-        raise TimeoutError(tr(*STAGE1_SILENT) + tr(
-            f" Прочитанные длины: {info['did_lengths']}. Пересобранный запрос тоже остался без ответа.",
-            f" DID lengths read: {info['did_lengths']}. The rebuilt request went unanswered as well.")) from None
+        resp = link.request_uds(b"\x22\xf1\x5b", 0x62, timeout=1.0)
+    except LINK_ERRORS:
+        return
+    if resp[1:3] == b"\xf1\x5b":  # a late stage-1 answer also starts with 62
+        info["f15b"] = resp[3:].hex(" ")
 
 
 def _is_fbl_session_nrc(exc: BaseException) -> bool:
@@ -283,15 +252,36 @@ def _stage_and_trigger_loader(
     info["seed"] = link.request_uds(b"\x27\x11", 0x67, timeout=2.0).hex()
     info["write_0410_05"] = link.request_uds(bytes.fromhex("2e041005"), 0x6E, timeout=2.0).hex()
     try:
-        resp1 = link.request_uds(stage1, 0x62, timeout=3.0)
+        resp1 = link.request_uds(stage1, 0x62, timeout=1.0)  # the answer starts within 60 ms on every log
     except TimeoutError:
-        resp1 = _stage1_replan(link, reporter, info)
-    if len(resp1) != STAGE1_TOTAL or resp1[-3:] != bytes.fromhex("041005"):
-        raise RuntimeError(f"Unexpected multi-DID stage 1 response ({len(resp1)} bytes)")
-    info["stage1_length"] = len(resp1)
-    # The byte that overruns onto the bootloader's gated state cell, free of charge on a gateway that answered —
-    # a silent one reports the same field from _stage1_replan, so both sides of the story end up in the reports.
-    info["stage1_gate_byte"] = f"{resp1[STAGE1_GATE_INDEX]:02X}"
+        _note_silent_stage1(link, reporter, info)
+    else:
+        if len(resp1) != STAGE1_TOTAL or resp1[-3:] != bytes.fromhex("041005"):
+            raise RuntimeError(f"Unexpected multi-DID stage 1 response ({len(resp1)} bytes)")
+        info["stage1_length"] = len(resp1)
+        info["stage1_overrun"] = resp1[STAGE1_OVERRUN:].hex(" ")  # 0xFEDE0C62..69 as sent (0C63 reads 0C by then)
+    try:
+        beacon = _stage2_and_trigger(link, reporter, info, stage2, trigger)
+    except LINK_ERRORS as exc:
+        if "stage1_response" not in info:
+            raise
+        f15b = f" F15B: {info['f15b']}." if "f15b" in info else ""
+        raise TimeoutError(tr(*STAGE1_SILENT) + f15b) from exc
+    info["beacon"] = beacon
+    info["loader_ready"] = True
+    reporter.success(
+        tr(
+            f"Сервисный RAM-Loader активен и подтверждён маяком: {beacon} (0x6F1)",
+            f"Service RAM-Loader active and confirmed by beacon: {beacon} (0x6F1)",
+        )
+    )
+    return info
+
+
+def _stage2_and_trigger(
+    link: J533CanLink, reporter: OperationReporter, info: dict[str, Any], stage2: bytes, trigger: bytes
+) -> str:
+    """`2E 0410 48`, stage 2 (never answered: it lands FAZIT digits on the suppress flag), the trigger, the beacon."""
     info["write_0410_48"] = link.request_uds(bytes.fromhex("2e041048"), 0x6E, timeout=2.0).hex()
 
     link.send_uds(stage2)
@@ -309,17 +299,7 @@ def _stage_and_trigger_loader(
         info["trigger_response"] = trig_resp.hex()
     except TimeoutError:
         info["trigger_response"] = "loader"
-
-    beacon = _probe_beacon_in_loader(link, reporter)
-    info["beacon"] = beacon
-    info["loader_ready"] = True
-    reporter.success(
-        tr(
-            f"Сервисный RAM-Loader активен и подтверждён маяком: {beacon} (0x6F1)",
-            f"Service RAM-Loader active and confirmed by beacon: {beacon} (0x6F1)",
-        )
-    )
-    return info
+    return _probe_beacon_in_loader(link, reporter)
 
 
 def enter_ram_loader(
@@ -1730,6 +1710,10 @@ def _program_application_uds(
     _note_hw_fallback(link, info, reporter)
     with _uds_session(link) as hw_uds:
         info["hardware_isotp"] = bool(hw_uds)
+        if not hw_uds and (why := getattr(getattr(link, "bus", None), "uds_refusal", "")):
+            info["hardware_isotp_refused"] = why
+            reporter.info(tr(f"Аппаратный ISO-TP адаптера не включился ({why}) — передача идёт программным путём",
+                             f"The adapter's hardware ISO-TP did not come up ({why}) — transferring on the software path"))
         reporter.can_log(tr("Вход в сессию программирования FBL (10 02) и авторизация SA2 (27 11/12)…", "Entering FBL Programming Session (10 02) & unlocking SA2 (27 11/12)…"))
         _enter_fbl_uds_programming(link, reporter)
         seed_resp = link.request_uds(b"\x27\x11", 0x67, timeout=3.0)
@@ -1741,14 +1725,10 @@ def _program_application_uds(
             link.request_uds(b"\x27\x12" + key.to_bytes(4, "big"), 0x67, timeout=3.0)
         info["security_unlocked"] = True
 
-        # Write mandatory 9-byte VAG Fingerprint (DID 0xF15A: BCD YY MM DD + 6-byte tester serial)
+        # Mandatory 9-byte VAG fingerprint (DID 0xF15A: BCD YY MM DD + 6-byte tester serial). The bootloader keeps
+        # it as the last F15B record, which the RAM-loader entry's stage 1 overruns: see FBL_TESTER_SERIAL.
         now = datetime.datetime.now(datetime.timezone.utc)
-        fp = bytes([
-            _bcd_byte(now.year % 100),
-            _bcd_byte(now.month),
-            _bcd_byte(now.day),
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-        ])
+        fp = bytes(_bcd_byte(v) for v in (now.year % 100, now.month, now.day)) + FBL_TESTER_SERIAL
         link.request_uds(b"\x2e\xf1\x5a" + fp, 0x6E, timeout=3.0)
         info["fingerprint_written"] = True
 

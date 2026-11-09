@@ -278,7 +278,9 @@ class J2534Bus(can.BusABC):
             self._uds_chan, self._uds_tx_id, self._uds_rx_id = chan.value, tx_id, rx_id
             probe = self.request_uds(b"\x3e\x00", timeout=1.5, allow_pending=True)
             opened = bool(probe and (probe[0] == 0x7E or (len(probe) >= 3 and probe[:2] == b"\x7f\x3e")))
-        except Exception:  # noqa: BLE001 - any driver refusal or mock assertion falls back to raw CAN + send_batch
+            self.uds_refusal = "" if opened else f"3E 00 answered {(probe or b'').hex(' ')}"
+        except Exception as exc:  # noqa: BLE001 - any driver refusal or mock assertion falls back to raw CAN + send_batch
+            self.uds_refusal = f"{type(exc).__name__}: {exc}"
             opened = False
         if not opened:
             bad = self._uds_chan or chan.value

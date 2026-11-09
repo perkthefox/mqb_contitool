@@ -744,6 +744,7 @@ class UdsCapablePduApi(FakePduApi):
             self._queue_uds_result(hcll, cid, b"\x67\x12")
             self._queue_uds_done(hcll, cid)
         elif req[:3] == b"\x2e\xf1\x5a":
+            self.fingerprint = req[3:]
             self._queue_uds_result(hcll, cid, b"\x6e\xf1\x5a")
             self._queue_uds_done(hcll, cid)
         elif req == bytes.fromhex("3101ff000101"):
@@ -794,6 +795,10 @@ def test_uds_application_flash_uses_one_isotp_primitive_per_514b_block_and_resto
         assert res["bytes_transferred"] == APP_SIZE
         assert res["reset_response"] == "no response after reset"
         assert bytes(api.flashed_app) == app_image
+        # The bootloader keeps this fingerprint (+ a status byte) as the last F15B record, and the RAM-loader
+        # entry's stage 1 lands record bytes 5..9 on 0xFEDE0C62..66. 2.0.1d wrote serial 01 02 03 04 05 06, put
+        # 03 on 0C62 (suppress-positive-response) and every later entry went unanswered at stage 1.
+        assert len(api.fingerprint) == 9 and api.fingerprint[5:9] == bytes(4)
         # 2,975 TransferData blocks + ~10 setup/check/reset primitives (vs 220,150 RawMode primitives!)
         assert 2980 <= api.uds_sendrecv_count <= 2995
         urid = next(iter(api.uds_urid.values()))
@@ -818,6 +823,7 @@ def test_uds_session_falls_back_to_rawmode_when_isotp_probe_stays_silent() -> No
     with J533CanLink("", bus=bus) as link:
         with link.uds_session() as hw_active:
             assert hw_active is False
+        assert bus.uds_refusal.startswith("3E 00")  # why goes into the flash result: a report can tell
         assert not bus.spent and bus.h_rx and bus.h_tx
         res = can_identify("", bus=bus)
         assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"

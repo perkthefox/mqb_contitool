@@ -152,36 +152,62 @@ def test_can_link_service_loader_entry_and_native_reader() -> None:
     with J533CanLink("mock", bus=bus) as link:
         info = enter_ram_loader(link)
         assert info["loader_ready"] is True
-        # every successful entry reports the byte that landed on the bootloader's gated state cell
-        assert info["stage1_gate_byte"] == "00"
+        # what landed on 0xFEDE0C62..69 goes into the result, as the ECU sent it
+        assert info["stage1_overrun"] == "00 00 00 00 00 04 10 05"
         assert info["beacon"] == BEACON_ASCII.decode("ascii")
         sample = read_memory_bytes(link, 0x01000000, 32)
         assert sample == bytes(range(32))
 
 
-def test_silent_loader_entry_step_is_named_not_a_bare_timeout() -> None:
-    """Issue #1: UDS works but the ECU stays silent on stage 1 — say which step, not "No CAN frame from 0x77A"."""
+# F15B as a gateway answers it after a 2.0.1d write: the factory record, then date + serial 01..06 + status.
+F15B_AFTER_201D = bytes.fromhex("00010100000000000000" "26110901020304050600")
+
+
+class _SilentStage1(_MockGatewayBus):
+    """Stage 1 unanswered, as on a gateway whose last F15B record puts a non-zero byte on the suppress flag."""
+
+    loader = True
+
+    def _handle_uds(self, req: bytes) -> None:
+        stage1, _, trigger = build_service_loader_uds_steps()
+        if req == stage1 or (req == trigger and not self.loader):
+            return
+        if req == b"\x22\xf1\x5b":
+            resp = b"\x62\xf1\x5b" + F15B_AFTER_201D
+            self._reply(0x77A, bytes([0x10, len(resp)]) + resp[:6])
+            for seq, off in enumerate(range(6, len(resp), 7), start=1):
+                self._reply(0x77A, bytes([0x20 | seq]) + resp[off : off + 7].ljust(7, b"\xaa"))
+            return
+        super()._handle_uds(req)
+
+    def send(self, message: can.Message, timeout: float = 1.0) -> None:
+        if message.arbitration_id == 0x6F0 and not self._in_loader:
+            return  # no loader runs: nobody answers on 0x6F1
+        super().send(message, timeout)
+
+
+def test_a_silent_stage1_does_not_stop_the_loader_entry() -> None:
+    """Stage 1 is there for its overrun (0xFEDE0C69 = 05), which happens whether or not the answer goes out:
+    stage 2 is never answered either. A gateway flashed by 2.0.1d stays silent at stage 1 and must still enter."""
+    with J533CanLink("mock", bus=_SilentStage1()) as link:
+        info = enter_ram_loader(link)
+    assert info["loader_ready"] is True and info["beacon"] == BEACON_ASCII.decode("ascii")
+    assert info["stage1_response"] == "suppressed" and "stage1_length" not in info
+    assert info["f15b"] == F15B_AFTER_201D.hex(" ")  # the record that explains the silence goes into the result
+
+
+def test_a_silent_stage1_with_no_loader_after_it_is_named_not_a_bare_timeout() -> None:
+    """Issue #1: UDS works but the entry fails after a silent stage 1 — say which step, and carry F15B."""
     import pytest
 
     from contitool.i18n import set_lang
 
     set_lang("en")
-    stage1 = build_service_loader_uds_steps()[0]
-
-    class SilentStage1(_MockGatewayBus):
-        def _handle_uds(self, req: bytes) -> None:
-            if req != stage1:
-                super()._handle_uds(req)
-
-        def send(self, message: can.Message, timeout: float = 1.0) -> None:
-            if message.arbitration_id == 0x6F0 and not self._in_loader:
-                return  # no loader runs: nobody answers on 0x6F1
-            super().send(message, timeout)
-
-    with J533CanLink("mock", bus=SilentStage1()) as link, pytest.raises(TimeoutError) as err:
+    bus = _SilentStage1()
+    bus.loader = False
+    with J533CanLink("mock", bus=bus) as link, pytest.raises(TimeoutError) as err:
         enter_ram_loader(link)
-    # The lengths this gateway really answers go into the message, so even a failure carries the explanation
-    assert "multi-DID, stage 1" in str(err.value) and "DID lengths read" in str(err.value)
+    assert "did not answer stage 1" in str(err.value) and F15B_AFTER_201D.hex(" ") in str(err.value)
 
 
 def test_every_staged_did_answers_a_length_fixed_in_the_firmware() -> None:
@@ -193,80 +219,6 @@ def test_every_staged_did_answers_a_length_fixed_in_the_firmware() -> None:
     dids = [int.from_bytes(req[i : i + 2], "big") for i in range(1, len(req), 2)]
     total = 1 + sum(2 + KNOWN_DID_LENGTHS[d] for d in dids if d not in UNKNOWN_DIDS)
     assert total == STAGE1_TOTAL and dids[-1] == 0x0410
-
-
-def test_stage1_layout_is_rebuilt_so_the_gate_byte_gets_through() -> None:
-    """The answer overruns the bootloader's 330-byte buffer by eight bytes onto its state block, and the byte
-    landing on 0xFEDE0C66 is gated: 0 or 0x04..0x7F makes the bootloader return without answering at all. Which
-    byte lands there is decided by the layout, so reading the DIDs first makes it computable."""
-    from contitool.can.payloads import (
-        STAGE1_GATE_INDEX,
-        STAGE1_GATE_OK,
-        STAGE1_TOTAL,
-        UNKNOWN_DIDS,
-        build_stage1_did_list,
-        plan_stage1_dids,
-        simulate_stage1_response,
-        stage1_state_ok,
-    )
-
-    base = {0xF17C: b"TST-AAA01.01.0100000001", 0xF1A2: b"013026", 0x0410: b"\x05"}  # 23 bytes, as the DID table
-    # Two 10-byte fingerprint records, as F15B answers them; only the last byte differs and it is the gate byte.
-    tail_ok = bytes.fromhex("00010100000000000000" "26110800000000002E03")
-    tail_bad = bytes.fromhex("00010100000000000000" "26110800000000002E00")
-
-    verified = build_stage1_did_list()
-    good = simulate_stage1_response(verified, {**base, 0xF15B: tail_ok})
-    bad = simulate_stage1_response(verified, {**base, 0xF15B: tail_bad})
-    assert len(good) == len(bad) == STAGE1_TOTAL  # the length never moves; only the gate byte does
-    assert good[STAGE1_GATE_INDEX] in STAGE1_GATE_OK
-    assert bad[STAGE1_GATE_INDEX] not in STAGE1_GATE_OK  # this is the gateway that stays silent
-
-    # Gate-passing layouts exist here, but only by putting 040F last — whose DID byte 0x0F then lands on 0C62,
-    # the suppress-response flag, and the bootloader drops the answer. That is no fix, so no plan.
-    values = {**base, 0xF15B: tail_bad, 0x040A: bytes(31), 0x040F: bytes([2, 0, 0, 3]),
-              0xF186: b"\x02", 0xF1DF: b"\x01", 0xF1D5: bytes([1, 2, 3, 0, 0, 0])}
-    assert plan_stage1_dids(values) is None
-
-    # A binary DID whose value ends 00 ?? 00 ?? <gate> is what makes a working layout.
-    values[0x040A] = bytes(26) + bytes([0x00, 0x07, 0x00, 0x09, 0x03])
-    plan = plan_stage1_dids(values)
-    assert plan is not None
-    resp = simulate_stage1_response(plan, values)
-    assert stage1_state_ok(resp)
-    assert len(resp) == STAGE1_TOTAL
-    assert resp[STAGE1_GATE_INDEX] in STAGE1_GATE_OK  # the gate now passes
-    assert resp[330] == 0 and resp[332] == 0  # the response is not suppressed, the boot-flags update still runs
-    assert plan[-1] == 0x0410  # 0410 last, so the answer still ends 04 10 <value>
-    assert plan.index(UNKNOWN_DIDS[0]) == 8  # the descriptor stays at offset 18 of the request
-
-
-def test_the_verified_layout_on_a_working_gateway_meets_every_state_byte_rule() -> None:
-    """The rules are taken from the firmware; the layout proven on hardware must satisfy all of them."""
-    from contitool.can.payloads import build_stage1_did_list, simulate_stage1_response, stage1_state_ok
-
-    good = {0xF17C: b"TST-AAA01.01.0100000001", 0xF1A2: b"013026", 0x0410: b"\x05",
-            0xF15B: bytes.fromhex("00010100000000000000" "26110800000000002E03")}
-    assert stage1_state_ok(simulate_stage1_response(build_stage1_did_list(), good))
-
-
-def test_a_late_answer_to_the_previous_did_is_not_taken_as_this_ones_length() -> None:
-    """The replan is only as good as the lengths it reads; a stale 62 F17C … arriving while F1A2 is asked must not
-    become F1A2's 23-byte value."""
-    from contitool.can.workflows import _read_dids
-
-    answers = {
-        0xF17C: b"\x62\xf1\x7c" + b"A" * 23,
-        0xF1A2: b"\x62\xf1\x7c" + b"A" * 23,  # the late echo of F17C, not F1A2
-        0x0410: b"\x62\x04\x10\x05",
-    }
-
-    class Link:
-        def request_uds(self, req: bytes, expected: int, timeout: float) -> bytes:
-            return answers[int.from_bytes(req[1:3], "big")]
-
-    got = _read_dids(Link(), (0xF17C, 0xF1A2, 0x0410))
-    assert got == {0xF17C: b"A" * 23, 0x0410: b"\x05"}
 
 
 def test_response_pending_waits_p2_star(monkeypatch) -> None:
@@ -384,8 +336,7 @@ def test_gateway_stuck_in_fbl_after_interrupted_flash_recovers_cleanly(monkeypat
     with J533CanLink("mock", bus=bus) as link:
         info = enter_ram_loader(link)
         assert info["loader_ready"] is True
-        # every successful entry reports the byte that landed on the bootloader's gated state cell
-        assert info["stage1_gate_byte"] == "00" and info.get("already_in_fbl") is True
+        assert info["stage1_length"] == 338 and info.get("already_in_fbl") is True
         rst = workflows._reset_to_application(link, allow_fbl=True)
         assert rst.get("in_fbl") is True and rst["fbl_session"].startswith("5002")
         # Strict post-flash check (allow_fbl=False) MUST still reject an ECU whose Application failed to boot
