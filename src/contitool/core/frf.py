@@ -1,6 +1,7 @@
-"""ODIS flash containers (.frf) for the J533 gateway: the application, its signature, and where it may go.
+"""ODIS flash containers (.frf, .odx) for the J533 gateway: the application, its signature, and where it may go.
 
-An FRF is a ZIP XOR-ed with a fixed keystream (frf_key.py) holding one ODX. For the gateway the ODX carries:
+An FRF is a ZIP XOR-ed with a fixed keystream (frf_key.py) holding one ODX; a plain .odx is that ODX on its own.
+For the gateway the ODX carries:
   * FD_0DATA — the application as plain bytes (ENCRYPT-COMPRESS-METHOD 00) for 0x00C200, 1,523,200 B;
   * the SHA1-RSA1024 signature (SECURITY-METHOD SIG_SHA1-RSA1024_S, 128 B) the factory bootloader checks in
     CheckMemory (31 01 02 02) — with it the application goes in over UDS on any bootloader, as ODIS flashes it;
@@ -37,6 +38,7 @@ IDENT_DIDS = {
     "EI_VWECUHardwVersiNumbe": "F1A3",
 }
 HARDWARE_IDENTS = ("F191", "F1A3")  # flashing onto other hardware is refused outright
+_XML_LEAD = b"\xef\xbb\xbf \t\r\n"  # UTF-8 BOM and whitespace allowed before an ODX's <?xml
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,6 +49,7 @@ class FrfImage:
     app: bytes  # 1,523,200 B for 0x00C200
     signature: bytes  # 128 B, SHA1-RSA1024
     idents: dict[str, tuple[str, ...]]  # DID -> allowed values
+    kind: str = "FRF"  # or "ODX": the container the user picked, for messages
 
 
 @lru_cache(maxsize=1)
@@ -78,7 +81,28 @@ def read_frf(data: bytes) -> FrfImage:
         root = ET.fromstring(zf.read(odx_name))  # noqa: S314 - a file the user picked; no entities are resolved
     except (zipfile.BadZipFile, StopIteration, ET.ParseError, KeyError, zlib.error) as exc:
         raise ValueError(tr("Это не FRF ODIS или он повреждён", "Not an ODIS FRF, or it is damaged")) from exc
+    return _from_odx(root, odx_name.rsplit("/", 1)[-1].rsplit(".", 1)[0], "FRF")
 
+
+def read_odx(data: bytes, name: str = "") -> FrfImage:
+    """The same flash container without the FRF wrapping: a plain ODX-F file (FL_..._S.odx). `name`: its file name."""
+    if len(data) > FRF_MAX_BYTES:
+        raise ValueError(tr(f"Файл слишком велик для ODX шлюза: {len(data):,} Б", f"Too large for a gateway ODX: {len(data):,} B"))
+    try:
+        # a BOM or a blank line before <?xml is common in hand-copied files and harmless, but expat refuses it
+        root = ET.fromstring(data.lstrip(_XML_LEAD))  # noqa: S314 - a file the user picked; no entities are resolved
+    except ET.ParseError as exc:
+        raise ValueError(tr("Это не ODX или он повреждён", "Not an ODX file, or it is damaged")) from exc
+    return _from_odx(root, name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].rsplit(".", 1)[0], "ODX")
+
+
+def read_flash_file(data: bytes, name: str = "") -> FrfImage:
+    """An FRF or a plain ODX, told apart by content: an ODX is XML text, an FRF is XOR-ed binary."""
+    head = data[:256].lstrip(_XML_LEAD)
+    return read_odx(data, name) if head.startswith((b"<?xml", b"<ODX")) else read_frf(data)
+
+
+def _from_odx(root: ET.Element, name: str, kind: str) -> FrfImage:
     app, signature, idents, mem = None, None, {}, ""
     for el in root.iter():
         tag = _local(el.tag)
@@ -87,36 +111,41 @@ def read_frf(data: bytes) -> FrfImage:
         elif tag == "FLASHDATA" and (el.get("ID") or "").endswith("FD_0DATA"):
             method = next((c.text for c in el if _local(c.tag) == "ENCRYPT-COMPRESS-METHOD"), "00")
             if (method or "00").strip() != "00":
-                raise ValueError(tr(f"Данные FRF сжаты или зашифрованы (метод {method}) — не поддерживается",
-                                    f"The FRF data is compressed or encrypted (method {method}) — not supported"))
+                raise ValueError(tr(f"Данные {kind} сжаты или зашифрованы (метод {method}) — не поддерживается",
+                                    f"The {kind} data is compressed or encrypted (method {method}) — not supported"))
             hex_text = next((c.text for c in el if _local(c.tag) == "DATA"), "") or ""
-            app = bytes.fromhex("".join(hex_text.split()))
+            try:
+                app = bytes.fromhex("".join(hex_text.split()))
+            except ValueError as exc:
+                raise ValueError(tr(f"Данные приложения в {kind} повреждены", f"The {kind} application data is damaged")) from exc
         elif tag == "SECURITY":
             method = next((c.text or "" for c in el if _local(c.tag) == "SECURITY-METHOD"), "")
             sig = next((c.text or "" for c in el if _local(c.tag) == "FW-SIGNATURE"), "")
             if method.strip().startswith("SIG_") and signature is None:
-                signature = bytes.fromhex("".join(sig.split()))
+                try:
+                    signature = bytes.fromhex("".join(sig.split()))
+                except ValueError:
+                    signature = b""  # reported below as a missing signature
         elif tag == "EXPECTED-IDENT":
-            name = next((c.text or "" for c in el if _local(c.tag) == "SHORT-NAME"), "")
-            did = IDENT_DIDS.get(name.strip())
+            ident = next((c.text or "" for c in el if _local(c.tag) == "SHORT-NAME"), "")
+            did = IDENT_DIDS.get(ident.strip())
             if did:
                 vals = tuple(v.text.strip() for v in el.iter() if _local(v.tag) == "IDENT-VALUE" and v.text)
                 idents[did] = idents.get(did, ()) + vals
 
     if app is None or len(app) != APP_SIZE_FRF:
-        raise ValueError(tr("В FRF нет приложения шлюза J533 (FD_0DATA, 1 523 200 Б с 0xC200)",
-                            "The FRF has no J533 gateway application (FD_0DATA, 1,523,200 B at 0xC200)"))
+        raise ValueError(tr(f"В {kind} нет приложения шлюза J533 (FD_0DATA, 1 523 200 Б с 0xC200)",
+                            f"The {kind} has no J533 gateway application (FD_0DATA, 1,523,200 B at 0xC200)"))
     if signature is None or len(signature) != 128:
-        raise ValueError(tr("В FRF нет подписи приложения (SIG_SHA1-RSA1024, 128 Б)",
-                            "The FRF has no application signature (SIG_SHA1-RSA1024, 128 B)"))
+        raise ValueError(tr(f"В {kind} нет подписи приложения (SIG_SHA1-RSA1024, 128 Б)",
+                            f"The {kind} has no application signature (SIG_SHA1-RSA1024, 128 B)"))
     stored, calc = app_crc(app)
     if stored != calc:
-        raise ValueError(tr(f"Приложение в FRF повреждено: CRC-16 0x{stored:04X} != 0x{calc:04X}",
-                            f"The FRF application is damaged: CRC-16 0x{stored:04X} != 0x{calc:04X}"))
+        raise ValueError(tr(f"Приложение в {kind} повреждено: CRC-16 0x{stored:04X} != 0x{calc:04X}",
+                            f"The {kind} application is damaged: CRC-16 0x{stored:04X} != 0x{calc:04X}"))
     m = re.match(r"EMEM_(\w+?)(\d{4})_", mem or "")
     part, ver = (m.group(1), m.group(2)) if m else ("", "")
-    name = odx_name.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-    return FrfImage(name, part, ver, app, signature, idents)
+    return FrfImage(name or (f"FL_{part}_{ver}_S" if part else kind), part, ver, app, signature, idents, kind)
 
 
 def frf_signature_ok(app: bytes, signature: bytes, modulus: bytes = STOCK_FBL_MODULUS) -> bool:
@@ -159,4 +188,4 @@ def frf_ident_problems(frf: FrfImage, ecu: dict[str, str]) -> tuple[list[str], l
     return hard, soft
 
 
-__all__ = ["APP_BASE", "FrfImage", "frf_ident_problems", "frf_signature_problem", "read_frf"]
+__all__ = ["APP_BASE", "FrfImage", "frf_ident_problems", "frf_signature_problem", "read_flash_file", "read_frf", "read_odx"]

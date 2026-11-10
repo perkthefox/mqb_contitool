@@ -116,6 +116,13 @@ EVENT_CALLBACK = getattr(C, "WINFUNCTYPE", C.CFUNCTYPE)(None, U32, U32, U32, C.c
 # no such link, and a RAM-loader payload needs the pace its verified 0.5 ms poll gives.
 CALLBACK_WAIT = 0.02
 CALLBACK_CONFIRM_WAIT = 0.25
+# The VCI's hardware ISO-TP stops for good after ~555 multi-frame requests in one module session: #19, #20 and #21
+# hung on the 555th (552 `36` blocks), the 2026-11-08 log of another MCD client on the 559th, on four VCIs and drivers
+# 30.3/31.0/31.1, whatever the ComParams, polling or callbacks; bytes, frames and single-frame requests do not count
+# (a 4095-byte flash survived 409 of them, 131k frames). The VCI rebuilds its per-session state ~40 ms after every
+# PDUModuleDisconnect (its clock restarts), so a long transfer reconnects the module well before the limit.
+UDS_SEGMENTED_BEFORE_REFRESH = 256
+MONITOR_CANCEL_WAIT = 0.3  # for the VCI to report the cancelled monitor before its link is disconnected
 OBJT_PROTOCOL, OBJT_BUSTYPE, OBJT_COMPARAM, OBJT_PINTYPE = 0x8021, 0x8022, 0x8024, 0x8025
 # Fallback for adapters whose firmware refuses RawMode: one link per request/response id pair, described the way
 # ODIS describes its own (bus + protocol + pins, resource PDU_ID_UNDEF) with the ids set in the URID table.
@@ -351,6 +358,12 @@ class DPduBus(can.BusABC):
         self._wake: dict[int, threading.Event] = {}
         self._cb_seen: dict[int, int] = {}
         self._event_cb = EVENT_CALLBACK(self._on_event)  # kept alive as long as the driver may call it
+        # hCoP -> the ctypes objects its PDUStartComPrimitive pointed at, kept until it finishes: ODIS builds them on a
+        # stack frame that outlives the primitive, and nothing guarantees this driver copies them all at the call
+        self._cop_keep: dict[int, tuple] = {}
+        self._uds_args: tuple | None = None  # how the hardware UDS link was opened, to open it again identically
+        self._uds_segmented = 0  # multi-frame requests sent in this module session (UDS_SEGMENTED_BEFORE_REFRESH)
+        self.uds_refreshes = 0  # module reconnects done mid-transfer: goes into the flash result
         for attempt in (1, 2):
             self._call("PDUConstruct", None, None)
             try:
@@ -386,6 +399,7 @@ class DPduBus(can.BusABC):
                 if self._call("PDUModuleConnect", hmod, also_ok=(ERR_FCT_FAILED,)) != 0:
                     raise can.CanOperationError(f"PDUModuleConnect: D-PDU error 0x{ERR_FCT_FAILED:02X}",
                                                 error_code=ERR_FCT_FAILED)
+                self._uds_segmented = 0  # a fresh module session on the VCI
                 self._open_links(bitrate)
                 return
             except can.CanError as exc:
@@ -535,10 +549,13 @@ class DPduBus(can.BusABC):
         """Release the links of one attempt, leaving the module connected for the next."""
         self._stop_links()
         for h in self._links:
-            self._unwatch(h)
+            # ODIS's order: disconnect, then take the callback off, then destroy. Before the disconnect the driver
+            # refuses the NULL callback (PDU_ERR_CLL_CONNECTED 0x84, #21 06:59:43) and keeps calling the old one.
             self._try("PDUDisconnect", self.hmod, h)
+            self._unwatch(h)
             self._try("PDUDestroyComLogicalLink", self.hmod, h)
         self._links.clear()
+        self._cop_keep.clear()
         self.h_rx = self.h_tx = self._mon_cop = self._uds_link = 0
         self._tx_cop_count = 0
         self.nonraw.clear()
@@ -599,12 +616,13 @@ class DPduBus(can.BusABC):
 
         Not `_start` + `_drain`: those treat a refusal or an error event as a dead adapter, while here it only
         means this link variant does not work and the caller moves on."""
-        ctrl = CopCtrl(0, 0, 0, 0, FlagData(4, (U8 * 4)(0, 0, 0, 0)))  # Time 0, as ODIS fills every primitive
+        tx = (U8 * 4)(0, 0, 0, 0)
+        ctrl = CopCtrl(0, 0, 0, 0, FlagData(4, tx))  # Time 0, as ODIS fills every primitive
         cop = U32(0)
         if self._try("PDUStartComPrimitive", self.hmod, hcll, cop_type, 0, None, C.byref(ctrl), None,
                      C.byref(cop)) != 0 or not cop.value:
             return
-        hcop, end = cop.value, time.monotonic() + timeout
+        hcop, end = cop.value, time.monotonic() + timeout  # ctrl and tx stay referenced until this returns
         while time.monotonic() < end:
             item = C.POINTER(EventItem)()
             if self._try("PDUGetEventItem", self.hmod, hcll, C.byref(item)) != 0 or not item:
@@ -626,8 +644,8 @@ class DPduBus(can.BusABC):
             self._uds_control(hcll, COPT_STOPCOMM, 0.5)
         except Exception:  # noqa: BLE001 - closing goes on whatever the VCI says
             pass
-        self._unwatch(hcll)  # ODIS drops the callback first when a link goes offline, then disconnects
         self._try("PDUDisconnect", self.hmod, hcll)
+        self._unwatch(hcll)  # after the disconnect, as ODIS does: the driver refuses it on a connected link
         self._try("PDUDestroyComLogicalLink", self.hmod, hcll)
         if hcll in self._links:
             self._links.remove(hcll)
@@ -709,6 +727,7 @@ class DPduBus(can.BusABC):
                 probe = self.request_uds(b"\x3e\x00", timeout=1.5, allow_pending=True)
                 if probe and (probe[0] == 0x7E or (len(probe) >= 3 and probe[:2] == b"\x7f\x3e")):
                     self.uds_refusal = ""
+                    self._uds_args = (bus, protos, hi, low, tx_id, rx_id)
                     return True
                 self.uds_refusal = f"3E 00 answered {(probe or b'').hex(' ')}"
             except (can.CanError, TimeoutError) as exc:
@@ -773,6 +792,28 @@ class DPduBus(can.BusABC):
         except BaseException:  # noqa: BLE001 - the flash error, if any, is the one worth reporting
             self.spent = True
 
+    def _refresh_uds_session(self) -> None:
+        """Between two requests of a long transfer: close the UDS link, reconnect the module and open the link again
+        exactly as before, so the VCI starts a new session long before its multi-frame limit. The ECU sees nothing
+        but a pause of a fraction of a second (its S3 is 5 s), and the reopen's `3E 00` keeps the session alive."""
+        args = self._uds_args
+        self._close_uds_link()
+        for attempt in (1, 2):
+            self._try("PDUModuleDisconnect", self.hmod)
+            if attempt == 2:
+                time.sleep(0.5)
+            if self._try("PDUModuleConnect", self.hmod) != 0:
+                continue
+            self._uds_segmented = 0
+            if args is not None and self._open_uds_link(*args):
+                self.uds_refreshes += 1
+                return
+        self.spent = True
+        raise can.CanOperationError(tr(
+            "VCI не переоткрыл аппаратный канал UDS посреди передачи (переподключение модуля D-PDU не удалось)",
+            "The VCI did not reopen the hardware UDS link mid-transfer (reconnecting the D-PDU module failed)",
+        ))
+
     def _drain_uds_leftovers(self, hcll: int) -> None:
         while True:
             item = C.POINTER(EventItem)()
@@ -795,6 +836,11 @@ class DPduBus(can.BusABC):
         if not payload:
             raise ValueError("Empty UDS payload")
         req_sid = payload[0]
+        if len(payload) > 7:  # more than one classic CAN frame: what the VCI runs out of (UDS_SEGMENTED_BEFORE_REFRESH)
+            if self._uds_segmented >= UDS_SEGMENTED_BEFORE_REFRESH:
+                self._refresh_uds_session()
+                hcll = self._uds_link
+            self._uds_segmented += 1
         self._drain_uds_leftovers(hcll)
 
         want = positive_prefix(payload)
@@ -808,11 +854,13 @@ class DPduBus(can.BusABC):
         )
         tx = (U8 * 4)(0, 0, 0, 0)
         deadline = time.monotonic() + timeout
+        keep: list = []  # every struct a started primitive points at lives until this request is over
 
         def start_primitive(send_cycles: int, tx_bytes: bytes) -> int:
             # Time 0: ODIS fills it so for every primitive (it only matters for cyclic sends)
             ctrl = CopCtrl(0, send_cycles, 1, 0, FlagData(4, tx), 2, C.cast(exps, C.POINTER(ExpResp)))
             buf = (U8 * len(tx_bytes)).from_buffer_copy(tx_bytes) if tx_bytes else None
+            keep.append((ctrl, buf))
             hcop_out = U32(0)
             self._call("PDUStartComPrimitive", self.hmod, hcll, COPT_SENDRECV, len(tx_bytes), buf, C.byref(ctrl),
                        None, C.byref(hcop_out))
@@ -1039,6 +1087,8 @@ class DPduBus(can.BusABC):
         hcop = U32(0)
         rc = self._call("PDUStartComPrimitive", self.hmod, hcll, cop, len(data), buf, C.byref(ctrl), None,
                         C.byref(hcop), also_ok=also_ok)
+        if rc == 0 and hcop.value:
+            self._cop_keep[hcop.value] = (ctrl, tx, mask, pattern, resp, buf)
         return rc, hcop.value
 
     # ------------------------------------------------------------------ events
@@ -1071,7 +1121,8 @@ class DPduBus(can.BusABC):
             self._unwatch(hcll)
 
     def _unwatch(self, hcll: int) -> None:
-        """Take the callback off a link before it is disconnected (ODIS: PDURegisterEventCallback(NULL) first)."""
+        """Take the callback off a link: PDURegisterEventCallback(NULL) once it is disconnected, as ODIS does. On a
+        connected link the driver refuses (0x84); the wake event is gone either way, so a late call does nothing."""
         wake = self._wake.pop(hcll, None)
         self._cb_seen.pop(hcll, None)
         if wake is not None:
@@ -1118,9 +1169,11 @@ class DPduBus(can.BusABC):
                 elif ev.ItemType == IT_STATUS and ev.pData and hcll != self.h_rx:
                     if C.cast(ev.pData, C.POINTER(U32)).contents.value in COPST_DONE:
                         self._tx_in_flight.pop(ev.hCop, None)
+                        self._cop_keep.pop(ev.hCop, None)
                 elif ev.ItemType == IT_ERROR and hcll != self.h_rx:
                     # a frame the VCI could not send (e.g. its queue overflowed): fail now, not by a later timeout
                     self._tx_in_flight.pop(ev.hCop, None)
+                    self._cop_keep.pop(ev.hCop, None)
                     self.spent = True
                     raise can.CanOperationError(tr("VCI не смог отправить кадр", "The VCI could not send a frame"))
             finally:
@@ -1291,10 +1344,29 @@ class DPduBus(can.BusABC):
             self._close_uds_link()
         if self._mon_cop:
             try:
-                self._dll.PDUCancelComPrimitive(self.hmod, self.h_rx, self._mon_cop)
+                if self._dll.PDUCancelComPrimitive(self.hmod, self.h_rx, self._mon_cop) == 0:
+                    self._await_cop_done(self.h_rx, self._mon_cop, MONITOR_CANCEL_WAIT)
             except Exception:  # noqa: BLE001
                 pass
             self._mon_cop = 0
+
+    def _await_cop_done(self, hcll: int, hcop: int, timeout: float) -> None:
+        """Read a link's events until `hcop` reports FINISHED/CANCELLED (or `timeout`), destroying every item. Used
+        before a link is torn down, so the VCI has acknowledged the stop instead of having it overtaken by the
+        disconnect (in #19/#21 the monitor's CANCELLED never arrived: the link was gone 4 ms after the cancel)."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            item = C.POINTER(EventItem)()
+            if self._try("PDUGetEventItem", self.hmod, hcll, C.byref(item)) != 0 or not item:
+                time.sleep(0.005)
+                continue
+            ev = item.contents
+            done = (ev.ItemType == IT_STATUS and bool(ev.pData) and ev.hCop == hcop
+                    and C.cast(ev.pData, C.POINTER(U32)).contents.value in COPST_DONE)
+            self._try("PDUDestroyItem", item)
+            if done:
+                self._cop_keep.pop(hcop, None)
+                return
 
     def _teardown(self) -> None:
         self._stop.set()  # before the links go: the receive thread must not poll a handle that is being destroyed

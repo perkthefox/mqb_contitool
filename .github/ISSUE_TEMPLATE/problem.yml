@@ -33,7 +33,7 @@ body:
       label: Окружение / Environment
       description: Версия ContiTool, ОС, адаптер и драйвер, блок (номер детали, версия ПО). ContiTool version, OS, adapter and driver, ECU part number and software version.
       placeholder: |
-        - ContiTool: 2.0.3a
+        - ContiTool: 2.0.3b
         - OS: Windows 10
         - Adapter: VAS 6154 / VNCI · dpdu · VW_D_PDU_API_OE
         - ECU: 3Q0907530AR, SW 5502

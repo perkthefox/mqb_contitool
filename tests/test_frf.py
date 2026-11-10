@@ -13,13 +13,13 @@ from contitool.core.analyzer import split_cflash_or_app
 from contitool.core import frf as frf_mod
 from contitool.core.constants import STOCK_FBL_MODULUS
 from contitool.core.crypto import generate_rsa1024_e3_keypair, sign_fbl_odx_application
-from contitool.core.frf import _keystream, frf_ident_problems, read_frf
+from contitool.core.frf import _keystream, frf_ident_problems, read_flash_file, read_frf, read_odx
 from contitool.i18n import set_lang
 
 SIG = bytes(range(128))
 
 
-def _frf(app: bytes, *, sw: str = "5388", sig: bytes = SIG) -> bytes:
+def _odx(app: bytes, *, sw: str = "5388", sig: bytes = SIG) -> str:
     idents = {"EI_VWSparePartNumbe": ["3Q0907530C ", "3Q0907530AA"], "EI_VWAppliSoftwVersiNumbe": ["5301", "5388"],
               "EI_VWECUHardwNumbe": ["3Q0907530C "], "EI_VWECUHardwVersiNumbe": ["517", "521"]}
     ei = "".join(f"<EXPECTED-IDENT><SHORT-NAME>{k}</SHORT-NAME><IDENT-VALUES>"
@@ -33,9 +33,13 @@ def _frf(app: bytes, *, sw: str = "5388", sig: bytes = SIG) -> bytes:
            "<SECURITY><SECURITY-METHOD>SA2</SECURITY-METHOD><FW-SIGNATURE>814A0A84</FW-SIGNATURE></SECURITY>"
            f"<SECURITY><SECURITY-METHOD>SIG_SHA1-RSA1024_S</SECURITY-METHOD><FW-SIGNATURE>{sig.hex()}</FW-SIGNATURE></SECURITY>"
            f"</SECURITYS>{ei}</ECU-MEM></ECU-MEMS></FLASH></ODX>")
+    return odx
+
+
+def _frf(app: bytes, *, sw: str = "5388", sig: bytes = SIG) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(f"FL_3Q0907530AC_{sw}_S.odx", odx)
+        z.writestr(f"FL_3Q0907530AC_{sw}_S.odx", _odx(app, sw=sw, sig=sig))
     plain = buf.getvalue()
     return bytes(a ^ b for a, b in zip(plain, _keystream()))
 
@@ -106,6 +110,31 @@ def test_an_frf_decrypts_to_its_application_signature_and_idents(synth_cflash: b
         read_frf(_frf(bytes(broken)))
     with pytest.raises(ValueError, match="Not an ODIS FRF"):
         read_frf(b"PK" + bytes(100))
+
+
+def test_a_plain_odx_is_the_same_container_without_the_frf_wrapping(synth_cflash: bytes) -> None:
+    """FL_..._S.odx as it lies inside the FRF: same application, signature and idents; the file picker tells the two
+    apart by content, not by extension."""
+    set_lang("en")
+    app = bytes(split_cflash_or_app(synth_cflash)[1])
+    odx = _odx(app).encode()
+    from_frf = read_frf(_frf(app))
+    plain = read_odx(odx, "C:\\flash\\FL_3Q0907530AC_5388_S.odx")
+    assert (plain.name, plain.kind, from_frf.kind) == ("FL_3Q0907530AC_5388_S", "ODX", "FRF")
+    assert (plain.app, plain.signature, plain.idents, plain.part_number, plain.sw_version) == (
+        from_frf.app, from_frf.signature, from_frf.idents, from_frf.part_number, from_frf.sw_version)
+    assert read_flash_file(b"\xef\xbb\xbf\r\n" + odx, "x.odx").kind == "ODX"  # BOM and a blank line first
+    assert read_flash_file(odx).name == "FL_3Q0907530AC_5388_S"  # no file name: taken from the ECU-MEM
+    assert read_flash_file(_frf(app), "renamed.odx").kind == "FRF"  # content decides, not the extension
+    broken = bytearray(app)
+    broken[0x1000] ^= 0xFF
+    with pytest.raises(ValueError, match="ODX application is damaged: CRC-16"):
+        read_odx(_odx(bytes(broken)).encode())
+    with pytest.raises(ValueError, match="Not an ODX file"):
+        read_flash_file(b"<?xml version='1.0'?><ODX><unclosed>")
+    with pytest.raises(ValueError, match="compressed or encrypted"):
+        read_odx(_odx(app).replace("<ENCRYPT-COMPRESS-METHOD>00</ENCRYPT-COMPRESS-METHOD><DATA>" + app.hex().upper()[:8],
+                                   "<ENCRYPT-COMPRESS-METHOD>11</ENCRYPT-COMPRESS-METHOD><DATA>" + app.hex().upper()[:8]).encode())
 
 
 def test_frf_flash_checks_the_ecu_then_programs_with_the_frf_signature(synth_cflash: bytes, tmp_path: Path, monkeypatch) -> None:

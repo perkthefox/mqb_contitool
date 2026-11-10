@@ -1,5 +1,23 @@
 # Changelog / История изменений
 
+## 2.0.3b — 2026-11-10
+
+### 🇷🇺 Добавлено
+- **Прошивка из ODX:** кроме `.frf` ContiTool принимает обычный файл ODIS `FL_…_S.odx` («Файл → Прошить FRF / ODX ODIS…»). Проверки те же: подпись, CRC и список блоков, для которых файл предназначен.
+
+### 🇷🇺 Исправлено
+- **VAS 6154 / VNCI, запись приложения по UDS:** VCI переставал отвечать примерно на 553-м блоке из 2975. Теперь во время длинной передачи ContiTool переподключается к VCI между блоками задолго до этой точки, блок этого не замечает.
+- **VAS 6154 / VNCI:** если VCI всё же отключился посреди прошивки, ContiTool прямо пишет, что делать, вместо обещания «продолжить программным путём».
+- **VAS 6154 / VNCI:** каналы драйвера закрываются в том же порядке, что у ODIS.
+
+### 🇬🇧 Added
+- **Flashing from ODX:** besides `.frf`, ContiTool takes a plain ODIS `FL_…_S.odx` file (“File → Flash an ODIS FRF / ODX…”). Same checks: signature, CRC and the list of ECUs the file is meant for.
+
+### 🇬🇧 Fixed
+- **VAS 6154 / VNCI, application write over UDS:** the VCI stopped answering around block 553 of 2975. During a long transfer ContiTool now reconnects to the VCI between blocks well before that point; the ECU does not notice.
+- **VAS 6154 / VNCI:** if the VCI still drops off mid-flash, ContiTool says plainly what to do instead of promising to "continue on the software path".
+- **VAS 6154 / VNCI:** driver links are closed in the same order as ODIS closes them.
+
 ## 2.0.3a — 2026-11-10
 
 ### 🇷🇺 Изменено

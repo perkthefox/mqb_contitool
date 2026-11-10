@@ -2149,6 +2149,7 @@ def _program_application_uds(
         link.request_uds(b"\x37", 0x77, timeout=5.0)
         info["transfer_exit_ok"] = True
         info["blocks"] = total_blocks
+        info["hardware_isotp_session_refreshes"] = getattr(getattr(link, "bus", None), "uds_refreshes", 0)
 
         sig = signature_128b if (signature_128b and len(signature_128b) == 128) else (b"\x00" * 128)
         chk_mem_req = (
@@ -2927,30 +2928,31 @@ def can_flash_frf(
             hard, soft = frf_ident_problems(frf, ecu)
             result["ident_problems"] = hard + soft
             if hard or (soft and not allow_unlisted):
-                raise RuntimeError(tr("FRF не для этого блока: ", "The FRF is not for this ECU: ") + "; ".join(hard + soft))
+                raise RuntimeError(tr(f"{frf.kind} не для этого блока: ", f"The {frf.kind} is not for this ECU: ") + "; ".join(hard + soft))
             reporter.step(2, 3, tr(f"Прошивка {frf.name} по UDS — НЕ ОТКЛЮЧАЙТЕ ПИТАНИЕ!",
                                    f"Flashing {frf.name} over UDS — DO NOT CUT POWER!"))
             try:
                 result["uds"] = _program_application_uds(link, frf.app, signature_128b=frf.signature, reporter=reporter)
             except FblRejectedAppError as exc:
                 raise FblRejectedAppError(tr(
-                    "Загрузчик не принял приложение из FRF с его подписью. Приложение стёрто, блок остался в загрузчике "
-                    "FBL — восстановите его «Залить бэкап…» (CodeFlash этого блока) или прошейте подходящий FRF.",
-                    "The bootloader refused the FRF application with its signature. The application is erased and the ECU "
-                    "stays in its FBL bootloader — restore it with \"Write backup…\" (this ECU's CodeFlash) or flash a "
-                    "matching FRF.",
+                    f"Загрузчик не принял приложение из {frf.kind} с его подписью. Приложение стёрто, блок остался в "
+                    "загрузчике FBL — восстановите его «Залить бэкап…» (CodeFlash этого блока) или прошейте подходящий "
+                    "FRF / ODX.",
+                    f"The bootloader refused the {frf.kind} application with its signature. The application is erased and "
+                    "the ECU stays in its FBL bootloader — restore it with \"Write backup…\" (this ECU's CodeFlash) or "
+                    "flash a matching FRF / ODX.",
                 )) from exc
         time.sleep(3.0)  # the reset that ends the programming
         with J533CanLink(port, interface=interface, log_path=out_dir / "after.jsonl") as link:
             reporter.step(3, 3, tr("Проверка: приложение запущено, новая версия", "Checking: application running, new version"))
             _s, in_fbl = _probe_app_or_fbl(link, attempts=5, allow_fbl=True)
             if in_fbl:
-                raise RuntimeError(tr("FRF записан, но блок остался в загрузчике FBL",
-                                      "The FRF is written, but the ECU stayed in its FBL bootloader"))
+                raise RuntimeError(tr(f"{frf.kind} записан, но блок остался в загрузчике FBL",
+                                      f"The {frf.kind} is written, but the ECU stayed in its FBL bootloader"))
             result["after"] = after = _read_ident_dids(link)
         old_v, new_v = ecu.get("F189", "?"), after.get("F189", frf.sw_version)
-        reporter.success(tr(f"FRF записан: ПО {old_v} → {new_v}, приложение запущено",
-                            f"FRF written: software {old_v} → {new_v}, application running"))
+        reporter.success(tr(f"{frf.kind} записан: ПО {old_v} → {new_v}, приложение запущено",
+                            f"{frf.kind} written: software {old_v} → {new_v}, application running"))
         if old_v != new_v:
             reporter.warning(tr(
                 "Версия ПО сменилась: параметрия ZDC должна соответствовать новой прошивке, иначе возможна ошибка "

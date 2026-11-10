@@ -249,6 +249,10 @@ class FakePduApi:
 
     def PDUCancelComPrimitive(self, _hmod, hcll, hcop) -> int:  # noqa: N802
         self.calls.append(("cancel", hcll, hcop))
+        with self._lock:  # as the driver does: the cancelled primitive reports PDU_COPST_CANCELLED on its link
+            st = C.c_uint32(0x8013)
+            self.keep.append(st)
+            self.events.setdefault(hcll, []).append(EventItem(IT_STATUS, hcop, None, 0, C.cast(C.pointer(st), C.c_void_p)))
         return 0
 
     def PDUDisconnect(self, _hmod, hcll) -> int:  # noqa: N802
@@ -258,7 +262,8 @@ class FakePduApi:
     def PDUDestroyComLogicalLink(self, *_a) -> int:  # noqa: N802
         return 0
 
-    def PDUModuleDisconnect(self, *_a) -> int:  # noqa: N802
+    def PDUModuleDisconnect(self, hmod=None, *_a) -> int:  # noqa: N802
+        self.calls.append(("module_disconnect", hmod))
         return 0
 
     def PDUDestruct(self) -> int:  # noqa: N802
@@ -342,7 +347,8 @@ def test_close_stops_the_send_link_and_cancels_the_monitor_before_disconnecting(
     tx = next(h for h, f in api.links.items() if f == (0x80, 0, 0, 0))
     api.calls.clear()
     bus.shutdown()
-    assert api.calls == [("stopcomm", tx), ("cancel", api.monitor, 0x01), ("disconnect", api.monitor), ("disconnect", tx)]
+    assert api.calls == [("stopcomm", tx), ("cancel", api.monitor, 0x01), ("disconnect", api.monitor), ("disconnect", tx),
+                         ("module_disconnect", 0x10000001)]
     assert api.destructed
 
 
@@ -616,6 +622,8 @@ class UdsCapablePduApi(FakePduApi):
         self.uds_sendrecv_count = 0
         self.flashed_app = bytearray()
         self._unlocked = False
+        self.segmented_in_session = 0  # multi-frame requests since the last PDUModuleConnect
+        self.max_segmented_in_session = 0
         self.objects.update({
             "ISO_15765_3_on_ISO_15765_2": 0x30,
             "CP_Baudrate": 126,
@@ -693,6 +701,10 @@ class UdsCapablePduApi(FakePduApi):
             return 0
         return super().PDUCreateComLogicalLink(hmod, rsc, resource, tag, phcll, flag)
 
+    def PDUModuleConnect(self, hmod) -> int:  # noqa: N802
+        self.segmented_in_session = 0
+        return super().PDUModuleConnect(hmod)
+
     def _queue_uds_result(self, hcll: int, hcop: int, payload: bytes) -> None:
         buf = (U8 * len(payload)).from_buffer_copy(payload)
         fl = (U8 * 4)(0, 0, 0, 0)
@@ -731,6 +743,9 @@ class UdsCapablePduApi(FakePduApi):
 
         self.uds_sendrecv_count += 1
         req = bytes(data[:size])
+        if size > 7:
+            self.segmented_in_session += 1
+            self.max_segmented_in_session = max(self.max_segmented_in_session, self.segmented_in_session)
         req_sid = req[0]
         exp0, exp1 = c.pExpectedResponseArray[0], c.pExpectedResponseArray[1]
         from contitool.can.transport import positive_prefix
@@ -816,8 +831,10 @@ def test_uds_application_flash_uses_one_isotp_primitive_per_514b_block_and_resto
         # entry's stage 1 lands record bytes 5..9 on 0xFEDE0C62..66. 2.0.1d wrote serial 01 02 03 04 05 06, put
         # 03 on 0C62 (suppress-positive-response) and every later entry went unanswered at stage 1.
         assert len(api.fingerprint) == 9 and api.fingerprint[5:9] == bytes(4)
-        # 2,975 TransferData blocks + ~10 setup/check/reset primitives (vs 220,150 RawMode primitives!)
-        assert 2980 <= api.uds_sendrecv_count <= 2995
+        # 2,975 TransferData blocks + ~10 setup/check/reset primitives (vs 220,150 RawMode primitives!), plus the
+        # `3E 00` that checks the link after each module reconnect (one per UDS_SEGMENTED_BEFORE_REFRESH requests)
+        assert bus.uds_refreshes == 11 and api.max_segmented_in_session <= dpdu.UDS_SEGMENTED_BEFORE_REFRESH
+        assert 2980 <= api.uds_sendrecv_count - bus.uds_refreshes <= 2995
         urid = next(iter(api.uds_urid.values()))
         assert urid[0x1A] == 0x710 and urid[0x1D] == 0x77A
         assert urid[0x1C] == urid[0x1E] == 5 and urid[0x1B] == 0xFFFFFFFF
@@ -874,10 +891,10 @@ class CallbackPduApi(UdsCapablePduApi):
         return rc
 
 
-def test_monitor_and_uds_links_get_a_callback_before_connect_and_lose_it_before_disconnect(monkeypatch) -> None:
-    """ODIS registers PDURegisterEventCallback on each link before PDUConnect and clears it (NULL) when the link
-    goes offline; a reader then sleeps until the driver calls, instead of polling the event queue. The RawMode
-    send link keeps its verified poll."""
+def test_monitor_and_uds_links_get_a_callback_before_connect_and_lose_it_after_disconnect(monkeypatch) -> None:
+    """ODIS registers PDURegisterEventCallback on each link before PDUConnect and clears it (NULL) after
+    PDUDisconnect, before destroying it — on a connected link the driver refuses NULL (0x84, #21). A reader sleeps
+    until the driver calls, instead of polling the event queue. The RawMode send link keeps its verified poll."""
     from contitool.can import J533CanLink, workflows
     from contitool.core.constants import APP_SIZE
 
@@ -902,7 +919,10 @@ def test_monitor_and_uds_links_get_a_callback_before_connect_and_lose_it_before_
         assert res["hardware_isotp"] is True and bytes(api.flashed_app) == app_image
     uds = next(iter(api.uds_urid))
     assert api.calls.index(("callback", uds, True)) < api.calls.index(("connect", uds))
-    assert api.calls.index(("callback", uds, False)) < api.calls.index(("disconnect", uds))
+    assert api.calls.index(("disconnect", uds)) < api.calls.index(("callback", uds, False))
+    first_mon = next(c[1] for c in api.calls if c[0] == "cancel")  # the monitor paused for the flash
+    assert (api.calls.index(("cancel", first_mon, 1)) < api.calls.index(("disconnect", first_mon))
+            < api.calls.index(("callback", first_mon, False)))
     assert set(api.callbacks) == {bus.h_rx}  # RawMode back: the new monitor is watched again
     bus.shutdown()
     assert not api.callbacks
@@ -934,6 +954,71 @@ def test_a_bus_abandoned_mid_operation_at_exit_drops_its_callbacks(monkeypatch) 
     dpdu.close_session()
     assert bus.spent and not api.callbacks and not api.destructed  # handles left alone, callbacks gone
     bus.claimed = False
+    bus.shutdown()
+
+
+def test_a_long_transfer_reconnects_the_module_before_the_vci_multiframe_limit(monkeypatch) -> None:
+    """The VCI hangs on the ~555th multi-frame request of a module session (#19-#22). A flash reconnects the module
+    between two blocks well before that, opens the link again as before, and the application still arrives whole."""
+    from contitool.can import J533CanLink, workflows
+    from contitool.core.constants import APP_SIZE
+
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(dpdu, "UDS_SEGMENTED_BEFORE_REFRESH", 100)
+    api = UdsCapablePduApi(require_resource_lookup=True, finish_on_78=True)
+    bus = DPduBus(dll=api)
+    app_image = bytes(((i * 37) ^ (i >> 8)) & 0xFF for i in range(APP_SIZE))
+    with J533CanLink("", bus=bus) as link:
+        res = workflows._program_application_uds(link, app_image)
+    assert res["hardware_isotp"] is True and bytes(api.flashed_app) == app_image
+    assert api.max_segmented_in_session <= 100  # never more in one module session
+    assert res["hardware_isotp_session_refreshes"] == bus.uds_refreshes >= 29  # 2,975 blocks / 100
+    assert sum(c[0] == "module_disconnect" for c in api.calls) == bus.uds_refreshes
+    # every reopened link is set up like the first one: the same ODIS ComParams and URID
+    links = list(api.uds_urid)
+    assert len(links) == bus.uds_refreshes + 1
+    assert all(api.params[h] == api.params[links[0]] and api.uds_urid[h] == api.uds_urid[links[0]] for h in links)
+    assert not bus.spent and bus.h_rx and bus.h_tx  # RawMode back afterwards
+    bus.shutdown()
+
+
+def test_a_vci_that_dies_mid_flash_is_reported_plainly_not_as_a_switch_to_the_software_path(monkeypatch) -> None:
+    """#21/#22: the VCI rebooted at block 553; the user was told "continuing on the verified software path", then
+    "this link no longer works". With the VCI gone there is no software path: say what happened and what to do."""
+    from contitool.can import J533CanLink, workflows
+    from contitool.core.constants import APP_SIZE
+
+    class DyingVci(UdsCapablePduApi):
+        def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+            if hcll in self.uds_links and cop == COPT_SENDRECV and size > 2 and data[0] == 0x36 and data[1] == 40:
+                hcop._obj.value = self.next_cop
+                self.next_cop += 1
+                st = C.c_uint32(dpdu.CLLST_OFFLINE)  # the driver's last word on the link before the TCP loss
+                self.keep.append(st)
+                self.events[hcll].append(EventItem(IT_STATUS, 0, None, 0, C.cast(C.pointer(st), C.c_void_p)))
+                self.connect_ok, self.create_rc = set(), 0x11  # and nothing reconnects any more
+                return 0
+            return super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+
+    set_lang("en")
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(dpdu, "VCI_RESTART_WAIT", 0.0)
+    from contitool.progress import OperationReporter
+
+    warnings: list[str] = []
+
+    class Rep(OperationReporter):
+        def warning(self, message: str) -> None:
+            warnings.append(message)
+
+    api = DyingVci(require_resource_lookup=True, finish_on_78=True)
+    bus = DPduBus(dll=api)
+    app_image = bytes(((i * 37) ^ (i >> 8)) & 0xFF for i in range(APP_SIZE))
+    with J533CanLink("", bus=bus) as link:
+        with pytest.raises(can.CanOperationError, match="Lost the VCI mid-transfer.*FBL.*power-cycle"):
+            workflows._program_application_uds(link, app_image, reporter=Rep())
+    assert not any("software path" in w for w in warnings)
+    assert bus.spent
     bus.shutdown()
 
 

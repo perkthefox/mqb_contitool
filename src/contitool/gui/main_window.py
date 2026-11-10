@@ -67,7 +67,7 @@ from contitool.gui.worker import OperationRunner
 from contitool.gui.workspace import NAMES, Workspace
 from contitool.i18n import get_lang, set_lang, subscribe_lang_change, tr
 from contitool.core.constants import FBL_MOD_OFFSET
-from contitool.core.frf import FrfImage, frf_ident_problems, frf_signature_problem, read_frf
+from contitool.core.frf import FrfImage, frf_ident_problems, frf_signature_problem, read_flash_file
 from contitool.report import Failure
 from contitool.storage import keep_as_base, latest_area, new_session, unit_of_cflash, unit_of_ident
 
@@ -456,19 +456,19 @@ class MainWindow(QMainWindow):
             " ContiTool до 2.0.1e и ODIS с ненулевым отпечатком в настройках), и загрузчик не пускает в RAM-"
             "Loader. Исправляет это одна перепрошивка приложения по UDS с нулевым серийником; RAM-Loader для "
             "неё не нужен.\n\nОткуда взять приложение:\n• CodeFlash этого блока: бэкап, снятый ContiTool, или "
-            "файл, который в него записывался (проверяется по FAZIT);\n• FRF ODIS для этого блока: прошивается"
-            " с подписью из FRF, бэкап не нужен.\n\nПриложение будет стёрто и записано заново. Это займёт "
+            "файл, который в него записывался (проверяется по FAZIT);\n• FRF или ODX ODIS для этого блока: "
+            "прошивается с подписью из файла, бэкап не нужен.\n\nПриложение будет стёрто и записано заново. Это займёт "
             "несколько минут; не отключайте питание.",
             "The last programming fingerprint of this ECU carries a non-zero tester serial (ContiTool before "
             "2.0.1e writes one, and so does ODIS set up with a non-zero fingerprint), and the bootloader "
             "keeps the RAM-Loader closed. One reflash of the application over UDS with a zero serial fixes "
             "it; it needs no RAM-Loader.\n\nWhere the application comes from:\n• this ECU's CodeFlash: a backup "
-            "ContiTool took, or a file that was written into it (checked against FAZIT);\n• an ODIS FRF for "
-            "this ECU: flashed with the FRF's own signature, no backup needed.\n\nThe application is erased and"
+            "ContiTool took, or a file that was written into it (checked against FAZIT);\n• an ODIS FRF or ODX "
+            "for this ECU: flashed with the file's own signature, no backup needed.\n\nThe application is erased and"
             " written again. It takes a few minutes; keep the power on.",
         ))
         from_cf = box.addButton(tr("CodeFlash этого блока…", "This ECU's CodeFlash…"), QMessageBox.ButtonRole.AcceptRole)
-        from_frf = box.addButton(tr("Файл FRF…", "FRF file…"), QMessageBox.ButtonRole.ActionRole)
+        from_frf = box.addButton(tr("Файл FRF / ODX…", "FRF / ODX file…"), QMessageBox.ButtonRole.ActionRole)
         box.addButton(tr("Отмена", "Cancel"), QMessageBox.ButtonRole.RejectRole)
         box.exec()
         if box.clickedButton() is from_frf:
@@ -490,18 +490,18 @@ class MainWindow(QMainWindow):
         )
 
     def flash_frf(self, path: str = "") -> None:
-        """An ODIS FRF over UDS with its own signature (can_flash_frf): a software update on any bootloader, and the
-        cure for a fingerprint that closed the RAM-loader entry, without a backup of the ECU."""
+        """An ODIS FRF or plain ODX over UDS with its own signature (can_flash_frf): a software update on any
+        bootloader, and the cure for a fingerprint that closed the RAM-loader entry, without a backup of the ECU."""
         self.set_mode("ecu")
         path = path or QFileDialog.getOpenFileName(
-            self, tr("Файл прошивки ODIS (.frf)", "ODIS flash file (.frf)"), str(Path.home()),
-            "ODIS FRF (*.frf);;All Files (*)")[0]
+            self, tr("Файл прошивки ODIS (.frf / .odx)", "ODIS flash file (.frf / .odx)"), str(Path.home()),
+            tr("Прошивка ODIS (*.frf *.odx);;Все файлы (*)", "ODIS flash file (*.frf *.odx);;All Files (*)"))[0]
         if not path:
             return
         try:
-            frf = read_frf(Path(path).read_bytes())
+            frf = read_flash_file(Path(path).read_bytes(), Path(path).name)
         except (OSError, ValueError) as exc:
-            QMessageBox.critical(self, tr("Прошивка FRF", "FRF flash"), str(exc))
+            QMessageBox.critical(self, tr("Прошивка FRF / ODX", "FRF / ODX flash"), str(exc))
             return
         if not ensure_ready(self.conn, self):
             return
@@ -517,14 +517,14 @@ class MainWindow(QMainWindow):
         vals = {i["did"]: str(i["value"]).strip() for i in ident.get("ident") or []}
         hard, soft = frf_ident_problems(frf, vals)
         head = tr(
-            f"FRF: {frf.name} — {frf.part_number}, ПО {frf.sw_version}.\n"
+            f"{frf.kind}: {frf.name} — {frf.part_number}, ПО {frf.sw_version}.\n"
             f"Блок: {vals.get('F187', '?')}, ПО {vals.get('F189', '?')}, оборудование {vals.get('F191', '?')} / "
             f"{vals.get('F1A3', '?')}.\n\n",
-            f"FRF: {frf.name} — {frf.part_number}, software {frf.sw_version}.\n"
+            f"{frf.kind}: {frf.name} — {frf.part_number}, software {frf.sw_version}.\n"
             f"ECU: {vals.get('F187', '?')}, software {vals.get('F189', '?')}, hardware {vals.get('F191', '?')} / "
             f"{vals.get('F1A3', '?')}.\n\n",
         )
-        title = tr("Прошивка FRF", "FRF flash")
+        title = tr(f"Прошивка {frf.kind}", f"{frf.kind} flash")
         # the bootloader checks the signature with the key in CodeFlash (0xA2F7), which ContiTool can replace; the
         # engineering bootloader checks none. Both are known from this gateway's latest read or write, if any.
         unit_dir = self.conn.out_dir / unit_of_ident(ident.get("ident") or [])
@@ -537,19 +537,20 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, title, head + why + src)
             return
         if hard:
-            QMessageBox.critical(self, title, head + tr("Этот FRF для другого оборудования: ",
-                                                        "This FRF is for other hardware: ") + "; ".join(hard) + ".")
+            QMessageBox.critical(self, title, head + tr(f"Этот {frf.kind} для другого оборудования: ",
+                                                        f"This {frf.kind} is for other hardware: ") + "; ".join(hard) + ".")
             return
         text = head + tr(
-            "Приложение будет стёрто и записано заново по UDS с подписью из FRF, как это делает ODIS. "
+            f"Приложение будет стёрто и записано заново по UDS с подписью из {frf.kind}, как это делает ODIS. "
             "Серийник тестера в отпечатке будет нулевым. Запись занимает несколько минут; не отключайте "
             "питание.",
-            "The application is erased and written again over UDS with the FRF's own signature, as ODIS does "
+            f"The application is erased and written again over UDS with the {frf.kind}'s own signature, as ODIS does "
             "it. The tester serial in the fingerprint will be zero. The write takes a few minutes; keep the "
             "power on.",
         )
         if soft:
-            text += (tr("\n\n⚠ ODIS не стал бы лить этот FRF на этот блок: ", "\n\n⚠ ODIS would not flash this FRF onto this ECU: ")
+            text += (tr(f"\n\n⚠ ODIS не стал бы лить этот {frf.kind} на этот блок: ",
+                        f"\n\n⚠ ODIS would not flash this {frf.kind} onto this ECU: ")
                      + "; ".join(soft) + tr(". Прошивать всё равно?", ". Flash it anyway?"))
         else:
             text += tr("\n\nПрошить?", "\n\nFlash it?")
@@ -643,7 +644,7 @@ class MainWindow(QMainWindow):
         self.act_files.setText(tr("Открыть файлы…", "Open files…"))
         self.act_export.setText(tr("Экспортировать бэкап…", "Export backup…"))
         self.act_restore.setText(tr("Залить бэкап в блок…", "Write backup to ECU…"))
-        self.act_frf.setText(tr("Прошить FRF ODIS…", "Flash an ODIS FRF…"))
+        self.act_frf.setText(tr("Прошить FRF / ODX ODIS…", "Flash an ODIS FRF / ODX…"))
         self.act_report.setText(tr("Подробный отчёт", "Full report"))
         self.act_close.setText(tr("Закрыть блок", "Close ECU"))
         self.act_conn.setText(tr("Подключение к блоку…", "ECU connection…"))

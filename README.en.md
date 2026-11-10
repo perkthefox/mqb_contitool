@@ -107,9 +107,9 @@ flowchart LR
 ### Option 1 — Standalone Executables (Recommended)
 
 Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.0.3a-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.0.3a-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.0.3a-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+- **Windows**: extract `ContiTool-v2.0.3b-windows-amd64.zip` and launch **`ContiTool.exe`**.
+- **macOS**: open `ContiTool-v2.0.3b-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
+- **Linux**: extract `ContiTool-v2.0.3b-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
 
 ### Option 2 — Run from Source (`Python 3.12+`)
 
@@ -210,7 +210,7 @@ Because they are built on completely different **NXP PowerPC (`MPC5607B` / `MPC5
 **Only if ODIS is set to a zero fingerprint — with its usual non-zero one ODIS triggers the exact same problem.** The last `F15B` copy in Stage 1's padding lands bytes `2..5` of the 6-byte tester serial onto FBL's suppress-response flag `0xFEDE0C62` ("do not answer"). Both `ContiTool <= v2.0.1d` (`01 02 03 04 05 06` → `0x03`) and `ODIS` (its own non-zero tester serial → e.g. `0xC8`) left a non-zero byte there, silencing Stage 1 on every subsequent entry. Since `v2.0.1e`, `ContiTool` writes a zero tester serial, and in `v2.0.2` it stops before sending `27 12` on a silent Stage 1 (avoiding `7F 27 37` lockout) and offers **the cure**: one UDS reflash of the gateway's own `CodeFlash` application with a zero serial.
 
 **ContiTool asks for a backup to clear the fingerprint, but I have no backup of this gateway.**
-Flash the gateway's original firmware from its FRF instead: with VCTool or ODIS, or with ContiTool itself (“File → Flash an ODIS FRF…”, or the “FRF file…” button in the cure dialog) — ContiTool always writes a zero fingerprint. If you flash with ODIS or VCTool on an original adapter, first check that their settings carry a zero fingerprint (importer, workshop and tester codes all 0): otherwise they write their own non-zero serial and the `RAM-Loader` entry stays closed.
+Flash the gateway's original firmware from its FRF instead: with VCTool or ODIS, or with ContiTool itself (“File → Flash an ODIS FRF / ODX…”, or the “FRF / ODX file…” button in the cure dialog; both `.frf` and a plain `.odx` work) — ContiTool always writes a zero fingerprint. If you flash with ODIS or VCTool on an original adapter, first check that their settings carry a zero fingerprint (importer, workshop and tester codes all 0): otherwise they write their own non-zero serial and the `RAM-Loader` entry stays closed.
 
 **How do I recover a gateway stuck in its `FBL` bootloader after an interrupted write?**
 Click **"Write backup…"** on the start screen and select that unit's backup folder. ContiTool recognizes that the gateway is in `FBL`, verifies backup ownership via `22 F1 7C` (`FAZIT`) over UDS without entering `RAM-Loader`, and flashes the application directly. If `FBL` answers `7F 27 37` (security delay), cut `+12 V` for `10` seconds when prompted and ContiTool will resume automatically.

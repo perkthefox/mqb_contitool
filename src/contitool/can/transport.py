@@ -15,6 +15,7 @@ from typing import Any
 import can
 
 from contitool.can.payloads import LOADER_SYNC, build_loader_packet
+from contitool.i18n import tr
 from contitool.progress import NULL_REPORTER, OperationReporter
 
 P2_STAR_WAIT = 6.0  # P2*server 5.0 s + 1 s for adapter latency
@@ -416,6 +417,19 @@ class J533CanLink:
                 # (a 7F answer) is not caught here: that is its answer, and no transport would change it.
                 self.drop_hw_uds()
                 self._write_trace("uds_hw_fallback", self.UDS_TX_ID, len(req), req[:16])
+                if getattr(self.bus, "spent", False):
+                    # The VCI itself is gone (it reboots, #19-#22): the software path would only fail on the next
+                    # frame with "this link no longer works", after promising to carry on.
+                    raise can.CanOperationError(tr(
+                        f"Связь с VCI потеряна посреди передачи ({req[:3].hex(' ').upper()}: {exc}): адаптер "
+                        "перезагрузился или отключился, продолжить на этом соединении нельзя. Если шла прошивка, блок "
+                        "остался в загрузчике FBL без приложения — это поправимо: выключите и включите питание блока и "
+                        "VCI, затем запустите ту же прошивку заново.",
+                        f"Lost the VCI mid-transfer ({req[:3].hex(' ').upper()}: {exc}): the adapter rebooted or "
+                        "disconnected, and this connection cannot go on. If a flash was running, the ECU stays in its "
+                        "FBL bootloader without an application — which can be fixed: power-cycle the ECU and the VCI, "
+                        "then run the same flash again.",
+                    )) from exc
                 if self.on_hw_fallback is not None:
                     self.on_hw_fallback(f"{req[:3].hex(' ').upper()}: {exc}")
             else:
