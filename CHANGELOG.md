@@ -1,5 +1,15 @@
 # Changelog / История изменений
 
+## 2.0.3a — 2026-11-10
+
+### 🇷🇺 Изменено
+- **VAS 6154 / VNCI, запись приложения по UDS:** канал аппаратного ISO-TP открывается с теми же параметрами связи, что ставит ODIS-E для шлюза по своим ODX-данным: таймауты P2/P3, ожидание `7F xx 78`, повтор при `7F xx 21`, TesterPresent. Сам VCI запросы не повторяет — как у ODIS во время передачи блоков.
+- **VAS 6154 / VNCI:** о новых данных драйвер сообщает сам, как в ODIS, вместо опроса каждые полмиллисекунды. Канал отправки RAW CAN работает как раньше.
+
+### 🇬🇧 Changed
+- **VAS 6154 / VNCI, application write over UDS:** the hardware ISO-TP link opens with the same communication parameters ODIS-E sets for the gateway from its ODX data: P2/P3 timeouts, waiting on `7F xx 78`, repeating on `7F xx 21`, TesterPresent. The VCI does not repeat requests on its own — as in ODIS while blocks are transferred.
+- **VAS 6154 / VNCI:** the driver reports new data by itself, as for ODIS, instead of being polled every half millisecond. The RAW CAN send link works as before.
+
 ## 2.0.3 — 2026-11-10
 
 ### 🇷🇺 Исправлено

@@ -630,7 +630,7 @@ class UdsCapablePduApi(FakePduApi):
             "CP_RC78Handling": 0x49,
             # the rest with their MDF_VW ids (as ODIS's driver log prints them)
             "CP_CanTransmissionTime": 1, "CP_ModifyTiming": 11, "CP_RC21CompletionTimeout": 18,
-            "CP_RC21Handling": 19, "CP_Br": 49, "CP_CanMaxNumWaitFrames": 58,
+            "CP_RC21Handling": 19, "CP_Br": 49, "CP_CanMaxNumWaitFrames": 58, "CP_RepeatReqCountApp": 27,
             "CP_CanPhysReqFormat": 0x1C,
             "CP_CanRespUSDTId": 0x1D,
             "CP_CanRespUSDTFormat": 0x1E,
@@ -673,6 +673,7 @@ class UdsCapablePduApi(FakePduApi):
             return super().PDUSetUniqueRespIdTable(hmod, hcll, table)
         t = table._obj if hasattr(table, "_obj") else table.contents
         entry = t.pUniqueData[0]
+        self.uds_urid_number = entry.UniqueRespIdentifier
         self.uds_urid[hcll] = {
             entry.pParams[i].ComParamId: C.cast(entry.pParams[i].pComParamData, C.POINTER(C.c_uint32)).contents.value
             for i in range(entry.NumParamItems)
@@ -717,6 +718,9 @@ class UdsCapablePduApi(FakePduApi):
             self._queue_uds_done(hcll, cid)
             return 0
         assert cop == COPT_SENDRECV and c.NumPossibleExpectedResponses == 2
+        # as ODIS's kernel fills them: Time 0, acceptance ids 0 (positive) and 1 (negative)
+        assert c.Time == 0
+        assert (c.pExpectedResponseArray[0].AcceptanceId, c.pExpectedResponseArray[1].AcceptanceId) == (0, 1)
         if self.silent_uds:
             return 0
         if c.NumSendCycles == 0:
@@ -816,17 +820,120 @@ def test_uds_application_flash_uses_one_isotp_primitive_per_514b_block_and_resto
         assert 2980 <= api.uds_sendrecv_count <= 2995
         urid = next(iter(api.uds_urid.values()))
         assert urid[0x1A] == 0x710 and urid[0x1D] == 0x77A
-        assert urid[0x1C] == urid[0x1E] == 5 and urid[0x1B] == 0xFFFFFFFF  # the rest stays as the driver has it
-        # the link as ODIS sets it for its own flash on this VCI (PDUAPI_VW_#48); the filler stays the driver's
+        assert urid[0x1C] == urid[0x1E] == 5 and urid[0x1B] == 0xFFFFFFFF
+        assert api.uds_urid_number == 1  # ODIS numbers the gateway's entry 1
+        # the link as ODIS-E's kernel opens it from its ODX data (spec + PR_UDSOnCAN + BV_GatewUDS)
         uds_link = next(iter(api.uds_urid))
         prm = api.params[uds_link]
-        assert api.objects["CP_CanFillerByte"] not in prm and prm[api.objects["CP_CanFillerByteHandling"]] == 1
-        assert prm[api.objects["CP_RC78Handling"]] == 1 and prm[api.objects["CP_RC21Handling"]] == 1
-        assert prm[api.objects["CP_Br"]] == 0 and prm[api.objects["CP_ModifyTiming"]] == 1
+        o = api.objects
+        assert prm[o["CP_CanFillerByte"]] == 0x55 and prm[o["CP_CanFillerByteHandling"]] == 1
+        assert prm[o["CP_RC78Handling"]] == 1 and prm[o["CP_RC78CompletionTimeout"]] == 100_000_000
+        assert prm[o["CP_RC21Handling"]] == 1 and prm[o["CP_RC21CompletionTimeout"]] == 60_000_000
+        assert prm[o["CP_Br"]] == 0 and prm[o["CP_ModifyTiming"]] == 1 and prm[o["CP_CanMaxNumWaitFrames"]] == 15
+        assert prm[o["CP_P2Max"]] == 200_000 and prm[o["CP_P2Star"]] == 5_150_000
+        assert prm[o["CP_TesterPresentHandling"]] == 1 and prm[o["CP_CanTransmissionTime"]] == 150_000
+        # ODIS's own flash sequence switches the VCI's request repeats off before the first `36`
+        assert prm[o["CP_RepeatReqCountApp"]] == 0
         # After _program_application_uds exits, RawMode (0x6F0/0x6F1 + monitor) is immediately live again
         assert not bus.spent and bus.h_rx and bus.h_tx
         api._result((0x6F1).to_bytes(4, "big") + b"\x84\x00\x00\x00\x00", b"\x00\x00\x00\x00")
         assert bytes(link.receive_frame(0x6F1, timeout=1.0).data) == b"\x84\x00\x00\x00\x00"
+    bus.shutdown()
+
+
+class CallbackPduApi(UdsCapablePduApi):
+    """The driver as ODIS uses it: one callback per link, called whenever an event is queued on that link."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.callbacks: dict[int, object] = {}
+
+    def PDURegisterEventCallback(self, _hmod, hcll, cb) -> int:  # noqa: N802
+        self.calls.append(("callback", hcll, cb is not None))
+        if cb is None:
+            self.callbacks.pop(hcll, None)
+        else:
+            self.callbacks[hcll] = cb
+        return 0
+
+    def notify(self, hcll: int) -> None:
+        if (cb := self.callbacks.get(hcll)) is not None:
+            cb(0x0801, 0x10000001, hcll, None, None)  # PDU_EVT_DATA_AVAILABLE
+
+    def _result(self, raw, flags, link=None) -> None:
+        super()._result(raw, flags, link)
+        self.notify(self.monitor if link is None else link)
+
+    def _queue_uds_done(self, hcll: int, hcop: int) -> None:
+        super()._queue_uds_done(hcll, hcop)
+        self.notify(hcll)
+
+    def _start_cop(self, hmod, hcll, *rest) -> int:
+        rc = super()._start_cop(hmod, hcll, *rest)
+        self.notify(hcll)  # a send primitive is finished by the "VCI" right away and reported
+        return rc
+
+
+def test_monitor_and_uds_links_get_a_callback_before_connect_and_lose_it_before_disconnect(monkeypatch) -> None:
+    """ODIS registers PDURegisterEventCallback on each link before PDUConnect and clears it (NULL) when the link
+    goes offline; a reader then sleeps until the driver calls, instead of polling the event queue. The RawMode
+    send link keeps its verified poll."""
+    from contitool.can import J533CanLink, workflows
+    from contitool.core.constants import APP_SIZE
+
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    api = CallbackPduApi(require_resource_lookup=True, finish_on_78=True)
+    bus = DPduBus(dll=api)
+    assert api.calls.index(("callback", bus.h_rx, True)) < api.calls.index(("connect", bus.h_rx))
+    assert not any(c[:2] == ("callback", bus.h_tx) for c in api.calls)
+
+    # a reader sleeping on a watched link is woken by the callback, not by its timeout
+    bus._watch(0x2FFF0000)
+    bus._wake[0x2FFF0000].clear()
+    threading.Timer(0.05, api.notify, args=(0x2FFF0000,)).start()
+    t0 = time.monotonic()
+    bus._wait(0x2FFF0000, 5.0, cap=5.0)
+    assert 0.03 < time.monotonic() - t0 < 1.0
+    bus._unwatch(0x2FFF0000)
+
+    app_image = bytes(((i * 37) ^ (i >> 8)) & 0xFF for i in range(APP_SIZE))
+    with J533CanLink("", bus=bus) as link:
+        res = workflows._program_application_uds(link, app_image)
+        assert res["hardware_isotp"] is True and bytes(api.flashed_app) == app_image
+    uds = next(iter(api.uds_urid))
+    assert api.calls.index(("callback", uds, True)) < api.calls.index(("connect", uds))
+    assert api.calls.index(("callback", uds, False)) < api.calls.index(("disconnect", uds))
+    assert set(api.callbacks) == {bus.h_rx}  # RawMode back: the new monitor is watched again
+    bus.shutdown()
+    assert not api.callbacks
+
+
+def test_a_driver_that_takes_the_callback_but_never_calls_back_leaves_the_links_on_polling(monkeypatch) -> None:
+    from contitool.can import J533CanLink, workflows
+
+    class SilentCallbackPduApi(CallbackPduApi):
+        def notify(self, hcll: int) -> None:
+            pass
+
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    api = SilentCallbackPduApi()
+    bus = DPduBus(dll=api)
+    assert bus.h_rx and bus.h_rx not in bus._wake and not api.callbacks
+    with J533CanLink("", bus=bus) as link, link.uds_session() as hw:
+        assert hw and bus._uds_link not in bus._wake  # fell back after STARTCOMM brought no callback
+        assert link.request_uds(b"\x10\x02", 0x50, timeout=2.0)[:2] == b"\x50\x02"
+    bus.shutdown()
+
+
+def test_a_bus_abandoned_mid_operation_at_exit_drops_its_callbacks(monkeypatch) -> None:
+    api = CallbackPduApi()
+    monkeypatch.setattr(dpdu, "DPduBus", lambda channel, bitrate: DPduBus(channel, bitrate, dll=api))
+    monkeypatch.setattr(dpdu, "CLOSE_WAIT", 0.05)
+    bus = dpdu.open_session("")  # claimed, as by an operation that does not let go
+    assert api.callbacks
+    dpdu.close_session()
+    assert bus.spent and not api.callbacks and not api.destructed  # handles left alone, callbacks gone
+    bus.claimed = False
     bus.shutdown()
 
 

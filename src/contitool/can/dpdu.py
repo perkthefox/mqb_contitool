@@ -75,7 +75,47 @@ RX_QUEUE_MAX = 50_000
 
 CLOSE_WAIT = 3.0  # how long close_session waits for a running operation to hand the link back
 PDU_ID_UNDEF = 0xFFFFFFFE
-COP_TIME_UNDEF = 0xFFFFFFFF  # CopCtrlData.Time on the UDS link, as ODIS fills it (the RawMode links keep 0)
+# The UDS link exactly as ODIS-E opens it for the gateway. ODIS's MCD kernel (McdKernel_vc142_64.dll, VW-MCD 20.0.0)
+# sends every ComParam of the protocol from its ODX data before PDUConnect: the ISO_15765_3_on_ISO_15765_2
+# COMPARAM-SPEC (byte-identical in 111 of 136 projects, every MQB one among them), overridden by the UDS protocol
+# layer PR_UDSOnCAN (P2/P3, Br/Cs 0, RC21/RC78, functional id 0x700, 15 wait frames) and by the gateway's base variant
+# BV_GatewUDS (ids 0x710/0x77A only). Values as the driver takes them (texts resolved through the ODX tables), times
+# in microseconds; CP_Baudrate is the bus's own. The byte fields (tester-present message 3E 80, empty expected
+# responses) equal the driver's defaults and are left alone. One runtime change of ODIS's flash sequence is taken
+# over too: it sets CP_RepeatReqCountApp 0 right before the first `36` (2 again only for `37`), so the VCI never
+# repeats a block, a key or the final `11 01` on its own — this link lives only for that programming.
+ODIS_UDS_COMPARAMS = (
+    ("CP_CanTransmissionTime", 150_000), ("CP_ChangeSpeedCtrl", 0), ("CP_ChangeSpeedRate", 0),
+    ("CP_ChangeSpeedResCtrl", 0), ("CP_ChangeSpeedTxDelay", 0), ("CP_CyclicRespTimeout", 0),
+    ("CP_EnablePerformanceTest", 0), ("CP_Loopback", 0), ("CP_ModifyTiming", 1), ("CP_P2Max", 200_000),
+    ("CP_P2Min", 0), ("CP_P2Star", 5_150_000), ("CP_P3Func", 400_000), ("CP_P3Phys", 400_000),
+    ("CP_RC21CompletionTimeout", 60_000_000), ("CP_RC21Handling", 1), ("CP_RC21RequestTime", 200_000),
+    ("CP_RC23CompletionTimeout", 0), ("CP_RC23Handling", 0), ("CP_RC23RequestTime", 200_000),
+    ("CP_RC78CompletionTimeout", 100_000_000), ("CP_RC78Handling", 1), ("CP_RCByteOffset", 0xFFFFFFFF),
+    ("CP_RepeatReqCountApp", 0), ("CP_StartMsgIndEnable", 0), ("CP_SuspendQueueOnError", 0),
+    ("CP_SwCan_HighVoltage", 0), ("CP_TesterPresentAddrMode", 1), ("CP_TesterPresentHandling", 1),
+    ("CP_TesterPresentReqRsp", 0), ("CP_TesterPresentSendType", 0), ("CP_TesterPresentTime", 2_000_000),
+    ("CP_TransmitIndEnable", 0), ("CP_Ar", 1_000_000), ("CP_As", 1_000_000), ("CP_BlockSize", 0),
+    ("CP_BlockSizeOverride", 0xFFFF), ("CP_Br", 0), ("CP_Bs", 1_000_000), ("CP_CanDataSizeOffset", 0),
+    ("CP_CanFillerByte", 0x55), ("CP_CanFillerByteHandling", 1), ("CP_CanFirstConsecutiveFrameValue", 1),
+    ("CP_CanFuncReqExtAddr", 0), ("CP_CanFuncReqFormat", 5), ("CP_CanFuncReqId", 0x700),
+    ("CP_CanMaxNumWaitFrames", 15), ("CP_Cr", 1_000_000), ("CP_Cs", 0), ("CP_RepeatReqCountTrans", 0),
+    ("CP_SendRemoteFrame", 0), ("CP_RequestAddrMode", 1), ("CP_StMin", 0), ("CP_StMinOverride", 0xFFFFFFFF),
+    ("CP_BitSamplePoint", 80), ("CP_ListenOnly", 0), ("CP_SamplesPerBit", 0), ("CP_SyncJumpWidth", 15),
+    ("CP_TerminationType", 0), ("CPM_VW_TesterPresentGrouping", 0), ("CP_CANFDTxMaxDataLength", 0),
+    ("CP_EscapeSequenceHandling", 0), ("CP_CANFDBaudrate", 0), ("CP_CANFDBitSamplePoint", 80),
+    ("CP_CANFDSyncJumpWidth", 15),
+)
+# Its unique-response table: ODIS numbers the gateway's entry 1; the ids are the base variant's, the rest the spec's.
+ODIS_UDS_URID = 1
+# ISO 22900-2 CALLBACKFNC(event type, hMod, hCLL, pCllTag, pAPITag) — x64 has one calling convention.
+EVENT_CALLBACK = getattr(C, "WINFUNCTYPE", C.CFUNCTYPE)(None, U32, U32, U32, C.c_void_p, C.c_void_p)
+# With a callback registered the driver wakes the reader of a link as soon as it queues an event, as it does for
+# ODIS; this only bounds a wait should a wakeup ever go missing. A link whose callback stays silent after its first
+# primitive (CALLBACK_CONFIRM_WAIT) goes back to polling. The RawMode send link is never put on a callback: ODIS has
+# no such link, and a RAM-loader payload needs the pace its verified 0.5 ms poll gives.
+CALLBACK_WAIT = 0.02
+CALLBACK_CONFIRM_WAIT = 0.25
 OBJT_PROTOCOL, OBJT_BUSTYPE, OBJT_COMPARAM, OBJT_PINTYPE = 0x8021, 0x8022, 0x8024, 0x8025
 # Fallback for adapters whose firmware refuses RawMode: one link per request/response id pair, described the way
 # ODIS describes its own (bus + protocol + pins, resource PDU_ID_UNDEF) with the ids set in the URID table.
@@ -307,6 +347,10 @@ class DPduBus(can.BusABC):
         self._stop = threading.Event()
         self._rx_thread: threading.Thread | None = None
         self._rx_error: BaseException | None = None
+        # link -> event its reader sleeps on, and how many callbacks it got; set from the driver's thread (_watch)
+        self._wake: dict[int, threading.Event] = {}
+        self._cb_seen: dict[int, int] = {}
+        self._event_cb = EVENT_CALLBACK(self._on_event)  # kept alive as long as the driver may call it
         for attempt in (1, 2):
             self._call("PDUConstruct", None, None)
             try:
@@ -409,8 +453,10 @@ class DPduBus(can.BusABC):
         out = U32(0)
         return out.value if self._try("PDUGetObjectId", kind, name.encode(), C.byref(out)) == 0 else None
 
-    def _patch_urid(self, hcll: int, want: dict[str, int]) -> None:
-        """Ids live in the unique-response table: read it, set the named UNUM32 params, write it back."""
+    def _patch_urid(self, hcll: int, want: dict[str, int], urid: int | None = None) -> None:
+        """Ids live in the unique-response table: read it, set the named UNUM32 params, write it back.
+        `urid` also renumbers the entry, as ODIS does for its own links — only a single one: several entries would
+        end up sharing one number."""
         # A param this MDF does not know is left out; one whose id is 0 is not, 0 being a valid ComParam id.
         by_id = {pid: value for name, value in want.items() if (pid := self._object_id(OBJT_COMPARAM, name)) is not None}
         table = C.POINTER(UridTable)()
@@ -419,6 +465,8 @@ class DPduBus(can.BusABC):
         t = table.contents
         for e in range(t.NumEntries):
             entry = t.pUniqueData[e]
+            if urid is not None and t.NumEntries == 1:
+                entry.UniqueRespIdentifier = urid
             for i in range(entry.NumParamItems):
                 item = entry.pParams[i]
                 if item.ComParamId in by_id and item.ComParamDataType == PT_UNUM32 and item.pComParamData:
@@ -487,6 +535,7 @@ class DPduBus(can.BusABC):
         """Release the links of one attempt, leaving the module connected for the next."""
         self._stop_links()
         for h in self._links:
+            self._unwatch(h)
             self._try("PDUDisconnect", self.hmod, h)
             self._try("PDUDestroyComLogicalLink", self.hmod, h)
         self._links.clear()
@@ -497,8 +546,11 @@ class DPduBus(can.BusABC):
         self._tx_in_flight.clear()
 
     # ------------------------------------------------------------------ hardware ISO-TP / UDS link for fast flashing
-    def _set_named_u32(self, hcll: int, name: str, value: int, cls: int = 2) -> bool:
-        """Set a named UNUM32 ComParam via PDUGetComParam -> PDUSetComParam so MDF class/type always match."""
+    def _set_named_u32(self, hcll: int, name: str, value: int, cls: int = 2, *, supported_only: bool = False) -> bool:
+        """Set a named UNUM32 ComParam via PDUGetComParam -> PDUSetComParam so MDF class/type always match.
+
+        `supported_only`: a param PDUGetComParam does not hand out is skipped, as ODIS skips it (its kernel asks
+        exactly so whether the interface supports it) — instead of being guessed at with class `cls`."""
         pid = self._object_id(OBJT_COMPARAM, name)
         if pid is None:
             return False
@@ -512,16 +564,20 @@ class DPduBus(can.BusABC):
                 return False
             finally:
                 self._try("PDUDestroyItem", item)
+        if supported_only:
+            return False
         v = U32(value)
         raw = ParamItem(IT_PARAM, pid, PT_UNUM32, cls, C.cast(C.pointer(v), C.c_void_p))
         return self._try("PDUSetComParam", self.hmod, hcll, C.byref(raw)) == 0
 
     def _set_uds_urid(self, hcll: int, phys: int, resp: int) -> None:
-        """Physical request (0x710) and segmented response (0x77A) ids in the UDS link's URID table — nothing else.
-
-        Exactly what read `22 F187` through a VNCI on the bench (probe v6, 2026-11-08): the driver's own defaults
-        for the rest (both formats 5, UUDT id 0xFFFFFFFF) stay as they are."""
-        self._patch_urid(hcll, {"CP_CanPhysReqId": phys, "CP_CanRespUSDTId": resp})
+        """The UDS link's unique-response table as ODIS writes it: entry 1, physical request on `phys` (0x710),
+        segmented response on `resp` (0x77A), the rest from the ODX spec — which is also the driver's default."""
+        self._patch_urid(hcll, {
+            "CP_CanPhysReqExtAddr": 0, "CP_CanPhysReqFormat": 5, "CP_CanPhysReqId": phys,
+            "CP_CanRespUSDTExtAddr": 0, "CP_CanRespUSDTFormat": 5, "CP_CanRespUSDTId": resp,
+            "CP_CanRespUUDTExtAddr": 0, "CP_CanRespUUDTFormat": 0, "CP_CanRespUUDTId": 0xFFFFFFFF,
+        }, urid=ODIS_UDS_URID)
 
     def _find_resource_id(self, rsc: RscData) -> int:
         """Resolve a module-specific ResourceId via PDUGetResourceIds when PDU_ID_UNDEF is not accepted."""
@@ -543,7 +599,7 @@ class DPduBus(can.BusABC):
 
         Not `_start` + `_drain`: those treat a refusal or an error event as a dead adapter, while here it only
         means this link variant does not work and the caller moves on."""
-        ctrl = CopCtrl(COP_TIME_UNDEF, 0, 0, 0, FlagData(4, (U8 * 4)(0, 0, 0, 0)))
+        ctrl = CopCtrl(0, 0, 0, 0, FlagData(4, (U8 * 4)(0, 0, 0, 0)))  # Time 0, as ODIS fills every primitive
         cop = U32(0)
         if self._try("PDUStartComPrimitive", self.hmod, hcll, cop_type, 0, None, C.byref(ctrl), None,
                      C.byref(cop)) != 0 or not cop.value:
@@ -552,7 +608,7 @@ class DPduBus(can.BusABC):
         while time.monotonic() < end:
             item = C.POINTER(EventItem)()
             if self._try("PDUGetEventItem", self.hmod, hcll, C.byref(item)) != 0 or not item:
-                time.sleep(0.001)
+                self._wait(hcll, 0.001)
                 continue
             ev = item.contents
             done = (ev.ItemType == IT_STATUS and bool(ev.pData) and ev.hCop == hcop
@@ -570,6 +626,7 @@ class DPduBus(can.BusABC):
             self._uds_control(hcll, COPT_STOPCOMM, 0.5)
         except Exception:  # noqa: BLE001 - closing goes on whatever the VCI says
             pass
+        self._unwatch(hcll)  # ODIS drops the callback first when a link goes offline, then disconnects
         self._try("PDUDisconnect", self.hmod, hcll)
         self._try("PDUDestroyComLogicalLink", self.hmod, hcll)
         if hcll in self._links:
@@ -577,6 +634,7 @@ class DPduBus(can.BusABC):
 
     def _pause_raw(self) -> None:
         self._stop.set()
+        self._wake_all()
         if self._rx_thread is not None:
             self._rx_thread.join(timeout=2.0)
             self._rx_thread = None
@@ -633,33 +691,20 @@ class DPduBus(can.BusABC):
                 v = U32(self.bitrate)
                 p = ParamItem(IT_PARAM, CP_BAUDRATE, PT_UNUM32, 5, C.cast(C.pointer(v), C.c_void_p))
                 self._try("PDUSetComParam", self.hmod, hcll, C.byref(p))
-            # The rest as ODIS sets this very link for its own flash of the gateway on this VCI (PDUAPI_VW_#48,
-            # 2026-11-08: 10 02 .. 34 / 36 x 2975 / 37 at hardware ISO-TP). The filler byte stays the driver's 0x55,
-            # as there. All times in microseconds.
-            self._set_named_u32(hcll, "CP_CanFillerByteHandling", 1)
-            self._set_named_u32(hcll, "CP_TesterPresentHandling", 0)
-            self._set_named_u32(hcll, "CP_BlockSize", 0)
-            self._set_named_u32(hcll, "CP_StMin", 0)
-            self._set_named_u32(hcll, "CP_Br", 0)  # our FlowControl at once (driver default 10 ms)
-            self._set_named_u32(hcll, "CP_CanTransmissionTime", 150_000)
-            self._set_named_u32(hcll, "CP_ModifyTiming", 1)  # take P2 / P2* from the ECU's `50 xx 00 32 01 F4`
-            self._set_named_u32(hcll, "CP_CanMaxNumWaitFrames", 0x0F)  # the default 0xFF never ends
-            # Until the first `50 xx` the VCI uses these; ours are wider than ODIS's 0.2 s / 5.15 s on purpose:
-            # the FBL repeats `7F xx 78` every ~2.5 s, and request_uds bounds every wait itself.
-            if not self._set_named_u32(hcll, "CP_P2Max", 2_500_000):
-                self._set_named_u32(hcll, "CP_P2Max", 500_000)
-            if not self._set_named_u32(hcll, "CP_P2Star", 6_000_000):
-                self._set_named_u32(hcll, "CP_P2Star", 5_000_000)
-            self._set_named_u32(hcll, "CP_RC78Handling", 1)  # ODIS: 1 (the driver's default for this link is 2)
-            self._set_named_u32(hcll, "CP_RC78CompletionTimeout", 150_000_000)  # above our longest request, 120 s
-            self._set_named_u32(hcll, "CP_RC21Handling", 1)  # busyRepeatRequest: the VCI repeats, as for ODIS
-            self._set_named_u32(hcll, "CP_RC21CompletionTimeout", 60_000_000)
+            # Everything else exactly as ODIS sends it (see ODIS_UDS_COMPARAMS). A param this driver does not know
+            # is skipped, as ODIS skips the optional ones its driver lacks. P2/P2* only last until the first `50 xx`:
+            # ModifyTiming makes the VCI take the ECU's own (`50 02 00 32 01 F4`), the FBL's `7F xx 78` every
+            # ~2.5 s are handled by the VCI (RC78Handling 1, up to 100 s), and request_uds bounds every wait itself.
+            for name, value in ODIS_UDS_COMPARAMS:
+                self._set_named_u32(hcll, name, value, supported_only=True)
             self._set_uds_urid(hcll, tx_id, rx_id)
+            self._watch(hcll)  # ODIS registers its callback before PDUConnect
             if (rc := self._try("PDUConnect", self.hmod, hcll)) != 0:
                 self.uds_refusal = f"PDUConnect 0x{rc:X}"
                 self._close_uds_link()
                 continue
             self._uds_control(hcll, COPT_STARTCOMM, 1.0)
+            self._confirm_watch(hcll)
             try:
                 probe = self.request_uds(b"\x3e\x00", timeout=1.5, allow_pending=True)
                 if probe and (probe[0] == 0x7E or (len(probe) >= 3 and probe[:2] == b"\x7f\x3e")):
@@ -755,15 +800,18 @@ class DPduBus(can.BusABC):
         want = positive_prefix(payload)
         pos_mask, pos_pat = (U8 * len(want))(*([0xFF] * len(want))), (U8 * len(want))(*want)
         neg_mask, neg_pat = (U8 * 2)(0xFF, 0xFF), (U8 * 2)(0x7F, req_sid)
+        # As ODIS's kernel builds them (TransferDataHelper for `36`, the ODX responses for the rest): acceptance
+        # ids numbered from 0 in order, positive first, the negative one matching `7F <SID>`.
         exps = (ExpResp * 2)(
-            ExpResp(0, 1, len(want), pos_mask, pos_pat, 0, None),
-            ExpResp(1, 2, 2, neg_mask, neg_pat, 0, None),
+            ExpResp(0, 0, len(want), pos_mask, pos_pat, 0, None),
+            ExpResp(1, 1, 2, neg_mask, neg_pat, 0, None),
         )
         tx = (U8 * 4)(0, 0, 0, 0)
         deadline = time.monotonic() + timeout
 
         def start_primitive(send_cycles: int, tx_bytes: bytes) -> int:
-            ctrl = CopCtrl(COP_TIME_UNDEF, send_cycles, 1, 0, FlagData(4, tx), 2, C.cast(exps, C.POINTER(ExpResp)))
+            # Time 0: ODIS fills it so for every primitive (it only matters for cyclic sends)
+            ctrl = CopCtrl(0, send_cycles, 1, 0, FlagData(4, tx), 2, C.cast(exps, C.POINTER(ExpResp)))
             buf = (U8 * len(tx_bytes)).from_buffer_copy(tx_bytes) if tx_bytes else None
             hcop_out = U32(0)
             self._call("PDUStartComPrimitive", self.hmod, hcll, COPT_SENDRECV, len(tx_bytes), buf, C.byref(ctrl),
@@ -839,7 +887,7 @@ class DPduBus(can.BusABC):
                             break
                         self._try("PDUDestroyItem", item)
                 raise TimeoutError(f"UDS response timeout ({timeout:.1f}s) for {payload[:8].hex()}")
-            time.sleep(RX_POLL)
+            self._wait(hcll, RX_POLL)
 
     # ------------------------------------------------------------------ receiving
     def _drain_rx_links(self) -> bool:
@@ -852,11 +900,12 @@ class DPduBus(can.BusABC):
     def _rx_loop(self) -> None:
         """Keep the monitor link drained for as long as the link is open.
 
-        The driver queues every frame as an event on the logical link and waits for its owner to take it — ODIS
-        hands it a callback for this, which is why its own log complains that ours is NULL. Draining only while an
-        operation runs was fine while the link was closed in between; with the link kept open, a quiet period let
-        the queue grow and the next operation had to chew through stale frames before its own answer. This thread
-        owns the monitor link; the send link stays with the calling thread, which waits for each frame itself."""
+        The driver queues every frame as an event on the logical link and waits for its owner to take it. As for
+        ODIS, its callback wakes this thread when there is something to take; without one (a driver that refuses
+        the registration, the fixed-id fallback) it polls. Draining only while an operation runs was fine while the
+        link was closed in between; with the link kept open, a quiet period let the queue grow and the next
+        operation had to chew through stale frames before its own answer. This thread owns the monitor link; the
+        send link stays with the calling thread, which waits for each frame itself."""
         while not self._stop.is_set():
             try:
                 busy = self._drain_rx_links()
@@ -867,7 +916,12 @@ class DPduBus(can.BusABC):
                 self._rx_error = exc
                 self.spent = True
                 return
-            self._stop.wait(RX_POLL if busy else RX_IDLE_POLL)
+            wake = self._wake.get(self.h_rx) if self.h_rx else None
+            if wake is None:
+                self._stop.wait(RX_POLL if busy else RX_IDLE_POLL)
+            elif not busy:  # taken all there was: sleep until the driver queues more
+                wake.wait(CALLBACK_WAIT)
+                wake.clear()
 
     def _check_rx(self) -> None:
         """Re-raise, in the caller's thread, whatever ended the receive thread."""
@@ -966,8 +1020,10 @@ class DPduBus(can.BusABC):
         for param_id, cls, value in MONITOR_PARAMS:
             self._set_u32(h, param_id, cls, value)
         self._set_u32(h, CP_BAUDRATE, 5, bitrate)
+        self._watch(h)
         self._call("PDUConnect", self.hmod, h)
         _, self._mon_cop = self._start(h, COPT_SENDRECV, b"", 0, -1, accept_any=True)
+        self._confirm_watch(h)
         return h
 
     def _start(self, hcll: int, cop: int, data: bytes, send: int, recv: int, *, accept_any: bool = False,
@@ -986,6 +1042,63 @@ class DPduBus(can.BusABC):
         return rc, hcop.value
 
     # ------------------------------------------------------------------ events
+    def _on_event(self, _event: int, _hmod: int, hcll: int, _cll_tag: Any, _api_tag: Any) -> None:
+        """The driver's callback thread: something was queued on `hcll`. Only wakes its reader — the events are
+        taken by that thread, with PDUGetEventItem, exactly as before."""
+        wake = self._wake.get(hcll)
+        if wake is not None:
+            self._cb_seen[hcll] = self._cb_seen.get(hcll, 0) + 1
+            wake.set()
+
+    def _watch(self, hcll: int) -> None:
+        """Have the driver call us when it queues an event on this link, as ODIS does for every link it opens,
+        instead of asking it a thousand times a second (each of those asks is a line in the driver's log).
+        Called before PDUConnect, like ODIS. A driver that refuses leaves the link on plain polling."""
+        self._cb_seen[hcll] = 0
+        self._wake[hcll] = threading.Event()  # in place before the first callback can arrive
+        if self._try("PDURegisterEventCallback", self.hmod, hcll, self._event_cb) != 0:
+            del self._wake[hcll]
+
+    def _confirm_watch(self, hcll: int) -> None:
+        """After the link's first primitive: a driver that took the registration but never calls back would leave
+        every wait sleeping out its cap, so such a link goes back to polling."""
+        if hcll not in self._wake:
+            return
+        end = time.monotonic() + CALLBACK_CONFIRM_WAIT
+        while not self._cb_seen.get(hcll) and time.monotonic() < end:
+            time.sleep(0.005)
+        if not self._cb_seen.get(hcll):
+            self._unwatch(hcll)
+
+    def _unwatch(self, hcll: int) -> None:
+        """Take the callback off a link before it is disconnected (ODIS: PDURegisterEventCallback(NULL) first)."""
+        wake = self._wake.pop(hcll, None)
+        self._cb_seen.pop(hcll, None)
+        if wake is not None:
+            self._try("PDURegisterEventCallback", self.hmod, hcll, None)
+            wake.set()  # whoever still sleeps on this link must not sleep out its wait
+
+    def drop_callbacks(self) -> None:
+        """Unregister every callback while leaving the links as they are: for a bus that is abandoned still in use
+        (close_session at exit), so the driver never calls into an interpreter that is shutting down."""
+        for hcll in list(self._wake):
+            self._unwatch(hcll)
+
+    def _wake_all(self) -> None:
+        """Let every sleeper notice `_stop` at once instead of after its wait cap."""
+        for wake in list(self._wake.values()):
+            wake.set()
+
+    def _wait(self, hcll: int, poll: float, cap: float = CALLBACK_WAIT) -> None:
+        """Sleep until the driver has something for this link: its callback, or `poll` on a link without one.
+        Cleared after waking, then the caller drains — so an event queued meanwhile is never lost."""
+        wake = self._wake.get(hcll)
+        if wake is None:
+            time.sleep(poll)
+            return
+        wake.wait(cap)
+        wake.clear()
+
     def _drain(self, hcll: int) -> bool:
         """Take every queued event of one link; results of the monitor link become messages. True if any arrived."""
         got = False
@@ -1185,6 +1298,7 @@ class DPduBus(can.BusABC):
 
     def _teardown(self) -> None:
         self._stop.set()  # before the links go: the receive thread must not poll a handle that is being destroyed
+        self._wake_all()
         if self._rx_thread is not None:
             self._rx_thread.join(timeout=2.0)
             self._rx_thread = None
@@ -1262,6 +1376,8 @@ def close_session() -> None:
         time.sleep(0.05)
     if bus.claimed:
         bus.spent = True  # nobody may hand this link out again, but nobody pulls it out from under the operation
+        # Its handles stay, but no callback may outlive us: at exit the driver would call into a dying interpreter.
+        bus.drop_callbacks()
         return
     bus.shutdown()
 
