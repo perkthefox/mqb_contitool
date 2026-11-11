@@ -2149,7 +2149,6 @@ def _program_application_uds(
         link.request_uds(b"\x37", 0x77, timeout=5.0)
         info["transfer_exit_ok"] = True
         info["blocks"] = total_blocks
-        info["hardware_isotp_session_refreshes"] = getattr(getattr(link, "bus", None), "uds_refreshes", 0)
 
         sig = signature_128b if (signature_128b and len(signature_128b) == 128) else (b"\x00" * 128)
         chk_mem_req = (

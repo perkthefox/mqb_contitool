@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes as C
+from pathlib import Path
 import threading
 import time
 
@@ -372,13 +373,46 @@ def test_a_vci_that_drops_on_connect_is_retried_once(monkeypatch) -> None:
 def test_only_known_driver_versions_run_without_confirmation(monkeypatch) -> None:
     set_lang("en")
     monkeypatch.setattr(dpdu, "accepted_drivers", set())
-    for ok in ("27.2.0", "31.0.0", "31.1.2"):
-        dpdu.check_driver(ok)
-    for bad in ("30.3.0", "34.0.0", ""):
+    dpdu.check_driver("27.2.0")
+    for unstable in ("30.3.0", "31.0.0", "31.1.2", "34.0.0"):  # the VCI hangs partway through a UDS flash on these
+        with pytest.raises(can.CanInitializationError, match="unstable.*27.2.*comes with ContiTool"):
+            dpdu.check_driver(unstable)
+    for unknown in ("24.1.0", ""):
         with pytest.raises(can.CanInitializationError, match="not verified"):
-            dpdu.check_driver(bad)
+            dpdu.check_driver(unknown)
     dpdu.accepted_drivers.add("30.3.0")
     dpdu.check_driver("30.3.0")
+
+
+def test_the_driver_that_ships_with_contitool_is_the_64_bit_27_2_with_its_vci_files() -> None:
+    folder = Path(dpdu.__file__).resolve().parents[3] / "dpdu" / "VW_PDUAPI_27.2"
+    assert dpdu._is_x64_dll(folder / "PDUAPI_VW.dll")
+    assert 'FILE_VERSION="27.2.0"' in (folder / "MDF_VW.xml").read_text(encoding="utf-8")[:400]
+    para = dict(line.split("=", 1) for line in (folder / "VAS6154/VAS6154-D-PDU_API-27.2.0.para").read_text().splitlines())
+    para = {k.strip(): v.strip() for k, v in para.items()}
+    assert para["Module Version"] == "27.2.0"
+    # what the driver flashes into the adapter on connect: without these two it cannot bring the VCI to its version
+    assert (folder / "VAS6154" / para["Image File"]).stat().st_size > 1_000_000
+    assert (folder / "VAS6154" / para["Module File"]).stat().st_size > 100_000
+
+
+def test_odis_and_vctool_must_be_closed_before_the_vci_is_touched(monkeypatch) -> None:
+    set_lang("en")
+    tasklist = '"explorer.exe","4321","Console","1","90 K"\n"OffboardDiagLauncher.exe","777","Console","1","1 K"\n' \
+               '"VCTool.exe","778","Console","1","1 K"\n'
+    monkeypatch.setattr(dpdu.sys, "platform", "win32")
+    monkeypatch.setattr(dpdu.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": tasklist})())
+    assert dpdu.vci_programs_running() == ["OffboardDiagLauncher.exe", "VCTool.exe"]
+    with pytest.raises(can.CanInitializationError, match="Close ODIS and VCTool.*OffboardDiagLauncher.exe, VCTool.exe"):
+        dpdu.check_vci_free()
+    monkeypatch.setattr(dpdu.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": tasklist.splitlines()[0]})())
+    dpdu.check_vci_free()  # neither is running
+
+    def no_tasklist(*a, **k):
+        raise OSError("tasklist is missing")
+
+    monkeypatch.setattr(dpdu.subprocess, "run", no_tasklist)
+    dpdu.check_vci_free()  # cannot tell: the dialog's note still says to close them
 
 
 XHORSE = (12, 0x10000007, b"VendorName='XHorse ELECTRONICS Co.,Ltd.' ModuleName='XHorse - MVCI - 1.4.8'")
@@ -467,12 +501,12 @@ def test_the_driver_the_user_picked_wins_over_a_longer_name_containing_it(monkey
     api = FakePduApi()
     loaded: list[str] = []
     monkeypatch.setattr(dpdu, "discover_dpdu", lambda: [
-        {"name": "VW_D_PDU_API_OE_2", "dll": "b.dll", "version": "31.1.0"},
-        {"name": "VW_D_PDU_API_OE", "dll": "a.dll", "version": "31.1.0"},
+        {"name": "VW_D_PDU_API_OE_2", "dll": "b.dll", "version": "27.2.0"},
+        {"name": "VW_D_PDU_API_OE", "dll": "a.dll", "version": "27.2.0"},
     ])
     monkeypatch.setattr(dpdu.C, "WinDLL", lambda path: (loaded.append(path), api)[1], raising=False)
     bus = DPduBus("VW_D_PDU_API_OE")
-    assert loaded == ["a.dll"] and bus.channel_key == "VW_D_PDU_API_OE"
+    assert loaded == ["a.dll"] and bus.channel_key == "VW_D_PDU_API_OE" and bus.driver_version == "27.2.0"
     bus.shutdown()
 
 
@@ -622,8 +656,6 @@ class UdsCapablePduApi(FakePduApi):
         self.uds_sendrecv_count = 0
         self.flashed_app = bytearray()
         self._unlocked = False
-        self.segmented_in_session = 0  # multi-frame requests since the last PDUModuleConnect
-        self.max_segmented_in_session = 0
         self.objects.update({
             "ISO_15765_3_on_ISO_15765_2": 0x30,
             "CP_Baudrate": 126,
@@ -701,10 +733,6 @@ class UdsCapablePduApi(FakePduApi):
             return 0
         return super().PDUCreateComLogicalLink(hmod, rsc, resource, tag, phcll, flag)
 
-    def PDUModuleConnect(self, hmod) -> int:  # noqa: N802
-        self.segmented_in_session = 0
-        return super().PDUModuleConnect(hmod)
-
     def _queue_uds_result(self, hcll: int, hcop: int, payload: bytes) -> None:
         buf = (U8 * len(payload)).from_buffer_copy(payload)
         fl = (U8 * 4)(0, 0, 0, 0)
@@ -743,9 +771,6 @@ class UdsCapablePduApi(FakePduApi):
 
         self.uds_sendrecv_count += 1
         req = bytes(data[:size])
-        if size > 7:
-            self.segmented_in_session += 1
-            self.max_segmented_in_session = max(self.max_segmented_in_session, self.segmented_in_session)
         req_sid = req[0]
         exp0, exp1 = c.pExpectedResponseArray[0], c.pExpectedResponseArray[1]
         from contitool.can.transport import positive_prefix
@@ -831,10 +856,10 @@ def test_uds_application_flash_uses_one_isotp_primitive_per_514b_block_and_resto
         # entry's stage 1 lands record bytes 5..9 on 0xFEDE0C62..66. 2.0.1d wrote serial 01 02 03 04 05 06, put
         # 03 on 0C62 (suppress-positive-response) and every later entry went unanswered at stage 1.
         assert len(api.fingerprint) == 9 and api.fingerprint[5:9] == bytes(4)
-        # 2,975 TransferData blocks + ~10 setup/check/reset primitives (vs 220,150 RawMode primitives!), plus the
-        # `3E 00` that checks the link after each module reconnect (one per UDS_SEGMENTED_BEFORE_REFRESH requests)
-        assert bus.uds_refreshes == 11 and api.max_segmented_in_session <= dpdu.UDS_SEGMENTED_BEFORE_REFRESH
-        assert 2980 <= api.uds_sendrecv_count - bus.uds_refreshes <= 2995
+        # 2,975 TransferData blocks + ~10 setup/check/reset primitives (vs 220,150 RawMode primitives!), all on one
+        # link of one module session: reconnecting the module mid-transfer (2.0.3b) reset nothing in the VCI
+        assert 2980 <= api.uds_sendrecv_count <= 2995
+        assert len(api.uds_urid) == 1 and not any(c[0] == "module_disconnect" for c in api.calls)
         urid = next(iter(api.uds_urid.values()))
         assert urid[0x1A] == 0x710 and urid[0x1D] == 0x77A
         assert urid[0x1C] == urid[0x1E] == 5 and urid[0x1B] == 0xFFFFFFFF
@@ -954,31 +979,6 @@ def test_a_bus_abandoned_mid_operation_at_exit_drops_its_callbacks(monkeypatch) 
     dpdu.close_session()
     assert bus.spent and not api.callbacks and not api.destructed  # handles left alone, callbacks gone
     bus.claimed = False
-    bus.shutdown()
-
-
-def test_a_long_transfer_reconnects_the_module_before_the_vci_multiframe_limit(monkeypatch) -> None:
-    """The VCI hangs on the ~555th multi-frame request of a module session (#19-#22). A flash reconnects the module
-    between two blocks well before that, opens the link again as before, and the application still arrives whole."""
-    from contitool.can import J533CanLink, workflows
-    from contitool.core.constants import APP_SIZE
-
-    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(dpdu, "UDS_SEGMENTED_BEFORE_REFRESH", 100)
-    api = UdsCapablePduApi(require_resource_lookup=True, finish_on_78=True)
-    bus = DPduBus(dll=api)
-    app_image = bytes(((i * 37) ^ (i >> 8)) & 0xFF for i in range(APP_SIZE))
-    with J533CanLink("", bus=bus) as link:
-        res = workflows._program_application_uds(link, app_image)
-    assert res["hardware_isotp"] is True and bytes(api.flashed_app) == app_image
-    assert api.max_segmented_in_session <= 100  # never more in one module session
-    assert res["hardware_isotp_session_refreshes"] == bus.uds_refreshes >= 29  # 2,975 blocks / 100
-    assert sum(c[0] == "module_disconnect" for c in api.calls) == bus.uds_refreshes
-    # every reopened link is set up like the first one: the same ODIS ComParams and URID
-    links = list(api.uds_urid)
-    assert len(links) == bus.uds_refreshes + 1
-    assert all(api.params[h] == api.params[links[0]] and api.uds_urid[h] == api.uds_urid[links[0]] for h in links)
-    assert not bus.spent and bus.h_rx and bus.h_tx  # RawMode back afterwards
     bus.shutdown()
 
 

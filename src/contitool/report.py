@@ -76,11 +76,15 @@ def environment(interface: str = "", port: str = "", adapter: str = "") -> dict[
 
 
 def driver_log_dirs() -> list[Path]:
-    """Where the VW D-PDU driver writes PDUAPI_VW*.log (one folder per installed variant, OE / OS)."""
+    """Where the VW D-PDU driver writes PDUAPI_VW*.log (one folder per installed variant, OE / OS).
+
+    The driver builds the path as <CommonAppData>/Volkswagen/<ShortName>/logs and takes ShortName from its installer's
+    registry entry; the 27.2 in dpdu/ has none, which leaves Volkswagen/logs (read from the DLL, not seen on a PC)."""
     root = os.environ.get("PROGRAMDATA")
     if not root:
         return []
-    return sorted(Path(root, "Volkswagen").glob("VW_D_PDU_API_*/logs"))
+    base = Path(root, "Volkswagen")
+    return sorted(base.glob("VW_D_PDU_API_*/logs")) + [d for d in (base / "logs",) if d.is_dir()]
 
 
 def driver_logs(since: float, dirs: list[Path] | None = None, *, fallback: bool = True) -> list[Path]:

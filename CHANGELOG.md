@@ -1,5 +1,33 @@
 # Changelog / История изменений
 
+## 2.0.4 — 2026-11-11
+
+### 🇷🇺 Добавлено
+- **Драйвер D-PDU 27.2 в комплекте (Windows):** лежит в `dpdu/VW_PDUAPI_27.2` рядом с программой и выбирается по умолчанию для VAS 6154 / VNCI. При подключении драйвер сам записывает в адаптер прошивку своей версии (около 30 секунд) — не отключайте адаптер до конца. Это безопасно: ODIS при следующем подключении так же запишет в адаптер свою версию. USB-драйвер адаптера (дополнение для VAS 6154) должен быть установлен в системе.
+- **VAS 6154 / VNCI:** пока запущены ODIS или VCTool, ContiTool к адаптеру не подключается и пишет, что закрыть.
+
+### 🇷🇺 Изменено
+- **Драйверы D-PDU 30 и новее:** работа на них сейчас нестабильна — адаптер зависает посреди прошивки по UDS, примерно на 550-м блоке из 2975. Без вопросов работает только 27.2; для остальных версий в окне «Подключение» нужна отдельная галочка.
+- **VAS 6154 / VNCI:** убрано переподключение к VCI во время длинной передачи, добавленное в 2.0.3b: зависание оно не предотвращало.
+
+### 🇷🇺 Исправлено
+- **CANable (SLCAN), запись приложения по UDS:** с версии 2.0.3 скорость упала примерно до 3,9 КБ/с — перед каждым запросом программа 0,1 с ждала пустой порт. Ожидание убрано.
+- **VAS 6154 / VNCI:** если VCI отключился посреди прошивки на драйвере 30 и новее, сообщение советует перейти на драйвер 27.2, а не запускать ту же прошивку заново.
+- **Отчёт о проблеме:** в архив попадают журналы и того драйвера D-PDU, что идёт вместе с программой.
+
+### 🇬🇧 Added
+- **D-PDU driver 27.2 included (Windows):** it sits in `dpdu/VW_PDUAPI_27.2` next to the program and is picked by default for a VAS 6154 / VNCI. On connect the driver itself writes firmware of its version into the adapter (about 30 seconds) — do not unplug the adapter until it finishes. This is safe: ODIS writes its own version back into the adapter the next time it connects. The adapter's USB driver (the VAS 6154 add-on) has to be installed on the PC.
+- **VAS 6154 / VNCI:** while ODIS or VCTool is running, ContiTool does not connect to the adapter and says what to close.
+
+### 🇬🇧 Changed
+- **D-PDU drivers 30 and newer:** work on them is unstable at the moment — the adapter hangs partway through a UDS flash, around block 550 of 2975. Only 27.2 runs without asking; any other version needs a separate tick in the Connection dialog.
+- **VAS 6154 / VNCI:** the reconnect to the VCI during a long transfer, added in 2.0.3b, is removed: it did not prevent the hang.
+
+### 🇬🇧 Fixed
+- **CANable (SLCAN), application write over UDS:** since 2.0.3 the speed had dropped to about 3.9 KB/s — before every request the program waited 0.1 s on an empty port. The wait is gone.
+- **VAS 6154 / VNCI:** when the VCI drops off mid-flash on a driver 30 or newer, the message says to switch to driver 27.2 instead of running the same flash again.
+- **Problem report:** the archive also takes the logs of the D-PDU driver that comes with the program.
+
 ## 2.0.3b — 2026-11-10
 
 ### 🇷🇺 Добавлено

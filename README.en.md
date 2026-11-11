@@ -107,9 +107,9 @@ flowchart LR
 ### Option 1 — Standalone Executables (Recommended)
 
 Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.0.3b-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.0.3b-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.0.3b-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+- **Windows**: extract `ContiTool-v2.0.4-windows-amd64.zip` and launch **`ContiTool.exe`**.
+- **macOS**: open `ContiTool-v2.0.4-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
+- **Linux**: extract `ContiTool-v2.0.4-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
 
 ### Option 2 — Run from Source (`Python 3.12+`)
 
@@ -225,18 +225,19 @@ No. Cheap Chinese adapters are not considered safe, even if the program “gets 
 Switch the ignition off for a few seconds and back on; as a last resort disconnect the battery terminal. On the bench, cut the +12 V supply for a few seconds. And in general, better not play with this on a live car.
 
 **Do I need ODIS to use a VAS 6154 / VNCI?**
-No. All you need is the **VW D-PDU API** driver, a standalone package (`VW_D-PDU_API_Win_x64` plus its VAS 6154 add-on); ODIS itself is not required.
+No. D-PDU driver 27.2 comes with ContiTool (the `dpdu/` folder next to the program). The system only needs the adapter's own USB driver — the VAS 6154 add-on of the **VW D-PDU API** package; ODIS itself is not required.
 
 **Several D-PDU drivers are installed — which one does ContiTool use?**
-Every one it finds is its own row in the Connection window (`OE`, `OS`, `VCTOOL`…) with its version. The ODIS-E variant is picked by default, but you can choose any other and the choice is remembered. If the adapter does not answer through one driver, try another.
+Every one it finds is its own row in the Connection window with its version. The driver 27.2 that comes with ContiTool is picked by default, but you can choose any other and the choice is remembered. On drivers 30 and newer work is unstable at the moment: the adapter hangs partway through a UDS flash, so those need a separate tick.
 
-**Update the VAS 6154 / VNCI adapter firmware.** Some adapters on older firmware refuse the raw CAN channel, without which reading memory does not work. The D-PDU driver updates the firmware itself on the first connect (about 30 seconds) — let it finish and do not unplug the adapter.
+**The driver reflashes the adapter — is that normal?**
+Yes. On connect the D-PDU driver itself writes firmware of its version into the VAS 6154 / VNCI (about 30 seconds) — let it finish and do not unplug the adapter. This is safe: ODIS writes its own version back into the adapter the next time it connects. ODIS and VCTool must stay closed while ContiTool is working.
 
 **What does "adapter provides no raw CAN channel" mean?**
 ContiTool reads memory through RawMode on pins 6/14. Some adapters do not provide it: other vendors' J2534 drivers, and some VAS 6154 / VNCI units — genuine ones included — where the refusal comes from the adapter itself on every driver. ContiTool then tries a fallback (ODIS-style links on fixed identifiers) and verifies it with one request. If that answers nothing, the adapter cannot be used; try another D-PDU driver, otherwise another adapter.
 
-**The driver is not installed, or may not be installed.**
-Copy the installed driver's folder into `dpdu/` next to ContiTool — it is found automatically and listed first. No registry entry and no administrator rights needed; it must be the 64-bit build. ContiTool ships no driver itself: the files are Volkswagen's, so bring your own copy.
+**I need a driver of another version.**
+Copy the installed driver's folder into `dpdu/` next to ContiTool, beside the `VW_PDUAPI_27.2` that is there — it is found automatically. No registry entry and no administrator rights needed; it must be the 64-bit build.
 
 **How do I report a problem?**
 After an error ContiTool offers a report itself (or Help → Report a problem…): it collects an archive with the program, operation and D-PDU driver logs (`*.bin` memory dumps are excluded by default unless you tick the optional checkbox to attach them) and opens a new [GitHub issue](https://github.com/perkthefox/mqb_contitool/issues) with the text filled in — just drag the archive into it. Please do not message the author directly.

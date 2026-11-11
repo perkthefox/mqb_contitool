@@ -163,6 +163,8 @@ def build() -> None:
         if not app_folder.exists():
             raise RuntimeError(f"Expected Windows build folder not found: {app_folder}")
         _copy_legal_files(app_folder)
+        # The D-PDU driver 27.2 for VAS 6154 / VNCI: found in dpdu/ next to the executable (dpdu.bundled_dpdu_dir)
+        shutil.copytree(ROOT_DIR / "dpdu", app_folder / "dpdu", dirs_exist_ok=True)
         zip_out = rel_dir / f"ContiTool-v{__version__}-windows-{arch}.zip"
         _zip_directory(app_folder, zip_out, arc_prefix="ContiTool")
         print(f"[build] Created Windows ZIP: {zip_out}")

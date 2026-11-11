@@ -248,12 +248,14 @@ class ConnectionDialog(Dialog):
         self.chk_driver.toggled.connect(lambda *_a: self._sync())
         self.body.addWidget(self.chk_driver)
         self.lbl_vnci = hint(tr(
-            "<b>Обновите прошивку адаптера.</b> VAS 6154 / VNCI со старой прошивкой может не давать сырой "
-            "канал CAN, без которого не работает чтение памяти. Драйвер D-PDU обновляет прошивку сам при "
-            "первом подключении (около 30 секунд); не отключайте адаптер до конца.",
-            "<b>Update the adapter firmware.</b> A VAS 6154 / VNCI on old firmware may refuse the raw CAN "
-            "channel that memory reads need. The D-PDU driver updates the firmware itself on the first "
-            "connect (about 30 seconds); do not unplug the adapter until it finishes.",
+            "<b>Драйвер перепрошьёт адаптер под свою версию.</b> При подключении драйвер D-PDU сам записывает в "
+            "VAS 6154 / VNCI прошивку своей версии (около 30 секунд); не отключайте адаптер до конца. Это безопасно: "
+            "ODIS при следующем подключении так же запишет в адаптер свою версию.<br>"
+            "<b>Закройте ODIS и VCTool.</b> Пока работает ContiTool, они должны быть закрыты.",
+            "<b>The driver reflashes the adapter to its own version.</b> On connect the D-PDU driver itself writes "
+            "firmware of its version into the VAS 6154 / VNCI (about 30 seconds); do not unplug the adapter until it "
+            "finishes. This is safe: ODIS writes its own version back into the adapter the next time it connects.<br>"
+            "<b>Close ODIS and VCTool.</b> They must stay closed while ContiTool is working.",
         ))
         self.body.addWidget(self.lbl_vnci)
         self.btn_pinout = _link("", self._toggle_pinout)
@@ -404,15 +406,25 @@ class ConnectionDialog(Dialog):
         self.chk_120ohm.blockSignals(True)
         self.chk_120ohm.setChecked(builtin or self._term_confirmed)
         self.chk_120ohm.blockSignals(False)
-        self.lbl_vnci.setVisible(iface == "dpdu")  # only the VAS 6154 / VNCI path depends on adapter firmware
+        self.lbl_vnci.setVisible(iface == "dpdu")  # only a D-PDU driver reflashes its adapter and shares it with ODIS
         drv = self._unverified_driver()
         self.chk_driver.setVisible(drv is not None)
-        self.chk_driver.setText(tr(
-            f"Разрешить непроверенный драйвер D-PDU {drv or '?'}: при подключении он перепрошьёт VCI под свою "
-            "версию",
-            f"Allow the unverified D-PDU driver {drv or '?'}: on connect it reflashes the VCI to its own "
-            "version",
-        ))
+        if dpdu.driver_unstable(drv or ""):
+            self.chk_driver.setText(tr(
+                f"Всё равно работать на драйвере D-PDU {drv}. На версиях 30 и новее работа сейчас нестабильна: "
+                "адаптер зависает посреди прошивки по UDS. Надёжнее выбрать в списке драйвер 27.2 — он идёт вместе "
+                "с ContiTool",
+                f"Use D-PDU driver {drv} anyway. On versions 30 and newer work is unstable at the moment: the "
+                "adapter hangs partway through a UDS flash. The reliable choice is driver 27.2 in the list — it "
+                "comes with ContiTool",
+            ))
+        else:
+            self.chk_driver.setText(tr(
+                f"Разрешить непроверенный драйвер D-PDU {drv or '?'}: при подключении он перепрошьёт VCI под свою "
+                "версию",
+                f"Allow the unverified D-PDU driver {drv or '?'}: on connect it reflashes the VCI to its own "
+                "version",
+            ))
         self.chk_driver.setToolTip(tr(f"Проверены: {', '.join(dpdu.SUPPORTED_DRIVERS)}",
                                       f"Verified: {', '.join(dpdu.SUPPORTED_DRIVERS)}"))
         driver_ok = drv is None or self.chk_driver.isChecked()

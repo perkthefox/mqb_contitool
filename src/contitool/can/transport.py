@@ -202,9 +202,17 @@ class J533CanLink:
                 + "\n"
             )
 
-    def drain_rx(self, max_frames: int = 64) -> None:
-        """Drain any stale buffered frames before starting a fresh handshake."""
+    def drain_rx(self, max_frames: int = 64, *, quick: bool = False) -> None:
+        """Drain any stale buffered frames before starting a fresh handshake.
+
+        `quick`: return at once when an slcan port has nothing waiting. python-can's slcan answers recv(timeout=0)
+        only after one read at the serial port's own timeout (0.1 s) then; before every UDS request that was 0.1 s
+        per `36` block (3.9 KB/s). The RAM-loader packets keep that read: their pacing on slcan was verified with it."""
+        port = getattr(self.bus, "serialPortOrig", None) if quick else None
+        parsed = getattr(self.bus, "_queue", None)  # slcan: lines already read from the port
         for _ in range(max_frames):
+            if port is not None and not port.in_waiting and not (parsed and parsed.qsize()):
+                break
             try:
                 msg = self.bus.recv(timeout=0.0)
             except can.CanOperationError as exc:
@@ -420,15 +428,25 @@ class J533CanLink:
                 if getattr(self.bus, "spent", False):
                     # The VCI itself is gone (it reboots, #19-#22): the software path would only fail on the next
                     # frame with "this link no longer works", after promising to carry on.
+                    from contitool.can.dpdu import driver_unstable
+
+                    # On a 30+ driver the same flash stops at the same place again: the way out is the 27.2 one.
+                    again = tr(
+                        "затем подключитесь через драйвер D-PDU 27.2 (идёт вместе с ContiTool) и запустите ту же "
+                        "прошивку заново: на драйверах 30 и новее обрыв повторится.",
+                        "then connect through D-PDU driver 27.2 (it comes with ContiTool) and run the same flash "
+                        "again: on drivers 30 and newer it breaks off again.",
+                    ) if driver_unstable(getattr(self.bus, "driver_version", "")) else tr(
+                        "затем запустите ту же прошивку заново.", "then run the same flash again.")
                     raise can.CanOperationError(tr(
                         f"Связь с VCI потеряна посреди передачи ({req[:3].hex(' ').upper()}: {exc}): адаптер "
                         "перезагрузился или отключился, продолжить на этом соединении нельзя. Если шла прошивка, блок "
                         "остался в загрузчике FBL без приложения — это поправимо: выключите и включите питание блока и "
-                        "VCI, затем запустите ту же прошивку заново.",
+                        f"VCI, {again}",
                         f"Lost the VCI mid-transfer ({req[:3].hex(' ').upper()}: {exc}): the adapter rebooted or "
                         "disconnected, and this connection cannot go on. If a flash was running, the ECU stays in its "
                         "FBL bootloader without an application — which can be fixed: power-cycle the ECU and the VCI, "
-                        "then run the same flash again.",
+                        f"{again}",
                     )) from exc
                 if self.on_hw_fallback is not None:
                     self.on_hw_fallback(f"{req[:3].hex(' ').upper()}: {exc}")
@@ -436,7 +454,7 @@ class J533CanLink:
                 self._write_trace("uds_rx", self.UDS_RX_ID, len(resp), resp[:16])
                 self.rx_frames += 1
                 return _checked_response(req_sid, resp, expected_sid)
-        self.drain_rx()  # a late answer to an earlier request must not be read as the answer to this one
+        self.drain_rx(quick=True)  # a late answer to an earlier request must not be read as the answer to this one
         self.send_uds(req)
         deadline = time.monotonic() + timeout
         wait = 2.5

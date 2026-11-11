@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--D-PDU-API cable description file-->
+<MVCI_CABLE_DESCRIPTION xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="pdu.xsd" FILE_VERSION="10.1.0" MVCI_PART2_STANDARD_VERSION="2.2.0">
+  <DESCRIPTION>cable description file (cdf), created at 20.10.2011</DESCRIPTION>
+  <SUPPLIER_NAME>Volkswagen AG</SUPPLIER_NAME>
+  <DLCTYPE EID="ID_DLCTYPE_ISO_15031_3">
+    <ID>8001</ID>
+    <SHORT_NAME>DLCTYPE_ISO_15031_3</SHORT_NAME>
+    <DESCRIPTION>ISO 15031-3 OBD Connector</DESCRIPTION>
+  </DLCTYPE>
+  <CABLE>
+    <ID>7001</ID>
+    <SHORT_NAME>CABLE_OBDII_VAS6154</SHORT_NAME>
+    <DESCRIPTION>Dummy cable for VAS6154, there is no cable
+      PIN usage
+    ===================================
+      1  (KL15)
+      2  (nc)
+      3  (Eth Rx+)
+      4  (GND)
+      5  (GND)
+      6  (HS-CAN1 H)
+      7  (K)
+      8  (LS-CAN2 H, DoIP Enable)
+      9  (LS-CAN2 L)
+      10 (nc)
+      11 (Eth Rx-)
+      12 (Eth Tx+)
+      13 (Eth Tx-)
+      14 (HS-CAN1 L)
+      15 (L)
+      16 (VBat)
+    </DESCRIPTION>
+    <CABLE_IDENTIFICATION>
+      <CABLE_ID>7002</CABLE_ID>
+    </CABLE_IDENTIFICATION>
+    <MAPPING>
+      <PIN_ON_DLC>1</PIN_ON_DLC>
+      <PIN_ON_MODULE>1</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>3</PIN_ON_DLC>
+      <PIN_ON_MODULE>3</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>4</PIN_ON_DLC>
+      <PIN_ON_MODULE>4</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>5</PIN_ON_DLC>
+      <PIN_ON_MODULE>5</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>6</PIN_ON_DLC>
+      <PIN_ON_MODULE>6</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>7</PIN_ON_DLC>
+      <PIN_ON_MODULE>7</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>8</PIN_ON_DLC>
+      <PIN_ON_MODULE>8</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>9</PIN_ON_DLC>
+      <PIN_ON_MODULE>9</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>11</PIN_ON_DLC>
+      <PIN_ON_MODULE>11</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>12</PIN_ON_DLC>
+      <PIN_ON_MODULE>12</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>13</PIN_ON_DLC>
+      <PIN_ON_MODULE>13</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>14</PIN_ON_DLC>
+      <PIN_ON_MODULE>14</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>15</PIN_ON_DLC>
+      <PIN_ON_MODULE>15</PIN_ON_MODULE>
+    </MAPPING>
+    <MAPPING>
+      <PIN_ON_DLC>16</PIN_ON_DLC>
+      <PIN_ON_MODULE>16</PIN_ON_MODULE>
+    </MAPPING>
+    <DLCTYPE IDREF="ID_DLCTYPE_ISO_15031_3"/>
+  </CABLE>
+</MVCI_CABLE_DESCRIPTION>
+
+
+
+
+
+
+
+
+
+

@@ -170,6 +170,8 @@ def test_unverified_dpdu_driver_needs_an_explicit_go_ahead(monkeypatch) -> None:
     dlg = connection.ConnectionDialog(win.conn, win)
     _scanned(app, dlg)
     assert dlg.chk_driver.isVisibleTo(dlg) and "30.3.0" in dlg.chk_driver.text()
+    assert "unstable" in dlg.chk_driver.text() and "driver 27.2" in dlg.chk_driver.text()  # what to pick instead
+    assert "Close ODIS and VCTool" in dlg.lbl_vnci.text() and "This is safe: ODIS writes its own" in dlg.lbl_vnci.text()
     assert not dlg.btn_ok.isEnabled() and not dlg.btn_check.isEnabled()
     dlg.chk_driver.setChecked(True)
     assert dlg.btn_ok.isEnabled()
@@ -177,10 +179,11 @@ def test_unverified_dpdu_driver_needs_an_explicit_go_ahead(monkeypatch) -> None:
     assert dpdu.accepted_drivers == {"30.3.0"}
 
     monkeypatch.setattr(connection, "discover_adapters", lambda: [
-        FoundAdapter("dpdu", "VW_D_PDU_API_OE", "VAS 6154 / VNCI", "D-PDU 31.0.0 · VW_D_PDU_API_OE", driver="31.0.0")])
+        FoundAdapter("dpdu", "ContiTool · VW_PDUAPI_27.2", "VAS 6154 / VNCI", "D-PDU 27.2.0 · ContiTool · VW_PDUAPI_27.2",
+                     driver="27.2.0")])
     dlg = connection.ConnectionDialog(win.conn, win)
     _scanned(app, dlg)
-    assert not dlg.chk_driver.isVisibleTo(dlg) and dlg.btn_ok.isEnabled()  # a supported driver asks nothing
+    assert not dlg.chk_driver.isVisibleTo(dlg) and dlg.btn_ok.isEnabled()  # the driver that ships with ContiTool asks nothing
     dlg.done(0)
     win.close()
 

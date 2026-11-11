@@ -487,6 +487,38 @@ def test_loader_payload_deadline_pacing_skips_sleep_when_send_already_took_longe
     assert sleeps == []  # 5 ms per send already exceeds 3 ms spacing; zero extra sleep wasted
 
 
+def test_a_drain_on_an_idle_slcan_port_does_not_wait_out_the_serial_timeout() -> None:
+    import queue
+    import types
+
+    class SlcanLike:
+        """python-can's slcan: recv(timeout=0) with no byte waiting still blocks for the port timeout (0.1 s)."""
+
+        def __init__(self, waiting: int) -> None:
+            self.serialPortOrig = types.SimpleNamespace(in_waiting=waiting)
+            self._queue: queue.Queue = queue.Queue()
+            self.recvs = 0
+
+        def recv(self, timeout: float = 0.0) -> can.Message | None:
+            self.recvs += 1
+            if not self.serialPortOrig.in_waiting:
+                return None
+            self.serialPortOrig.in_waiting = 0
+            return can.Message(arbitration_id=0x77A, data=b"\x02\x7e\x00", is_extended_id=False)
+
+        def shutdown(self) -> None:
+            pass
+
+    idle, stale = SlcanLike(0), SlcanLike(22)
+    J533CanLink("mock", bus=idle).drain_rx(quick=True)
+    assert idle.recvs == 0  # nothing waiting: no 0.1 s read per UDS request
+    J533CanLink("mock", bus=idle).drain_rx()
+    assert idle.recvs == 1  # the RAM-loader packets keep the read their slcan pacing was verified with
+    link = J533CanLink("mock", bus=stale)
+    link.drain_rx(quick=True)
+    assert (stale.recvs, link.rx_frames) == (1, 1)  # a late frame is still thrown away
+
+
 def test_after_a_write_only_f197_proves_the_application_runs() -> None:
     """10 03 -> 50 03 is answered by a cold FBL too, and F1DF bit 2 comes from a check outside the dump: a FBL
     that clears it must still not pass for a running application once something has been written."""

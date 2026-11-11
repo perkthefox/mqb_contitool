@@ -791,6 +791,8 @@ def cmd_can(args: argparse.Namespace) -> int:
             print(tr('J2534: --interface j2534 --port "<имя>"', 'J2534: --interface j2534 --port "<name>"'))
         for api in pdu_apis:
             note = "" if dpdu.driver_supported(api["version"]) else tr(
+                "  [30+: нестабилен — нужен --allow-dpdu-driver]", "  [30+: unstable — needs --allow-dpdu-driver]",
+            ) if dpdu.driver_unstable(api["version"]) else tr(
                 "  [версия не проверена — нужен --allow-dpdu-driver]", "  [unverified version — needs --allow-dpdu-driver]")
             print(f"D-PDU  {api['name']:<36}  {api['version'] or '?'}{note}")
         return 0

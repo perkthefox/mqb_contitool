@@ -1,0 +1,9 @@
+Image Version                   = 27.0r00-14023-2684
+Image File                      = VAS6154_27.0r00-14023-2684-20221014
+Module Name                     = D-PDU-API
+Module Version                  = 27.2.0
+Module File                     = VAS6154-D-PDU_API-27.2.0.tgz
+Image Boot Timeout              = 330s
+Update Timeout Default          = 15s
+Update Timeout Image            = 200s
+Update Timeout Module           = 45s

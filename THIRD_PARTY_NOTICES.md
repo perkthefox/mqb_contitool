@@ -33,10 +33,14 @@ Qt, PySide6, shiboken6 и python-can используются без измен�
 сборками тех же версий и исследовать ContiTool настолько, насколько это нужно для отладки такой замены.
 Полный текст LGPL-3.0 — в `LICENSES/LGPL-3.0.txt`; он дополняет GPL-3.0 из `LICENSES/GPL-3.0.txt`.
 
-## Not included / Не входит в состав
+## VW D-PDU API driver 27.2 / Драйвер VW D-PDU API 27.2
 
-ContiTool does not ship any vehicle-manufacturer software. The VW D-PDU API driver (`PDUAPI_VW.dll`)
-and ODIS are installed by the user and remain under their owners' terms.
+The Windows build carries the VW D-PDU API driver 27.2.0 in `dpdu/VW_PDUAPI_27.2/`, unmodified: `PDUAPI_VW.dll`,
+its description files, the protocol-layer programs and the VAS 6154 firmware image the driver writes into the
+adapter. These files are Volkswagen AG's and remain under their owner's terms; ContiTool's license does not
+cover them. ODIS and the adapter's USB driver are not included.
 
-ContiTool не содержит программ производителей автомобилей. Драйвер VW D-PDU API (`PDUAPI_VW.dll`) и ODIS
-устанавливает сам пользователь; на них распространяются условия их правообладателей.
+Сборка для Windows содержит драйвер VW D-PDU API 27.2.0 в `dpdu/VW_PDUAPI_27.2/`, без изменений: `PDUAPI_VW.dll`,
+его файлы описаний, программы протокольного слоя и образ прошивки VAS 6154, который драйвер записывает в
+адаптер. Это файлы Volkswagen AG, на них распространяются условия правообладателя; лицензия ContiTool на них
+не действует. ODIS и USB-драйвер адаптера в состав не входят.

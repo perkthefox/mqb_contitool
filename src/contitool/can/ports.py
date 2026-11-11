@@ -114,8 +114,8 @@ def discover_adapters() -> list[FoundAdapter]:
     found = [FoundAdapter("slcan", p.device, _serial_title(p), f"SLCAN · {p.device}") for p in discover_serial_ports() if p.is_likely_can]
     from contitool.can.dpdu import discover_dpdu
 
-    # One entry per installed D-PDU driver, ODIS-E's first: they drive the same VCI, but a machine can hold several
-    # (seen on one PC: OE 27.2.0, OS 31.1.0 and VCTOOL 30.4.0) and only one of them talks to a given adapter, so
+    # One entry per D-PDU driver, the 27.2 that ships in dpdu/ first: they drive the same VCI, but a machine can hold
+    # several (seen on one PC: OE 27.2.0, OS 31.1.0 and VCTOOL 30.4.0) and only one of them talks to a given adapter, so
     # the user picks. With several around, the row has to say which is which, not three times "VAS 6154 / VNCI".
     apis = discover_dpdu()
     for api in apis:

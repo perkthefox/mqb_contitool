@@ -22,6 +22,7 @@ import collections
 from collections.abc import Iterator
 import contextlib
 import ctypes as C
+import subprocess
 import sys
 import threading
 import time
@@ -47,10 +48,15 @@ ERR_FCT_FAILED = 0x01  # "the call failed": from PDUModuleConnect it is a module
 ERR_INVALID_PARAMETERS = 0x50
 VW_MODULE_TYPE_ID = 14  # a Volkswagen VCI (VAS 6154 / 6154A); 12 is some other vendor's J2534 driver
 VCI_RESTART_WAIT = 4.0
-# Driver versions (major.minor) that run without asking: 27.2 is verified on hardware (backup + write);
-# 31.0/31.1 is what ODIS installs today. Others reflash the VCI and need the user's explicit go-ahead.
-SUPPORTED_DRIVERS = ("27.2", "31.0", "31.1")
+# Driver versions (major.minor) that run without asking: 27.2 is verified on hardware (backup, write, UDS flash) and
+# ships with ContiTool in dpdu/. On 30.3, 31.0 and 31.1 the VCI stops answering partway through a UDS flash (around
+# block 550 of 2,975, every report so far), so those and anything unknown need the user's explicit go-ahead.
+SUPPORTED_DRIVERS = ("27.2",)
+UNSTABLE_DRIVER_MAJOR = 30  # from this version on: see above
 accepted_drivers: set[str] = set()  # other versions the user confirmed in this run
+# Programs that hold the VCI while they run (its device lock) and reflash it to their own driver's version:
+# ODIS-S / ODIS-E (OffboardDiagLauncher.exe) and VCTool. Matched as part of the process name, lower case.
+VCI_PROGRAMS = ("offboarddiag", "vctool")
 CLLST_OFFLINE = 0x8050
 COPST_DONE = (0x8012, 0x8013)  # FINISHED, CANCELLED
 # One frame at a time. Every frame is a primitive the VCI runs about every 4 ms. When its firmware queue overflows
@@ -116,12 +122,6 @@ EVENT_CALLBACK = getattr(C, "WINFUNCTYPE", C.CFUNCTYPE)(None, U32, U32, U32, C.c
 # no such link, and a RAM-loader payload needs the pace its verified 0.5 ms poll gives.
 CALLBACK_WAIT = 0.02
 CALLBACK_CONFIRM_WAIT = 0.25
-# The VCI's hardware ISO-TP stops for good after ~555 multi-frame requests in one module session: #19, #20 and #21
-# hung on the 555th (552 `36` blocks), the 2026-11-08 log of another MCD client on the 559th, on four VCIs and drivers
-# 30.3/31.0/31.1, whatever the ComParams, polling or callbacks; bytes, frames and single-frame requests do not count
-# (a 4095-byte flash survived 409 of them, 131k frames). The VCI rebuilds its per-session state ~40 ms after every
-# PDUModuleDisconnect (its clock restarts), so a long transfer reconnects the module well before the limit.
-UDS_SEGMENTED_BEFORE_REFRESH = 256
 MONITOR_CANCEL_WAIT = 0.3  # for the VCI to report the cancelled monitor before its link is disconnected
 OBJT_PROTOCOL, OBJT_BUSTYPE, OBJT_COMPARAM, OBJT_PINTYPE = 0x8021, 0x8022, 0x8024, 0x8025
 # Fallback for adapters whose firmware refuses RawMode: one link per request/response id pair, described the way
@@ -251,24 +251,68 @@ def driver_supported(version: str) -> bool:
     return ".".join(version.split(".")[:2]) in SUPPORTED_DRIVERS or version in accepted_drivers
 
 
+def driver_unstable(version: str) -> bool:
+    """A 30+ driver: the VCI it reflashes to its own version hangs during a UDS flash."""
+    major = version.split(".")[0]
+    return major.isdigit() and int(major) >= UNSTABLE_DRIVER_MAJOR
+
+
 def check_driver(version: str) -> None:
     """Refuse a driver version nobody confirmed before PDUModuleConnect gets the chance to reflash the VCI."""
-    if not driver_supported(version):
-        shown = version or "?"
+    if driver_supported(version):
+        return
+    shown = version or "?"
+    if driver_unstable(version):
         raise can.CanInitializationError(tr(
-            f"Драйвер D-PDU {shown} не проверен с ContiTool (проверены {', '.join(SUPPORTED_DRIVERS)}). При подключении он "
-            "перепрошьёт VCI под свою версию. Установите поддерживаемую версию или подтвердите этот драйвер в окне «Подключение».",
-            f"D-PDU driver {shown} is not verified with ContiTool (verified: {', '.join(SUPPORTED_DRIVERS)}). On connect it "
-            "reflashes the VCI to its own version. Install a supported version or confirm this driver in the Connection dialog.",
+            f"На драйверах D-PDU 30 и новее (у вас {shown}) работа сейчас нестабильна: адаптер зависает посреди прошивки "
+            "по UDS. Выберите в окне «Подключение» драйвер 27.2 — он идёт вместе с ContiTool — или подтвердите там же "
+            "этот драйвер.",
+            f"Work on D-PDU drivers 30 and newer (yours is {shown}) is unstable at the moment: the adapter hangs partway "
+            "through a UDS flash. Pick driver 27.2 in the Connection dialog — it comes with ContiTool — or confirm this "
+            "driver there.",
+        ))
+    raise can.CanInitializationError(tr(
+        f"Драйвер D-PDU {shown} не проверен с ContiTool (проверены {', '.join(SUPPORTED_DRIVERS)}). При подключении он "
+        "перепрошьёт VCI под свою версию. Выберите в окне «Подключение» драйвер 27.2 из комплекта ContiTool или "
+        "подтвердите там же этот драйвер.",
+        f"D-PDU driver {shown} is not verified with ContiTool (verified: {', '.join(SUPPORTED_DRIVERS)}). On connect it "
+        "reflashes the VCI to its own version. Pick the driver 27.2 that comes with ContiTool in the Connection dialog, "
+        "or confirm this driver there.",
+    ))
+
+
+def vci_programs_running() -> list[str]:
+    """Process names of ODIS / VCTool that are running now (Windows `tasklist`); [] when none, or when it cannot say."""
+    if sys.platform != "win32":
+        return []
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=10,
+                             creationflags=0x08000000).stdout  # CREATE_NO_WINDOW: no console flashes up in the GUI
+    except (OSError, subprocess.SubprocessError):
+        return []
+    names = {line.split('","')[0].strip('"') for line in out.splitlines() if line.strip()}
+    return sorted(n for n in names if any(key in n.lower() for key in VCI_PROGRAMS))
+
+
+def check_vci_free() -> None:
+    """ODIS and VCTool must be closed: they hold the VCI, and their driver would reflash it back under us."""
+    busy = vci_programs_running()
+    if busy:
+        raise can.CanInitializationError(tr(
+            f"Закройте ODIS и VCTool (запущено: {', '.join(busy)}). Пока они работают, адаптер занят ими, а их драйвер "
+            "перепрошивает его под свою версию.",
+            f"Close ODIS and VCTool (running: {', '.join(busy)}). While they run they hold the adapter, and their "
+            "driver reflashes it to its own version.",
         ))
 
 
 def bundled_dpdu_dir() -> Path:
     """`dpdu/` next to the ContiTool executable (the repo root when run from source).
 
-    A D-PDU driver folder copied in there is used as it is, with no installer run and no registry entry — for a PC
-    where the driver is not installed, or where the installed one does not talk to this adapter. ContiTool ships no
-    driver itself: the files are Volkswagen's, so the user puts their own copy there."""
+    A D-PDU driver folder in there is used as it is, with no installer run and no registry entry. ContiTool ships
+    driver 27.2 there (`VW_PDUAPI_27.2`: the DLL, its description files and the VCI image it flashes into the
+    adapter); a user's own copy of another version goes next to it. The adapter's USB driver ("VAS6154 add-on",
+    HKLM\\Software\\Volkswagen\\VAS6154) is not part of it and has to be installed."""
     root = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[3]
     return root / "dpdu"
 
@@ -316,6 +360,7 @@ class DPduBus(can.BusABC):
         self.claimed = False
         self.module_label = self.module_vendor = ""
         self.module_is_vci = False  # a VW VCI, as opposed to another vendor's J2534 driver the VW driver wraps
+        self.driver_version = ""  # of the driver DLL in use ("27.2.0"); empty for a DLL handed in
         if dll is None:
             apis = [a for a in discover_dpdu() if not channel or channel.upper() in a["name"].upper()]
             # The driver the user picked wins over one whose name merely contains it (…_OE vs …_OE_2).
@@ -329,6 +374,8 @@ class DPduBus(can.BusABC):
                 ))
             channel = apis[0]["name"]
             check_driver(apis[0]["version"])
+            check_vci_free()
+            self.driver_version = apis[0]["version"]
             try:
                 dll = C.WinDLL(apis[0]["dll"])  # type: ignore[attr-defined]
             except OSError as exc:  # a 32-bit driver gives a bare "[WinError 193] not a valid Win32 application"
@@ -361,9 +408,6 @@ class DPduBus(can.BusABC):
         # hCoP -> the ctypes objects its PDUStartComPrimitive pointed at, kept until it finishes: ODIS builds them on a
         # stack frame that outlives the primitive, and nothing guarantees this driver copies them all at the call
         self._cop_keep: dict[int, tuple] = {}
-        self._uds_args: tuple | None = None  # how the hardware UDS link was opened, to open it again identically
-        self._uds_segmented = 0  # multi-frame requests sent in this module session (UDS_SEGMENTED_BEFORE_REFRESH)
-        self.uds_refreshes = 0  # module reconnects done mid-transfer: goes into the flash result
         for attempt in (1, 2):
             self._call("PDUConstruct", None, None)
             try:
@@ -399,7 +443,6 @@ class DPduBus(can.BusABC):
                 if self._call("PDUModuleConnect", hmod, also_ok=(ERR_FCT_FAILED,)) != 0:
                     raise can.CanOperationError(f"PDUModuleConnect: D-PDU error 0x{ERR_FCT_FAILED:02X}",
                                                 error_code=ERR_FCT_FAILED)
-                self._uds_segmented = 0  # a fresh module session on the VCI
                 self._open_links(bitrate)
                 return
             except can.CanError as exc:
@@ -727,7 +770,6 @@ class DPduBus(can.BusABC):
                 probe = self.request_uds(b"\x3e\x00", timeout=1.5, allow_pending=True)
                 if probe and (probe[0] == 0x7E or (len(probe) >= 3 and probe[:2] == b"\x7f\x3e")):
                     self.uds_refusal = ""
-                    self._uds_args = (bus, protos, hi, low, tx_id, rx_id)
                     return True
                 self.uds_refusal = f"3E 00 answered {(probe or b'').hex(' ')}"
             except (can.CanError, TimeoutError) as exc:
@@ -792,28 +834,6 @@ class DPduBus(can.BusABC):
         except BaseException:  # noqa: BLE001 - the flash error, if any, is the one worth reporting
             self.spent = True
 
-    def _refresh_uds_session(self) -> None:
-        """Between two requests of a long transfer: close the UDS link, reconnect the module and open the link again
-        exactly as before, so the VCI starts a new session long before its multi-frame limit. The ECU sees nothing
-        but a pause of a fraction of a second (its S3 is 5 s), and the reopen's `3E 00` keeps the session alive."""
-        args = self._uds_args
-        self._close_uds_link()
-        for attempt in (1, 2):
-            self._try("PDUModuleDisconnect", self.hmod)
-            if attempt == 2:
-                time.sleep(0.5)
-            if self._try("PDUModuleConnect", self.hmod) != 0:
-                continue
-            self._uds_segmented = 0
-            if args is not None and self._open_uds_link(*args):
-                self.uds_refreshes += 1
-                return
-        self.spent = True
-        raise can.CanOperationError(tr(
-            "VCI не переоткрыл аппаратный канал UDS посреди передачи (переподключение модуля D-PDU не удалось)",
-            "The VCI did not reopen the hardware UDS link mid-transfer (reconnecting the D-PDU module failed)",
-        ))
-
     def _drain_uds_leftovers(self, hcll: int) -> None:
         while True:
             item = C.POINTER(EventItem)()
@@ -836,11 +856,6 @@ class DPduBus(can.BusABC):
         if not payload:
             raise ValueError("Empty UDS payload")
         req_sid = payload[0]
-        if len(payload) > 7:  # more than one classic CAN frame: what the VCI runs out of (UDS_SEGMENTED_BEFORE_REFRESH)
-            if self._uds_segmented >= UDS_SEGMENTED_BEFORE_REFRESH:
-                self._refresh_uds_session()
-                hcll = self._uds_link
-            self._uds_segmented += 1
         self._drain_uds_leftovers(hcll)
 
         want = positive_prefix(payload)
