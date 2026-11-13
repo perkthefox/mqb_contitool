@@ -135,10 +135,9 @@ class MainWindow(QMainWindow):
         self.modes.addWidget(self.splitter)
         self.modes.addWidget(self.terminal)
         lay.addWidget(self.modes, 1)
+        lay.addWidget(self.console.status_widget)
 
         self._build_menu()
-        self.statusBar().setSizeGripEnabled(False)
-        self.statusBar().addWidget(self.console.status_widget, 1)
 
         self.ws.changed.connect(self._refresh_header)
         self.ws.changed.connect(self._refresh_screen)
@@ -291,6 +290,9 @@ class MainWindow(QMainWindow):
             self.terminal.disconnect_bus()
         self.modes.setCurrentWidget(self.terminal if term else self.splitter)
         (self.tab_term if term else self.tab_ecu).setChecked(True)
+        self.console.status_divider.setVisible(not term)
+        self.console.btn_toggle_log.setVisible(not term)
+        self.act_log.setEnabled(not term)
 
     def _open_in_terminal(self, request: str) -> None:
         self.set_mode("terminal")

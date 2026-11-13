@@ -316,9 +316,12 @@ def build_stylesheet() -> str:
     QMenu::separator {{ height: 1px; background: {BORDER}; margin: 4px 6px; }}
     QStatusBar {{
         background-color: {BG_CHROME}; border-top: 1px solid #22252C; color: {TEXT_SECONDARY};
-        min-height: 30px;
     }}
     QStatusBar::item {{ border: none; }}
+    QFrame#StatusStrip {{
+        background-color: {BG_CHROME};
+        border-top: 1px solid #22252C;
+    }}
 
     /* ── Application Chrome & Architectural Surfaces ── */
     QFrame#Header {{
@@ -572,6 +575,22 @@ def build_stylesheet() -> str:
         background-color: #22262F; border-color: #343946; color: {TEXT};
     }}
     QPushButton#GhostBtn:disabled {{ color: {TEXT_MUTED}; background: transparent; border-color: transparent; }}
+    QFrame#ConsoleHeader QPushButton#GhostBtn {{
+        padding: 2px 9px; min-height: 16px; font-size: 12px; border-radius: 5px;
+    }}
+    QFrame#StatusStrip QPushButton#DangerBtn {{
+        padding: 2px 10px; min-height: 16px; max-height: 22px; font-size: 12px; border-radius: 5px;
+    }}
+    QPushButton#StatusBtn {{
+        background-color: transparent; border: 1px solid transparent; border-radius: 5px;
+        color: {TEXT_SECONDARY}; padding: 2px 10px; min-height: 16px; max-height: 22px; font-size: 12px;
+    }}
+    QPushButton#StatusBtn:hover {{
+        background-color: #20232B; border-color: #2D313C; color: {TEXT};
+    }}
+    QPushButton#StatusBtn:checked {{
+        background-color: #22262F; border-color: #363C4A; color: {TEXT};
+    }}
 
     QPushButton#LinkBtn {{ background: transparent; border: none; padding: 0; min-height: 0; color: {INFO}; }}
     QPushButton#LinkBtn:hover {{ color: #82B4FA; text-decoration: underline; }}

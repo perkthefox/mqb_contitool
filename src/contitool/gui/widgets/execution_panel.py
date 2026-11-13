@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import time
 
-from PySide6.QtCore import QSettings, QTimer, QUrl
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -99,12 +99,13 @@ class ExecutionPanel(QFrame):
 
         hdr_bar = QFrame()
         hdr_bar.setObjectName("ConsoleHeader")
+        hdr_bar.setFixedHeight(34)
         hdr = QHBoxLayout(hdr_bar)
-        hdr.setContentsMargins(16, 4, 14, 4)
+        hdr.setContentsMargins(18, 0, 18, 0)
         hdr.setSpacing(8)
         self.lbl_title = QLabel()
         self.lbl_title.setObjectName("GroupLabel")
-        hdr.addWidget(self.lbl_title)
+        hdr.addWidget(self.lbl_title, 0, Qt.AlignmentFlag.AlignVCenter)
         hdr.addSpacing(6)
         self.btn_short = QPushButton()
         self.btn_full = QPushButton()
@@ -114,7 +115,7 @@ class ExecutionPanel(QFrame):
             b.setProperty("pos", pos)
             b.setCheckable(True)
             group.addButton(b)
-            hdr.addWidget(b)
+            hdr.addWidget(b, 0, Qt.AlignmentFlag.AlignVCenter)
         hdr.addStretch(1)
         self.btn_open_dir = button("", "GhostBtn", slot=self._on_open_target)
         self.btn_open_dir.setVisible(False)
@@ -122,7 +123,7 @@ class ExecutionPanel(QFrame):
         self.btn_clear = button("", "GhostBtn", slot=self.clear_logs)
         self.btn_hide = button("", "GhostBtn")
         for b in (self.btn_open_dir, self.btn_copy, self.btn_clear, self.btn_hide):
-            hdr.addWidget(b)
+            hdr.addWidget(b, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(hdr_bar)
 
         self.txt_short = QTextBrowser()
@@ -160,36 +161,38 @@ class ExecutionPanel(QFrame):
         self.retranslate_ui()
 
     def _build_status(self) -> QWidget:
-        w = QWidget()
+        w = QFrame()
+        w.setObjectName("StatusStrip")
+        w.setFixedHeight(32)
         lay = QHBoxLayout(w)
-        lay.setContentsMargins(16, 2, 12, 2)
+        lay.setContentsMargins(18, 0, 18, 0)
         lay.setSpacing(10)
         self.lbl_status = QLabel()
         self.lbl_status.setObjectName("FieldLabel")
-        lay.addWidget(self.lbl_status)
+        lay.addWidget(self.lbl_status, 0, Qt.AlignmentFlag.AlignVCenter)
         self.lbl_step = QLabel()
         self.lbl_step.setObjectName("Hint")
         self.lbl_step.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        lay.addWidget(self.lbl_step, 1)
+        lay.addWidget(self.lbl_step, 1, Qt.AlignmentFlag.AlignVCenter)
         self.lbl_metrics = QLabel()
         self.lbl_metrics.setFont(mono_font(12))
         set_tone(self.lbl_metrics, "muted")
-        lay.addWidget(self.lbl_metrics)
+        lay.addWidget(self.lbl_metrics, 0, Qt.AlignmentFlag.AlignVCenter)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setFixedWidth(160)
         self.progress_bar.setVisible(False)
-        lay.addWidget(self.progress_bar)
+        lay.addWidget(self.progress_bar, 0, Qt.AlignmentFlag.AlignVCenter)
         self.btn_stop = button("", "DangerBtn", slot=self.runner.cancel_current)
         self.btn_stop.setVisible(False)
-        lay.addWidget(self.btn_stop)
-        vdiv = vdivider()
-        vdiv.setFixedHeight(14)
-        lay.addWidget(vdiv)
-        self.btn_toggle_log = button("", "GhostBtn")
+        lay.addWidget(self.btn_stop, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.status_divider = vdivider()
+        self.status_divider.setFixedHeight(14)
+        lay.addWidget(self.status_divider, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.btn_toggle_log = button("", "StatusBtn")
         self.btn_toggle_log.setCheckable(True)
-        lay.addWidget(self.btn_toggle_log)
+        lay.addWidget(self.btn_toggle_log, 0, Qt.AlignmentFlag.AlignVCenter)
         return w
 
     # ────────────────────────────── text ──────────────────────────────
