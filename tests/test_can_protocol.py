@@ -711,3 +711,77 @@ def test_a_switched_off_ecu_does_not_take_the_adapter_off_its_hardware_isotp(mon
     assert seed == b"\x67\x11\x00\x00\x12\x34"
     after_prompt = calls[state["prompt_at"] :]
     assert state["off_polls"] > 3 and after_prompt and all(not resend for _req, resend in after_prompt)
+
+
+def test_slcan_bulk_read_and_win32_buffer_tuning_prevent_64kb_stream_frame_loss(monkeypatch) -> None:
+    """Windows `pyserial` `read(1)` makes 4 Win32 syscalls per ASCII byte (~70k IRPs/s on a 64 KB 0x6F1 burst),
+    capping python-can's byte-by-byte `slcanBus._read` around ~30 KB/65536 B on a genuine USB-CDC CANable.
+    `J533CanLink` must enlarge `SetupComm` (`set_buffer_size`) and read `in_waiting` bytes in bulk."""
+    from can.interfaces import slcan as slcan_mod
+
+    from contitool.can import workflows
+    from contitool.can.transport import J533CanLink, SLCAN_RX_BUFFER, SLCAN_TX_BUFFER
+
+    expected = bytes((i * 131 + 17) & 0xFF for i in range(65_536))
+
+    class FakeWinSerial:
+        def __init__(self) -> None:
+            self._rx = bytearray()
+            self.read_calls = 0
+            self.buffer_sizes: list[tuple[int, int]] = []
+            self.write_timeout: float | None = 0.1
+            self.is_open = True
+
+        @property
+        def in_waiting(self) -> int:
+            # Simulate usbser.sys exposing up to 4 KB per USB bulk transfer batch
+            return min(len(self._rx), 4096)
+
+        def set_buffer_size(self, rx_size: int = 4096, tx_size: int = 4096) -> None:
+            self.buffer_sizes.append((rx_size, tx_size))
+
+        def read(self, size: int = 1) -> bytes:
+            self.read_calls += 1
+            if not self._rx:
+                return b""
+            n = min(size, len(self._rx))
+            out = bytes(self._rx[:n])
+            del self._rx[:n]
+            return out
+
+        def write(self, data: bytes) -> int:
+            if data.startswith(b"t6F0584"):
+                self._rx.extend(b"z\rt6F158400000000\r")
+            elif data.startswith(b"t6F0") and len(data) < 22:
+                stream = bytearray(b"z\r")
+                for off in range(0, len(expected), 8):
+                    stream.extend(b"t6F18" + expected[off : off + 8].hex().upper().encode("ascii") + b"\r")
+                stream.extend(b"t6F120000\r")
+                self._rx.extend(stream)
+            return len(data)
+
+        def flush(self) -> None:
+            pass
+
+        def reset_input_buffer(self) -> None:
+            self._rx.clear()
+
+        def close(self) -> None:
+            self.is_open = False
+
+    fake_ser = FakeWinSerial()
+    monkeypatch.setattr(slcan_mod.serial, "serial_for_url", lambda *a, **kw: fake_ser)
+    monkeypatch.setattr(slcan_mod.slcanBus, "_SLEEP_AFTER_SERIAL_OPEN", 0.0)
+
+    with J533CanLink("COM7", interface="slcan") as link:
+        assert fake_ser.buffer_sizes == [(SLCAN_RX_BUFFER, SLCAN_TX_BUFFER)]
+        fake_ser.read_calls = 0
+        payload = workflows.build_fed_reader_payload(0x00000000, 4096, 16)
+        got = workflows._stream_loader_read_payload(link, payload, 0x00000000, 65_536)
+        assert got == expected
+        # Byte-by-byte python-can would make >180,000 `read(1)` calls; bulk reading takes ~45 calls total.
+        assert fake_ser.read_calls < 100
+
+        # Also verify `drain_rx(quick=True)` clears a buffered frame sitting behind a `z\r` SLCAN TX ack
+        link.bus._buffer.extend(b"z\rt77A37F2278\r")
+        assert link.drain_rx(quick=True) == 1

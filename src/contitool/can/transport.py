@@ -95,6 +95,67 @@ def _release_win_timer() -> None:
                     pass
 
 
+SLCAN_RX_BUFFER = 262_144  # 256 KB (>11,900 SLCAN frames = >93 KB of flash): keeps Windows usbser.sys from NAKing Bulk IN
+SLCAN_TX_BUFFER = 65_536
+
+
+def _pop_slcan_line(buf: bytearray) -> str | None:
+    """Pop one complete `\\r`- or `\\x07`-terminated SLCAN line from `buf`, leaving any partial tail intact."""
+    cr = buf.find(13)  # b"\r" (_OK / frame terminator)
+    bel = buf.find(7)  # b"\x07" (_ERROR)
+    if cr < 0 and bel < 0:
+        return None
+    cut = cr if bel < 0 else (bel if cr < 0 else min(cr, bel))
+    line = bytes(buf[: cut + 1]).decode("ascii", errors="replace")
+    del buf[: cut + 1]
+    return line
+
+
+def _tune_slcan_bus(bus: Any) -> None:
+    """Replace python-can's byte-by-byte `serialPortOrig.read(1)` loop and enlarge Windows `usbser.sys` RX FIFO.
+
+    `python-can`'s `slcanBus._read` calls `serialPortOrig.read(1)` once per ASCII byte — 22 Win32 overlapped `ReadFile`
+    + `ClearCommError` + `GetOverlappedResult` kernel calls per 8-byte CAN frame (~70,000 IRPs/s during a 500 kbit/s
+    RAM-Loader stream), capping Windows throughput around ~1,530 fps (~30 KB of a 64 KB block) and overflowing
+    `usbser.sys`'s default 4 KB RX buffer even on a native USB-CDC CANable (`0x16D0:0x117E`). Reading `in_waiting`
+    bytes in one bulk `ReadFile` and enlarging `SetupComm` to 256 KB cuts Win32 syscalls >100x so 64 KB bursts arrive
+    with zero frame loss.
+    """
+    ser = getattr(bus, "serialPortOrig", None)
+    buf = getattr(bus, "_buffer", None)
+    if ser is None or not callable(getattr(ser, "read", None)) or not isinstance(buf, bytearray):
+        return
+    set_buf = getattr(ser, "set_buffer_size", None)
+    if callable(set_buf):
+        with contextlib.suppress(Exception):
+            set_buf(rx_size=SLCAN_RX_BUFFER, tx_size=SLCAN_TX_BUFFER)
+
+    from can.interfaces.slcan import error_check
+
+    def _bulk_read(timeout: float | None) -> str | None:
+        line = _pop_slcan_line(buf)
+        if line is not None:
+            return line
+        deadline = None if timeout is None else (time.monotonic() + max(0.0, timeout))
+        with error_check("Could not read from serial device"):
+            while True:
+                waiting = ser.in_waiting
+                chunk = ser.read(waiting if waiting > 0 else 1)
+                if chunk:
+                    buf.extend(chunk)
+                    if waiting == 0:
+                        more = ser.in_waiting
+                        if more > 0:
+                            buf.extend(ser.read(more))
+                    line = _pop_slcan_line(buf)
+                    if line is not None:
+                        return line
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
+
+    bus._read = _bulk_read
+
+
 class J533CanLink:
     """Clean, logged CAN bus link for Continental J533 Diagnosis CAN (500 kbit/s)."""
 
@@ -157,6 +218,8 @@ class J533CanLink:
                 kwargs["tty_baudrate"] = tty_baudrate
                 kwargs["listen_only"] = listen_only
             self.bus = can.interface.Bus(**kwargs)
+            if interface == "slcan":
+                _tune_slcan_bus(self.bus)
             self._owns_bus = True
         self._timer_held = _acquire_win_timer()
 
@@ -238,9 +301,11 @@ class J533CanLink:
         per `36` block (3.9 KB/s). The RAM-loader packets keep that read: their pacing on slcan was verified with it."""
         port = getattr(self.bus, "serialPortOrig", None) if quick else None
         parsed = getattr(self.bus, "_queue", None)  # slcan: lines already read from the port
+        raw_buf = getattr(self.bus, "_buffer", None)
         drained = 0
         for _ in range(max_frames):
-            if port is not None and not port.in_waiting and not (parsed and parsed.qsize()):
+            has_buf_line = isinstance(raw_buf, bytearray) and (13 in raw_buf or 7 in raw_buf)
+            if port is not None and not port.in_waiting and not (parsed and parsed.qsize()) and not has_buf_line:
                 break
             try:
                 msg = self.bus.recv(timeout=0.0)
@@ -252,6 +317,8 @@ class J533CanLink:
                 drained += 1
                 continue  # a result of the stale stream the bus could not interpret: thrown away with the rest
             if msg is None:
+                if isinstance(raw_buf, bytearray) and (13 in raw_buf or 7 in raw_buf):
+                    continue  # e.g. an slcan TX ack (`z\r` / `\r`) sat ahead of a real buffered frame
                 break
             raw = bytes(msg.data)
             self.rx_frames += 1

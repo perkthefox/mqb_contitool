@@ -1309,8 +1309,17 @@ def can_verify(
             report["complete"] = True
             reporter.progress(100, 100)
             return report
+        except OperationCancelledError:
+            _hand_back_after_cancel(link, reporter)
+            raise
         except Exception as exc:
             report["error"] = str(exc)
+            _hand_back_after_read_error(
+                link,
+                reporter,
+                active_loader=bool(report.get("loader_session") or report.get("beacon")),
+                return_to_app=return_to_app,
+            )
             raise
         finally:
             _write_json(out_dir / "verification.json", report)
