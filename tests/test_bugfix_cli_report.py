@@ -46,7 +46,7 @@ def test_report_never_carries_key_material(tmp_path: Path) -> None:
                                     dumps=dumps)
         with zipfile.ZipFile(z) as zf:
             names = zf.namelist()
-            assert f"sessions/{UNIT}/dumps/base_read/manifest.json" in names  # the rest of the folder still goes in
+            assert f"sessions/{report.mask_ids(UNIT)}/dumps/base_read/manifest.json" in names  # the rest of the folder still goes in
             assert not any("contitool_keys" in n.lower() or n.lower().endswith(".pem") for n in names), names
             assert not any(b"d_hex" in zf.read(n) or b"PRIVATE KEY" in zf.read(n) for n in names)
     assert all(p.is_file() for p in saved)
