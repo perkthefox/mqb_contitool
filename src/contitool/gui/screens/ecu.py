@@ -92,10 +92,9 @@ from contitool.gui.dialogs.zdc import (
 from contitool.gui.screens import status
 from contitool.gui.screens.status import State
 from contitool.gui import theme
-from contitool.gui.theme import glyph_pixmap, mono_font, set_tone
+from contitool.gui.theme import mono_font, set_tone
 from contitool.gui.widgets.page import (
     Callout,
-    Section,
     TextResultDialog,
     button,
     clear_layout,
@@ -106,6 +105,7 @@ from contitool.gui.widgets.page import (
     row,
     run_dialog,
     set_pill,
+    status_readout,
 )
 from contitool.gui.worker import OperationRunner
 from contitool.gui.workspace import CANDIDATES, KINDS, NAMES, OPTIONAL_KINDS, Workspace
@@ -140,25 +140,19 @@ def _title(key: str) -> str:
 
 
 class _NavRow(QWidget):
-    """Category vector icon, function name, and status badge on the right."""
+    """Function name on the left with quiet semantic status text on the right."""
 
-    def __init__(self, key: str = "cp") -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._key = key
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(10, 0, 8, 0)
-        lay.setSpacing(9)
-        self.lbl_icon = QLabel()
-        self.lbl_icon.setFixedSize(16, 16)
+        lay.setContentsMargins(10, 0, 10, 0)
+        lay.setSpacing(8)
         self.lbl_name = QLabel()
         self.pill = pill()
-        lay.addWidget(self.lbl_icon, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self.lbl_name, 1)
         lay.addWidget(self.pill, 0, Qt.AlignmentFlag.AlignVCenter)
-        self.set_active(False)
 
     def set_active(self, active: bool) -> None:
-        self.lbl_icon.setPixmap(glyph_pixmap(self._key, theme.INFO if active else theme.TEXT_SECONDARY, 16))
         f = self.lbl_name.font()
         f.setWeight(f.Weight.DemiBold if active else f.Weight.Normal)
         self.lbl_name.setFont(f)
@@ -196,11 +190,12 @@ class EcuScreen(QWidget):
         self.actions: dict[str, QPushButton] = {}  # buttons of the page on screen
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(28, 18, 28, 14)
-        outer.setSpacing(12)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
         outer.addWidget(self._build_identity())
         split = QHBoxLayout()
-        split.setSpacing(12)
+        split.setContentsMargins(0, 0, 0, 0)
+        split.setSpacing(0)
         split.addWidget(self._build_nav())
         split.addWidget(self._build_page_area(), 1)
         outer.addLayout(split, 1)
@@ -216,47 +211,51 @@ class EcuScreen(QWidget):
 
     # ────────────────────────────── layout ──────────────────────────────
     def _build_identity(self) -> QWidget:
-        self.sec_id = Section()
-        self.sec_id.setObjectName("IdentityCard")
-        self.sec_id.body.setContentsMargins(20, 14, 20, 14)
-        self.sec_id.body.setSpacing(10)
-        id_badge = QLabel()
-        id_badge.setPixmap(glyph_pixmap("hw", theme.INFO, 20))
+        self.sec_id = QFrame()
+        self.sec_id.setObjectName("IdentityBar")
+        body = QVBoxLayout(self.sec_id)
+        body.setContentsMargins(24, 12, 24, 12)
+        body.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
         self.lbl_pn = QLabel()
         self.lbl_pn.setObjectName("PartNumber")
-        self.lbl_pn.setFont(mono_font(20, bold=True))
+        self.lbl_pn.setFont(mono_font(19, bold=True))
         self.lbl_pn.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.pill_source = pill()
-        self.sec_id.head.insertWidget(0, id_badge)
-        self.sec_id.head.insertWidget(1, self.lbl_pn)
-        self.sec_id.lbl_title.setVisible(False)
-        self.sec_id.head.insertWidget(2, self.pill_source)
-        self.sec_id.head.setAlignment(id_badge, Qt.AlignmentFlag.AlignVCenter)
-        self.sec_id.head.setAlignment(self.pill_source, Qt.AlignmentFlag.AlignVCenter)
-        self.btn_export = button("", "GhostBtn", slot=self.export_backup)
-        self.btn_restore = button("", "GhostBtn", slot=self.restore_requested.emit)
-        self.btn_report = button("", "GhostBtn", slot=self.report_requested.emit)
-        self.btn_close = button("", slot=self.close_requested.emit)
-        self.sec_id.head.addWidget(self.btn_export)
-        self.sec_id.head.addWidget(self.btn_restore)
-        self.sec_id.head.addWidget(self.btn_report)
-        self.sec_id.head.addWidget(self.btn_close)
+        self.pill_source = QLabel()
+        self.pill_source.setObjectName("Hint")
+        head.addWidget(self.lbl_pn)
+        head.addWidget(self.pill_source, 0, Qt.AlignmentFlag.AlignVCenter)
+        head.addStretch(1)
+
+        self.btn_export = button("", slot=self.export_backup)
+        self.btn_restore = button("", slot=self.restore_requested.emit)
+        self.btn_report = button("", slot=self.report_requested.emit)
+        self.btn_close = button("", "GhostBtn", slot=self.close_requested.emit)
+        for b in (self.btn_export, self.btn_restore, self.btn_report, self.btn_close):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            head.addWidget(b)
+        body.addLayout(head)
 
         self.files_row = QHBoxLayout()  # which areas are loaded, and from which folder
-        self.files_row.setSpacing(6)
-        self.sec_id.body.addLayout(self.files_row)
+        self.files_row.setSpacing(16)
+        body.addLayout(self.files_row)
+        body.addWidget(divider())
 
         self.grid_id = QGridLayout()
-        self.grid_id.setHorizontalSpacing(10)
-        self.grid_id.setVerticalSpacing(0)
-        self.sec_id.body.addLayout(self.grid_id)
+        self.grid_id.setHorizontalSpacing(36)
+        self.grid_id.setVerticalSpacing(2)
+        body.addLayout(self.grid_id)
         return self.sec_id
 
     def _build_nav(self) -> QWidget:
-        sec = Section()
-        sec.hide_head()
-        sec.body.setContentsMargins(6, 6, 6, 8)
-        sec.setFixedWidth(316)
+        pane = QFrame()
+        pane.setObjectName("NavPane")
+        pane.setFixedWidth(298)
+        lay = QVBoxLayout(pane)
+        lay.setContentsMargins(6, 6, 6, 8)
+        lay.setSpacing(0)
         self.nav = QListWidget()
         self.nav.setObjectName("Nav")
         self.nav_rows: dict[str, _NavRow] = {}
@@ -267,37 +266,33 @@ class EcuScreen(QWidget):
             head.setFlags(Qt.ItemFlag.NoItemFlags)
             head.setSizeHint(QSize(0, 30))
             lbl = group_label()
-            lbl.setContentsMargins(10, 10, 0, 0)
+            lbl.setContentsMargins(12, 10, 0, 0)
             self.nav.setItemWidget(head, lbl)
             self._group_labels[group] = lbl
             for key in keys:
                 item = QListWidgetItem(self.nav)
                 item.setData(Qt.ItemDataRole.UserRole, key)
-                item.setSizeHint(QSize(0, 40))
-                nav_row = _NavRow(key)
+                item.setSizeHint(QSize(0, 36))
+                nav_row = _NavRow()
                 self.nav.setItemWidget(item, nav_row)
                 self.nav_rows[key] = nav_row
                 self._nav_items[key] = item
         self.nav.currentItemChanged.connect(self._on_nav)
-        sec.body.addWidget(self.nav)
-        return sec
+        lay.addWidget(self.nav)
+        return pane
 
     def _build_page_area(self) -> QWidget:
-        sec = Section()
-        sec.hide_head()
-        sec.body.setContentsMargins(0, 0, 0, 0)
         self.page_area = QScrollArea()
         self.page_area.setWidgetResizable(True)
         self.page_area.setFrameShape(QFrame.Shape.NoFrame)
         self.page_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        sec.body.addWidget(self.page_area)
-        return sec
+        return self.page_area
 
     def _build_changes(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("WriteBar")
         lay = QVBoxLayout(bar)
-        lay.setContentsMargins(16, 10, 14, 10)
+        lay.setContentsMargins(24, 10, 24, 10)
         lay.setSpacing(6)
         top = QHBoxLayout()
         top.setSpacing(8)
@@ -308,12 +303,12 @@ class EcuScreen(QWidget):
         self.btn_revert = button("", "GhostBtn", slot=self._revert)
         self.btn_save = button("", slot=self._save_dumps)
         self.btn_write = button("", "PrimaryBtn", slot=self._write_pending)
-        self.btn_write_df = button("", "GhostBtn", slot=self._write_to_ecu)  # dataset-only edits: the RAM-Loader way
+        self.btn_write_df = button("", slot=self._write_to_ecu)  # dataset-only edits: the RAM-Loader way
         for b in (self.btn_revert, self.btn_save, self.btn_write_df, self.btn_write):
             top.addWidget(b)
         lay.addLayout(top)
         self.grid_changes = QGridLayout()
-        self.grid_changes.setHorizontalSpacing(14)
+        self.grid_changes.setHorizontalSpacing(16)
         self.grid_changes.setVerticalSpacing(3)
         lay.addLayout(self.grid_changes)
         bar.setVisible(False)
@@ -352,11 +347,10 @@ class EcuScreen(QWidget):
 
     def _refresh_identity(self) -> None:
         self.lbl_pn.setText(self.ws.part_number or tr("Блок не определён", "Unknown ECU"))
-        set_pill(
-            self.pill_source,
-            tr("считан по CAN", "read over CAN") if self.ws.source == "can" else tr("из файлов", "from files"),
-            "info" if self.ws.source == "can" else "muted",
+        self.pill_source.setText(
+            "·  " + (tr("считан по CAN", "read over CAN") if self.ws.source == "can" else tr("открыт из файлов", "opened from files"))
         )
+        set_tone(self.pill_source, "info" if self.ws.source == "can" else "muted")
         self.btn_export.setText(tr("Экспортировать бэкап…", "Export backup…"))
         self.btn_export.setToolTip(tr("Копирует дампы в том виде, как они считаны, в выбранную папку", "Copies the dumps as read to a folder you pick"))
         self.btn_restore.setText(tr("Залить бэкап в блок…", "Write backup to ECU…"))
@@ -367,48 +361,51 @@ class EcuScreen(QWidget):
         clear_layout(self.grid_id)
         rows = status.passport_rows(self.ws)
         for col, (label, value, tone) in enumerate(rows):
-            box = QFrame()
-            box.setObjectName("MetricBox")
-            b_lay = QVBoxLayout(box)
-            b_lay.setContentsMargins(12, 7, 12, 8)
-            b_lay.setSpacing(2)
             cap = QLabel(label.upper())
             cap.setObjectName("GroupLabel")
             val = QLabel(value)
-            val.setFont(mono_font(12, bold=True))
+            val.setFont(mono_font(13))
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             if tone != "muted":
                 set_tone(val, tone)
-            b_lay.addWidget(cap)
-            b_lay.addWidget(val)
-            self.grid_id.addWidget(box, 0, col)
-            self.grid_id.setColumnStretch(col, 0)
+            self.grid_id.addWidget(cap, 0, col)
+            self.grid_id.addWidget(val, 1, col)
         self.grid_id.setColumnStretch(len(rows), 1)
 
         clear_layout(self.files_row)
         for k in KINDS:
             have = self.ws.path(k) is not None
-            chip = pill(NAMES[k] if have else tr(f"{NAMES[k]}: нет", f"{NAMES[k]}: missing"), "ok" if have else "warn")
-            chip.setToolTip(str(self.ws.path(k) or tr("Файла нет в папке", "Not in the folder")))
-            self.files_row.addWidget(chip)
+            item_lbl = QLabel(
+                f"✓ {NAMES[k]}" if have else tr(f"— {NAMES[k]}: нет", f"— {NAMES[k]}: missing")
+            )
+            item_lbl.setFont(mono_font(11))
+            set_tone(item_lbl, "ok" if have else "warn")
+            item_lbl.setToolTip(str(self.ws.path(k) or tr("Файла нет в папке", "Not in the folder")))
+            self.files_row.addWidget(item_lbl)
         for k in OPTIONAL_KINDS:
             p_opt = self.ws.path(k)
             if p_opt is not None:
-                chip = pill(NAMES[k], "ok")
-                chip.setToolTip(str(p_opt))
-                self.files_row.addWidget(chip)
+                item_lbl = QLabel(f"✓ {NAMES[k]}")
+                item_lbl.setFont(mono_font(11))
+                set_tone(item_lbl, "ok")
+                item_lbl.setToolTip(str(p_opt))
+                self.files_row.addWidget(item_lbl)
             elif k in self.ws.read_warnings:
-                chip = pill(tr(f"{NAMES[k]}: сбой", f"{NAMES[k]}: warning"), "warn")
-                chip.setToolTip(self.ws.read_warnings[k])
-                self.files_row.addWidget(chip)
+                item_lbl = QLabel(tr(f"! {NAMES[k]}: сбой", f"! {NAMES[k]}: warning"))
+                item_lbl.setFont(mono_font(11))
+                set_tone(item_lbl, "warn")
+                item_lbl.setToolTip(self.ws.read_warnings[k])
+                self.files_row.addWidget(item_lbl)
         folder = self.ws.folder
         if folder:
-            where = hint(tr(f"Папка: {folder.name}", f"Folder: {folder.name}"))
+            where = hint(folder.name)
+            where.setFont(mono_font(11))
             where.setWordWrap(False)
             where.setToolTip(str(folder))
-            self.files_row.addSpacing(10)
+            self.files_row.addStretch(1)
             self.files_row.addWidget(where)
-        self.files_row.addStretch(1)
+        else:
+            self.files_row.addStretch(1)
 
     def _state(self, key: str) -> State:
         if key == "cp":
@@ -456,8 +453,13 @@ class EcuScreen(QWidget):
         if not self.ws.is_open:
             return
         page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(24, 18, 24, 20)
+        outer = QHBoxLayout(page)
+        outer.setContentsMargins(28, 20, 28, 24)
+        outer.setSpacing(0)
+        column = QWidget()
+        column.setMaximumWidth(960)
+        lay = QVBoxLayout(column)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(12)
         self.actions = {}
         pages = {
@@ -471,17 +473,19 @@ class EcuScreen(QWidget):
         }
         pages[self._key](lay)
         lay.addStretch(1)
+        outer.addWidget(column, 1)
+        outer.addStretch(0)
         self.page_area.setWidget(page)  # the scroll area deletes the previous page
 
     def _head(self, lay: QVBoxLayout, key: str) -> State:
         st = self._state(key)
         h = QHBoxLayout()
-        h.setSpacing(10)
+        h.setSpacing(12)
         t = QLabel(_title(key))
         t.setObjectName("PageTitle")
         h.addWidget(t)
-        h.addWidget(pill(st.text, st.tone), 0, Qt.AlignmentFlag.AlignVCenter)
         h.addStretch(1)
+        h.addWidget(status_readout(st.text, st.tone), 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addLayout(h)
         return st
 
@@ -500,6 +504,7 @@ class EcuScreen(QWidget):
 
     def _btn(self, key: str, text: str, slot: Any, kind: str = "", enabled: bool = True, tip: str = "") -> QPushButton:
         b = button(text, kind, slot=slot)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
         b.setEnabled(enabled and not self.runner.is_busy)
         b.setToolTip(tip)
         self.actions[key] = b
@@ -508,13 +513,13 @@ class EcuScreen(QWidget):
     def _block(
         self, lay: QVBoxLayout, title: str, state: State | None, text: str, *btns: QPushButton, num: str = ""
     ) -> None:
-        """A bordered part of a page: optional step number, title with state, explanation, buttons."""
+        """A bordered part of a page: optional step number, title with right-aligned state, explanation, buttons."""
         frame = QFrame()
         frame.setObjectName("Step")
         g = QGridLayout(frame)
-        g.setContentsMargins(14, 12, 14, 12)
+        g.setContentsMargins(16, 13, 16, 14)
         g.setHorizontalSpacing(12)
-        g.setVerticalSpacing(6)
+        g.setVerticalSpacing(7)
         col = 0
         if num:
             n = QLabel(num)
@@ -524,13 +529,13 @@ class EcuScreen(QWidget):
             g.addWidget(n, 0, 0, Qt.AlignmentFlag.AlignTop)
             col = 1
         h = QHBoxLayout()
-        h.setSpacing(8)
+        h.setSpacing(10)
         t = QLabel(title)
         t.setObjectName("FieldLabel")
         h.addWidget(t)
-        if state is not None:
-            h.addWidget(pill(state.text, state.tone), 0, Qt.AlignmentFlag.AlignVCenter)
         h.addStretch(1)
+        if state is not None:
+            h.addWidget(status_readout(state.text, state.tone), 0, Qt.AlignmentFlag.AlignVCenter)
         g.addLayout(h, 0, col)
         r = 1
         if text:
@@ -821,7 +826,7 @@ class EcuScreen(QWidget):
             "swap_check",
             tr("Проверить в блоке", "Check in the ECU") if self._swap_live is None else tr("Проверить снова", "Check again"),
             self._swap_check,
-            "PrimaryBtn" if self._swap_live is None else "GhostBtn",
+            "" if self._swap_live is None else "GhostBtn",
         )
         if self._swap_live is None:
             self._block(
@@ -863,7 +868,7 @@ class EcuScreen(QWidget):
         states = [(status.swap_live_state(f["status"]), f["fsid"]) for f in self._swap_live]
         r = 2
         for st, code in sorted((s for s in states if s[0].key != "off"), key=lambda x: (x[0].key != "on", x[1])):
-            g.addWidget(pill(st.text, st.tone), r, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            g.addWidget(status_readout(st.text, st.tone), r, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             cell = QVBoxLayout()
             cell.setSpacing(1)
             cell.addWidget(self._label(status.fec_name(code), primary=True))
@@ -1031,7 +1036,7 @@ class EcuScreen(QWidget):
             self._btn("zdc_export", tr("Экспорт…", "Export…"), self._export_zdc, "", ok_df, tip_df),
             self._btn("zdc_import_odis", tr("Импорт ODIS…", "Import ODIS…"), self._import_odis_zdc, "", ok_df, tip_df),
             self._btn("zdc_passport", tr("Паспорт и разделы…", "Passport & sections…"), self._open_passport_editor,
-                      "GhostBtn", ok_df, tip_df),
+                      "", ok_df, tip_df),
         )
         self._block(
             lay,
@@ -1042,7 +1047,7 @@ class EcuScreen(QWidget):
                 "zdc_fpa",
                 tr("Настроить профили и кнопки…", "Configure profiles & buttons…"),
                 self._open_fpa_editor,
-                "PrimaryBtn",
+                "",
                 ok_df,
                 tip_df,
             ),
@@ -1050,7 +1055,7 @@ class EcuScreen(QWidget):
                 "zdc_learn_mfl",
                 tr("Проверить кнопку руля по CAN…", "Test wheel button over CAN…"),
                 self._test_mfl_button_live,
-                "GhostBtn",
+                "",
             ),
         )
         self._block(
@@ -1098,7 +1103,7 @@ class EcuScreen(QWidget):
         lay.addLayout(
             row(
                 self._btn("dtc", tr("Прочитать ошибки", "Read codes"), lambda: self._dtc_run(False), "PrimaryBtn"),
-                self._btn("dtc_clear", tr("Стереть ошибки", "Clear codes"), lambda: self._dtc_run(True), "GhostBtn"),
+                self._btn("dtc_clear", tr("Стереть ошибки", "Clear codes"), lambda: self._dtc_run(True)),
             )
         )
         if self._dtc is None:
@@ -1208,7 +1213,7 @@ class EcuScreen(QWidget):
         ok, tip = self._need("cflash")
         btns = [
             self._btn("fbl_key", tr("Вшить свой ключ…", "Embed your key…"), lambda: self._replace_key("fbl"), "", ok, tip),
-            self._btn("odx", tr("Подписать прошивку для ODX…", "Sign firmware for ODX…"), self._sign_odx, "GhostBtn", ok, tip),
+            self._btn("odx", tr("Подписать прошивку для ODX…", "Sign firmware for ODX…"), self._sign_odx, "", ok, tip),
         ]
         if fbl.key == "custom":
             btns.append(self._btn("fbl_stock", tr("Вернуть ключ VAG", "Restore VAG key"), lambda: self._restore_key("fbl"), "GhostBtn", ok))
@@ -1293,7 +1298,6 @@ class EcuScreen(QWidget):
                 "hw_open_eeprom",
                 tr("Открыть файл…", "Open file…"),
                 lambda: self._pick_optional_file("eeprom"),
-                "GhostBtn",
             ),
         ]
         if ee_path is not None:
@@ -1302,7 +1306,6 @@ class EcuScreen(QWidget):
                     "hw_report_eeprom",
                     tr("Подробный отчёт EEPROM", "Full EEPROM report"),
                     self._show_eeprom_report,
-                    "GhostBtn",
                 )
             )
         self._block(
@@ -1408,7 +1411,6 @@ class EcuScreen(QWidget):
                 "hw_open_opbt",
                 tr("Открыть файл…", "Open file…"),
                 lambda: self._pick_optional_file("opbt"),
-                "GhostBtn",
             ),
         ]
         if op_path is not None:
@@ -1417,7 +1419,6 @@ class EcuScreen(QWidget):
                     "hw_report_opbt",
                     tr("Подробный отчёт OPBT", "Full OPBT report"),
                     self._show_opbt_report,
-                    "GhostBtn",
                 )
             )
         self._block(
@@ -1627,7 +1628,7 @@ class EcuScreen(QWidget):
             name = QLabel(NAMES[kind])
             name.setObjectName("FieldLabel")
             self.grid_changes.addWidget(name, r, 0)
-            self.grid_changes.addWidget(pill(tag, tone), r, 1, Qt.AlignmentFlag.AlignLeft)
+            self.grid_changes.addWidget(status_readout(tag, tone), r, 1, Qt.AlignmentFlag.AlignLeft)
             self.grid_changes.addWidget(hint(how), r, 2)
         self.grid_changes.setColumnStretch(2, 1)
 

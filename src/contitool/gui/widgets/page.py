@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from contitool.gui.theme import mono_font, set_tone
+from contitool.gui import theme
+from contitool.gui.theme import dot_icon, mono_font, set_tone
 from contitool.i18n import tr
 
 
@@ -72,7 +73,7 @@ class Callout(QFrame):
 
 
 def pill(text: str = "", tone: str = "muted") -> QLabel:
-    """Rounded status badge; change later with set_pill()."""
+    """Borderless semantic status readout; change later with set_pill()."""
     lbl = QLabel()
     lbl.setObjectName("Pill")
     set_pill(lbl, text, tone)
@@ -83,6 +84,22 @@ def set_pill(lbl: QLabel, text: str, tone: str) -> None:
     lbl.setText(text)
     set_tone(lbl, tone)
     lbl.setVisible(bool(text))
+
+
+def status_readout(text: str = "", tone: str = "muted") -> QWidget:
+    """Crisp instrument status indicator: geometric 6px LED dot + semantic text (zero pill box)."""
+    w = QWidget()
+    lay = QHBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(6)
+    dot = QLabel()
+    col = theme.TONES.get(tone, theme.TEXT_MUTED)
+    dot.setPixmap(dot_icon(col, 6).pixmap(12, 12))
+    lbl = pill(text, tone)
+    lay.addWidget(dot, 0, Qt.AlignmentFlag.AlignVCenter)
+    lay.addWidget(lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+    w.setVisible(bool(text))
+    return w
 
 
 def group_label(text: str = "") -> QLabel:
@@ -169,8 +186,9 @@ class Dialog(QDialog):
         self._scroll.setWidget(content)
         outer.addWidget(self._scroll, 1)
         self._footer = QWidget()
+        self._footer.setObjectName("DialogFooter")
         self.buttons = QHBoxLayout(self._footer)
-        self.buttons.setContentsMargins(24, 0, 24, 20)
+        self.buttons.setContentsMargins(24, 12, 24, 14)
         self.buttons.setSpacing(8)
         self._footer.setHidden(True)  # finish() shows it
         outer.addWidget(self._footer)

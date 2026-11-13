@@ -8,7 +8,7 @@
   - На экране блока добавлен раздел **«EEPROM и OPBT»** с расшифровкой паспорта `NvM 0x00`, VIN, кодировки `0x0600`, списка оборудования `0x04A3`, АКБ `BEM`, блока безопасности `NvM 0x5E` (маска обученных слотов CP, `Master CP`, `Showroom`, инженерные флаги `0x80/0x81/0x83`), проверкой `CRC-16/CCITT-FALSE` по всем записям и битовой расшифровкой `OPBT0` / `OPBT8 (ICU-S)`.
   - В CLI добавлены команды `can read-eeprom`, `can read-opbt` и флаги `inspect --eeprom` / `--opbt`.
 - **Редактор профилей движения (`FPA`):** добавлена поддержка целевых режимов `On` / `Off` (`0x0300`) и непрерывного 15-ступенчатого слайдера жёсткости подвески `DCC` (`Step 1..15`, атрибут `0xFFFE` в профиле `Individual`).
-- **Обновлённый графический интерфейс:** глубокая тёмная палитра с многослойными карточками, векторными иконками разделов, стартовым баннером платформы, плиточным паспортом блока и переработанной типографикой таблиц и диалогов.
+- **Обновлённый графический интерфейс:** строгая графитовая палитра в стиле измерительного прибора, полноширинная панель телеметрии открытого блока, переработанная иерархия кнопок, выровненные индикаторы состояния без декоративных «капсул» и улучшенная вёрстка таблиц и диалогов.
 
 ### 🇷🇺 Исправлено
 - **Редактор профилей движения (`FPA`, #24):** исправлен каталог функциональных групп `CharismaFunctions` (`0x01..0x1C` — `Motor`, `Getriebe`, `Lenkung`, `DCC`, `ACC`, `Kurvenlicht`, `Klima`, `Bussound` и др.), порядок целевых режимов (`8: On`, `9: Off`, `10: Snow`), Big-Endian формула байта `PaCo` (`12 - (pbit - 1) // 8`) и список силовых групп `KL15` (`0x04 EDS` больше не помечается как требующая перезапуска двигателя).
@@ -25,7 +25,7 @@
   - Added the **“EEPROM & OPBT”** service page in the GUI with full decoding of `NvM 0x00` passport, VIN, coding `0x0600`, installation list `0x04A3`, `BEM` battery data, `NvM 0x5E` security state (learned CP slot mask, `Master CP`, `Showroom`, `0x80/0x81/0x83` engineering flags), per-record `CRC-16/CCITT-FALSE` verification, and `OPBT0` / `OPBT8 (ICU-S)` bitfields.
   - Added CLI subcommands `can read-eeprom`, `can read-opbt`, and `inspect --eeprom` / `--opbt`.
 - **Driving-profile editor (`FPA`):** added support for `On` / `Off` (`0x0300`) target modes and the 15-step continuous `DCC` damping slider (`Step 1..15`, `0xFFFE` in `Individual`).
-- **Redesigned dark studio GUI:** layered obsidian-cobalt surfaces, custom HiDPI vector iconography across navigation and workflow cards, platform hero banner, passport metric tiles, and refined dialogs and tables.
+- **Redesigned precision-instrument GUI:** restrained machined-graphite palette, full-width ECU telemetry bar, tactile button hierarchy, clean right-aligned status readouts, and refined tables and modal dialogs.
 
 ### 🇬🇧 Fixed
 - **Driving-profile editor (`FPA`, #24):** fixed the `CharismaFunctions` group catalog (`0x01..0x1C` — `Engine`, `Gearbox`, `Steering`, `DCC`, `ACC`, `AFS`, `Climatronic`, `Interior sound`, etc.), target mode mapping (`8: On`, `9: Off`, `10: Snow`), Big-Endian `PaCo` byte indexing (`12 - (pbit - 1) // 8`), and `KL15` powertrain group tagging (`0x04 EDS` is no longer flagged as requiring an ignition cycle).

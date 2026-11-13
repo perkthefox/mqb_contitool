@@ -1,14 +1,13 @@
-"""Obsidian-cobalt automotive studio theme: palette tokens, QSS, vector icons, monospace font, and tone helpers."""
+"""Machined graphite & precision instrument theme: palette tokens, QSS, monospace font, tone helper, and app icon."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import (
     QColor,
     QFont,
     QFontDatabase,
     QIcon,
-    QLinearGradient,
     QPainter,
     QPainterPath,
     QPalette,
@@ -17,29 +16,31 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QComboBox, QProxyStyle, QStyle, QStyleFactory, QWidget
 
-# Layered surfaces (deep obsidian -> slate canvas -> elevated card -> interactive hover)
-BG_WINDOW = "#0E121A"
-BG_SIDEBAR = "#090C12"  # header, menu & status bars
-BG_SECTION = "#151B26"
-BG_INPUT = "#0B0F16"
-BG_HOVER = "#1E2636"
-BG_SELECTED = "#1B3159"
-BORDER = "#242E40"
-BORDER_STRONG = "#334159"
+# Precision machined graphite elevation hierarchy (subtle cool steel undertone, zero SaaS navy/purple)
+BG_CHROME = "#0E1013"    # menu bar & status bar
+BG_SIDEBAR = "#121519"   # header bar, left nav pane, dialog footers & journal header
+BG_WINDOW = "#16191E"    # main workspace canvas
+BG_SECTION = "#1C2027"   # single-level elevated panels & action cards
+BG_INPUT = "#101317"     # recessed inputs, tables & log views
+BG_HOVER = "#242932"
+BG_SELECTED = "#272D38"
+BORDER = "#282E38"
+BORDER_SUBTLE = "#20252E"
+BORDER_STRONG = "#39414F"
 
-# Crisp high-contrast text hierarchy
-TEXT = "#ECF1F8"
-TEXT_SECONDARY = "#97A4BA"
-TEXT_MUTED = "#616F87"
+# Crisp high-legibility typography
+TEXT = "#ECEEF2"
+TEXT_SECONDARY = "#9AA2B0"
+TEXT_MUTED = "#666E7C"
 
-# Luminous automotive accents & semantic tones
-ACCENT = "#3B82F6"
-ACCENT_HOVER = "#60A5FA"
-OK = "#34D399"
-WARN = "#FBBF24"
-ERR = "#F87171"
-INFO = "#60A5FA"
-CAN = "#C084FC"
+# Calibrated instrument-grade accent & semantic tones (authoritative, never neon)
+ACCENT = "#2E66B8"
+ACCENT_HOVER = "#3874CC"
+OK = "#44B57B"
+WARN = "#D99B38"
+ERR = "#DF5A5A"
+INFO = "#639BF2"
+CAN = "#A98DF5"
 
 TONES = {"ok": OK, "warn": WARN, "err": ERR, "info": INFO, "muted": TEXT_MUTED}
 
@@ -62,12 +63,22 @@ def set_tone(widget: QWidget, tone: str) -> None:
 
 
 class _Style(QProxyStyle):
-    """Fusion with crisp custom check/radio/combo indicators tailored for dark obsidian surfaces."""
+    """Fusion with crisp check/radio/combo indicators and non-eliding button sizing."""
 
     _CHECKS = (
         QStyle.PrimitiveElement.PE_IndicatorCheckBox,
         QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck,
     )
+
+    def sizeFromContents(self, ct, option, size, widget=None) -> QSize:  # noqa: ANN001, N802 (Qt override)
+        sz = super().sizeFromContents(ct, option, size, widget)
+        if ct == QStyle.ContentsType.CT_PushButton and widget is not None:
+            name = widget.objectName()
+            if name != "LinkBtn":
+                # QSS medium/demibold font-weight widens glyphs beyond Fusion's base metric; pad so labels never elide.
+                extra = 6 if name in ("SegBtn", "TabBtn") else 14
+                sz.setWidth(sz.width() + extra)
+        return sz
 
     def drawPrimitive(self, element, option, painter, widget=None) -> None:  # noqa: N802 (Qt override)
         if element == QStyle.PrimitiveElement.PE_IndicatorRadioButton:
@@ -77,7 +88,7 @@ class _Style(QProxyStyle):
             c = QRectF(option.rect).center()
             painter.save()
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setPen(QPen(QColor(TEXT_SECONDARY), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.setPen(QPen(QColor(TEXT_SECONDARY), 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             painter.drawPolyline([QPointF(c.x() - 4, c.y() - 2), QPointF(c.x(), c.y() + 2), QPointF(c.x() + 4, c.y() - 2)])
             painter.restore()
             return
@@ -94,18 +105,18 @@ class _Style(QProxyStyle):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setOpacity(1.0 if enabled else 0.45)
-        border = ACCENT_HOVER if on else (ACCENT if hover else "#4B5973")
-        painter.setPen(QPen(QColor(border), 1.15))
+        border = ACCENT_HOVER if on else ("#687182" if hover else "#48505E")
+        painter.setPen(QPen(QColor(border), 1.0))
         painter.setBrush(QColor(ACCENT if on else BG_INPUT))
-        painter.drawRoundedRect(box, 3.8, 3.8)
+        painter.drawRoundedRect(box, 3.2, 3.2)
         if on:
-            pen = QPen(QColor("#FFFFFF"), max(1.7, side * 0.135))
+            pen = QPen(QColor("#FFFFFF"), max(1.6, side * 0.13))
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(pen)
             x, y, s = box.x(), box.y(), box.width()
             painter.drawPolyline(
-                [QPointF(x + s * 0.24, y + s * 0.52), QPointF(x + s * 0.43, y + s * 0.71), QPointF(x + s * 0.77, y + s * 0.31)]
+                [QPointF(x + s * 0.24, y + s * 0.52), QPointF(x + s * 0.43, y + s * 0.70), QPointF(x + s * 0.76, y + s * 0.32)]
             )
         painter.restore()
 
@@ -119,7 +130,7 @@ class _Style(QProxyStyle):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setOpacity(1.0 if option.state & QStyle.StateFlag.State_Enabled else 0.45)
-        painter.setPen(QPen(QColor(ACCENT_HOVER if on else (ACCENT if hover else "#4B5973")), 1.15))
+        painter.setPen(QPen(QColor(ACCENT_HOVER if on else ("#687182" if hover else "#48505E")), 1.0))
         painter.setBrush(QColor(ACCENT if on else BG_INPUT))
         painter.drawEllipse(box)
         if on:
@@ -133,7 +144,7 @@ _STYLE: _Style | None = None
 
 
 def apply_theme(app: QApplication) -> None:
-    """Fusion style + dark obsidian palette + QSS stylesheet."""
+    """Fusion style + machined graphite palette + QSS stylesheet."""
     global _STYLE
     if app.property("_contitool_themed"):
         return
@@ -156,7 +167,7 @@ def apply_theme(app: QApplication) -> None:
         QPalette.ColorRole.PlaceholderText: TEXT_MUTED,
         QPalette.ColorRole.Link: INFO,
         QPalette.ColorRole.Mid: BORDER,
-        QPalette.ColorRole.Dark: BG_SIDEBAR,
+        QPalette.ColorRole.Dark: BG_CHROME,
     }
     for role, hex_col in roles.items():
         pal.setColor(role, QColor(hex_col))
@@ -170,7 +181,7 @@ def apply_theme(app: QApplication) -> None:
 
 
 def build_app_icon() -> QIcon:
-    """Sapphire-indigo gradient MCU squircle with QFP pins and CAN pulse trace."""
+    """Anodized graphite QFP microcontroller mark with a precision cobalt pin-1 dot."""
     icon = QIcon()
     for sz in (32, 64, 128, 256):
         pix = QPixmap(sz, sz)
@@ -178,381 +189,179 @@ def build_app_icon() -> QIcon:
         p = QPainter(pix)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        m = sz * 0.055
+        m = sz * 0.06
         rect = QRectF(m, m, sz - 2 * m, sz - 2 * m)
         tile = QPainterPath()
-        tile.addRoundedRect(rect, sz * 0.23, sz * 0.23)
-
-        grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        grad.setColorAt(0.0, QColor("#4F94FF"))
-        grad.setColorAt(0.55, QColor("#2563EB"))
-        grad.setColorAt(1.0, QColor("#1E3A8A"))
-        p.fillPath(tile, grad)
-
-        # Subtle inner glass highlight border
-        p.setPen(QPen(QColor(255, 255, 255, 55), max(1.0, sz * 0.024)))
+        tile.addRoundedRect(rect, sz * 0.20, sz * 0.20)
+        p.fillPath(tile, QColor("#20252E"))
+        p.setPen(QPen(QColor("#38404E"), max(1.0, sz * 0.03)))
         p.drawPath(tile)
 
-        # QFP package pins
-        pin_pen = QPen(QColor(255, 255, 255, 225), max(1.4, sz * 0.042))
-        pin_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pin_pen)
+        pen = QPen(QColor("#CFD5E0"), max(1.4, sz * 0.042))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
         for frac in (0.37, 0.50, 0.63):
             pos = sz * frac
-            p.drawLine(QPointF(pos, sz * 0.18), QPointF(pos, sz * 0.285))
-            p.drawLine(QPointF(pos, sz * 0.715), QPointF(pos, sz * 0.82))
-            p.drawLine(QPointF(sz * 0.18, pos), QPointF(sz * 0.285, pos))
-            p.drawLine(QPointF(sz * 0.715, pos), QPointF(sz * 0.82, pos))
+            p.drawLine(QPointF(pos, sz * 0.19), QPointF(pos, sz * 0.29))
+            p.drawLine(QPointF(pos, sz * 0.71), QPointF(pos, sz * 0.81))
+            p.drawLine(QPointF(sz * 0.19, pos), QPointF(sz * 0.29, pos))
+            p.drawLine(QPointF(sz * 0.71, pos), QPointF(sz * 0.81, pos))
 
-        # Silicon die core
-        core_rect = QRectF(sz * 0.285, sz * 0.285, sz * 0.43, sz * 0.43)
         core = QPainterPath()
-        core.addRoundedRect(core_rect, sz * 0.075, sz * 0.075)
-        p.fillPath(core, QColor(11, 18, 38, 125))
-        p.setPen(QPen(QColor("#FFFFFF"), max(1.4, sz * 0.04)))
+        core.addRoundedRect(QRectF(sz * 0.30, sz * 0.30, sz * 0.40, sz * 0.40), sz * 0.055, sz * 0.055)
+        p.fillPath(core, QColor("#13161B"))
+        p.setPen(QPen(QColor("#ECEEF2"), max(1.3, sz * 0.038)))
         p.drawPath(core)
 
-        # Crisp CAN differential square/pulse wave inside the silicon die
-        wave_pen = QPen(QColor("#93C5FD"), max(1.2, sz * 0.036))
-        wave_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        wave_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        p.setPen(wave_pen)
-        p.drawPolyline(
-            [
-                QPointF(sz * 0.355, sz * 0.54),
-                QPointF(sz * 0.42, sz * 0.54),
-                QPointF(sz * 0.46, sz * 0.42),
-                QPointF(sz * 0.535, sz * 0.58),
-                QPointF(sz * 0.575, sz * 0.47),
-                QPointF(sz * 0.645, sz * 0.47),
-            ]
-        )
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(INFO))
+        p.drawEllipse(QPointF(sz * 0.41, sz * 0.41), sz * 0.045, sz * 0.045)
         p.end()
         icon.addPixmap(pix)
     return icon
 
 
-def dot_icon(color: str, size: int = 8) -> QIcon:
-    """Luminous status dot with soft translucent halo for chips and the status bar."""
+def dot_icon(color: str, size: int = 7) -> QIcon:
+    """Crisp geometric status LED without blurry glow."""
     pix = QPixmap(size * 2, size * 2)
     pix.fill(Qt.GlobalColor.transparent)
     p = QPainter(pix)
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     p.setPen(Qt.PenStyle.NoPen)
-    halo = QColor(color)
-    halo.setAlpha(52)
-    p.setBrush(halo)
-    p.drawEllipse(QRectF(size * 0.18, size * 0.18, size * 1.64, size * 1.64))
     p.setBrush(QColor(color))
-    p.drawEllipse(QRectF(size * 0.52, size * 0.52, size * 0.96, size * 0.96))
+    p.drawEllipse(QRectF(size * 0.5, size * 0.5, size, size))
     p.end()
     return QIcon(pix)
-
-
-def _draw_glyph(p: QPainter, kind: str, rect: QRectF, color: QColor, stroke: float) -> None:
-    pen = QPen(color, stroke, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-    p.setPen(pen)
-    p.setBrush(Qt.BrushStyle.NoBrush)
-    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
-
-    if kind == "can":
-        # ECU connector + dual CAN-H/CAN-L differential bus nodes
-        p.drawRoundedRect(QRectF(x + w * 0.10, y + h * 0.24, w * 0.44, h * 0.52), w * 0.10, w * 0.10)
-        p.drawLine(QPointF(x + w * 0.54, y + h * 0.38), QPointF(x + w * 0.80, y + h * 0.38))
-        p.drawLine(QPointF(x + w * 0.54, y + h * 0.62), QPointF(x + w * 0.80, y + h * 0.62))
-        p.setBrush(color)
-        p.drawEllipse(QPointF(x + w * 0.85, y + h * 0.38), w * 0.065, w * 0.065)
-        p.drawEllipse(QPointF(x + w * 0.85, y + h * 0.62), w * 0.065, w * 0.065)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawLine(QPointF(x + w * 0.24, y + h * 0.42), QPointF(x + w * 0.38, y + h * 0.42))
-        p.drawLine(QPointF(x + w * 0.24, y + h * 0.58), QPointF(x + w * 0.38, y + h * 0.58))
-    elif kind == "files":
-        # Stacked flash memory layers (CodeFlash / DataFlash / Uflash)
-        top = QPainterPath()
-        top.moveTo(x + w * 0.50, y + h * 0.14)
-        top.lineTo(x + w * 0.88, y + h * 0.33)
-        top.lineTo(x + w * 0.50, y + h * 0.52)
-        top.lineTo(x + w * 0.12, y + h * 0.33)
-        top.closeSubpath()
-        p.drawPath(top)
-        p.drawPolyline([QPointF(x + w * 0.12, y + h * 0.50), QPointF(x + w * 0.50, y + h * 0.69), QPointF(x + w * 0.88, y + h * 0.50)])
-        p.drawPolyline([QPointF(x + w * 0.12, y + h * 0.67), QPointF(x + w * 0.50, y + h * 0.86), QPointF(x + w * 0.88, y + h * 0.67)])
-    elif kind == "folder":
-        path = QPainterPath()
-        path.moveTo(x + w * 0.10, y + h * 0.26)
-        path.lineTo(x + w * 0.38, y + h * 0.26)
-        path.lineTo(x + w * 0.47, y + h * 0.36)
-        path.lineTo(x + w * 0.90, y + h * 0.36)
-        path.lineTo(x + w * 0.90, y + h * 0.78)
-        path.lineTo(x + w * 0.10, y + h * 0.78)
-        path.closeSubpath()
-        fill = QColor(color)
-        fill.setAlpha(32)
-        p.fillPath(path, fill)
-        p.drawPath(path)
-    elif kind == "cp":
-        # Shield + security keyhole (IKA / Component Protection)
-        sh = QPainterPath()
-        sh.moveTo(x + w * 0.50, y + h * 0.12)
-        sh.lineTo(x + w * 0.84, y + h * 0.25)
-        sh.quadTo(x + w * 0.84, y + h * 0.65, x + w * 0.50, y + h * 0.88)
-        sh.quadTo(x + w * 0.16, y + h * 0.65, x + w * 0.16, y + h * 0.25)
-        sh.closeSubpath()
-        p.drawPath(sh)
-        p.drawEllipse(QPointF(x + w * 0.50, y + h * 0.45), w * 0.08, w * 0.08)
-        p.drawLine(QPointF(x + w * 0.50, y + h * 0.53), QPointF(x + w * 0.50, y + h * 0.66))
-    elif kind == "eng":
-        # Diagnostic telemetry waveform
-        p.drawPolyline(
-            [
-                QPointF(x + w * 0.10, y + h * 0.54),
-                QPointF(x + w * 0.30, y + h * 0.54),
-                QPointF(x + w * 0.42, y + h * 0.20),
-                QPointF(x + w * 0.57, y + h * 0.82),
-                QPointF(x + w * 0.69, y + h * 0.46),
-                QPointF(x + w * 0.90, y + h * 0.46),
-            ]
-        )
-    elif kind == "swap":
-        # Key / FEC license emblem
-        p.drawEllipse(QPointF(x + w * 0.34, y + h * 0.50), w * 0.20, w * 0.20)
-        p.drawLine(QPointF(x + w * 0.54, y + h * 0.50), QPointF(x + w * 0.90, y + h * 0.50))
-        p.drawLine(QPointF(x + w * 0.74, y + h * 0.50), QPointF(x + w * 0.74, y + h * 0.66))
-        p.drawLine(QPointF(x + w * 0.86, y + h * 0.50), QPointF(x + w * 0.86, y + h * 0.63))
-    elif kind == "zdc":
-        # 3 calibration sliders (ZDC / FPA parameterization)
-        for ry, knob in ((0.26, 0.36), (0.50, 0.68), (0.74, 0.44)):
-            p.drawLine(QPointF(x + w * 0.14, y + h * ry), QPointF(x + w * 0.86, y + h * ry))
-            p.setBrush(QColor(BG_SECTION))
-            p.drawEllipse(QPointF(x + w * knob, y + h * ry), w * 0.09, w * 0.09)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-    elif kind == "dtc":
-        # Octagon / alert diagnostic indicator
-        tri = QPainterPath()
-        tri.moveTo(x + w * 0.50, y + h * 0.15)
-        tri.lineTo(x + w * 0.88, y + h * 0.82)
-        tri.lineTo(x + w * 0.12, y + h * 0.82)
-        tri.closeSubpath()
-        p.drawPath(tri)
-        p.drawLine(QPointF(x + w * 0.50, y + h * 0.42), QPointF(x + w * 0.50, y + h * 0.60))
-        p.setBrush(color)
-        p.drawEllipse(QPointF(x + w * 0.50, y + h * 0.71), w * 0.03, w * 0.03)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-    elif kind == "boot":
-        # Bootloader shackle lock
-        p.drawRoundedRect(QRectF(x + w * 0.20, y + h * 0.46, w * 0.60, h * 0.40), w * 0.10, w * 0.10)
-        shackle = QPainterPath()
-        shackle.moveTo(x + w * 0.32, y + h * 0.46)
-        shackle.lineTo(x + w * 0.32, y + h * 0.31)
-        shackle.arcTo(QRectF(x + w * 0.32, y + h * 0.14, w * 0.36, h * 0.34), 180, -180)
-        shackle.lineTo(x + w * 0.68, y + h * 0.46)
-        p.drawPath(shackle)
-    else:  # "hw" (EEPROM & OPBT silicon IC)
-        p.drawRoundedRect(QRectF(x + w * 0.25, y + h * 0.22, w * 0.50, h * 0.56), w * 0.09, w * 0.09)
-        for ry in (0.34, 0.50, 0.66):
-            p.drawLine(QPointF(x + w * 0.11, y + h * ry), QPointF(x + w * 0.25, y + h * ry))
-            p.drawLine(QPointF(x + w * 0.75, y + h * ry), QPointF(x + w * 0.89, y + h * ry))
-        p.setBrush(color)
-        p.drawEllipse(QPointF(x + w * 0.37, y + h * 0.35), w * 0.035, w * 0.035)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-
-
-def glyph_pixmap(kind: str, color: str = TEXT_SECONDARY, size: int = 16) -> QPixmap:
-    """Crisp 2x HiDPI vector icon for navigation items, rows, and badges."""
-    dpr = 2
-    pix = QPixmap(size * dpr, size * dpr)
-    pix.setDevicePixelRatio(dpr)
-    pix.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    _draw_glyph(p, kind, QRectF(1.0, 1.0, size - 2.0, size - 2.0), QColor(color), max(1.35, size * 0.095))
-    p.end()
-    return pix
-
-
-def tile_badge_pixmap(kind: str, accent: str = ACCENT, size: int = 40) -> QPixmap:
-    """Rounded translucent squircle badge with glowing border and crisp vector glyph inside."""
-    dpr = 2
-    pix = QPixmap(size * dpr, size * dpr)
-    pix.setDevicePixelRatio(dpr)
-    pix.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-    box = QRectF(1.0, 1.0, size - 2.0, size - 2.0)
-    path = QPainterPath()
-    path.addRoundedRect(box, size * 0.26, size * 0.26)
-
-    c_top = QColor(accent)
-    c_top.setAlpha(46)
-    c_bot = QColor(accent)
-    c_bot.setAlpha(18)
-    grad = QLinearGradient(box.topLeft(), box.bottomRight())
-    grad.setColorAt(0.0, c_top)
-    grad.setColorAt(1.0, c_bot)
-    p.fillPath(path, grad)
-
-    rim = QColor(accent)
-    rim.setAlpha(115)
-    p.setPen(QPen(rim, 1.1))
-    p.drawPath(path)
-
-    inset = size * 0.24
-    _draw_glyph(
-        p,
-        kind,
-        QRectF(inset, inset, size - 2 * inset, size - 2 * inset),
-        QColor(accent),
-        max(1.6, size * 0.048),
-    )
-    p.end()
-    return pix
 
 
 def build_stylesheet() -> str:
     """QSS for ContiTool. Fonts are left to QApplication.setFont / mono_font() so setFont() keeps working."""
     return f"""
     QToolTip {{
-        background-color: #1A2232; color: {TEXT}; border: 1px solid {BORDER_STRONG};
-        border-radius: 6px; padding: 5px 8px;
+        background-color: #21262F; color: {TEXT}; border: 1px solid {BORDER_STRONG};
+        border-radius: 4px; padding: 4px 8px;
     }}
     QMenuBar {{
-        background-color: {BG_SIDEBAR}; color: {TEXT_SECONDARY};
-        border-bottom: 1px solid #182030; padding: 3px 10px;
+        background-color: {BG_CHROME}; color: {TEXT_SECONDARY};
+        border-bottom: 1px solid #1C2027; padding: 2px 8px;
     }}
-    QMenuBar::item {{ background: transparent; padding: 5px 11px; border-radius: 5px; }}
+    QMenuBar::item {{ background: transparent; padding: 4px 10px; border-radius: 4px; }}
     QMenuBar::item:selected {{ background-color: {BG_HOVER}; color: {TEXT}; }}
     QMenu {{
-        background-color: #171E2C; border: 1px solid {BORDER_STRONG};
-        border-radius: 8px; padding: 5px;
+        background-color: #1C2027; border: 1px solid {BORDER_STRONG};
+        border-radius: 6px; padding: 4px;
     }}
-    QMenu::item {{ padding: 6px 26px 6px 12px; border-radius: 5px; color: {TEXT}; }}
+    QMenu::item {{ padding: 5px 24px 5px 12px; border-radius: 4px; color: {TEXT}; }}
     QMenu::item:selected {{ background-color: {BG_SELECTED}; color: #FFFFFF; }}
     QMenu::item:disabled {{ color: {TEXT_MUTED}; }}
-    QMenu::separator {{ height: 1px; background: {BORDER}; margin: 4px 8px; }}
+    QMenu::separator {{ height: 1px; background: {BORDER}; margin: 4px 6px; }}
     QStatusBar {{
-        background-color: {BG_SIDEBAR}; border-top: 1px solid #1A2232; color: {TEXT_SECONDARY};
+        background-color: {BG_CHROME}; border-top: 1px solid #1E232B; color: {TEXT_SECONDARY};
     }}
     QStatusBar::item {{ border: none; }}
 
-    /* ── Surfaces ── */
+    /* ── Architectural Surfaces ── */
     QFrame#Header {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0E131D, stop:1 {BG_SIDEBAR});
-        border-bottom: 1px solid #1E2738;
-        min-height: 46px;
+        background-color: {BG_SIDEBAR};
+        border-bottom: 1px solid {BORDER};
+        min-height: 42px;
+    }}
+    QFrame#IdentityBar {{
+        background-color: #191D24;
+        border-bottom: 1px solid {BORDER};
+    }}
+    QFrame#NavPane {{
+        background-color: {BG_SIDEBAR};
+        border-right: 1px solid {BORDER};
+    }}
+    QWidget#DialogFooter {{
+        background-color: {BG_SIDEBAR};
+        border-top: 1px solid {BORDER};
     }}
     QFrame#Section {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #18202E, stop:1 #131924);
+        background-color: {BG_SECTION};
         border: 1px solid {BORDER};
-        border-radius: 10px;
-    }}
-    QFrame#HeroBanner {{
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #17233B, stop:0.55 #141C2B, stop:1 #111723);
-        border: 1px solid #2A3B5C;
-        border-radius: 12px;
-    }}
-    QFrame#FeatureTile {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1A2334, stop:1 #131925);
-        border: 1px solid #28344B;
-        border-radius: 12px;
-    }}
-    QFrame#FeatureTile:hover {{
-        border: 1px solid #3C547D;
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1E293D, stop:1 #151C2A);
-    }}
-    QFrame#IdentityCard {{
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #192338, stop:0.45 #161E2D, stop:1 #131924);
-        border: 1px solid #2B3A55;
-        border-radius: 12px;
-    }}
-    QFrame#MetricBox {{
-        background-color: rgba(10, 14, 22, 0.58);
-        border: 1px solid #20293A;
-        border-radius: 8px;
-    }}
-    QFrame#Console {{
-        background-color: #0B0F17;
-        border-top: 1px solid #1E2738;
-    }}
-    QFrame#Divider {{ background-color: #20293B; max-height: 1px; min-height: 1px; border: none; }}
-    QFrame#WriteBar {{
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1A2947, stop:1 #152038);
-        border: 1px solid #314E85;
-        border-left: 3px solid {ACCENT};
-        border-radius: 10px;
+        border-top-color: #303743;
+        border-radius: 6px;
     }}
     QFrame#Step {{
-        background-color: rgba(255, 255, 255, 0.025);
+        background-color: {BG_SECTION};
         border: 1px solid {BORDER};
-        border-radius: 8px;
+        border-top-color: #303743;
+        border-radius: 6px;
+    }}
+    QFrame#Console {{
+        background-color: {BG_SIDEBAR};
+        border-top: 1px solid {BORDER};
+    }}
+    QFrame#Divider {{ background-color: {BORDER}; max-height: 1px; min-height: 1px; border: none; }}
+    QFrame#WriteBar {{
+        background-color: #18202C;
+        border-top: 1px solid #2B3B52;
+        border-left: 3px solid {ACCENT_HOVER};
     }}
     QLabel#StepNum {{
-        background-color: #22304A; color: #93C5FD; border: 1px solid rgba(96, 165, 250, 0.35);
-        border-radius: 11px; font-size: 11px; font-weight: 700;
+        background-color: #262C36; color: {TEXT}; border: 1px solid #353C4A;
+        border-radius: 4px; font-size: 11px; font-weight: 600;
     }}
+
     QListWidget#Nav {{ background: transparent; border: none; outline: 0; }}
     QListWidget#Nav::item {{
-        border-radius: 7px; margin: 2px 2px; border: 1px solid transparent;
+        border-radius: 5px; margin: 1px 4px; border-left: 2px solid transparent;
     }}
     QListWidget#Nav::item:selected {{
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(59, 130, 246, 0.24), stop:1 rgba(59, 130, 246, 0.06));
-        border: 1px solid rgba(96, 165, 250, 0.30);
-        border-left: 3px solid {ACCENT};
+        background-color: #202631;
+        border-left: 2px solid {INFO};
     }}
     QListWidget#Nav::item:hover:!selected {{
-        background-color: rgba(255, 255, 255, 0.035);
-        border: 1px solid rgba(255, 255, 255, 0.05);
+        background-color: #1A1E26;
     }}
+
     QListWidget#Adapters {{
         background-color: {BG_INPUT}; border: 1px solid {BORDER};
-        border-radius: 8px; padding: 4px; outline: 0;
+        border-radius: 5px; padding: 3px; outline: 0;
     }}
-    QListWidget#Adapters::item {{ border-radius: 6px; margin: 2px; border: 1px solid transparent; }}
-    QListWidget#Adapters::item:selected {{
-        background-color: {BG_SELECTED}; border: 1px solid rgba(96, 165, 250, 0.40);
-    }}
+    QListWidget#Adapters::item {{ border-radius: 4px; margin: 1px; }}
+    QListWidget#Adapters::item:selected {{ background-color: {BG_SELECTED}; border-left: 2px solid {INFO}; }}
     QListWidget#Adapters::item:hover:!selected {{ background-color: {BG_HOVER}; }}
     QLabel#AdapterTitle {{ color: {TEXT}; font-weight: 600; }}
     QLabel#AdapterTitle[tone="muted"] {{ color: {TEXT_MUTED}; }}
+
     QFrame#ListRow {{
-        background-color: rgba(21, 27, 38, 0.72);
-        border: 1px solid #1F2838;
-        border-radius: 8px;
+        background-color: transparent;
+        border-bottom: 1px solid {BORDER_SUBTLE};
+        border-radius: 0;
     }}
     QFrame#ListRow:hover {{
-        background-color: #1B2436;
-        border: 1px solid #324463;
+        background-color: #1B1F26;
+        border-radius: 4px;
     }}
+
     QScrollArea {{ background: transparent; border: none; }}
     QScrollArea > QWidget > QWidget {{ background: transparent; }}
-    QSplitter::handle {{ background-color: #1D2636; }}
+    QSplitter::handle {{ background-color: {BORDER}; }}
 
     QFrame#Callout {{
-        border-radius: 5px; border: 1px solid rgba(96, 165, 250, 0.24); border-left: 3px solid {INFO};
-        background-color: #131D2E;
+        border-radius: 5px; border: 1px solid #282F3B; border-left: 3px solid {INFO};
+        background-color: #181D25;
     }}
     QFrame#Callout[tone="ok"] {{
-        border-color: rgba(52, 211, 153, 0.24); border-left: 3px solid {OK}; background-color: #11221E;
+        border-color: #24362E; border-left-color: {OK}; background-color: #161F1B;
     }}
     QFrame#Callout[tone="warn"] {{
-        border-color: rgba(251, 191, 36, 0.24); border-left: 3px solid {WARN}; background-color: #231E13;
+        border-color: #3B3122; border-left-color: {WARN}; background-color: #1E1B16;
     }}
     QFrame#Callout[tone="err"] {{
-        border-color: rgba(248, 113, 113, 0.26); border-left: 3px solid {ERR}; background-color: #27171C;
+        border-color: #3F2629; border-left-color: {ERR}; background-color: #201719;
     }}
 
-    /* ── Typography ── */
+    /* ── Typography & Pure Text Status Readouts (Zero Pill Capsules) ── */
     QLabel {{ background: transparent; }}
-    QLabel#AppName {{ font-size: 14px; font-weight: 700; color: #F8FAFC; letter-spacing: 0.2px; }}
-    QLabel#VersionBadge {{
-        font-size: 10px; font-weight: 700; color: #93C5FD;
-        background-color: rgba(59, 130, 246, 0.14); border: 1px solid rgba(96, 165, 250, 0.30);
-        border-radius: 7px; padding: 1px 6px;
-    }}
-    QLabel#PageTitle {{ font-size: 19px; font-weight: 700; color: #F8FAFC; }}
-    QLabel#PartNumber {{ font-size: 21px; font-weight: 700; color: #F8FAFC; letter-spacing: 0.4px; }}
+    QLabel#AppName {{ font-size: 13px; font-weight: 600; color: {TEXT}; letter-spacing: 0.2px; }}
+    QLabel#PageTitle {{ font-size: 18px; font-weight: 600; color: {TEXT}; }}
+    QLabel#PartNumber {{ font-size: 19px; font-weight: 600; color: {TEXT}; letter-spacing: 0.3px; }}
     QLabel#SectionTitle {{ font-size: 14px; font-weight: 600; color: {TEXT}; }}
-    QLabel#GroupLabel {{ font-size: 10px; font-weight: 700; color: {TEXT_MUTED}; letter-spacing: 0.7px; }}
+    QLabel#GroupLabel {{ font-size: 10px; font-weight: 600; color: {TEXT_MUTED}; letter-spacing: 0.7px; }}
     QLabel#FieldLabel {{ font-weight: 600; color: {TEXT}; }}
     QLabel#Hint {{ color: {TEXT_SECONDARY}; }}
     QLabel[tone="ok"], QLabel#Hint[tone="ok"] {{ color: {OK}; }}
@@ -562,176 +371,191 @@ def build_stylesheet() -> str:
     QLabel[tone="muted"], QLabel#Hint[tone="muted"] {{ color: {TEXT_MUTED}; }}
 
     QLabel#Pill {{
-        border-radius: 9px; padding: 2px 9px; font-size: 11px; font-weight: 600;
-        background-color: rgba(148, 163, 184, 0.10); border: 1px solid rgba(148, 163, 184, 0.24);
-        color: {TEXT_SECONDARY};
+        background-color: transparent; border: none; padding: 0;
+        font-size: 12px; font-weight: 500; color: {TEXT_MUTED};
     }}
-    QLabel#Pill[tone="ok"] {{
-        background-color: rgba(52, 211, 153, 0.13); border-color: rgba(52, 211, 153, 0.38); color: {OK};
-    }}
-    QLabel#Pill[tone="warn"] {{
-        background-color: rgba(251, 191, 36, 0.13); border-color: rgba(251, 191, 36, 0.38); color: {WARN};
-    }}
-    QLabel#Pill[tone="err"] {{
-        background-color: rgba(248, 113, 113, 0.14); border-color: rgba(248, 113, 113, 0.40); color: {ERR};
-    }}
-    QLabel#Pill[tone="info"] {{
-        background-color: rgba(96, 165, 250, 0.14); border-color: rgba(96, 165, 250, 0.40); color: {INFO};
+    QLabel#Pill[tone="ok"] {{ color: {OK}; }}
+    QLabel#Pill[tone="warn"] {{ color: {WARN}; }}
+    QLabel#Pill[tone="err"] {{ color: {ERR}; }}
+    QLabel#Pill[tone="info"] {{ color: {INFO}; }}
+    QListWidget#Nav QLabel#Pill {{
+        font-size: 11px; font-weight: 500;
     }}
 
-    /* ── Buttons ── */
+    /* ── Tactile Machined Buttons ── */
     QPushButton, QToolButton {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #232C3F, stop:1 #1A2130);
-        color: {TEXT}; border: 1px solid {BORDER_STRONG};
-        border-radius: 6px; padding: 5px 13px; min-height: 20px; font-weight: 500;
+        background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2B303B, stop:1 #232831);
+        color: {TEXT};
+        border: 1px solid #373E4B;
+        border-top-color: #444C5C;
+        border-bottom-color: #1B1F26;
+        border-radius: 5px;
+        padding: 5px 13px;
+        min-height: 20px;
     }}
     QPushButton:hover, QToolButton:hover {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2B364D, stop:1 #212A3D);
-        border-color: #46597A;
+        background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #333946, stop:1 #2A303B);
+        border-color: #4A5364;
+        border-top-color: #586276;
     }}
-    QPushButton:pressed, QToolButton:pressed {{ background-color: #161C29; }}
+    QPushButton:pressed, QToolButton:pressed {{
+        background-color: #1E222A;
+        border-color: #303642;
+    }}
     QPushButton:disabled, QToolButton:disabled {{
-        background: rgba(255, 255, 255, 0.02); color: {TEXT_MUTED}; border-color: #1E2636;
+        background-color: #181B21;
+        color: {TEXT_MUTED};
+        border-color: #252A33;
     }}
     QPushButton:focus, QToolButton:focus {{ outline: none; }}
-    QPushButton:checked {{ background-color: {BG_SELECTED}; border-color: {ACCENT}; color: #FFFFFF; }}
+    QPushButton:checked {{
+        background-color: #2E3542; border-color: #4D576B; color: #FFFFFF;
+    }}
     QToolButton::menu-indicator {{ image: none; width: 0; }}
 
     QPushButton#PrimaryBtn {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #4F8FF7, stop:1 #2563EB);
-        border: 1px solid #60A5FA; border-bottom-color: #1D4ED8;
-        color: #FFFFFF; font-weight: 600;
+        background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3570C6, stop:1 #2859A3);
+        border: 1px solid #3A76CC;
+        border-top-color: #508CE0;
+        border-bottom-color: #1B3F75;
+        color: #FFFFFF;
+        font-weight: bold;
     }}
     QPushButton#PrimaryBtn:hover {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #60A5FA, stop:1 #3B82F6);
-        border-color: #93C5FD;
+        background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3F7CD4, stop:1 #2F65B5);
+        border-color: #4E8AE0;
+        border-top-color: #669EEB;
     }}
     QPushButton#PrimaryBtn:pressed {{
-        background: #1D4ED8; border-color: #2563EB;
+        background-color: #234E8F;
+        border-color: #2D5FA8;
     }}
     QPushButton#PrimaryBtn:disabled {{
-        background: #1C2942; border-color: #253554; color: #697A98;
+        background-color: #1D2533;
+        border-color: #283345;
+        color: #657082;
     }}
 
     QPushButton#DangerBtn {{
-        background-color: rgba(248, 113, 113, 0.08); border-color: rgba(248, 113, 113, 0.42); color: {ERR};
+        background-color: #23181B;
+        border: 1px solid #572F34;
+        border-top-color: #6B393F;
+        color: #EB6C6C;
     }}
     QPushButton#DangerBtn:hover {{
-        background-color: rgba(248, 113, 113, 0.18); border-color: {ERR};
+        background-color: #2F1D21;
+        border-color: #7D4148;
+        color: #F48383;
     }}
-    QPushButton#DangerBtn:disabled {{ background: transparent; border-color: {BORDER}; color: {TEXT_MUTED}; }}
+    QPushButton#DangerBtn:disabled {{ background-color: transparent; border-color: {BORDER}; color: {TEXT_MUTED}; }}
 
     QPushButton#GhostBtn, QToolButton#GhostBtn {{
-        background: transparent; border-color: transparent; color: {TEXT_SECONDARY}; padding: 4px 10px;
+        background-color: transparent; border: 1px solid transparent; color: {TEXT_SECONDARY}; padding: 4px 9px;
     }}
     QPushButton#GhostBtn:hover, QToolButton#GhostBtn:hover {{
-        background-color: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.08); color: {TEXT};
+        background-color: #222730; border-color: #2F3642; color: {TEXT};
     }}
-    QPushButton#GhostBtn:checked {{ background-color: {BG_HOVER}; color: {TEXT}; }}
+    QPushButton#GhostBtn:checked {{ background-color: {BG_HOVER}; border-color: #363E4C; color: {TEXT}; }}
     QPushButton#GhostBtn:disabled {{ color: {TEXT_MUTED}; background: transparent; border-color: transparent; }}
 
-    QPushButton#LinkBtn {{ background: transparent; border: none; padding: 0; min-height: 0; color: {INFO}; font-weight: 500; }}
-    QPushButton#LinkBtn:hover {{ color: #93C5FD; text-decoration: underline; }}
+    QPushButton#LinkBtn {{ background: transparent; border: none; padding: 0; min-height: 0; color: {INFO}; }}
+    QPushButton#LinkBtn:hover {{ color: #82B0F7; text-decoration: underline; }}
 
+    /* Header adapter readout: matches SegBtn geometry (4px radius, recessed instrument frame) */
     QPushButton#Chip {{
-        background-color: #131A26; border: 1px solid #29354B; border-radius: 13px;
-        padding: 4px 12px; min-height: 18px; color: {TEXT}; font-size: 12px; font-weight: 500;
+        background-color: #171B21; border: 1px solid #2B313C; border-radius: 4px;
+        padding: 3px 10px; min-height: 18px; color: {TEXT_SECONDARY}; font-size: 12px; font-weight: 500;
     }}
-    QPushButton#Chip:hover {{ background-color: #1B2536; border-color: #3E5275; }}
+    QPushButton#Chip:hover {{ background-color: #1F242D; border-color: #3C4454; color: {TEXT}; }}
 
     QPushButton#TabBtn {{
         background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
-        color: {TEXT_SECONDARY}; padding: 0 14px; min-height: 44px; font-weight: 600;
+        color: {TEXT_SECONDARY}; padding: 0 12px; min-height: 41px; font-weight: 600;
     }}
-    QPushButton#TabBtn:hover {{ color: {TEXT}; background-color: rgba(255, 255, 255, 0.025); }}
-    QPushButton#TabBtn:checked {{
-        color: #FFFFFF; border-bottom: 2px solid {ACCENT};
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 transparent, stop:1 rgba(59, 130, 246, 0.12));
-    }}
+    QPushButton#TabBtn:hover {{ color: {TEXT}; }}
+    QPushButton#TabBtn:checked {{ color: {TEXT}; border-bottom-color: {INFO}; background: transparent; }}
     QPushButton#TabBtn:disabled {{ color: {TEXT_MUTED}; }}
 
     QPushButton#SegBtn {{
-        background-color: #111622; border: 1px solid #2A364D; color: {TEXT_SECONDARY};
-        border-radius: 0; padding: 3px 10px; min-height: 18px; font-size: 11px; font-weight: 600;
+        background-color: #171B21; border: 1px solid #2B313C; color: {TEXT_SECONDARY};
+        border-radius: 0; padding: 3px 9px; min-height: 18px; font-size: 11px; font-weight: 600;
     }}
-    QPushButton#SegBtn:hover {{ color: {TEXT}; background-color: #192132; }}
+    QPushButton#SegBtn:hover {{ color: {TEXT}; background-color: #1E232B; }}
     QPushButton#SegBtn:checked {{
-        background-color: #213458; border-color: #3B82F6; color: #FFFFFF;
+        background-color: #2A303C; border-color: #3F4758; color: {TEXT};
     }}
-    QPushButton#SegBtn[pos="left"] {{ border-top-left-radius: 6px; border-bottom-left-radius: 6px; border-right: none; }}
-    QPushButton#SegBtn[pos="right"] {{ border-top-right-radius: 6px; border-bottom-right-radius: 6px; }}
+    QPushButton#SegBtn[pos="left"] {{ border-top-left-radius: 4px; border-bottom-left-radius: 4px; border-right: none; }}
+    QPushButton#SegBtn[pos="right"] {{ border-top-right-radius: 4px; border-bottom-right-radius: 4px; }}
 
     /* ── Inputs ── */
     QLineEdit, QComboBox, QSpinBox {{
-        background-color: {BG_INPUT}; color: {TEXT}; border: 1px solid #2A364B;
-        border-radius: 6px; padding: 5px 9px; min-height: 22px; selection-background-color: {ACCENT};
+        background-color: {BG_INPUT}; color: {TEXT}; border: 1px solid #2E3542;
+        border-radius: 5px; padding: 5px 9px; min-height: 21px; selection-background-color: {ACCENT};
     }}
-    QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{ border-color: #3A4B69; }}
+    QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{ border-color: #414A5C; }}
     QPlainTextEdit, QTextEdit {{
-        background-color: {BG_INPUT}; color: {TEXT}; border: 1px solid #222C3F;
-        border-radius: 7px; padding: 6px; selection-background-color: {ACCENT};
+        background-color: {BG_INPUT}; color: {TEXT}; border: 1px solid #242A34;
+        border-radius: 5px; padding: 6px; selection-background-color: {ACCENT};
     }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QPlainTextEdit:focus, QTextEdit:focus {{
-        border-color: {ACCENT};
+        border-color: {INFO};
     }}
     QLineEdit[tone="err"] {{ border-color: {ERR}; }}
-    QLineEdit[drag="true"] {{ border: 1px dashed {ACCENT}; background-color: #152238; }}
+    QLineEdit[drag="true"] {{ border: 1px dashed {INFO}; background-color: #17202E; }}
     QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{ color: {TEXT_MUTED}; border-color: {BORDER}; }}
     QComboBox::drop-down {{ border: none; width: 24px; }}
     QComboBox QAbstractItemView {{
-        background-color: #171E2C; border: 1px solid {BORDER_STRONG}; border-radius: 6px; padding: 4px;
+        background-color: #1C2027; border: 1px solid {BORDER_STRONG}; border-radius: 5px; padding: 4px;
         selection-background-color: {BG_SELECTED}; outline: 0;
     }}
-    QComboBox QAbstractItemView::item {{ min-height: 25px; padding: 3px 8px; border-radius: 4px; }}
+    QComboBox QAbstractItemView::item {{ min-height: 24px; padding: 3px 8px; border-radius: 3px; }}
     QCheckBox, QRadioButton {{ spacing: 8px; color: {TEXT}; background: transparent; min-height: 20px; }}
     QCheckBox:disabled, QRadioButton:disabled {{ color: {TEXT_MUTED}; }}
 
     /* ── Tabs ── */
     QTabWidget::pane {{
-        border: 1px solid {BORDER}; border-radius: 8px; background-color: {BG_WINDOW}; top: -1px;
+        border: 1px solid {BORDER}; border-radius: 6px; background-color: {BG_WINDOW}; top: -1px;
     }}
     QTabBar::tab {{
         background-color: transparent; color: {TEXT_SECONDARY}; border: 1px solid transparent;
-        border-bottom: 2px solid transparent; padding: 8px 15px; min-height: 20px; font-weight: 600;
-        margin-right: 3px;
+        border-bottom: 2px solid transparent; padding: 7px 14px; min-height: 20px; font-weight: 600;
+        margin-right: 2px;
     }}
     QTabBar::tab:hover:!selected {{
-        color: {TEXT}; background-color: {BG_HOVER}; border-top-left-radius: 6px; border-top-right-radius: 6px;
+        color: {TEXT}; background-color: #1D222A; border-top-left-radius: 4px; border-top-right-radius: 4px;
     }}
-    QTabBar::tab:selected {{ color: #FFFFFF; border-bottom-color: {ACCENT}; }}
+    QTabBar::tab:selected {{ color: {TEXT}; border-bottom-color: {INFO}; }}
 
     /* ── Progress ── */
     QProgressBar {{
-        background-color: #1A2334; border: none; border-radius: 3px; max-height: 6px; min-height: 6px;
+        background-color: #242A34; border: none; border-radius: 2px; max-height: 4px; min-height: 4px;
     }}
-    QProgressBar::chunk {{
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563EB, stop:1 #60A5FA);
-        border-radius: 3px;
-    }}
-    QProgressBar[tone="ok"]::chunk {{
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #10B981, stop:1 #34D399);
-    }}
+    QProgressBar::chunk {{ background-color: {INFO}; border-radius: 2px; }}
+    QProgressBar[tone="ok"]::chunk {{ background-color: {OK}; }}
     QProgressBar[tone="err"]::chunk {{ background-color: {ERR}; }}
     QProgressBar[tone="warn"]::chunk {{ background-color: {WARN}; }}
 
     /* ── Tables ── */
     QTableView {{
-        background-color: {BG_INPUT}; alternate-background-color: #101622; gridline-color: #1A2233;
-        border: 1px solid {BORDER}; border-radius: 8px; color: {TEXT};
-        selection-background-color: {BG_SELECTED}; selection-color: #FFFFFF;
+        background-color: {BG_INPUT}; alternate-background-color: #14181E; gridline-color: #1F242D;
+        border: 1px solid {BORDER}; border-radius: 5px; color: {TEXT};
+        selection-background-color: {BG_SELECTED}; selection-color: {TEXT};
     }}
     QTableView::item {{ padding: 2px 8px; }}
-    QTableView::item:hover {{ background-color: rgba(255, 255, 255, 0.03); }}
+    QTableView QComboBox {{
+        background-color: transparent; border: none; border-radius: 0; padding: 2px 8px; min-height: 24px;
+    }}
+    QTableView QComboBox:hover {{ background-color: #1C222B; }}
     QHeaderView::section {{
-        background-color: #141B28; color: {TEXT_SECONDARY}; border: none;
+        background-color: #171B22; color: {TEXT_SECONDARY}; border: none;
         border-bottom: 1px solid {BORDER}; padding: 6px 8px; font-weight: 600;
     }}
 
     /* ── Scrollbars ── */
     QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
     QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
-    QScrollBar::handle {{ background: #2D3A52; border-radius: 4px; min-height: 26px; min-width: 26px; }}
-    QScrollBar::handle:hover {{ background: #435578; }}
+    QScrollBar::handle {{ background: #313845; border-radius: 3px; min-height: 24px; min-width: 24px; }}
+    QScrollBar::handle:hover {{ background: #454E60; }}
     QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
     QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
     """
