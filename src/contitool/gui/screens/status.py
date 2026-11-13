@@ -323,7 +323,7 @@ def swap_features(ws: Workspace) -> State:
 
 
 def passport_rows(ws: Workspace) -> list[tuple[str, str, str]]:
-    """(label, value, tone) lines for the ECU identity card."""
+    """Atomic (label, value, tone) columns for the ECU identity bar — one field per column, zero middle dots."""
     rows: list[tuple[str, str, str]] = []
     cf = ws.info("cflash")
     ee = ws.info("eeprom")
@@ -331,12 +331,14 @@ def passport_rows(ws: Workspace) -> list[tuple[str, str, str]]:
     if cf and cf.cflash_info:
         c = cf.cflash_info
         sw_pn = c.sw_pn or (e.part_number if e and c.sw_ver and e.sw_version == c.sw_ver else "")
-        sw_parts = [p for p in (sw_pn, c.sw_ver) if p]
-        if sw_parts:
-            rows.append((tr("Версия ПО", "Software"), " · ".join(sw_parts), "muted"))
-        hw_parts = [p for p in (c.hw_pn if sw_pn else "", c.hw_ver) if p]
-        if hw_parts:
-            rows.append((tr("Оборудование", "Hardware"), " · ".join(hw_parts), "muted"))
+        if sw_pn:
+            rows.append((tr("Номер ПО", "SW part"), sw_pn, "muted"))
+        if c.sw_ver:
+            rows.append((tr("Версия ПО", "Software"), c.sw_ver, "muted"))
+        if sw_pn and c.hw_pn:
+            rows.append((tr("Железо", "HW part"), c.hw_pn, "muted"))
+        if c.hw_ver:
+            rows.append((tr("Ревизия HW", "Hardware"), c.hw_ver, "muted"))
         rows.append(
             (
                 tr("Контрольная сумма", "Checksum"),
@@ -357,9 +359,11 @@ def passport_rows(ws: Workspace) -> list[tuple[str, str, str]]:
     if e:
         if not any(lbl == "VIN" for lbl, _, _ in rows) and e.vin:
             rows.append(("VIN", e.vin, "muted"))
-        if not cf and (e.part_number or e.sw_version):
-            sw_ee = " · ".join(p for p in (e.part_number, e.sw_version) if p)
-            rows.append((tr("Версия ПО (EEPROM)", "Software (EEPROM)"), sw_ee, "muted"))
+        if not cf:
+            if e.part_number:
+                rows.append((tr("Номер ПО (EEPROM)", "SW part (EEPROM)"), e.part_number, "muted"))
+            if e.sw_version:
+                rows.append((tr("Версия ПО (EEPROM)", "Software (EEPROM)"), e.sw_version, "muted"))
     return rows
 
 

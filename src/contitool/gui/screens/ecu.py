@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -79,7 +80,7 @@ from contitool.core import (
 )
 from contitool.core import dtc
 from contitool.core.constants import DFLASH_FSC_BASE_OFF, DFLASH_FSC_STRIDE, DFLASH_SWAP_NVM_OFF, FBL_MOD_OFFSET, ZDC_DATASET_SPECS
-from contitool.gui.connection import CanConnection, ensure_ready
+from contitool.gui.connection import CanConnection, PathLabel, ensure_ready
 from contitool.gui.dialogs.cp import CpBindDialog
 from contitool.gui.dialogs.crypto import FscDialog, OdxSignDialog, RsaKeyDialog, SwapActivateDialog
 from contitool.gui.dialogs.zdc import (
@@ -106,6 +107,7 @@ from contitool.gui.widgets.page import (
     run_dialog,
     set_pill,
     status_readout,
+    vdivider,
 )
 from contitool.gui.worker import OperationRunner
 from contitool.gui.workspace import CANDIDATES, KINDS, NAMES, OPTIONAL_KINDS, Workspace
@@ -214,59 +216,55 @@ class EcuScreen(QWidget):
         self.sec_id = QFrame()
         self.sec_id.setObjectName("IdentityBar")
         body = QVBoxLayout(self.sec_id)
-        body.setContentsMargins(24, 11, 24, 12)
-        body.setSpacing(9)
+        body.setContentsMargins(24, 12, 24, 12)
+        body.setSpacing(10)
 
         head = QHBoxLayout()
-        head.setSpacing(8)
+        head.setSpacing(10)
         self.lbl_pn = QLabel()
         self.lbl_pn.setObjectName("PartNumber")
-        self.lbl_pn.setFont(mono_font(19, bold=True))
+        self.lbl_pn.setFont(mono_font(20, bold=True))
         self.lbl_pn.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_sys = QLabel()
+        self.lbl_sys.setObjectName("Hint")
+        self.sep_source = vdivider()
+        self.sep_source.setFixedHeight(14)
         self.pill_source = QLabel()
         self.pill_source.setObjectName("Hint")
-        self.lbl_folder = QLabel()
+        self.lbl_folder = PathLabel()
         self.lbl_folder.setObjectName("Hint")
         self.lbl_folder.setFont(mono_font(12))
-        head.addWidget(self.lbl_pn)
+        head.addWidget(self.lbl_pn, 0, Qt.AlignmentFlag.AlignVCenter)
+        head.addWidget(self.lbl_sys, 0, Qt.AlignmentFlag.AlignVCenter)
+        head.addWidget(self.sep_source, 0, Qt.AlignmentFlag.AlignVCenter)
         head.addWidget(self.pill_source, 0, Qt.AlignmentFlag.AlignVCenter)
-        head.addWidget(self.lbl_folder, 0, Qt.AlignmentFlag.AlignVCenter)
-        head.addStretch(1)
+        head.addWidget(self.lbl_folder, 1, Qt.AlignmentFlag.AlignVCenter)
+        head.addSpacing(8)
 
         self.btn_export = button("", slot=self.export_backup)
         self.btn_restore = button("", slot=self.restore_requested.emit)
         self.btn_report = button("", slot=self.report_requested.emit)
         self.btn_close = button("", "GhostBtn", slot=self.close_requested.emit)
         for b in (self.btn_export, self.btn_restore, self.btn_report, self.btn_close):
+            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             head.addWidget(b)
         body.addLayout(head)
 
-        strip = QFrame()
-        strip.setObjectName("TelemetryStrip")
-        strip_lay = QVBoxLayout(strip)
-        strip_lay.setContentsMargins(14, 8, 14, 8)
-        strip_lay.setSpacing(7)
+        body.addWidget(divider())
 
         self.grid_id = QGridLayout()
-        self.grid_id.setHorizontalSpacing(24)
+        self.grid_id.setHorizontalSpacing(22)
         self.grid_id.setVerticalSpacing(2)
-        strip_lay.addLayout(self.grid_id)
-
-        strip_lay.addWidget(divider())
-
-        self.files_row = QHBoxLayout()  # rectangular memory-bank status map
-        self.files_row.setSpacing(6)
-        strip_lay.addLayout(self.files_row)
-        body.addWidget(strip)
+        body.addLayout(self.grid_id)
         return self.sec_id
 
     def _build_nav(self) -> QWidget:
         pane = QFrame()
         pane.setObjectName("NavPane")
-        pane.setFixedWidth(298)
+        pane.setFixedWidth(306)
         lay = QVBoxLayout(pane)
-        lay.setContentsMargins(6, 6, 6, 8)
+        lay.setContentsMargins(6, 6, 6, 0)
         lay.setSpacing(0)
         self.nav = QListWidget()
         self.nav.setObjectName("Nav")
@@ -276,21 +274,34 @@ class EcuScreen(QWidget):
         for group, keys in GROUPS:
             head = QListWidgetItem(self.nav)
             head.setFlags(Qt.ItemFlag.NoItemFlags)
-            head.setSizeHint(QSize(0, 30))
+            head.setSizeHint(QSize(0, 26))
             lbl = group_label()
-            lbl.setContentsMargins(12, 10, 0, 0)
+            lbl.setContentsMargins(12, 8, 0, 0)
             self.nav.setItemWidget(head, lbl)
             self._group_labels[group] = lbl
             for key in keys:
                 item = QListWidgetItem(self.nav)
                 item.setData(Qt.ItemDataRole.UserRole, key)
-                item.setSizeHint(QSize(0, 36))
+                item.setSizeHint(QSize(0, 33))
                 nav_row = _NavRow()
                 self.nav.setItemWidget(item, nav_row)
                 self.nav_rows[key] = nav_row
                 self._nav_items[key] = item
         self.nav.currentItemChanged.connect(self._on_nav)
-        lay.addWidget(self.nav)
+        lay.addWidget(self.nav, 1)
+
+        self.nav_dumps = QFrame()
+        self.nav_dumps.setObjectName("NavDumps")
+        nd_lay = QVBoxLayout(self.nav_dumps)
+        nd_lay.setContentsMargins(16, 10, 16, 12)
+        nd_lay.setSpacing(4)
+        self.lbl_dumps_hdr = group_label()
+        nd_lay.addWidget(self.lbl_dumps_hdr)
+        self.dumps_list = QVBoxLayout()
+        self.dumps_list.setContentsMargins(0, 1, 0, 0)
+        self.dumps_list.setSpacing(3)
+        nd_lay.addLayout(self.dumps_list)
+        lay.addWidget(self.nav_dumps)
         return pane
 
     def _build_page_area(self) -> QWidget:
@@ -358,39 +369,61 @@ class EcuScreen(QWidget):
             self._render_page()
 
     @staticmethod
-    def _bank_cell(text: str, tone: str, tip: str = "") -> QFrame:
-        cell = QFrame()
-        cell.setObjectName("BankCell")
-        set_tone(cell, tone)
+    def _fmt_dump_size(path: Path) -> str:
+        try:
+            n = path.stat().st_size
+        except OSError:
+            return "—"
+        if n >= 1024 * 1024 and n % (512 * 1024) == 0:
+            return f"{n / (1024 * 1024):.1f} MB"
+        if n >= 1024:
+            return f"{n // 1024} KB"
+        return f"{n} B"
+
+    @staticmethod
+    def _dump_ledger_row(name: str, val: str, tone: str = "muted", tip: str = "") -> QWidget:
+        w = QWidget()
         if tip:
-            cell.setToolTip(tip)
-        lay = QHBoxLayout(cell)
-        lay.setContentsMargins(8, 2, 8, 2)
-        lay.setSpacing(0)
-        lbl = QLabel(text)
-        lbl.setFont(mono_font(11))
-        if tone == "warn":
-            set_tone(lbl, "warn")
-        lay.addWidget(lbl)
-        return cell
+            w.setToolTip(tip)
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        lbl_n = QLabel(name)
+        lbl_n.setObjectName("Hint")
+        if tone == "muted":
+            set_tone(lbl_n, "muted")
+        lbl_v = QLabel(val)
+        lbl_v.setFont(mono_font(11))
+        set_tone(lbl_v, tone if tone in ("warn", "err", "info") else "muted")
+        lay.addWidget(lbl_n, 1)
+        lay.addWidget(lbl_v, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return w
 
     def _refresh_identity(self) -> None:
         self.lbl_pn.setText(self.ws.part_number or tr("Блок не определён", "Unknown ECU"))
-        self.pill_source.setText(
-            "·  " + (tr("считан по CAN", "read over CAN") if self.ws.source == "can" else tr("открыт из файлов", "opened from files"))
-        )
-        set_tone(self.pill_source, "info" if self.ws.source == "can" else "muted")
+        cf_inf = self.ws.info("cflash")
+        sys_name = (cf_inf.cflash_info.system_name if (cf_inf and cf_inf.cflash_info) else "").strip()
+        self.lbl_sys.setText(sys_name)
+        self.lbl_sys.setVisible(bool(sys_name))
         folder = self.ws.folder
+        is_can = self.ws.source == "can"
+        self.pill_source.setVisible(is_can or not folder)
+        self.pill_source.setText(
+            tr("Считан по CAN", "Read over CAN") if is_can else tr("Открыт из файлов", "Opened from files")
+        )
+        set_tone(self.pill_source, "info" if is_can else "muted")
         self.lbl_folder.setVisible(bool(folder))
         if folder:
-            self.lbl_folder.setText(f"·  {folder.name}")
+            self.lbl_folder.set_path(folder.name)
             self.lbl_folder.setToolTip(str(folder))
-        self.btn_export.setText(tr("Экспортировать бэкап…", "Export backup…"))
+        else:
+            self.lbl_folder.set_path("")
+        self.btn_export.setText(tr("Экспорт бэкапа…", "Export backup…"))
         self.btn_export.setToolTip(tr("Копирует дампы в том виде, как они считаны, в выбранную папку", "Copies the dumps as read to a folder you pick"))
-        self.btn_restore.setText(tr("Залить бэкап в блок…", "Write backup to ECU…"))
+        self.btn_restore.setText(tr("Залить бэкап…", "Write backup…"))
         self.btn_restore.setEnabled(not self.runner.is_busy)
         self.btn_report.setText(tr("Подробный отчёт", "Full report"))
-        self.btn_close.setText(tr("Закрыть блок", "Close ECU"))
+        self.btn_close.setText(tr("Закрыть", "Close"))
 
         clear_layout(self.grid_id)
         rows = status.passport_rows(self.ws)
@@ -398,7 +431,7 @@ class EcuScreen(QWidget):
             cap = QLabel(label.upper())
             cap.setObjectName("GroupLabel")
             val = QLabel(value)
-            val.setFont(mono_font(13))
+            val.setFont(mono_font(12))
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             if tone != "muted":
                 set_tone(val, tone)
@@ -406,24 +439,24 @@ class EcuScreen(QWidget):
             self.grid_id.addWidget(val, 1, col)
         self.grid_id.setColumnStretch(len(rows), 1)
 
-        clear_layout(self.files_row)
-        mem_cap = group_label(tr("ПАМЯТЬ", "MEMORY"))
-        self.files_row.addWidget(mem_cap, 0, Qt.AlignmentFlag.AlignVCenter)
-        self.files_row.addSpacing(4)
+        self.lbl_dumps_hdr.setText(tr("ФАЙЛЫ ПАМЯТИ", "MEMORY DUMPS"))
+        clear_layout(self.dumps_list)
         for k in KINDS:
-            have = self.ws.path(k) is not None
-            txt = f"✓ {NAMES[k]}" if have else tr(f"— {NAMES[k]}: нет", f"— {NAMES[k]}: missing")
-            tip = str(self.ws.path(k) or tr("Файла нет в папке", "Not in the folder"))
-            self.files_row.addWidget(self._bank_cell(txt, "ok" if have else "warn", tip))
+            p_k = self.ws.path(k)
+            if p_k is not None:
+                self.dumps_list.addWidget(self._dump_ledger_row(NAMES[k], self._fmt_dump_size(p_k), "ok", str(p_k)))
+            else:
+                self.dumps_list.addWidget(
+                    self._dump_ledger_row(NAMES[k], tr("нет", "missing"), "warn", tr("Файла нет в папке", "Not in the folder"))
+                )
         for k in OPTIONAL_KINDS:
             p_opt = self.ws.path(k)
             if p_opt is not None:
-                self.files_row.addWidget(self._bank_cell(f"✓ {NAMES[k]}", "ok", str(p_opt)))
+                self.dumps_list.addWidget(self._dump_ledger_row(NAMES[k], self._fmt_dump_size(p_opt), "ok", str(p_opt)))
             elif k in self.ws.read_warnings:
-                self.files_row.addWidget(
-                    self._bank_cell(tr(f"! {NAMES[k]}: сбой", f"! {NAMES[k]}: warning"), "warn", self.ws.read_warnings[k])
+                self.dumps_list.addWidget(
+                    self._dump_ledger_row(NAMES[k], tr("сбой", "warning"), "warn", self.ws.read_warnings[k])
                 )
-        self.files_row.addStretch(1)
 
     def _state(self, key: str) -> State:
         if key == "cp":
@@ -532,17 +565,14 @@ class EcuScreen(QWidget):
     def _block(
         self, lay: QVBoxLayout, title: str, state: State | None, text: str, *btns: QPushButton, num: str = ""
     ) -> None:
-        """Structured 2-tone engineering module: header strip + body + inline right action (1 btn) or footer bar (2+ btns)."""
+        """Unified single-surface architectural card: aligned right status readout, inline action (1 btn) or bottom row (2+ btns)."""
         frame = QFrame()
         frame.setObjectName("Step")
         outer = QVBoxLayout(frame)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        outer.setContentsMargins(18, 15, 18, 16)
+        outer.setSpacing(7)
 
-        hdr = QFrame()
-        hdr.setObjectName("BlockHeader")
-        h = QHBoxLayout(hdr)
-        h.setContentsMargins(15, 7, 15, 7)
+        h = QHBoxLayout()
         h.setSpacing(9)
         if num:
             n = QLabel(num)
@@ -556,39 +586,31 @@ class EcuScreen(QWidget):
         h.addStretch(1)
         if state is not None:
             h.addWidget(status_readout(state.text, state.tone), 0, Qt.AlignmentFlag.AlignVCenter)
-        outer.addWidget(hdr)
+        outer.addLayout(h)
 
         if len(btns) == 1 and not num and text:
-            body = QWidget()
-            b_lay = QHBoxLayout(body)
-            b_lay.setContentsMargins(15, 11, 15, 11)
-            b_lay.setSpacing(16)
-            b_lay.addWidget(self._label(text), 1)
-            b_lay.addWidget(btns[0], 0, Qt.AlignmentFlag.AlignVCenter)
-            outer.addWidget(body)
+            row_lay = QHBoxLayout()
+            row_lay.setSpacing(20)
+            row_lay.addWidget(self._label(text), 1)
+            btns[0].setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            row_lay.addWidget(btns[0], 0, Qt.AlignmentFlag.AlignVCenter)
+            outer.addLayout(row_lay)
         else:
             if text:
-                body = QWidget()
-                b_lay = QVBoxLayout(body)
-                b_lay.setContentsMargins(15, 11, 15, 11)
-                b_lay.setSpacing(6)
-                b_lay.addWidget(self._label(text))
-                outer.addWidget(body)
+                outer.addWidget(self._label(text))
             if btns:
-                foot = QFrame()
-                foot.setObjectName("BlockFooter")
-                f_lay = QHBoxLayout(foot)
-                f_lay.setContentsMargins(15, 8, 15, 8)
+                outer.addSpacing(3)
+                f_lay = QHBoxLayout()
                 f_lay.setSpacing(8)
                 for b in btns:
                     f_lay.addWidget(b)
                 f_lay.addStretch(1)
-                outer.addWidget(foot)
+                outer.addLayout(f_lay)
         lay.addWidget(frame)
 
     @staticmethod
     def _table(lay: QVBoxLayout, title: str, rows: list[tuple[str, ...]], muted: bool = False) -> None:
-        """Striped hardware register / telemetry inspector table with 2-tone header band."""
+        """Clean single-surface inspector table with subtle hairline dividers."""
         frame = QFrame()
         frame.setObjectName("Step")
         outer = QVBoxLayout(frame)
@@ -596,9 +618,9 @@ class EcuScreen(QWidget):
         outer.setSpacing(0)
 
         hdr = QFrame()
-        hdr.setObjectName("BlockHeader")
+        hdr.setObjectName("TableHead")
         h = QHBoxLayout(hdr)
-        h.setContentsMargins(15, 7, 15, 7)
+        h.setContentsMargins(18, 10, 18, 8)
         h.setSpacing(8)
         h.addWidget(group_label(title.upper()))
         h.addStretch(1)
@@ -616,12 +638,10 @@ class EcuScreen(QWidget):
         for idx, cells in enumerate(rows):
             r_frame = QFrame()
             r_frame.setObjectName("TableRow")
-            if idx % 2 == 1:
-                r_frame.setProperty("alt", True)
             if idx == len(rows) - 1:
                 r_frame.setProperty("last", True)
             rl = QHBoxLayout(r_frame)
-            rl.setContentsMargins(15, 6, 15, 6)
+            rl.setContentsMargins(18, 7, 18, 7)
             rl.setSpacing(16)
 
             lbl0 = QLabel(cells[0] if cells else "")
@@ -939,9 +959,9 @@ class EcuScreen(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         hdr = QFrame()
-        hdr.setObjectName("BlockHeader")
+        hdr.setObjectName("TableHead")
         h = QHBoxLayout(hdr)
-        h.setContentsMargins(15, 7, 15, 7)
+        h.setContentsMargins(18, 12, 18, 10)
         h.setSpacing(10)
         t = QLabel(tr("Состояние в блоке", "State in the ECU"))
         t.setObjectName("FieldLabel")
@@ -953,7 +973,7 @@ class EcuScreen(QWidget):
 
         body = QWidget()
         g = QGridLayout(body)
-        g.setContentsMargins(15, 11, 15, 12)
+        g.setContentsMargins(18, 12, 18, 16)
         g.setHorizontalSpacing(14)
         g.setVerticalSpacing(7)
         summary = status.swap_live_summary(self._swap_live, self.ws)
@@ -1011,14 +1031,13 @@ class EcuScreen(QWidget):
                 "(MKE), Start-Stop messages on screen, alternator (BEM).",
             ),
         )
-        if st.detail:
-            self._text(lay, st.detail, primary=True)
-
         ok_df, tip_df = self._need("dflash")
         df_path = self.ws.path("dflash")
         raw_df = df_path.read_bytes() if (ok_df and df_path is not None and df_path.is_file()) else None
 
         unsup_active = status.unsupported_active_fecs(self.ws)
+        if st.detail and not (unsup_active and raw_df is not None):
+            self._text(lay, st.detail, primary=True)
         if unsup_active and raw_df is not None:
             unsup_names = ", ".join(status.fec_name(c) for c in unsup_active)
             self._note(
@@ -1462,7 +1481,7 @@ class EcuScreen(QWidget):
                 slots_txt = ", ".join(s.ecu_addr for s in ee_summary.learned_cp_slots) or tr("нет ведомых", "no slaves")
                 m_txt = tr("Мастер CP: обучен", "Master CP: learned") if ee_summary.master_cp_learned else tr("Мастер CP: нет", "Master CP: no")
                 if ee_summary.showroom_mode_active:
-                    m_txt += " · Showroom ON"
+                    m_txt += ", Showroom ON"
                 ee_rows.append(
                     (
                         tr("CP в NvM 0x5E", "CP in NvM 0x5E"),

@@ -27,8 +27,8 @@ from PySide6.QtWidgets import (
 
 from contitool.cli.formatting import format_bytes_human, format_eta
 from contitool.gui import theme
-from contitool.gui.theme import dot_icon, mono_font, set_tone, ui_font
-from contitool.gui.widgets.page import button
+from contitool.gui.theme import mono_font, set_tone, ui_font
+from contitool.gui.widgets.page import button, vdivider
 from contitool.gui.worker import OperationRunner
 from contitool.i18n import subscribe_lang_change, tr
 from contitool.progress import LogEntry, ProgressSnapshot, StepSnapshot
@@ -120,7 +120,8 @@ class ExecutionPanel(QFrame):
         self.btn_open_dir.setVisible(False)
         self.btn_copy = button("", "GhostBtn", slot=self._on_copy_logs)
         self.btn_clear = button("", "GhostBtn", slot=self.clear_logs)
-        for b in (self.btn_open_dir, self.btn_copy, self.btn_clear):
+        self.btn_hide = button("", "GhostBtn")
+        for b in (self.btn_open_dir, self.btn_copy, self.btn_clear, self.btn_hide):
             hdr.addWidget(b)
         lay.addWidget(hdr_bar)
 
@@ -161,10 +162,8 @@ class ExecutionPanel(QFrame):
     def _build_status(self) -> QWidget:
         w = QWidget()
         lay = QHBoxLayout(w)
-        lay.setContentsMargins(14, 3, 16, 3)
-        lay.setSpacing(8)
-        self.lbl_dot = QLabel()
-        lay.addWidget(self.lbl_dot)
+        lay.setContentsMargins(16, 2, 12, 2)
+        lay.setSpacing(10)
         self.lbl_status = QLabel()
         self.lbl_status.setObjectName("FieldLabel")
         lay.addWidget(self.lbl_status)
@@ -185,6 +184,12 @@ class ExecutionPanel(QFrame):
         self.btn_stop = button("", "DangerBtn", slot=self.runner.cancel_current)
         self.btn_stop.setVisible(False)
         lay.addWidget(self.btn_stop)
+        vdiv = vdivider()
+        vdiv.setFixedHeight(14)
+        lay.addWidget(vdiv)
+        self.btn_toggle_log = button("", "GhostBtn")
+        self.btn_toggle_log.setCheckable(True)
+        lay.addWidget(self.btn_toggle_log)
         return w
 
     # ────────────────────────────── text ──────────────────────────────
@@ -197,21 +202,24 @@ class ExecutionPanel(QFrame):
         self.btn_copy.setText(tr("Копировать", "Copy"))
         self.btn_copy.setToolTip(tr("Копирует подробный лог", "Copies the detailed log"))
         self.btn_clear.setText(tr("Очистить", "Clear"))
+        self.btn_hide.setText(tr("Скрыть", "Hide"))
+        self.btn_toggle_log.setText(tr("Журнал", "Log"))
+        self.btn_toggle_log.setToolTip(tr("Показать или скрыть журнал операций (Ctrl+J)", "Show or hide the operation log (Ctrl+J)"))
         self.btn_stop.setText(tr("Остановить", "Stop"))
         self._apply_status()
         self._render_short()
 
     def _apply_status(self) -> None:
         labels = {
-            "idle": (theme.TEXT_MUTED, "muted", tr("Готов к работе", "Ready")),
-            "running": (theme.INFO, "info", tr("Выполняется", "Running")),
-            "ok": (theme.OK, "ok", tr("Готово", "Done")),
-            "err": (theme.ERR, "err", tr("Ошибка", "Failed")),
-            "cancel": (theme.WARN, "warn", tr("Остановлено", "Stopped")),
+            "idle": ("muted", tr("Готов к работе", "Ready")),
+            "running": ("info", tr("Выполняется", "Running")),
+            "ok": ("ok", tr("Готово", "Done")),
+            "err": ("err", tr("Ошибка", "Failed")),
+            "cancel": ("warn", tr("Остановлено", "Stopped")),
         }
-        col, tone, text = labels[self._state]
-        self.lbl_dot.setPixmap(dot_icon(col).pixmap(16, 16))
+        tone, text = labels[self._state]
         self.lbl_status.setText(text)
+        set_tone(self.lbl_status, tone)
         set_tone(self.progress_bar, tone)
         self.lbl_step.setText(self._step_text)
         self.lbl_step.setToolTip(self._step_text)
@@ -268,7 +276,7 @@ class ExecutionPanel(QFrame):
             if snap.eta_sec is not None:
                 parts.append(tr(f"осталось {format_eta(snap.eta_sec)}", f"{format_eta(snap.eta_sec)} left"))
         parts.append(format_eta(time.monotonic() - self._started_mono))
-        self.lbl_metrics.setText("  ·  ".join(parts))
+        self.lbl_metrics.setText("    ".join(parts))
 
     def _on_log(self, entry: LogEntry) -> None:
         ts = time.strftime("%H:%M:%S", time.localtime(entry.timestamp)) + f".{int(entry.timestamp * 1000) % 1000:03d}"
@@ -310,7 +318,7 @@ class ExecutionPanel(QFrame):
             "err": (theme.ERR, tr("Ошибка", "Failed")),
             "cancel": (theme.WARN, tr("Остановлено", "Stopped")),
         }[self._state]
-        self._full_line(f"<span style='color:{col}'>── {word} · {_duration(elapsed)}</span>")
+        self._full_line(f"<span style='color:{col}'>── {word} ({_duration(elapsed)})</span>")
 
     # ────────────────────────────── journal ──────────────────────────────
     def _add_item(self, item: _Op | _Note) -> None:
@@ -353,7 +361,7 @@ class ExecutionPanel(QFrame):
             col, word = states[it.state]
             right = f"<span style='color:{col}'>{word}</span>"
             if it.state != "running":
-                right += f"<span style='color:{muted}'> · {_duration(it.elapsed)}</span>"
+                right += f"<span style='color:{muted}'>&nbsp;&nbsp;{_duration(it.elapsed)}</span>"
             rows.append(
                 f"<tr>{time_cell}<td style='color:{theme.TEXT}; font-weight:600'>{html.escape(it.title)}</td>"
                 f"<td align='right'>{right}</td></tr>"

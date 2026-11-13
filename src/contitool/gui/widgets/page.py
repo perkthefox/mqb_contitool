@@ -17,13 +17,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from contitool.gui import theme
-from contitool.gui.theme import dot_icon, mono_font, set_tone
+from contitool.gui.theme import mono_font, set_tone
 from contitool.i18n import tr
 
 
 class Section(QFrame):
-    """Structured 2-tone engineering panel: header strip (title + right toolbar), body, and optional footer bar."""
+    """Unified single-surface architectural card: title row, body, and optional bottom action row."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -32,10 +31,9 @@ class Section(QFrame):
         self._outer.setContentsMargins(0, 0, 0, 0)
         self._outer.setSpacing(0)
 
-        self._head_bar = QFrame()
-        self._head_bar.setObjectName("BlockHeader")
+        self._head_bar = QWidget()
         self.head = QHBoxLayout(self._head_bar)
-        self.head.setContentsMargins(16, 8, 16, 8)
+        self.head.setContentsMargins(18, 14, 18, 2)
         self.head.setSpacing(8)
         self.lbl_title = QLabel()
         self.lbl_title.setObjectName("SectionTitle")
@@ -45,7 +43,7 @@ class Section(QFrame):
 
         self._body_wrap = QWidget()
         self.body = QVBoxLayout(self._body_wrap)
-        self.body.setContentsMargins(16, 13, 16, 15)
+        self.body.setContentsMargins(18, 6, 18, 16)
         self.body.setSpacing(10)
 
         self.lbl_desc = QLabel()
@@ -58,13 +56,14 @@ class Section(QFrame):
     def hide_head(self) -> None:
         """For sections whose heading is carried by their own content."""
         self._head_bar.setVisible(False)
+        self.body.setContentsMargins(16, 12, 16, 12)
 
     def add_footer(self, *buttons: QWidget) -> QHBoxLayout:
-        """Attach a flush recessed control shelf at the bottom of the panel."""
-        foot = QFrame()
-        foot.setObjectName("BlockFooter")
+        """Append a clean action row inside the same card surface."""
+        self.body.setContentsMargins(18, 6, 18, 10)
+        foot = QWidget()
         lay = QHBoxLayout(foot)
-        lay.setContentsMargins(16, 9, 16, 9)
+        lay.setContentsMargins(18, 4, 18, 16)
         lay.setSpacing(8)
         for b in buttons:
             lay.addWidget(b)
@@ -107,20 +106,13 @@ def set_pill(lbl: QLabel, text: str, tone: str) -> None:
     lbl.setVisible(bool(text))
 
 
-def status_readout(text: str = "", tone: str = "muted") -> QWidget:
-    """Crisp instrument status indicator: geometric 6px LED dot + semantic text (zero pill box)."""
-    w = QWidget()
-    lay = QHBoxLayout(w)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(6)
-    dot = QLabel()
-    col = theme.TONES.get(tone, theme.TEXT_MUTED)
-    dot.setPixmap(dot_icon(col, 6).pixmap(12, 12))
-    lbl = pill(text, tone)
-    lay.addWidget(dot, 0, Qt.AlignmentFlag.AlignVCenter)
-    lay.addWidget(lbl, 0, Qt.AlignmentFlag.AlignVCenter)
-    w.setVisible(bool(text))
-    return w
+def status_readout(text: str = "", tone: str = "muted") -> QLabel:
+    """Pure typographic status readout (zero LED dot, zero pill border)."""
+    lbl = QLabel(text)
+    lbl.setObjectName("StatusReadout")
+    set_tone(lbl, tone)
+    lbl.setVisible(bool(text))
+    return lbl
 
 
 def group_label(text: str = "") -> QLabel:
@@ -153,6 +145,12 @@ def clear_layout(layout: QLayout) -> None:
 def divider() -> QFrame:
     line = QFrame()
     line.setObjectName("Divider")
+    return line
+
+
+def vdivider() -> QFrame:
+    line = QFrame()
+    line.setObjectName("VDivider")
     return line
 
 
@@ -252,6 +250,8 @@ class Dialog(QDialog):
         if scr is None:
             return
         avail = scr.availableGeometry()
+        if avail.width() < 640 or avail.height() < 480:
+            return
         w, h = min(self.width(), avail.width() - 24), min(self.height(), avail.height() - 64)
         if (w, h) != (self.width(), self.height()):
             self.resize(w, h)
@@ -265,6 +265,8 @@ class Dialog(QDialog):
         if scr is None:
             return
         avail, geo = scr.availableGeometry(), self.frameGeometry()
+        if avail.width() < 640 or avail.height() < 480:
+            return
         x = min(max(geo.x(), avail.x()), avail.x() + avail.width() - geo.width())
         y = min(max(geo.y(), avail.y()), avail.y() + avail.height() - geo.height())
         if (x, y) != (geo.x(), geo.y()):

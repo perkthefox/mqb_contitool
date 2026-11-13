@@ -83,7 +83,7 @@ class CpBindDialog(Dialog):
             addr.setFont(mono_font(12, bold=True))
             name = QTableWidgetItem(spec.short)
             name.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            name.setToolTip(f"{spec.details}\nDataFlash 0x{spec.off1:04X} / 0x{spec.off2:04X} · bank #{spec.slot}")
+            name.setToolTip(f"{spec.details}\nDataFlash 0x{spec.off1:04X} / 0x{spec.off2:04X}, bank #{spec.slot}")
             txt, col = slot_state_text(states.get(spec.slot))
             st = QTableWidgetItem(txt)
             st.setFlags(Qt.ItemFlag.ItemIsEnabled)

@@ -29,8 +29,8 @@ from PySide6.QtWidgets import (
 from contitool.gui import theme
 from contitool.gui.can_session import CanSession, TraceRow, parse_hex, parse_id
 from contitool.gui.connection import CanConnection, ConnectionDialog, ensure_ready
-from contitool.gui.theme import dot_icon, mono_font, set_tone
-from contitool.gui.widgets.page import Section, button, hint, run_dialog
+from contitool.gui.theme import mono_font, set_tone
+from contitool.gui.widgets.page import Section, button, hint, run_dialog, vdivider
 from contitool.gui.worker import OperationRunner
 from contitool.i18n import subscribe_lang_change, tr
 from contitool.report import Failure
@@ -217,17 +217,20 @@ class TerminalScreen(QWidget):
             lambda _i: QSettings().setValue("terminal/bitrate", self.cmb_bitrate.currentData())
         )
         self.btn_settings = button("", "GhostBtn", slot=lambda: run_dialog(ConnectionDialog(self.conn, self)))
-        self.lbl_dot = QLabel()
         self.lbl_state = QLabel()
+        self.lbl_state.setObjectName("StatusReadout")
+        sep = vdivider()
+        sep.setFixedHeight(14)
         self.lbl_counts = QLabel()
         self.lbl_counts.setFont(mono_font(12))
         set_tone(self.lbl_counts, "muted")
         for w in (self.btn_connect, self.lbl_link, self.cmb_bitrate, self.btn_settings):
             row.addWidget(w)
         row.addStretch(1)
-        for w in (self.lbl_dot, self.lbl_state):
-            row.addWidget(w)
-        row.addSpacing(10)
+        row.addWidget(self.lbl_state)
+        row.addSpacing(8)
+        row.addWidget(sep, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addSpacing(8)
         row.addWidget(self.lbl_counts)
         sec.body.addLayout(row)
         return sec
@@ -395,14 +398,14 @@ class TerminalScreen(QWidget):
             self.lbl_link.setText(tr("Адаптер не настроен", "Adapter not set up"))
 
     def _apply_state(self) -> None:
-        col, text = {
-            "off": (theme.TEXT_MUTED, tr("Отключено", "Disconnected")),
-            "connecting": (theme.INFO, tr("Подключение…", "Connecting…")),
-            "on": (theme.OK, tr("Подключено", "Connected")),
-            "err": (theme.ERR, tr("Ошибка подключения", "Connection failed")),
+        tone, text = {
+            "off": ("muted", tr("Отключено", "Disconnected")),
+            "connecting": ("info", tr("Подключение…", "Connecting…")),
+            "on": ("ok", tr("Подключено", "Connected")),
+            "err": ("err", tr("Ошибка подключения", "Connection failed")),
         }[self._state]
-        self.lbl_dot.setPixmap(dot_icon(col).pixmap(16, 16))
         self.lbl_state.setText(text)
+        set_tone(self.lbl_state, tone)
         self.lbl_state.setToolTip(self._error)
         live = self.session is not None
         self.btn_connect.setText(tr("Отключиться", "Disconnect") if live else tr("Подключиться", "Connect"))
@@ -416,7 +419,7 @@ class TerminalScreen(QWidget):
         self._refresh_counts()
 
     def _refresh_counts(self) -> None:
-        self.lbl_counts.setText(f"Rx {self._rx}  ·  Tx {self._tx}")
+        self.lbl_counts.setText(f"Rx {self._rx}    Tx {self._tx}")
 
     def _say(self, text: str, tone: str = "") -> None:
         self.lbl_msg.setText(text)

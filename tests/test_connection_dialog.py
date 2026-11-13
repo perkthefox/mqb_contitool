@@ -53,7 +53,7 @@ def test_found_adapter_is_preselected_checked_and_saved(monkeypatch) -> None:
     assert dlg.btn_ok.isEnabled()
     dlg._save()
     assert (win.conn.interface, win.conn.port, win.conn.ready) == ("slcan", "/dev/cu.usbmodem1101", True)
-    assert win.conn.display() == "CANable2 · cu.usbmodem1101"
+    assert win.conn.display() == "CANable2 (cu.usbmodem1101)"
     win.close()
 
 

@@ -453,6 +453,8 @@ def test_sw_part_number_resolved_and_displayed_in_identity_bar(
     assert win.ws.part_number == "3Q0907530AA"
     assert win.ecu_screen.lbl_pn.text() == "3Q0907530AA"
     rows = dict((lbl, val) for lbl, val, _tone in passport_rows(win.ws))
-    assert rows["Версия ПО"] == "3Q0907530AA · 5366"
-    assert rows["Оборудование"] == "3Q0907530C · 521"
+    assert rows["Номер ПО"] == "3Q0907530AA"
+    assert rows["Версия ПО"] == "5366"
+    assert rows["Железо"] == "3Q0907530C"
+    assert rows["Ревизия HW"] == "521"
     win.close()

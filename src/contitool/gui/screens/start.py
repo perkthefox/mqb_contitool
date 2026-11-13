@@ -9,12 +9,12 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from contitool.gui.theme import mono_font
+from contitool.gui.theme import mono_font, ui_font
 from contitool.gui.widgets.page import Section, button, clear_layout, group_label, hint
 from contitool.gui.workspace import recent_folders
 from contitool.i18n import subscribe_lang_change, tr
 
-_COLUMN_WIDTH = 880
+_COLUMN_WIDTH = 840
 
 
 class _RecentRow(QFrame):
@@ -30,7 +30,7 @@ class _RecentRow(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(str(folder))
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(16, 9, 16, 9)
+        lay.setContentsMargins(18, 10, 18, 10)
         lay.setSpacing(16)
         text = QVBoxLayout()
         text.setSpacing(2)
@@ -39,7 +39,7 @@ class _RecentRow(QFrame):
         path = hint()
         path.setFont(mono_font(11))
         path.setWordWrap(False)
-        path.setText(path.fontMetrics().elidedText(str(folder.parent), Qt.TextElideMode.ElideMiddle, 580))
+        path.setText(path.fontMetrics().elidedText(str(folder.parent), Qt.TextElideMode.ElideMiddle, 560))
         text.addWidget(name)
         text.addWidget(path)
         lay.addLayout(text, 1)
@@ -76,7 +76,7 @@ class StartScreen(QWidget):
         self.setAcceptDrops(True)
 
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(32, 34, 32, 24)
+        outer.setContentsMargins(36, 48, 36, 28)
         outer.addStretch(1)
         column = QWidget()
         column.setMaximumWidth(_COLUMN_WIDTH)
@@ -85,74 +85,65 @@ class StartScreen(QWidget):
 
         body = QVBoxLayout(column)
         body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(5)
+        body.setSpacing(6)
 
         self.lbl_title = QLabel()
         self.lbl_title.setObjectName("PageTitle")
+        self.lbl_title.setFont(ui_font(23, bold=True))
         self.lbl_sub = hint()
-        self.lbl_sub.setFont(mono_font(12))
         body.addWidget(self.lbl_title)
         body.addWidget(self.lbl_sub)
-        body.addSpacing(16)
+        body.addSpacing(22)
 
         self.tile_can = Section()
-        self.lbl_can_meta = QLabel()
-        self.lbl_can_meta.setFont(mono_font(11))
-        self.lbl_can_meta.setObjectName("Hint")
-        self.tile_can.head.addWidget(self.lbl_can_meta)
+        self.lbl_can_eyebrow = group_label()
+        self.tile_can.body.insertWidget(0, self.lbl_can_eyebrow)
+        self.tile_can.head.setContentsMargins(20, 18, 20, 2)
         self.btn_read = button("", "PrimaryBtn", slot=self.read_can_requested.emit)
         self.btn_restore = button("", slot=self.restore_requested.emit)
-        self.btn_wiring = button("", slot=self.wiring_requested.emit)
+        self.btn_wiring = button("", "GhostBtn", slot=self.wiring_requested.emit)
 
         self.tile_files = Section()
-        self.lbl_files_meta = QLabel()
-        self.lbl_files_meta.setFont(mono_font(11))
-        self.lbl_files_meta.setObjectName("Hint")
-        self.tile_files.head.addWidget(self.lbl_files_meta)
+        self.lbl_files_eyebrow = group_label()
+        self.tile_files.body.insertWidget(0, self.lbl_files_eyebrow)
+        self.tile_files.head.setContentsMargins(20, 18, 20, 2)
         self.btn_folder = button("", slot=lambda: self.open_folder_requested.emit(""))
         self.btn_files = button("", slot=self.open_files_requested.emit)
 
         tiles = QHBoxLayout()
-        tiles.setSpacing(14)
-        for tile, actions in (
-            (self.tile_can, (self.btn_read, self.btn_restore, self.btn_wiring)),
-            (self.tile_files, (self.btn_folder, self.btn_files)),
+        tiles.setSpacing(16)
+        for tile, eyebrow, actions in (
+            (self.tile_can, self.lbl_can_eyebrow, (self.btn_read, self.btn_restore, self.btn_wiring)),
+            (self.tile_files, self.lbl_files_eyebrow, (self.btn_folder, self.btn_files)),
         ):
+            # Put eyebrow above title inside head area visually: move eyebrow into _outer at index 0
+            tile.body.removeWidget(eyebrow)
+            eyebrow.setContentsMargins(20, 16, 20, 0)
+            tile._outer.insertWidget(0, eyebrow)
+            tile.head.setContentsMargins(20, 4, 20, 2)
             tile.body.addStretch(1)
             for b in actions:
                 b.setCursor(Qt.CursorShape.PointingHandCursor)
-            tile.add_footer(*actions)
+            foot_lay = tile.add_footer(*actions)
+            tile.body.setContentsMargins(20, 6, 20, 12)
+            foot_lay.setContentsMargins(20, 4, 20, 18)
             tiles.addWidget(tile, 1)
         body.addLayout(tiles)
 
-        body.addSpacing(18)
+        body.addSpacing(24)
+        self.recent_wrap = QWidget()
+        rw_lay = QVBoxLayout(self.recent_wrap)
+        rw_lay.setContentsMargins(0, 0, 0, 0)
+        rw_lay.setSpacing(8)
+        self.lbl_recent = group_label()
+        rw_lay.addWidget(self.lbl_recent)
         self.recent_box = QFrame()
         self.recent_box.setObjectName("RecentBox")
-        rb_lay = QVBoxLayout(self.recent_box)
-        rb_lay.setContentsMargins(0, 0, 0, 0)
-        rb_lay.setSpacing(0)
-        rb_hdr = QFrame()
-        rb_hdr.setObjectName("BlockHeader")
-        rb_hdr_lay = QHBoxLayout(rb_hdr)
-        rb_hdr_lay.setContentsMargins(16, 7, 16, 7)
-        self.lbl_recent = group_label()
-        rb_hdr_lay.addWidget(self.lbl_recent)
-        rb_hdr_lay.addStretch(1)
-        rb_lay.addWidget(rb_hdr)
-        self.recent_list = QVBoxLayout()
+        self.recent_list = QVBoxLayout(self.recent_box)
         self.recent_list.setContentsMargins(0, 0, 0, 0)
         self.recent_list.setSpacing(0)
-        rb_lay.addLayout(self.recent_list)
-        body.addWidget(self.recent_box)
-
-        self.drop_hint = QFrame()
-        self.drop_hint.setObjectName("DropHint")
-        dh_lay = QHBoxLayout(self.drop_hint)
-        dh_lay.setContentsMargins(18, 14, 18, 14)
-        self.lbl_drop = hint()
-        self.lbl_drop.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        dh_lay.addWidget(self.lbl_drop, 1)
-        body.addWidget(self.drop_hint)
+        rw_lay.addWidget(self.recent_box)
+        body.addWidget(self.recent_wrap)
 
         body.addStretch(1)
 
@@ -163,9 +154,7 @@ class StartScreen(QWidget):
     def refresh_recent(self) -> None:
         clear_layout(self.recent_list)
         folders = recent_folders()[:5]
-        has_recent = bool(folders)
-        self.recent_box.setVisible(has_recent)
-        self.drop_hint.setVisible(not has_recent)
+        self.recent_wrap.setVisible(bool(folders))
         for idx, folder in enumerate(folders):
             r = _RecentRow(folder, is_last=(idx == len(folders) - 1))
             r.clicked.connect(lambda f=folder: self.open_folder_requested.emit(str(f)))
@@ -175,14 +164,14 @@ class StartScreen(QWidget):
         self.lbl_title.setText(tr("Открыть блок", "Open an ECU"))
         self.lbl_sub.setText(
             tr(
-                "Шлюз VAG MQB J533 · Continental 3Q0 907 530 · Renesas RH850/F1L",
-                "VAG MQB J533 gateway · Continental 3Q0 907 530 · Renesas RH850/F1L",
+                "Шлюз VAG MQB J533 — Continental 3Q0 907 530 (Renesas RH850/F1L)",
+                "VAG MQB J533 gateway — Continental 3Q0 907 530 (Renesas RH850/F1L)",
             )
         )
-        self.lbl_can_meta.setText(tr("CAN · 500 кбит/с", "CAN · 500 kbit/s"))
-        self.lbl_files_meta.setText(".BIN / .RAW")
+        self.lbl_can_eyebrow.setText(tr("ПОДКЛЮЧЕНИЕ ПО CAN (500 КБИТ/С)", "CAN CONNECTION (500 KBIT/S)"))
+        self.lbl_files_eyebrow.setText(tr("ЛОКАЛЬНЫЕ ФАЙЛЫ (.BIN / .RAW)", "LOCAL FILES (.BIN / .RAW)"))
         self.tile_can.set_text(
-            tr("Блок на стенде или авто", "ECU on bench or car"),
+            tr("Блок на стенде или в авто", "ECU on bench or car"),
             tr(
                 "Полная копия памяти по CAN: CodeFlash, DataFlash, Uflash, внешняя EEPROM и OPBT. После чтения блок откроется сам.",
                 "Full memory backup over CAN: CodeFlash, DataFlash, Uflash, external EEPROM and OPBT. Opens once read.",
@@ -191,8 +180,8 @@ class StartScreen(QWidget):
         self.tile_files.set_text(
             tr("Дампы на диске", "Dumps on disk"),
             tr(
-                "Папка с CodeFlash, DataFlash и Uflash или отдельные файлы. Папку или файлы можно перетащить в окно.",
-                "A folder with CodeFlash, DataFlash and Uflash, or separate files. Drop a folder or files anywhere here.",
+                "Папка с CodeFlash, DataFlash и Uflash или отдельные файлы. Папку или файлы .bin можно также перетащить прямо в окно.",
+                "A folder with CodeFlash, DataFlash and Uflash, or separate files. Drop a folder or .bin files anywhere in this window.",
             ),
         )
         self.btn_read.setText(tr("Считать блок", "Read the ECU"))
@@ -208,12 +197,6 @@ class StartScreen(QWidget):
         self.btn_folder.setText(tr("Открыть папку…", "Open folder…"))
         self.btn_files.setText(tr("Выбрать файлы…", "Choose files…"))
         self.lbl_recent.setText(tr("НЕДАВНИЕ БЛОКИ", "RECENT ECUS"))
-        self.lbl_drop.setText(
-            tr(
-                "Перетащите папку с дампами или файлы .bin в окно программы",
-                "Drop a dump folder or .bin files anywhere in this window",
-            )
-        )
         self.refresh_recent()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:

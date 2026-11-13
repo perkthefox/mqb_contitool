@@ -82,11 +82,11 @@ class CanConnection(QObject):
         return self.interface
 
     def display(self) -> str:
-        """Short label for the header chip: "CANable2 · cu.usbmodem…", "VAS6154A"."""
+        """Short label for the header button: "CANable2 (cu.usbmodem…)", "VAS6154A"."""
         port = self.port.replace("\\", "/").rsplit("/", 1)[-1]
         if self.title:
-            return self.title if self.title == self.port else f"{self.title} · {port}"
-        return f"{self.adapter_name()} · {port}" if port else self.adapter_name()
+            return self.title if self.title == self.port else f"{self.title} ({port})"
+        return f"{self.adapter_name()} ({port})" if port else self.adapter_name()
 
 
 _ORPHANS: set[OperationWorker] = set()  # threads of closed dialogs, kept alive until they end
