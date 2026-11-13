@@ -299,13 +299,25 @@ class J533CanLink:
         `quick`: return at once when an slcan port has nothing waiting. python-can's slcan answers recv(timeout=0)
         only after one read at the serial port's own timeout (0.1 s) then; before every UDS request that was 0.1 s
         per `36` block (3.9 KB/s). The RAM-loader packets keep that read: their pacing on slcan was verified with it."""
-        port = getattr(self.bus, "serialPortOrig", None) if quick else None
+        def _waiting(ser: Any) -> int:
+            try:
+                return int(ser.in_waiting)
+            except can.CanError:
+                raise
+            except Exception as exc:
+                raise can.CanOperationError(f"Could not inspect serial input queue: {exc}") from exc
+
+        slcan_port = getattr(self.bus, "serialPortOrig", None)
+        port = slcan_port if quick else None
         parsed = getattr(self.bus, "_queue", None)  # slcan: lines already read from the port
         raw_buf = getattr(self.bus, "_buffer", None)
         drained = 0
-        for _ in range(max_frames):
+        polls = 0
+        max_polls = max_frames * 4 + 256
+        while drained < max_frames and polls < max_polls:
+            polls += 1
             has_buf_line = isinstance(raw_buf, bytearray) and (13 in raw_buf or 7 in raw_buf)
-            if port is not None and not port.in_waiting and not (parsed and parsed.qsize()) and not has_buf_line:
+            if port is not None and not _waiting(port) and not (parsed and parsed.qsize()) and not has_buf_line:
                 break
             try:
                 msg = self.bus.recv(timeout=0.0)
@@ -317,8 +329,13 @@ class J533CanLink:
                 drained += 1
                 continue  # a result of the stale stream the bus could not interpret: thrown away with the rest
             if msg is None:
-                if isinstance(raw_buf, bytearray) and (13 in raw_buf or 7 in raw_buf):
-                    continue  # e.g. an slcan TX ack (`z\r` / `\r`) sat ahead of a real buffered frame
+                still_queued = (
+                    (isinstance(raw_buf, bytearray) and (13 in raw_buf or 7 in raw_buf))
+                    or bool(parsed and parsed.qsize())
+                    or (slcan_port is not None and callable(getattr(slcan_port, "read", None)) and _waiting(slcan_port) > 0)
+                )
+                if still_queued:
+                    continue  # e.g. an slcan TX ack (`z\r` / `\r`) sat ahead of buffered or waiting RX frames
                 break
             raw = bytes(msg.data)
             self.rx_frames += 1

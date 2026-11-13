@@ -43,8 +43,10 @@ def mask_ids(text: str) -> str:
     """Hide the serial part of VINs and FAZIT IDs, and the user's home folder (its name is the OS user name), in text
     that may end up in a public issue."""
     home = os.path.expanduser("~")
-    if len(Path(home).parts) > 1:  # "~" when unknown, "/" for root: nothing to hide
-        for h in {home, Path(home).as_posix()}:
+    posix_home = home.replace("\\", "/").rstrip("/")
+    if len([p for p in posix_home.split("/") if p and p != "~"]) > 1:  # "~", "/", "C:/": nothing to hide
+        variants = {home, posix_home, posix_home.replace("/", "\\"), posix_home.replace("/", "\\\\")}
+        for h in sorted(variants, key=len, reverse=True):
             text = re.sub(re.escape(h) + r"(?![\w.-])", "~", text, flags=re.I)
     return _FAZIT.sub(r"\1********", _VIN.sub(r"\1******", text))
 
@@ -234,15 +236,18 @@ def build_report_zip(
                 z.write(p, f"dumps/{name}")
         budget = DUMP_BUDGET
         for p in session_files(out_dir, failure.started, with_dumps=dumps is not None):
-            arc = "sessions/" + p.relative_to(out_dir).as_posix()
+            arc = mask_ids("sessions/" + p.relative_to(out_dir).as_posix())
             if p.suffix.lower() == ".bin":
                 if p.stat().st_size <= budget:
                     z.write(p, arc)
                     budget -= p.stat().st_size
             elif p.name == "can.jsonl":
-                z.writestr(arc, _can_log_excerpt(p))
+                z.writestr(arc, mask_ids(_can_log_excerpt(p)))
             elif p.stat().st_size <= 20 * 1024 * 1024:
-                z.write(p, arc)
+                if p.suffix.lower() in (".json", ".txt", ".log", ".jsonl", ".md"):
+                    z.writestr(arc, mask_ids(p.read_text(encoding="utf-8", errors="replace")))
+                else:
+                    z.write(p, arc)
         dirs = driver_log_dirs() if driver_dirs is None else driver_dirs
         # Only the driver this operation ran on: another one's logs mislead. A 2.0.1c report for a run on the
         # ODIS-S driver came with VCTool driver logs from an hour earlier, because "the newest two anywhere" was

@@ -1114,9 +1114,10 @@ class EcuScreen(QWidget):
             ssa = parse_ssa_block(raw_df)
             if ssa.crc_ok:
                 ssa_lbl = {
-                    0: tr("скрыты", "hidden"),
+                    0: tr("только причины", "reasons only"),
                     1: tr("стандартно", "standard"),
-                    3: tr("подробно", "detailed"),
+                    2: tr("подробно", "detailed"),
+                    3: tr("скрыты", "hidden"),
                 }.get(ssa.bap_output_mode, tr("включены", "enabled"))
                 ssa_st = State(ssa_lbl, "ok", key="on")
             else:

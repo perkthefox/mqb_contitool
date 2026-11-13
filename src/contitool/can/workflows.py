@@ -1410,8 +1410,8 @@ def read_eeprom_in_loader(
 
     reporter.can_log(
         tr(
-            "Запуск апплета чтения внешней SPI EEPROM ST M95640 (8 КБ, CSIH1 Mode 0, P10.11 CS#) into RAM…",
-            "Running ST M95640 external SPI EEPROM reader applet (8 KB, CSIH1 Mode 0, P10.11 CS#) into RAM…",
+            "Запуск апплета чтения внешней SPI EEPROM ST M95640 (8 КБ, CSIH1 Mode 0, P10.11 CS#) в ОЗУ…",
+            "Running ST M95640 external SPI EEPROM reader applet (8 KB, CSIH1 Mode 0, P10.11 CS#) in RAM…",
         )
     )
     link.send_loader_payload(EEPROM_M95640_READER_STUB, reporter=reporter)
@@ -1560,10 +1560,11 @@ def can_backup(
                     raise
                 except Exception as exc:
                     file_path.unlink(missing_ok=True)
-                    if not has_core_flash and len(selected) == 1:
+                    if not has_core_flash and not manifest["areas"] and area_key == selected[-1]:
                         raise
                     time.sleep(0.2)
-                    link.drain_rx(max_frames=100_000)
+                    with contextlib.suppress(*LINK_ERRORS):
+                        link.drain_rx(max_frames=100_000)
                     warn_msg = (
                         tr(
                             f"ContiTool не смог прочитать OPBT (опционные байты RH850): {exc}. Основной бэкап продолжен.",
@@ -3688,6 +3689,16 @@ def can_upload_zdc_datasets(
         crc_st = int.from_bytes(payload[-4:], "little")
         crc_ca = zdc_crc32_le(payload[:-4])
         if crc_st != crc_ca:
+            full_pay = export_zdc_block(dflash_bytes, idx)
+            if len(full_pay) != len(payload) and int.from_bytes(full_pay[-4:], "little") == zdc_crc32_le(full_pay[:-4]):
+                raise RuntimeError(
+                    tr(
+                        f"Прошивка этого шлюза принимает ZDC #{idx} ({code_name}) по UDS длиной {uds_len} Б, "
+                        f"а блок в DataFlash собран под формат {len(full_pay)} Б. Запишите DataFlash через RAM-Loader.",
+                        f"This gateway's firmware expects a {uds_len}-byte UDS image for ZDC #{idx} ({code_name}), "
+                        f"whereas DataFlash holds a {len(full_pay)}-byte block. Write DataFlash via RAM-Loader instead.",
+                    )
+                )
             raise ValueError(
                 tr(
                     f"Блок ZDC #{idx} ({spec_names.get(idx, '')}) имеет неверный CRC-32 (0x{crc_st:08X} != 0x{crc_ca:08X}).",

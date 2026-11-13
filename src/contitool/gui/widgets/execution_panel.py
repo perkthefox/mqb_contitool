@@ -157,7 +157,10 @@ class ExecutionPanel(QFrame):
         runner.log_added.connect(self._on_log)
         runner.operation_finished.connect(self._on_finished)
 
-        self._unsub = subscribe_lang_change(lambda _l: self.retranslate_ui())
+        self._unsub = subscribe_lang_change(self._on_lang_changed)
+        self.retranslate_ui()
+
+    def _on_lang_changed(self, _lang: str) -> None:
         self.retranslate_ui()
 
     def _build_status(self) -> QWidget:

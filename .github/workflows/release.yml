@@ -66,6 +66,38 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess
+          from pathlib import Path
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          ver = tag.lstrip("v")
+          text = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          m = re.search(rf"^## {re.escape(ver)}\b[^\n]*\n+(.*?)(?=^## |\Z)", text, flags=re.M | re.S)
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          if m and m.group(1).strip():
+              notes = m.group(1).strip()
+              tags = subprocess.run(
+                  ["git", "tag", "--sort=-creatordate"], capture_output=True, text=True, check=True
+              ).stdout.splitlines()
+              prev = next((t for t in tags if t.startswith("v") and t != tag), "")
+              if prev:
+                  repo = os.environ["GITHUB_REPOSITORY"]
+                  notes = f"{notes}\n\n**Full Changelog**: https://github.com/{repo}/compare/{prev}...{tag}"
+              Path("release_notes.md").write_text(notes + "\n", encoding="utf-8")
+              out.write_text(out.read_text(encoding="utf-8") + "has_changelog=true\n" if out.exists() else "has_changelog=true\n", encoding="utf-8")
+          else:
+              out.write_text(out.read_text(encoding="utf-8") + "has_changelog=false\n" if out.exists() else "has_changelog=false\n", encoding="utf-8")
+          PY
+
       - name: Download all platform release archives
         uses: actions/download-artifact@v4
         with:
@@ -75,5 +107,6 @@ jobs:
       - name: Create / Update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.has_changelog == 'true' && 'release_notes.md' || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.has_changelog != 'true' }}
           files: release-assets/*

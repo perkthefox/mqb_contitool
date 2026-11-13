@@ -416,7 +416,11 @@ class DPduBus(can.BusABC):
         # stack frame that outlives the primitive, and nothing guarantees this driver copies them all at the call
         self._cop_keep: dict[int, tuple] = {}
         self._vci_updated = False
-        for attempt in (1, 2):
+        reflashing = False
+        max_attempts = 2
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
             self._vci_updated = False
             self._call("PDUConstruct", None, None)
             try:
@@ -425,7 +429,15 @@ class DPduBus(can.BusABC):
                 break
             except can.CanError as exc:
                 self._teardown()
-                if attempt == 2 or (exc.error_code != ERR_COMM_PC_TO_VCI_FAILED and not self._vci_updated):
+                if self._vci_updated and not reflashing:
+                    reflashing = True
+                    max_attempts = 4  # freshly reflashed VCI may still be booting its RTOS on USB re-enumeration
+                retryable = (
+                    exc.error_code == ERR_COMM_PC_TO_VCI_FAILED
+                    or self._vci_updated
+                    or (reflashing and exc.error_code == ERR_FCT_FAILED)
+                )
+                if attempt >= max_attempts or not retryable:
                     raise
                 time.sleep(VCI_RESTART_WAIT)  # the session after a dropped or reflashed VCI always connected in the logs
             except Exception:
@@ -493,6 +505,7 @@ class DPduBus(can.BusABC):
             return
         if self._raw_monitor_deaf:
             if not self._open_nonraw(bitrate, verify=verify):
+                self._close_links()
                 if not verify or not self._probe_uds_only_fallback(verify=True):
                     raise can.CanOperationError(tr("D-PDU: не удалось переоткрыть резервный канал",
                                                    "D-PDU: could not reopen the fallback link"))

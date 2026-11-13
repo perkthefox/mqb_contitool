@@ -239,11 +239,12 @@ def test_eeprom_decoder_standalone_and_with_cflash_nvm_table(synth_cflash: bytes
     assert from_cf.vin == "WVWZZZ3CZWE000123"
     assert from_cf.crc_bad_count == 0
 
-    # Corrupt 1 byte inside NvM 0x0D -> detected as CRC error
+    # Corrupt 1 byte inside NvM 0x0D -> detected as CRC error and corrupt coding payload is rejected
     corrupted = bytearray(ee_raw)
     corrupted[0x03D8] ^= 0xFF
     bad_summary = analyze_eeprom(bytes(corrupted), cf_with_tbl)
     assert bad_summary.crc_bad_count == 1
+    assert bad_summary.long_coding == b""
 
     ee_file = tmp_path / "Eeprom.bin"
     ee_file.write_bytes(ee_raw)

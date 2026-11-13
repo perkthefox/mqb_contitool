@@ -231,3 +231,25 @@ def test_dumps_go_in_only_when_asked(tmp_path: Path) -> None:
         assert "dumps/loaded/Cflash.bin" in names
         assert "sessions/PN_FZ/writes/2026-11-09_17-00-00_write/dflash/backup/Dflash_before.bin" in names
         assert "VIN" in z.read("README.txt").decode()
+
+
+def test_session_archive_paths_and_json_contents_mask_fazit_vin_and_escaped_home(tmp_path: Path, monkeypatch) -> None:
+    """Session folder names `<PN>_<FAZIT>` and JSON fields (`fazit`, `session_dir` with `\\\\` on Windows) must be masked."""
+    fake_home = r"C:\Users\SecretTech"
+    monkeypatch.setattr(report.os.path, "expanduser", lambda _p: fake_home)
+    started = time.time() - 1
+    gw_dir = tmp_path / "runs" / f"3Q0907530C_{FAZIT}" / "dumps" / "2026-11-13_12-00-00_read"
+    gw_dir.mkdir(parents=True)
+    win_escaped = fake_home.replace("\\", "\\\\") + f"\\\\runs\\\\3Q0907530C_{FAZIT}"
+    (gw_dir / "manifest.json").write_text(f'{{"session_dir": "{win_escaped}", "fazit": "{FAZIT}", "vin": "{VIN}"}}')
+
+    failure = report.Failure("Reading the ECU memory", "boom", "tb", started)
+    dest = report.build_report_zip(tmp_path / "masked.zip", failure, {"OS": "Windows"}, "log\n", tmp_path / "runs", driver_dirs=[])
+    with zipfile.ZipFile(dest) as z:
+        names = z.namelist()
+        assert not any(FAZIT in n or VIN in n for n in names)
+        manifest_entry = next(n for n in names if n.endswith("/manifest.json"))
+        assert "TST-SYN01.01.24********" in manifest_entry
+        body = z.read(manifest_entry).decode("utf-8")
+        assert FAZIT not in body and VIN not in body and "SecretTech" not in body
+        assert "~" in body and "WVWZZZAUZNW******" in body

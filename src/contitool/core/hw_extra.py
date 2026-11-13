@@ -367,7 +367,8 @@ def parse_cflash_eeprom_nvm_table(cflash_bytes: bytes | None) -> list[tuple[int,
                 off, sz, copies, _b5, _w6, _rom, _w12, drv, _flg = struct.unpack_from(
                     "<HHBBHIHBB", cflash_bytes, idx + nvm_id * 16
                 )
-                if drv != 0 or sz == 0 or off + sz > EEPROM_SIZE:
+                end_off = (off + sz) if nvm_id < 2 else (off + 6 + sz)
+                if drv != 0 or sz == 0 or end_off > EEPROM_SIZE:
                     valid = False
                     break
                 out.append((nvm_id, off, sz, copies == 0))
@@ -517,12 +518,19 @@ def analyze_eeprom(
         if records and records[0].nvm_id == 0x00:
             by_nvm[0x00] = records[0]
 
-    def _find_record(nvm_id: int, *, approx_off: tuple[int, int], length: int) -> EepromNvmRecord | None:
+    def _find_record(
+        nvm_id: int,
+        *,
+        approx_off: tuple[int, int],
+        length: int,
+        require_crc: bool = True,
+    ) -> EepromNvmRecord | None:
         if nvm_id in by_nvm:
-            return by_nvm[nvm_id]
+            rec = by_nvm[nvm_id]
+            return rec if (not require_crc or rec.crc_ok) else None
         lo, hi = approx_off
         for r in records:
-            if r.length == length and lo <= r.offset <= hi and r.crc_ok:
+            if r.length == length and lo <= r.offset <= hi and (not require_crc or r.crc_ok):
                 return r
         return None
 
@@ -562,14 +570,14 @@ def analyze_eeprom(
     # 6. VIN (check NvM 0x0F or any 17-char ASCII WMI/VIN across EEPROM)
     vin = ""
     rec_0f = by_nvm.get(0x0F)
-    if rec_0f is not None and not rec_0f.erased:
+    if rec_0f is not None and not rec_0f.erased and rec_0f.crc_ok:
         cand = _clean_ascii(rec_0f.payload)
         if len(cand) >= 11 and cand.isalnum():
             vin = cand
     if not vin:
         # Search for standard 17-character alphanumeric VIN if stored in another vehicle ID block
         for r in records:
-            if r.length >= 17 and not r.erased:
+            if r.length >= 17 and not r.erased and r.crc_ok:
                 txt = _clean_ascii(r.payload)
                 if len(txt) == 17 and txt.isalnum() and not txt.startswith(("3Q0", "5Q0", "EV_", "JCB")):
                     vin = txt
@@ -610,7 +618,7 @@ def analyze_eeprom(
                         dtcs.append((dtc_code, st_byte))
 
     # 10. KSCHUTZ / Component Protection & Engineering Feature state (NvM 0x5E @ 0x1324, 18 bytes)
-    rec_5e = _find_record(0x5E, approx_off=(0x1300, 0x1340), length=18)
+    rec_5e = _find_record(0x5E, approx_off=(0x1300, 0x1340), length=18, require_crc=False)
     nvm_5e_present = rec_5e is not None and not rec_5e.erased
     nvm_5e_crc_ok = bool(rec_5e and rec_5e.crc_ok)
     cp_mask: int | None = None
@@ -623,7 +631,7 @@ def analyze_eeprom(
     f81: bool | None = None
     f83: bool | None = None
 
-    if nvm_5e_present and rec_5e is not None and len(rec_5e.payload) == 18:
+    if nvm_5e_present and nvm_5e_crc_ok and rec_5e is not None and len(rec_5e.payload) == 18:
         p5e = rec_5e.payload
         showroom_cnt = p5e[4]
         cp_mask = struct.unpack_from("<H", p5e, 5)[0] & 0x0FFF
@@ -638,7 +646,7 @@ def analyze_eeprom(
         f81 = (eng_mask & (1 << 1)) == 0
         f83 = (eng_mask & (1 << 3)) == 0
 
-    rec_5f = _find_record(0x5F, approx_off=(0x1328, 0x1360), length=55)
+    rec_5f = _find_record(0x5F, approx_off=(0x1328, 0x1360), length=55, require_crc=False)
     nvm_5f_present = rec_5f is not None and not rec_5f.erased
     nvm_5f_crc_ok = bool(rec_5f and rec_5f.crc_ok)
 
