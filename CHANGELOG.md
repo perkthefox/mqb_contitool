@@ -8,6 +8,7 @@
   - На экране блока добавлен раздел **«EEPROM и OPBT»** с расшифровкой паспорта `NvM 0x00`, VIN, кодировки `0x0600`, списка оборудования `0x04A3`, АКБ `BEM`, блока безопасности `NvM 0x5E` (маска обученных слотов CP, `Master CP`, `Showroom`, инженерные флаги `0x80/0x81/0x83`), проверкой `CRC-16/CCITT-FALSE` по всем записям и битовой расшифровкой `OPBT0` / `OPBT8 (ICU-S)`.
   - В CLI добавлены команды `can read-eeprom`, `can read-opbt` и флаги `inspect --eeprom` / `--opbt`.
 - **Редактор профилей движения (`FPA`):** добавлена поддержка целевых режимов `On` / `Off` (`0x0300`) и непрерывного 15-ступенчатого слайдера жёсткости подвески `DCC` (`Step 1..15`, атрибут `0xFFFE` в профиле `Individual`).
+- **Индекс ПО (`F187`) в шапке блока и отчётах:** из таблицы аппаратных вариантов `FD_0DATA` и байта варианта `0x0000A600` (именно так сам шлюз формирует ответ на `UDS 22 F187`) определяется полный программный номер детали с буквенным индексом (`3Q0907530AA`, `AC`, `AG`, `AL`, `AR`, `AS`, `8S0907468N` и др.) и отображается в заголовке блока, полосе телеметрии (`3Q0907530AA · 5366` рядом с аппаратным `3Q0907530C · 521`) и подробном отчёте.
 - **Обновлённый инженерный интерфейс:** сбалансированная сланцево-графитовая палитра без провалов в чистый чёрный, явное сглаживание системных и моноширинных шрифтов с поддержкой HiDPI (`PassThrough`), двухтонные инженерные блоки с заголовочной планкой и нижней полкой управления, полосатые регистровые таблицы телеметрии, прямоугольная карта банков памяти в шапке блока и док журнала операций в стиле IDE.
 
 ### 🇷🇺 Исправлено
@@ -25,6 +26,7 @@
   - Added the **“EEPROM & OPBT”** service page in the GUI with full decoding of `NvM 0x00` passport, VIN, coding `0x0600`, installation list `0x04A3`, `BEM` battery data, `NvM 0x5E` security state (learned CP slot mask, `Master CP`, `Showroom`, `0x80/0x81/0x83` engineering flags), per-record `CRC-16/CCITT-FALSE` verification, and `OPBT0` / `OPBT8 (ICU-S)` bitfields.
   - Added CLI subcommands `can read-eeprom`, `can read-opbt`, and `inspect --eeprom` / `--opbt`.
 - **Driving-profile editor (`FPA`):** added support for `On` / `Off` (`0x0300`) target modes and the 15-step continuous `DCC` damping slider (`Step 1..15`, `0xFFFE` in `Individual`).
+- **Software part number & letter index (`F187`) in the ECU header and reports:** resolves the exact software part number (`3Q0907530AA`, `AC`, `AG`, `AL`, `AR`, `AS`, `8S0907468N`, etc.) directly from the `FD_0DATA` 8-tier variant table and `0x0000A600` hardware tier index (matching the gateway's own `UDS 22 F187` DID handler) and displays it in the ECU title, telemetry strip (`3Q0907530AA · 5366` alongside hardware `3Q0907530C · 521`), and full report.
 - **Redesigned engineering workbench GUI:** balanced slate-graphite surface hierarchy, explicit antialiased UI & monospace typography with `PassThrough` HiDPI scaling, structured 2-tone module blocks (header band + right-aligned compact actions or footer shelf), striped register/telemetry inspector tables, rectangular memory-bank cells in the ECU telemetry strip, and a flush IDE-style operation log dock.
 
 ### 🇬🇧 Fixed

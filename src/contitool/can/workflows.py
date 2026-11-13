@@ -1580,6 +1580,9 @@ def can_backup(
                 cf_raw = cflash_cache if cflash_cache is not None else (out_dir / "Cflash.bin").read_bytes()
                 cf_info = analyze_cflash(cf_raw)
                 manifest["gateway_identity"] = {
+                    "sw_pn": cf_info.sw_pn,
+                    "sw_ver": cf_info.sw_ver,
+                    "system_name": cf_info.system_name,
                     "hw_pn": cf_info.hw_pn,
                     "hw_ver": cf_info.hw_ver,
                     "fazit": cf_info.fazit,

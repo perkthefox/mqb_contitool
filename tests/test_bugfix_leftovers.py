@@ -377,3 +377,82 @@ def test_a_recommit_of_the_bytes_already_written_is_not_pending(synth_cflash, sy
     ws.commit("dflash", out)
     assert not ws.pending("dflash")
     win.close()
+
+
+# M. F187 software part number (AA, AC, AR, …) from FD_0DATA 8-tier variant table
+
+
+def _with_sw_variant_table(
+    synth_cflash: bytes,
+    *,
+    sw_ver: str = "5366",
+    hw_pn: str = "3Q0907530C",
+    hw_ver: str = "521",
+    hw_variant: int | None = 3,
+    high_pn: str = "3Q0907530AA",
+    ev_pn: str = "3Q0907530AB",
+    tt_pn: str = "8S0907468J",
+) -> bytes:
+    from contitool.core.checksums import app_crc
+
+    buf = bytearray(synth_cflash)
+    buf[0xA257:0xA25A] = f"{hw_ver:<3}".encode("ascii")[:3]
+    buf[0xA25A:0xA265] = f"{hw_pn:<11}".encode("ascii")[:11]
+    struct.pack_into("<I", buf, 0xA600, 0xFFFFFFFF if hw_variant is None else hw_variant)
+
+    app = bytearray(buf[APP_BASE:])
+    sw_off = 0x1000
+    pn_off = 0x1100
+    nm_off = 0x1200
+    did_off = 0x1300
+    pns = ("3Q0907530", "3Q0907530K", "3Q0907530J", high_pn, ev_pn, tt_pn, "8V1907468", "5Q0907530in")
+    nms = ("GW MQB Full", "GW MQB Mid", "GW MQB Low", "GW MQB High", "GW MQB EV", "GW MQB TT3", "GW MQB High", "GW MQB Inval.")
+    app[sw_off : sw_off + 4] = sw_ver.encode("ascii")
+    for i, (pn, nm) in enumerate(zip(pns, nms, strict=True)):
+        p_addr = APP_BASE + pn_off + i * 11
+        n_addr = APP_BASE + nm_off + i * 16
+        app[pn_off + i * 11 : pn_off + (i + 1) * 11] = f"{pn:<11}".encode("ascii")[:11]
+        app[nm_off + i * 16 : nm_off + i * 16 + 13] = f"{nm:<13}".encode("ascii")[:13]
+        struct.pack_into("<I", app, sw_off + 0x14 + i * 4, p_addr)
+        struct.pack_into("<I", app, sw_off + 0x34 + i * 4, n_addr)
+    struct.pack_into("<II", app, 0x40, APP_BASE + pn_off, APP_BASE + sw_off)
+    app[did_off : did_off + 12] = b"\x89\xf1\x01\x00\x04\x00\x00\x00" + struct.pack("<I", APP_BASE + sw_off)
+
+    _, calc = app_crc(app)
+    struct.pack_into("<H", app, 0x1C, calc)
+    buf[APP_BASE:] = app
+    return bytes(buf)
+
+
+def test_sw_part_number_resolved_and_displayed_in_identity_bar(
+    synth_cflash: bytes, synth_dflash: bytes, synth_uflash: bytes, tmp_path: Path
+) -> None:
+    from contitool.cli.formatting import format_cflash_report
+    from contitool.core.analyzer import analyze_cflash
+    from contitool.gui.screens.status import passport_rows
+
+    cf_aa = _with_sw_variant_table(synth_cflash, sw_ver="5366", hw_pn="3Q0907530C", hw_ver="521", hw_variant=3, high_pn="3Q0907530AA")
+    info_aa = analyze_cflash(cf_aa)
+    assert (info_aa.sw_pn, info_aa.sw_ver, info_aa.system_name, info_aa.hw_pn, info_aa.hw_ver) == (
+        "3Q0907530AA", "5366", "GW MQB High", "3Q0907530C", "521",
+    )
+    assert "3Q0907530AA" in format_cflash_report(info_aa)
+
+    # EV tier (hw_variant=4) and Audi TT tier (hw_variant=5), plus standalone FD_0DATA without prefix
+    cf_ev = _with_sw_variant_table(synth_cflash, sw_ver="5504", hw_pn="3Q0907530H", hw_ver="527", hw_variant=4, high_pn="3Q0907530AR", ev_pn="3Q0907530AS")
+    assert analyze_cflash(cf_ev).sw_pn == "3Q0907530AS"
+    assert analyze_cflash(cf_aa[APP_BASE:]).sw_pn == "3Q0907530AA"
+
+    set_lang("ru")
+    app, win = create_window()
+    folder = tmp_path / "backup_20261109_142145"
+    folder.mkdir()
+    for name, raw in (("Cflash.bin", cf_aa), ("Dflash.bin", synth_dflash), ("Uflash.bin", synth_uflash)):
+        (folder / name).write_bytes(raw)
+    win.ws.open_folder(folder)
+    assert win.ws.part_number == "3Q0907530AA"
+    assert win.ecu_screen.lbl_pn.text() == "3Q0907530AA"
+    rows = dict((lbl, val) for lbl, val, _tone in passport_rows(win.ws))
+    assert rows["Версия ПО"] == "3Q0907530AA · 5366"
+    assert rows["Оборудование"] == "3Q0907530C · 521"
+    win.close()

@@ -303,6 +303,10 @@ def format_cflash_report(summary: CflashSummary, style: Style | None = None, pat
     ]
     if path_label:
         lines.append(f"  {tr('Файл', 'File')}:              {path_label}")
+    if summary.sw_pn or summary.sw_ver:
+        sw_meta = " • ".join(p for p in (summary.sw_ver, summary.system_name) if p)
+        sw_tail = f"  ({sw_meta})" if sw_meta else ""
+        lines.append(f"  {tr('Номер ПО / SW', 'SW Part / Ver')}:     {st.bold(summary.sw_pn or '—')}{sw_tail}")
     lines.extend(
         [
             f"  {tr('Номер блока / HW', 'Part Number / HW')}:  {st.bold(summary.hw_pn or '—')}  ({summary.hw_ver or '—'})",

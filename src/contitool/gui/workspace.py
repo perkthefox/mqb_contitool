@@ -86,10 +86,17 @@ class Workspace(QObject):
     @property
     def part_number(self) -> str:
         inf = self.info("cflash")
-        if inf and inf.cflash_info and inf.cflash_info.hw_pn:
-            return inf.cflash_info.hw_pn
         einf = self.info("eeprom")
-        return einf.eeprom_info.part_number if einf and einf.eeprom_info else ""
+        e = einf.eeprom_info if einf else None
+        if inf and inf.cflash_info:
+            c = inf.cflash_info
+            if c.sw_pn:
+                return c.sw_pn
+            if e and e.part_number and c.sw_ver and e.sw_version == c.sw_ver:
+                return e.part_number
+            if c.hw_pn:
+                return c.hw_pn
+        return e.part_number if e else ""
 
     # ── loading ──
     def open_folder(self, folder: Path, source: str = "files") -> list[str]:

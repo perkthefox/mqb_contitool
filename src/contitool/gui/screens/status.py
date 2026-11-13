@@ -326,12 +326,17 @@ def passport_rows(ws: Workspace) -> list[tuple[str, str, str]]:
     """(label, value, tone) lines for the ECU identity card."""
     rows: list[tuple[str, str, str]] = []
     cf = ws.info("cflash")
+    ee = ws.info("eeprom")
+    e = ee.eeprom_info if ee else None
     if cf and cf.cflash_info:
         c = cf.cflash_info
-        if c.sw_ver:
-            rows.append((tr("Версия ПО", "Software"), c.sw_ver, "muted"))
-        if c.hw_ver:
-            rows.append((tr("Оборудование", "Hardware"), c.hw_ver, "muted"))
+        sw_pn = c.sw_pn or (e.part_number if e and c.sw_ver and e.sw_version == c.sw_ver else "")
+        sw_parts = [p for p in (sw_pn, c.sw_ver) if p]
+        if sw_parts:
+            rows.append((tr("Версия ПО", "Software"), " · ".join(sw_parts), "muted"))
+        hw_parts = [p for p in (c.hw_pn if sw_pn else "", c.hw_ver) if p]
+        if hw_parts:
+            rows.append((tr("Оборудование", "Hardware"), " · ".join(hw_parts), "muted"))
         rows.append(
             (
                 tr("Контрольная сумма", "Checksum"),
@@ -349,13 +354,12 @@ def passport_rows(ws: Workspace) -> list[tuple[str, str, str]]:
             rows.append(("VIN", sw.vin, "muted"))
         if sw.vcrn:
             rows.append(("VCRN", sw.vcrn.hex().upper(), "muted"))
-    ee = ws.info("eeprom")
-    if ee and ee.eeprom_info:
-        e = ee.eeprom_info
+    if e:
         if not any(lbl == "VIN" for lbl, _, _ in rows) and e.vin:
             rows.append(("VIN", e.vin, "muted"))
-        if not cf and e.sw_version:
-            rows.append((tr("Версия ПО (EEPROM)", "Software (EEPROM)"), e.sw_version, "muted"))
+        if not cf and (e.part_number or e.sw_version):
+            sw_ee = " · ".join(p for p in (e.part_number, e.sw_version) if p)
+            rows.append((tr("Версия ПО (EEPROM)", "Software (EEPROM)"), sw_ee, "muted"))
     return rows
 
 

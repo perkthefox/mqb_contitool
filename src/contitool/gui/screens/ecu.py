@@ -249,7 +249,7 @@ class EcuScreen(QWidget):
         strip_lay.setSpacing(7)
 
         self.grid_id = QGridLayout()
-        self.grid_id.setHorizontalSpacing(32)
+        self.grid_id.setHorizontalSpacing(24)
         self.grid_id.setVerticalSpacing(2)
         strip_lay.addLayout(self.grid_id)
 

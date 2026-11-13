@@ -304,7 +304,10 @@ class CflashSummary:
     fazit: str = ""
     hw_pn: str = ""
     hw_ver: str = ""
+    sw_pn: str = ""  # F187 VW Spare Part Number (e.g. 3Q0907530AA / AC / AR)
     sw_ver: str = ""  # F189 as the application answers it
+    system_name: str = ""  # F19E System Name (e.g. GW MQB High / GW MQB EV)
+    hw_variant: int | None = None  # OTP 0x0000A600 hardware tier index (0..6)
     fbl_c000: int = 0
     fbl_c100: int = 0
     fbl_ok: bool = True
@@ -453,21 +456,27 @@ def analyze_cflash(raw: bytes) -> CflashSummary:
         crc_ok=crc_valid,
         crc_range_count=range_cnt,
     )
+    hw_variant: int | None = None
     if prefix:
         m_c000, = struct.unpack_from("<I", prefix, 0xC000)
         m_c100, = struct.unpack_from("<I", prefix, 0xC100)
         res.fbl_c000 = m_c000
         res.fbl_c100 = m_c100
         res.fbl_ok = fbl_app_valid(prefix)
-        res.fazit = prefix[0xA240:0xA257].decode("ascii", errors="replace").strip()
-        res.hw_ver = prefix[0xA257:0xA25A].decode("ascii", errors="replace").strip()
-        res.hw_pn = prefix[0xA25A:0xA265].decode("ascii", errors="replace").strip()
+        res.fazit = _clean_printable_ascii(prefix[0xA240:0xA257])
+        res.hw_ver = _clean_printable_ascii(prefix[0xA257:0xA25A])
+        res.hw_pn = _clean_printable_ascii(prefix[0xA25A:0xA265])
+        raw_var, = struct.unpack_from("<I", prefix, HW_VARIANT_OFFSET)
+        if raw_var < 7:
+            hw_variant = raw_var
+        res.hw_variant = hw_variant
         res.a167_otp_byte = prefix[OTP_ENG_FLAG_OFFSET]
         res.fbl_rsa_mod = bytes(prefix[FBL_MOD_OFFSET : FBL_MOD_OFFSET + 128])
         res.fbl_rsa_exp_ok = bytes(prefix[FBL_EXP_OFFSET : FBL_EXP_OFFSET + 128]) == ((b"\x00" * 127) + b"\x03")
 
     app_ro = bytes(app)
     res.sw_ver = app_sw_version(app_ro)
+    res.sw_pn, res.system_name = app_sw_identity(app_ro, hw_variant=hw_variant, hw_pn=res.hw_pn)
     hits = find_kschutz_hook_sites(app_ro)
     if len(hits) == 1:
         off = hits[0]
@@ -780,6 +789,7 @@ def check_fec_dataset_support(
 
 
 FBL_LIBRARY_ID = b"SH850T01"  # Renesas flash library ID string inside every J533 bootloader build seen
+HW_VARIANT_OFFSET = 0xA600  # uint32 hardware tier index (0..6) read by DID 0xF187/0xF19E in FD_0DATA
 
 
 def app_sw_version(app: bytes) -> str:
@@ -790,6 +800,55 @@ def app_sw_version(app: bytes) -> str:
         if val.isdigit():
             return val.decode()
     return ""
+
+
+def app_sw_identity(app: bytes, *, hw_variant: int | None = None, hw_pn: str = "") -> tuple[str, str]:
+    """Return `(sw_pn, system_name)` (`F187`, `F19E`) from the FD_0DATA header and 8-tier variant table.
+
+    In Continental J533 RH850 builds, `app + 0x44` points to the 4-digit `F189` version string, followed at
+    `+0x14` by 8 pointers to 11-byte `F187` part numbers and at `+0x34` by 8 pointers to 13-byte `F19E` names.
+    The UDS `0x22 F187` / `0x22 F19E` handler indexes those tables with `*(uint32_t *)0x0000A600` (`0..6`).
+    """
+    if len(app) < 0x60:
+        return "", ""
+    _, p_sw = struct.unpack_from("<II", app, 0x40)
+    sw_off = p_sw - APP_BASE
+    if not (0 <= sw_off <= len(app) - 0x54) or not app[sw_off : sw_off + 4].isdigit():
+        return "", ""
+    sw_ptrs = struct.unpack_from("<8I", app, sw_off + 0x14)
+    nm_ptrs = struct.unpack_from("<8I", app, sw_off + 0x34)
+    pns: list[str] = []
+    for ptr in sw_ptrs[:7]:
+        off = ptr - APP_BASE
+        if not (0 <= off <= len(app) - 11):
+            return "", ""
+        raw_pn = app[off : off + 11]
+        if not all(0x20 <= b <= 0x7E for b in raw_pn):
+            return "", ""
+        pns.append(raw_pn.decode("ascii").strip())
+
+    if hw_variant is not None and 0 <= hw_variant < 7:
+        idx = hw_variant
+    else:
+        hp = hw_pn.strip()
+        if hp and hp in pns:
+            idx = pns.index(hp)
+        elif hp.startswith("8S0907468"):
+            idx = 5
+        elif hp.startswith(("81D907468", "8V1907468")):
+            idx = 6
+        elif hp in ("3Q0907530B", "3Q0907530D", "3Q0907530F", "3Q0907530H"):
+            idx = 4
+        else:
+            idx = 3  # GW MQB High (3Q0907530AA / AC / AG / AL / AR / ...)
+
+    nm = ""
+    nm_off = nm_ptrs[idx] - APP_BASE
+    if 0 <= nm_off <= len(app) - 13:
+        raw_nm = app[nm_off : nm_off + 13]
+        if all(0x20 <= b <= 0x7E for b in raw_nm):
+            nm = raw_nm.decode("ascii").strip()
+    return pns[idx], nm
 
 
 def analyze_uflash(uf: bytes) -> UflashSummary:
@@ -879,13 +938,15 @@ def detect_dump_file(path: Path) -> DetectedDumpFile:
         try:
             info = analyze_cflash(raw)
             kind = "cflash" if sz == CFLASH_SIZE else "fd_0data"
-            hw = f" • {info.hw_pn}" if info.hw_pn else ""
+            pn_main = info.sw_pn or info.hw_pn
+            sw_tag = f" ({info.sw_ver})" if info.sw_ver else ""
+            pn_lbl = f" • {pn_main}{sw_tag}" if pn_main else (f" • SW {info.sw_ver}" if info.sw_ver else "")
             crc_lbl = "CRC OK" if info.crc_ok else "CRC ERR!"
             mode_lbl = info.hook_mode
             eng_lbl = " • ENG" if (info.eng_gate_unlocked and info.a167_branch_bypassed) else ""
             label = (
                 f"{'CodeFlash 1.5 MB' if kind == 'cflash' else 'FD_0DATA 1.45 MB'}"
-                f"{hw} • {crc_lbl} • CP:{mode_lbl}{eng_lbl}"
+                f"{pn_lbl} • {crc_lbl} • CP:{mode_lbl}{eng_lbl}"
             )
             return DetectedDumpFile(path=path, kind=kind, valid=True, summary_text=label, cflash_info=info)
         except Exception as exc:
