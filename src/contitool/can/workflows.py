@@ -479,6 +479,17 @@ def _refuse_memory_via_j2534_wrapper(link: Any) -> None:
     bus = _j2534_wrapper_bus(link)
     if bus is not None:
         raise RuntimeError(_j2534_wrapper_problem(bus))
+    raw_bus = getattr(link, "bus", None)
+    nonraw = getattr(raw_bus, "nonraw", None)
+    if getattr(raw_bus, "uds_only", False) or (nonraw and 0x6F0 not in nonraw):
+        raise RuntimeError(tr(
+            "Этот адаптер D-PDU работает только по UDS ISO-TP (0x710/0x77A) и не даёт канал заводского RAM-Loader "
+            "(0x6F0/0x6F1): диагностика, прошивка FRF / ODX и запись параметрии по UDS доступны, а для чтения и "
+            "записи дампов памяти нужен CANable, candleLight или совместимый VAS 6154 / VNCI с raw CAN.",
+            "This D-PDU adapter works only over UDS ISO-TP (0x710/0x77A) and provides no factory RAM-Loader channel "
+            "(0x6F0/0x6F1): diagnostics, FRF / ODX flashing, and UDS dataset uploads work, while reading and writing "
+            "memory dumps requires CANable, candleLight, or a compatible VAS 6154 / VNCI with raw CAN.",
+        ))
 
 
 def _abort_if_unsupported_ecu(link: J533CanLink) -> None:
@@ -700,6 +711,9 @@ def read_memory_area(
                 )
                 time.sleep(2.5)  # a 64 KB stream lasts ~2.1 s: let a broken one run out before the next sync
                 link.drain_rx(max_frames=100_000)
+                recycle = getattr(getattr(link, "bus", None), "recycle_raw_links", None)
+                if callable(recycle):
+                    recycle()
         if len(chunk) != size:
             raise RuntimeError(f"Short chunk at 0x{addr:08X}: {len(chunk)}")
         with output_path.open("ab") as fh:
@@ -2352,8 +2366,9 @@ def _bcd_byte(val: int) -> int:
 
 def _dpdu_frame_by_frame(link: Any) -> bool:
     """A VAS 6154 / VNCI link that would send UDS frame by frame (no hardware ISO-TP, or it has given way)."""
-    on_dpdu = getattr(link, "interface", "") == "dpdu" or type(getattr(link, "bus", None)).__name__ == "DPduBus"
-    return on_dpdu and not getattr(link, "_hw_uds", False)
+    bus = getattr(link, "bus", None)
+    on_dpdu = getattr(link, "interface", "") == "dpdu" or type(bus).__name__ == "DPduBus"
+    return on_dpdu and not (getattr(link, "_hw_uds", False) or getattr(bus, "uds_only", False))
 
 
 def _uds_session(link: Any) -> Any:
@@ -3267,7 +3282,7 @@ def can_flash_frf(
     out_dir = session_dir or default_session_dir(None, "frf")
     result: dict[str, Any] = {"session_dir": str(out_dir), "frf": frf.name, "frf_version": frf.sw_version}
     try:
-        with J533CanLink(port, interface=interface, log_path=out_dir / "can.jsonl") as link:
+        with J533CanLink(port, interface=interface, log_path=out_dir / "can.jsonl") as link, _uds_session(link):
             reporter.step(1, 3, tr("Идентификация блока (F187 / F189 / F191 / F1A3)", "Identifying the ECU (F187 / F189 / F191 / F1A3)"))
             result["before"] = ecu = _read_ident_dids(link)
             hard, soft = frf_ident_problems(frf, ecu)
@@ -3288,7 +3303,7 @@ def can_flash_frf(
                     "flash a matching FRF / ODX.",
                 )) from exc
         time.sleep(3.0)  # the reset that ends the programming
-        with J533CanLink(port, interface=interface, log_path=out_dir / "after.jsonl") as link:
+        with J533CanLink(port, interface=interface, log_path=out_dir / "after.jsonl") as link, _uds_session(link):
             reporter.step(3, 3, tr("Проверка: приложение запущено, новая версия", "Checking: application running, new version"))
             _s, in_fbl = _probe_app_or_fbl(link, attempts=5, allow_fbl=True)
             if in_fbl:

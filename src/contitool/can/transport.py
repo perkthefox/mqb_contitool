@@ -387,7 +387,7 @@ class J533CanLink:
 
         The adapter only proves it can segment once a real multi-block transfer runs, and by then the application
         is already erased — so a failure there must be recoverable, not fatal. Returns True if it was active."""
-        if not self._hw_uds:
+        if getattr(self.bus, "uds_only", False) or not self._hw_uds:
             return False
         self._hw_uds = False
         end = getattr(self.bus, "end_uds_session", None)
@@ -412,7 +412,8 @@ class J533CanLink:
         if not req:
             raise ValueError("Empty UDS payload")
         req_sid = req[0]
-        if self._hw_uds:
+        uds_only = bool(getattr(self.bus, "uds_only", False)) and (self.UDS_TX_ID, self.UDS_RX_ID) == (0x710, 0x77A)
+        if self._hw_uds or uds_only:
             self._write_trace("uds_tx", self.UDS_TX_ID, len(req), req[:16])
             self.tx_frames += 1
             try:
@@ -424,7 +425,8 @@ class J533CanLink:
                 # goes again on the verified software path instead of ending the operation. The ECU refusing
                 # (a 7F answer) is not caught here: that is its answer, and no transport would change it.
                 self.drop_hw_uds()
-                self._write_trace("uds_hw_fallback", self.UDS_TX_ID, len(req), req[:16])
+                if not uds_only:
+                    self._write_trace("uds_hw_fallback", self.UDS_TX_ID, len(req), req[:16])
                 if getattr(self.bus, "spent", False):
                     # The VCI itself is gone (it reboots, #19-#22): the software path would only fail on the next
                     # frame with "this link no longer works", after promising to carry on.
@@ -448,33 +450,51 @@ class J533CanLink:
                         "FBL bootloader without an application — which can be fixed: power-cycle the ECU and the VCI, "
                         f"{again}",
                     )) from exc
+                if uds_only:
+                    raise
                 if self.on_hw_fallback is not None:
                     self.on_hw_fallback(f"{req[:3].hex(' ').upper()}: {exc}")
             else:
                 self._write_trace("uds_rx", self.UDS_RX_ID, len(resp), resp[:16])
                 self.rx_frames += 1
                 return _checked_response(req_sid, resp, expected_sid)
-        self.drain_rx(quick=True)  # a late answer to an earlier request must not be read as the answer to this one
-        self.send_uds(req)
-        deadline = time.monotonic() + timeout
-        wait = 2.5
-        while True:
-            rem = deadline - time.monotonic()
-            if rem <= 0:
-                raise TimeoutError(f"UDS response timeout ({timeout:.1f}s) for {req[:8].hex()}")
-            resp = self.receive_uds(timeout=min(wait, rem))
-            if (
-                allow_pending
-                and len(resp) >= 3
-                and resp[0] == 0x7F
-                and resp[1] == req_sid
-                and resp[2] == 0x78
-            ):
-                # After 78 the ECU has P2* (5000 ms, from `50 xx 00 32 01 F4`) for the next frame; the FBL repeats
-                # 78 every ~2.5 s, so waiting only 2.5 s raced it and broke an erase over a slower adapter.
-                wait = P2_STAR_WAIT
-                continue
-            return _checked_response(req_sid, resp, expected_sid)
+        try:
+            self.drain_rx(quick=True)  # a late answer to an earlier request must not be read as the answer to this one
+            self.send_uds(req)
+            deadline = time.monotonic() + timeout
+            wait = 2.5
+            while True:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError(f"UDS response timeout ({timeout:.1f}s) for {req[:8].hex()}")
+                resp = self.receive_uds(timeout=min(wait, rem))
+                if (
+                    allow_pending
+                    and len(resp) >= 3
+                    and resp[0] == 0x7F
+                    and resp[1] == req_sid
+                    and resp[2] == 0x78
+                ):
+                    # After 78 the ECU has P2* (5000 ms, from `50 xx 00 32 01 F4`) for the next frame; the FBL repeats
+                    # 78 every ~2.5 s, so waiting only 2.5 s raced it and broke an erase over a slower adapter.
+                    wait = P2_STAR_WAIT
+                    continue
+                return _checked_response(req_sid, resp, expected_sid)
+        except TimeoutError:
+            fb = (
+                getattr(self.bus, "fallback_from_silent_raw", None)
+                if (resend and not self._recycle_held and (self.UDS_TX_ID, self.UDS_RX_ID) == (0x710, 0x77A))
+                else None
+            )
+            if callable(fb) and fb():
+                return self.request_uds(
+                    req,
+                    expected_sid,
+                    timeout=timeout,
+                    allow_pending=allow_pending,
+                    resend=False,
+                )
+            raise
 
     def send_loader_payload(
         self,
@@ -487,9 +507,18 @@ class J533CanLink:
         """Synchronize (`84 00 00 00 00`) and stream a framed RAM-loader packet over 0x6F0."""
         packet = build_loader_packet(payload)
         self._maybe_recycle_tx()
-        self.drain_rx()
+        self.drain_rx(max_frames=16_384)
         self.send_frame(self.LOADER_TX_ID, LOADER_SYNC)
+        sync_deadline = time.monotonic() + 2.0
         sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=2.0).data)
+        while sync_rx != LOADER_SYNC:
+            rem = min(0.15, sync_deadline - time.monotonic())
+            if rem <= 0:
+                break
+            try:
+                sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=rem).data)
+            except TimeoutError:
+                break
         if sync_rx != LOADER_SYNC:
             raise RuntimeError(f"Factory loader sync failed: got {sync_rx.hex()}")
         total = len(packet)

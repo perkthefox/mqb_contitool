@@ -1297,3 +1297,230 @@ def test_rawcan_resource_lookup_and_0x10000_refusal_fallback() -> None:
     res = can_identify("", bus=bus_fallback)
     assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
     bus_fallback.shutdown()
+
+
+def test_deaf_rawmode_monitor_switches_to_fixed_id_nonraw_with_uudt_format_5_and_stays_off_rawmode() -> None:
+    """VNCI 6154A + D-PDU 27.2 report: RawMode 0x80000001 + 0x80000000 open with rc=0 and echo TX frames, yet the
+    monitor never delivers bus responses on 0x77A. Automatically switch to ODIS fixed-ID ISO_11898_RAW links
+    (writing CP_CanRespUUDTFormat=5 as required by MDF_VW.xml, where default is 0) and keep RawMode disabled."""
+    set_lang("en")
+
+    class DeafMonitorPduApi(UdsCapablePduApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.objects["CP_CanRespUUDTFormat"] = 0x1F
+
+        def PDUGetUniqueRespIdTable(self, hmod, hcll, out) -> int:  # noqa: N802
+            if hcll in self.uds_links:
+                return super().PDUGetUniqueRespIdTable(hmod, hcll, out)
+            # MDF_VW.xml ISO_11898_RAW defaults: CP_CanPhysReqFormat=5, CP_CanRespUUDTFormat=0 (disabled!)
+            pids = (0x1A, 0x1C, 0x1B, 0x1F)
+            vals = (C.c_uint32 * len(pids))(0x7E0, 5, 0xFFFFFFFF, 0)
+            params = (ParamItem * len(pids))(*(
+                ParamItem(0x1200, pid, 0x105, 1, C.cast(C.byref(vals, idx * C.sizeof(C.c_uint32)), C.c_void_p))
+                for idx, pid in enumerate(pids)
+            ))
+            entry = (EcuUniqueRespData * 1)(EcuUniqueRespData(0, len(pids), C.cast(params, C.POINTER(ParamItem))))
+            table = UridTable(0x1700, 1, C.cast(entry, C.POINTER(EcuUniqueRespData)))
+            self.keep += [vals, params, entry, table, hcll]
+            out._obj.contents = table
+            return 0
+
+        def PDUSetUniqueRespIdTable(self, hmod, hcll, table) -> int:  # noqa: N802
+            if hcll in self.uds_links:
+                return super().PDUSetUniqueRespIdTable(hmod, hcll, table)
+            t = table._obj if hasattr(table, "_obj") else table.contents
+            entry = t.pUniqueData[0]
+            ids = {
+                entry.pParams[i].ComParamId: C.cast(entry.pParams[i].pComParamData, C.POINTER(C.c_uint32)).contents.value
+                for i in range(entry.NumParamItems)
+            }
+            self.nonraw_links[hcll] = {
+                "phys": ids.get(0x1A, 0),
+                "phys_fmt": ids.get(0x1C, 0),
+                "resp": ids.get(0x1B, 0),
+                "resp_fmt": ids.get(0x1F, 0),
+            }
+            return 0
+
+        def _result(self, raw: bytes, flags: bytes, link: int | None = None) -> None:
+            if link is None and not (len(flags) >= 4 and flags[3] & 0x01):
+                return  # RawMode monitor is deaf to ECU responses (only TX echoes come back)
+            if link in self.nonraw_links and self.nonraw_links[link].get("resp_fmt") != 5:
+                return  # MDF_VW ISO_11898_RAW ignores UUDT responses while CP_CanRespUUDTFormat == 0
+            super()._result(raw, flags, link=link)
+
+    api = DeafMonitorPduApi()
+    bus = DPduBus(dll=api)
+    assert bus.h_rx and bus.h_tx and not bus.nonraw  # RawMode opened with rc=0 initially
+
+    res = can_identify("", bus=bus)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    assert bus.nonraw and sorted(bus.nonraw) == [0x6F0, 0x710] and not bus.h_rx
+    assert all(v["resp_fmt"] == 5 and v["phys_fmt"] == 5 for v in api.nonraw_links.values())
+    assert "no raw CAN" in bus.describe()
+
+    # Entering and leaving hardware ISO-TP must reopen nonraw, never the deaf RawMode monitor
+    with bus.uds_session() as hw:
+        assert hw is True
+    assert bus.nonraw and sorted(bus.nonraw) == [0x6F0, 0x710] and not bus.h_rx
+    bus.shutdown()
+
+
+def test_deaf_rawmode_monitor_falls_back_to_odis_uds_only_when_nonraw_fails_and_blocks_ram_loader() -> None:
+    """When both RawMode monitor and ISO_11898_RAW fixed-ID links stay silent, fall back to ODIS's hardware ISO_15765
+    link for UDS operations (identify, FRF/ODX flash, ZDC upload) and refuse RAM-Loader cleanly up front."""
+    from contitool.can import J533CanLink, workflows
+    from test_identify import IDENT
+
+    set_lang("en")
+
+    class OdisIsoTpOnlyApi(UdsCapablePduApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.nonraw_ok = False
+
+        def _result(self, raw: bytes, flags: bytes, link: int | None = None) -> None:
+            if link is None and not (len(flags) >= 4 and flags[3] & 0x01):
+                return  # RawMode monitor is deaf
+            super()._result(raw, flags, link=link)
+
+        def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+            if hcll in self.uds_links and cop == COPT_SENDRECV and size:
+                req = bytes(data[:size])
+                if req == b"\x10\x03":
+                    cid = self.next_cop
+                    self.next_cop += 1
+                    hcop._obj.value = cid
+                    self._queue_uds_result(hcll, cid, b"\x50\x03\x00\x32\x01\xf4")
+                    self._queue_uds_done(hcll, cid)
+                    return 0
+                if req[0] == 0x22 and len(req) == 3:
+                    cid = self.next_cop
+                    self.next_cop += 1
+                    hcop._obj.value = cid
+                    did = int.from_bytes(req[1:3], "big")
+                    ans = (b"\x62" + req[1:3] + IDENT[did]) if did in IDENT else b"\x7f\x22\x31"
+                    self._queue_uds_result(hcll, cid, ans)
+                    self._queue_uds_done(hcll, cid)
+                    return 0
+                if req[0] not in (0x3E, 0x10, 0x27, 0x2E, 0x31, 0x34, 0x36, 0x37, 0x11):
+                    cid = self.next_cop
+                    self.next_cop += 1
+                    hcop._obj.value = cid
+                    self._queue_uds_result(hcll, cid, bytes([0x7F, req[0], 0x11]))
+                    self._queue_uds_done(hcll, cid)
+                    return 0
+            return super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+
+    api = OdisIsoTpOnlyApi()
+    bus = DPduBus(dll=api)
+    res = can_identify("", bus=bus)
+    assert bus.uds_only and bus._uds_link
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    assert "UDS ISO-TP only" in bus.describe()
+
+    with J533CanLink("", interface="dpdu", bus=bus) as link:
+        with pytest.raises(RuntimeError, match="no factory RAM-Loader channel"):
+            workflows.enter_ram_loader(link)
+    bus.shutdown()
+
+
+def test_unpowered_ecu_on_healthy_rawmode_restores_rawmode_after_silent_probe(monkeypatch) -> None:
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.05)
+    api = FakePduApi()
+    api.gw.answers = False
+    bus = DPduBus(dll=api)
+    assert bus.fallback_from_silent_raw() is False
+    assert not bus.nonraw and not bus.uds_only and bus.h_rx and bus.h_tx and not bus.spent
+
+    api.gw.answers = True
+    res = can_identify("", bus=bus)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    assert bus._raw_rx_verified and not bus.nonraw
+    bus.shutdown()
+
+
+def test_rawmode_rx_monitor_recycles_between_packets_and_on_stream_retry_issue_28(monkeypatch, tmp_path: Path) -> None:
+    """Issue #28: 1.5 MB CodeFlash read over D-PDU 27.2 stalled past ~1 MB when the RawMode RX monitor was never
+    recycled. Verify periodic RX monitor recycling, trailing-stream sync drain, and retry link reopening."""
+    from contitool.can import J533CanLink, workflows
+    from contitool.can.transport import LOADER_SYNC
+    from contitool.can.workflows import READ_CHUNK_BYTES
+
+    # 1. Periodic RX monitor recycle at inter-packet boundary (never mid-stream)
+    monkeypatch.setattr(dpdu, "MAX_RAW_RX_RESULTS_BEFORE_RECYCLE", 25)
+    api = FakePduApi()
+    bus = DPduBus(dll=api)
+    first_mon = bus.h_rx
+    first_tx = bus.h_tx
+    for i in range(30):
+        bus.send(can.Message(arbitration_id=0x6F0, data=i.to_bytes(8, "little"), is_extended_id=False))
+    # Drain TX echoes so _rx_result_count >= 25 while send() itself never recycled mid-stream
+    end = time.monotonic() + 1.0
+    while bus._rx_result_count < 30 and time.monotonic() < end:
+        time.sleep(0.002)
+    assert bus.h_rx == first_mon and bus._rx_result_count >= 30
+    bus.maybe_recycle_tx()
+    assert bus.h_rx != first_mon and bus._rx_result_count == 0
+    assert bus.h_tx == first_tx and not bus.spent
+
+    # 2. send_loader_payload flushes >64 queued stale frames AND skips trailing 0xFF..FF stream frames ahead of sync
+    class TrailingStreamBus:
+        def __init__(self) -> None:
+            self.rx = (
+                [can.Message(arbitration_id=0x6F1, data=b"\xff" * 8, is_extended_id=False) for _ in range(200)]
+                + [can.Message(arbitration_id=0x6F1, data=LOADER_SYNC, is_extended_id=False)]
+            )
+            self.sent: list[can.Message] = []
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            self.sent.append(msg)
+            if bytes(msg.data) == LOADER_SYNC:
+                # Two delayed stream frames arrive from the VCI batch right before the ECU's LOADER_SYNC echo
+                self.rx = [
+                    can.Message(arbitration_id=0x6F1, data=b"\xff" * 8, is_extended_id=False),
+                    can.Message(arbitration_id=0x6F1, data=b"\xff" * 8, is_extended_id=False),
+                    can.Message(arbitration_id=0x6F1, data=LOADER_SYNC, is_extended_id=False),
+                ]
+
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            return self.rx.pop(0) if self.rx else None
+
+        def shutdown(self) -> None:
+            pass
+
+    with J533CanLink("", bus=TrailingStreamBus()) as link:
+        sent_bytes = link.send_loader_payload(b"\x11\x22\x33\x44", inter_frame_delay=0.0)
+        assert sent_bytes > 0
+
+    # 3. read_memory_area calls bus.recycle_raw_links() before retrying a stalled chunk
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    recycled_monitors: list[int] = []
+    orig_recycle = bus.recycle_raw_links
+
+    def tracked_recycle() -> None:
+        before = bus.h_rx
+        orig_recycle()
+        recycled_monitors.append((before, bus.h_rx))
+
+    monkeypatch.setattr(bus, "recycle_raw_links", tracked_recycle)
+    calls = 0
+    expected = bytes((i * 13) & 0xFF for i in range(READ_CHUNK_BYTES))
+
+    def flaky_stream(_link, _payload, addr, size, **_kw) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError(f"Stream from 0x6F1 at 0x{addr:08X} stopped after 1024/{size} bytes")
+        return expected
+
+    monkeypatch.setattr(workflows, "_stream_loader_read_payload", flaky_stream)
+    out = tmp_path / "chunk.bin"
+    with J533CanLink("", interface="dpdu", bus=bus) as link:
+        rep = workflows.read_memory_area(link, 0x00000000, READ_CHUNK_BYTES, out, label="CodeFlash")
+    assert rep["complete"] and out.read_bytes() == expected
+    assert len(recycled_monitors) == 1 and recycled_monitors[0][0] != recycled_monitors[0][1]
+    bus.shutdown()
+

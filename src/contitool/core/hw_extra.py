@@ -81,7 +81,8 @@ def is_plausible_opbt_bytes(raw: bytes) -> bool:
     words = struct.unpack(f"<{len(opbt_slice) // 4}I", opbt_slice)
     if (words[0] & OPBT0_REQUIRED_ONES_MASK) != OPBT0_REQUIRED_ONES_MASK:
         return False
-    return all(w in (0x00000000, 0xFFFFFFFF) for w in words[1:8])
+    # OPBT1 configures RH850/F1L PLL/clock/reset (e.g. 0xFEFFFBDB on J533); OPBT2..OPBT7 are unused/reserved.
+    return all(w in (0x00000000, 0xFFFFFFFF) for w in words[2:8])
 
 
 def analyze_opbt(raw: bytes) -> OpbtSummary:

@@ -100,9 +100,13 @@ def _scroll_tab(content: QWidget) -> QScrollArea:
     for sec in content.findChildren(Section):
         sec.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         sec.lbl_desc.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+    for cmb in content.findChildren(QComboBox):
+        cmb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        cmb.setMinimumContentsLength(16)
     area = QScrollArea()
     area.setWidgetResizable(True)
     area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     area.setWidget(content)
     return area
 
@@ -142,7 +146,7 @@ class FpaEditorDialog(Dialog):
                 "Available driving modes, keeping the mode after the ignition is switched off, switching with the"
                 " MODE button and a wheel button.",
             ),
-            width=920,
+            width=1020,
         )
         self._df = bytes(df)
         self._conn = conn
@@ -259,7 +263,7 @@ class FpaEditorDialog(Dialog):
         self.finish(ok=self.btn_ok)
         if runner is not None:
             runner.busy_changed.connect(self._on_runner_busy)
-        self.resize(940, 780)
+        self.resize(1040, 780)
         self._load_all_from_fpa()
 
     # ── Tab 1: Profiles & Ignition Memory ──
@@ -660,12 +664,23 @@ class FpaEditorDialog(Dialog):
                 "Race",
                 tr("Вкл", "On"),
                 tr("Выкл", "Off"),
-                tr("Слайдер 1–15", "Slider 1–15"),
+                "DCC 1–15",
             ]
         )
+        dcc_hdr = self.tbl_s033.horizontalHeaderItem(8)
+        if dcc_hdr is not None:
+            dcc_hdr.setToolTip(
+                tr(
+                    "15-ступенчатый слайдер жёсткости подвески DCC в меню Individual",
+                    "15-step DCC damper stiffness slider in Individual menu",
+                )
+            )
         self.tbl_s033.setAlternatingRowColors(True)
         self.tbl_s033.verticalHeader().setDefaultSectionSize(30)
-        self.tbl_s033.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        hh_s033 = self.tbl_s033.horizontalHeader()
+        hh_s033.setMinimumSectionSize(58)
+        hh_s033.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hh_s033.setStretchLastSection(True)
         self.tbl_s033.itemChanged.connect(self._on_s033_item_changed)
         lay.addWidget(self.tbl_s033, 1)
         return w

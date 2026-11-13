@@ -1302,9 +1302,10 @@ class EcuScreen(QWidget):
                 )
             )
             if ee_summary.vin:
-                ee_rows.append(("VIN (NvM 0x0D)", ee_summary.vin, ""))
+                ee_rows.append(("VIN (NvM 0x0F)", ee_summary.vin, ""))
             if ee_summary.long_coding:
-                ee_rows.append((tr("Кодировка 0x0600", "Coding 0x0600"), ee_summary.long_coding.hex().upper(), "NvM 0x21"))
+                lc_spaced = " ".join(f"{b:02X}" for b in ee_summary.long_coding)
+                ee_rows.append((tr("Кодировка 0x0600", "Coding 0x0600"), lc_spaced, "NvM 0x0D"))
             if ee_summary.prog_date or ee_summary.prog_counter is not None or ee_summary.workshop_hex:
                 cnt_txt = f"#{ee_summary.prog_counter}" if ee_summary.prog_counter is not None else ""
                 ee_rows.append(
@@ -1411,6 +1412,8 @@ class EcuScreen(QWidget):
                     else tr("нестандартные биты", "non-standard bits"),
                 )
             ]
+            if len(op_summary.words) >= 2:
+                op_rows.append(("OPBT1", f"0x{op_summary.words[1]:08X}", tr("тактирование / PLL0", "clock / PLL0")))
             if op_summary.opbt8 is not None:
                 icus_txt = (
                     tr("ICU-S активен", "ICU-S active")

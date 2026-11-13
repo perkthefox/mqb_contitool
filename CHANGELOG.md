@@ -12,7 +12,10 @@
 ### 🇷🇺 Исправлено
 - **Редактор профилей движения (`FPA`, #24):** исправлен каталог функциональных групп `CharismaFunctions` (`0x01..0x1C` — `Motor`, `Getriebe`, `Lenkung`, `DCC`, `ACC`, `Kurvenlicht`, `Klima`, `Bussound` и др.), порядок целевых режимов (`8: On`, `9: Off`, `10: Snow`), Big-Endian формула байта `PaCo` (`12 - (pbit - 1) // 8`) и список силовых групп `KL15` (`0x04 EDS` больше не помечается как требующая перезапуска двигателя).
 - **Загрузка параметрии ZDC по CAN (#26):** по UDS теперь выгружаются только реально изменённые блоки датасета вместо перезаписи всех непустых блоков; адреса `RequestDownload (0x34)` определяются динамически из таблицы прошивки `CodeFlash` (если дамп открыт), а при отказе `7F 34 31` / `7F 34 70` выводится понятное объяснение с предложением записать `DataFlash` через RAM-Loader.
-- **VAS 6154 / VNCI (D-PDU, #10, #23):** после автоматического обновления прошивки адаптера драйвером D-PDU добавлено повторное переподключение при перезагрузке USB-интерфейса VCI; ID ресурса `RawCAN` теперь определяется из `MDF`-файла драйвера с резервным перебором `0x10000`.
+- **VAS 6154 / VNCI (D-PDU, #10, #23, #28):**
+  - Добавлен автоматический переход на резервный канал ODIS с фиксированными ID (`ISO_11898_RAW`, `CP_CanRespUUDTFormat = 5`) или аппаратный `ISO_15765` (ISO-TP), если адаптер открывает `RawMode` (`rc = 0`), но его `monitor` (`0x80000001`) не видит ответы `0x77A`; прошивка `FRF` / `ODX` теперь целиком идёт через аппаратный сеанс `ISO_15765`, как в ODIS.
+  - Исправлена остановка чтения `CodeFlash` (1,5 МБ) через RAM-Loader в районе ~1 МБ на драйвере D-PDU 27.2 (#28): канал приёма `RawMode` периодически переоткрывается на границах пакетов и при повторе сорванного блока, а задержанные хвосты потока очищаются перед синхронизацией `84 00 00 00 00`.
+  - После автоматического обновления прошивки адаптера драйвером D-PDU добавлено повторное переподключение при перезагрузке USB-интерфейса VCI; ID ресурса `RawCAN` определяется из `MDF`-файла драйвера с резервным перебором `0x10000`.
 - **Неподдерживаемые шлюзы `5Q0` и `Lear` (#8, #13, #14, #15):** проверка аппаратной платформы добавлена непосредственно перед входом в RAM-Loader во всех CAN-операциях, чтобы исключить неинформативную ошибку `7F 22 31` на блоках MPC5607B / MPC5748G.
 
 ### 🇬🇧 Added
@@ -25,7 +28,10 @@
 ### 🇬🇧 Fixed
 - **Driving-profile editor (`FPA`, #24):** fixed the `CharismaFunctions` group catalog (`0x01..0x1C` — `Engine`, `Gearbox`, `Steering`, `DCC`, `ACC`, `AFS`, `Climatronic`, `Interior sound`, etc.), target mode mapping (`8: On`, `9: Off`, `10: Snow`), Big-Endian `PaCo` byte indexing (`12 - (pbit - 1) // 8`), and `KL15` powertrain group tagging (`0x04 EDS` is no longer flagged as requiring an ignition cycle).
 - **ZDC dataset upload over CAN (#26):** UDS upload now sends only the ZDC blocks actually modified since the base `DataFlash` read; `RequestDownload (0x34)` addresses are resolved dynamically from the open `CodeFlash` image when available, and `7F 34 31` / `7F 34 70` rejections report a clear explanation suggesting RAM-Loader `DataFlash` write.
-- **VAS 6154 / VNCI (D-PDU, #10, #23):** added reconnect retries while the VCI reboots over USB right after a D-PDU firmware update, and dynamic `RawCAN` resource ID lookup from the driver's `MDF` file with fallback to `0x10000`.
+- **VAS 6154 / VNCI (D-PDU, #10, #23, #28):**
+  - Added automatic fallback to ODIS fixed-ID links (`ISO_11898_RAW`, `CP_CanRespUUDTFormat = 5`) or hardware `ISO_15765` (ISO-TP) when an adapter opens `RawMode` (`rc = 0`) with a deaf `0x80000001` monitor that delivers zero `0x77A` frames; `FRF` / `ODX` flashing now runs end-to-end on ODIS's `ISO_15765` session.
+  - Fixed 1.5 MB `CodeFlash` RAM-Loader reads stalling past ~1 MB on D-PDU 27.2 (#28): the `RawMode` RX monitor is periodically reopened at inter-packet boundaries and before retrying a failed chunk, and delayed trailing stream frames are flushed ahead of `84 00 00 00 00` sync.
+  - Added reconnect retries while the VCI reboots over USB right after a D-PDU firmware update, and dynamic `RawCAN` resource ID lookup from the driver's `MDF` file with fallback to `0x10000`.
 - **Unsupported `5Q0` and `Lear` gateways (#8, #13, #14, #15):** added an upfront platform check inside `enter_ram_loader` across all CAN workflows so MPC5607B / MPC5748G units report a clear unsupported-hardware error instead of failing with `7F 22 31`.
 
 ## 2.0.4 — 2026-11-11

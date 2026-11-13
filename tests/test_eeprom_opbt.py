@@ -121,8 +121,8 @@ def make_synthetic_eeprom() -> bytes:
     return bytes(ee)
 
 
-def make_synthetic_opbt36(*, opbt0: int = 0x9AA7FFEF, opbt8: int = 0x0FFFFFFF) -> bytes:
-    return struct.pack("<9I", opbt0, 0, 0, 0, 0, 0, 0, 0, opbt8)
+def make_synthetic_opbt36(*, opbt0: int = 0x9AA7FFEF, opbt1: int = 0, opbt8: int = 0x0FFFFFFF) -> bytes:
+    return struct.pack("<9I", opbt0, opbt1, 0, 0, 0, 0, 0, 0, opbt8)
 
 
 def _embed_cflash_eeprom_table(cflash: bytes) -> bytes:
@@ -389,7 +389,9 @@ def test_cli_inspect_and_gui_hw_screen_and_warnings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ee_raw = make_synthetic_eeprom()
-    op_raw = make_synthetic_opbt36()
+    # Real RH850/F1L J533 silicon layout: OPBT1 = 0xFEFFFBDB (clock/PLL), OPBT2..7 = 0xFFFFFFFF
+    op_raw = struct.pack("<9I", 0x9AA7FFEF, 0xFEFFFBDB, *([0xFFFFFFFF] * 6), 0x0FFFFFFF)
+    assert is_plausible_opbt_bytes(op_raw)
 
     folder = tmp_path / "full_dump"
     folder.mkdir()
@@ -415,6 +417,7 @@ def test_cli_inspect_and_gui_hw_screen_and_warnings(
     out = capsys.readouterr().out
     assert "WVWZZZ3CZWE000123" in out
     assert "0x9AA7FFEF" in out
+    assert "0xFEFFFBDB" in out
     assert "0x0FFFFFFF" in out
 
     # 2. GUI Workspace & `hw` page with both EEPROM + OPBT loaded

@@ -487,9 +487,15 @@ def format_opbt_report(summary: OpbtSummary, style: Style | None = None, path_la
     else:
         icus_badge = st.badge_warn(tr("НЕ АКТИВИРОВАН (bit 31 = 1)", "NOT ACTIVATED (bit 31 = 1)"))
 
+    lines.append(
+        f"  OPBT0:          0x{summary.opbt0:08X}  ({tr('резервные биты', 'reserved bits')}: {res_badge})"
+    )
+    if len(summary.words) >= 2:
+        lines.append(
+            f"  OPBT1:          0x{summary.words[1]:08X}  ({tr('тактовый генератор / PLL', 'clock / PLL config')})"
+        )
     lines.extend(
         [
-            f"  OPBT0:          0x{summary.opbt0:08X}  ({tr('резервные биты', 'reserved bits')}: {res_badge})",
             f"  OPBT8 (ICU-S):  {('0x' + format(summary.opbt8, '08X')) if summary.opbt8 is not None else '—'}  ({icus_badge})",
             f"  {tr('Отладка JTAG/LPD', 'JTAG/LPD Debug')}: {jtag_badge}",
         ]
