@@ -124,6 +124,7 @@ class J533CanLink:
         self._borrowed: Any = None  # a kept-open bus this link only borrows, handed back in close()
         self.on_hw_fallback: Any = None  # called with a short reason when hardware ISO-TP gives way to software
         self._recycle_held = 0  # >0 inside a window where no TX link reopen may pause the stream
+        self._rx_trace_suspended = 0  # >0 while streaming 200k 0x6F1 memory frames so json.dumps never starves RX
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = log_path.open("a", encoding="utf-8", buffering=1)
@@ -188,7 +189,7 @@ class J533CanLink:
         self.close()
 
     def _write_trace(self, direction: str, arb_id: int, dlc: int, data: bytes) -> None:
-        if self._log_file is not None:
+        if self._log_file is not None and not (direction == "rx" and self._rx_trace_suspended):
             self._log_file.write(
                 json.dumps(
                     {
@@ -202,7 +203,34 @@ class J533CanLink:
                 + "\n"
             )
 
-    def drain_rx(self, max_frames: int = 64, *, quick: bool = False) -> None:
+    @contextlib.contextmanager
+    def suspend_rx_trace(self) -> Iterator[None]:
+        """Skip per-frame JSONL writes during 200k-frame memory streams so disk I/O / GIL never starves VCI RX (#28)."""
+        self._rx_trace_suspended += 1
+        try:
+            yield
+        finally:
+            self._rx_trace_suspended -= 1
+
+    def write_stream_summary(self, address: int, expected: int, received: int, frames: int) -> None:
+        """Record one compact summary line in `can.jsonl` for a streamed `0x6F1` memory burst."""
+        if self._log_file is not None:
+            self._log_file.write(
+                json.dumps(
+                    {
+                        "time": time.time(),
+                        "direction": "rx_stream",
+                        "id": f"0x{self.LOADER_RX_ID:x}",
+                        "address": f"0x{address:08x}",
+                        "expected_bytes": expected,
+                        "received_bytes": received,
+                        "frames": frames,
+                    }
+                )
+                + "\n"
+            )
+
+    def drain_rx(self, max_frames: int = 64, *, quick: bool = False) -> int:
         """Drain any stale buffered frames before starting a fresh handshake.
 
         `quick`: return at once when an slcan port has nothing waiting. python-can's slcan answers recv(timeout=0)
@@ -210,6 +238,7 @@ class J533CanLink:
         per `36` block (3.9 KB/s). The RAM-loader packets keep that read: their pacing on slcan was verified with it."""
         port = getattr(self.bus, "serialPortOrig", None) if quick else None
         parsed = getattr(self.bus, "_queue", None)  # slcan: lines already read from the port
+        drained = 0
         for _ in range(max_frames):
             if port is not None and not port.in_waiting and not (parsed and parsed.qsize()):
                 break
@@ -220,12 +249,50 @@ class J533CanLink:
 
                 if not isinstance(exc, FrameError):
                     raise
+                drained += 1
                 continue  # a result of the stale stream the bus could not interpret: thrown away with the rest
             if msg is None:
                 break
             raw = bytes(msg.data)
             self.rx_frames += 1
-            self._write_trace("rx", msg.arbitration_id, msg.dlc, raw)
+            drained += 1
+            if drained <= 32:
+                self._write_trace("rx", msg.arbitration_id, msg.dlc, raw)
+        return drained
+
+    def drain_until_quiet(
+        self,
+        identifier: int | None = None,
+        *,
+        quiet_window: float = 0.08,
+        max_wait: float = 2.5,
+    ) -> int:
+        """Drain frames until `identifier` (or the whole bus) stays silent for `quiet_window` seconds."""
+        deadline = time.monotonic() + max_wait
+        quiet_since = time.monotonic()
+        discarded = 0
+        while time.monotonic() < deadline:
+            rem_quiet = quiet_window - (time.monotonic() - quiet_since)
+            if rem_quiet <= 0:
+                break
+            wait = min(0.02, max(0.002, rem_quiet), max(0.001, deadline - time.monotonic()))
+            try:
+                msg = self.bus.recv(timeout=wait)
+            except can.CanOperationError as exc:
+                from contitool.can.dpdu import FrameError
+
+                if not isinstance(exc, FrameError):
+                    raise
+                discarded += 1
+                quiet_since = time.monotonic()
+                continue
+            if msg is None:
+                continue
+            self.rx_frames += 1
+            if identifier is None or msg.arbitration_id == identifier:
+                discarded += 1
+                quiet_since = time.monotonic()
+        return discarded
 
     def send_frame(self, identifier: int, data: bytes | bytearray, pad: int | None = None) -> None:
         import can
@@ -507,7 +574,8 @@ class J533CanLink:
         """Synchronize (`84 00 00 00 00`) and stream a framed RAM-loader packet over 0x6F0."""
         packet = build_loader_packet(payload)
         self._maybe_recycle_tx()
-        self.drain_rx(max_frames=16_384)
+        if self.drain_rx(max_frames=16_384):
+            self.drain_until_quiet(self.LOADER_RX_ID, quiet_window=0.06, max_wait=2.0)
         self.send_frame(self.LOADER_TX_ID, LOADER_SYNC)
         sync_deadline = time.monotonic() + 2.0
         sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=2.0).data)

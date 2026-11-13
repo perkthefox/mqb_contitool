@@ -123,6 +123,9 @@ def _uninterruptible(fn):  # noqa: ANN001, ANN202
 
     return run
 FED_READS_PER_PAYLOAD = 16  # 64 KB per upload outside DataFlash; verified: full CodeFlash over a CANable2, 0 retries
+# On D-PDU VCIs (VAS 6154A / VNCI over TCP, #28) an unpaused 8,192-frame (2.6 s) burst lets PDUAPI_VW.dll's monitor
+# queue fall seconds behind past ~1 MB; 4 x 4 KB (16 KB = 2,048 frames, ~0.65 s) drains the queue cleanly between bursts.
+DPDU_FED_READS_PER_PAYLOAD = 4
 AREA_READ_RETRIES = 2
 SELFID_OFFSET = 0x0000AB00
 SELFID_SIZE = 16
@@ -172,9 +175,9 @@ def _consume_loader_end_frame(
     timeout: float = 1.5,
     label: str = "RAM-loader",
 ) -> bytes:
-    """Consume the mandatory 2-byte `00 00` status frame emitted by `0x0100120E` after every RAM applet."""
+    """Consume the mandatory exact 2-byte `00 00` status frame emitted by `0x0100120E` after every RAM applet."""
     resp = bytes(link.receive_frame(link.LOADER_RX_ID, timeout=timeout).data)
-    if resp[:2] != b"\x00\x00":
+    if resp != b"\x00\x00":
         raise RuntimeError(f"Unexpected {label} closing frame on 0x6F1: {resp.hex()}")
     return resp
 
@@ -236,6 +239,30 @@ def _hand_back_after_cancel(link: J533CanLink, reporter: OperationReporter) -> N
     """Cancelled outside a write (a read, a backup, before the first erase): do not leave the gateway in the
     RAM-loader with no application running. NULL_REPORTER: the user's cancel must not stop this reset too."""
     reporter.info(tr("Операция отменена — возвращаем шлюз в штатный режим", "Cancelled — returning the gateway to its application"))
+    with contextlib.suppress(*LINK_ERRORS):
+        _reset_to_application(link, allow_fbl=True)
+
+
+def _hand_back_after_read_error(
+    link: J533CanLink,
+    reporter: OperationReporter,
+    *,
+    active_loader: bool,
+    return_to_app: bool,
+) -> None:
+    """Read-only workflow failed after entering RAM-Loader (#28): return J533 to Application so vehicle CAN / fans recover."""
+    if not active_loader or not return_to_app:
+        return
+    reporter.info(
+        tr(
+            "Сбой чтения — возвращаем шлюз из RAM-Loader в штатный режим…",
+            "Read failed — returning gateway from RAM-Loader to Application mode…",
+        )
+    )
+    drain_quiet = getattr(link, "drain_until_quiet", None)
+    if callable(drain_quiet):
+        with contextlib.suppress(*LINK_ERRORS):
+            drain_quiet(link.LOADER_RX_ID, quiet_window=0.15, max_wait=2.5)
     with contextlib.suppress(*LINK_ERRORS):
         _reset_to_application(link, allow_fbl=True)
 
@@ -575,18 +602,34 @@ def _stream_loader_read_payload(
     """Execute one reader RAM applet, collect `length` data bytes from 0x6F1, and consume closing `00 00`."""
     link.send_loader_payload(payload)
     data = bytearray()
+    frames = 0
+    suspend_trace = getattr(link, "suspend_rx_trace", contextlib.nullcontext)
+    write_summary = getattr(link, "write_stream_summary", None)
     deadline = time.monotonic() + max(10.0, length / 1000.0, frame_timeout + 1.0)
-    while len(data) < length and time.monotonic() < deadline:
-        try:
-            frame = link.receive_frame(link.LOADER_RX_ID, timeout=frame_timeout)
-        except TimeoutError:
-            if not data:
-                raise
-            # the ECU streams at full bus speed; an adapter that cannot keep up drops frames and the stream "stops"
-            raise TimeoutError(
-                f"Stream from 0x6F1 at 0x{address:08X} stopped after {len(data)}/{length} bytes (frames lost by the adapter?)"
-            ) from None
-        data.extend(bytes(frame.data))
+    with suspend_trace():
+        while len(data) < length and time.monotonic() < deadline:
+            try:
+                frame = link.receive_frame(link.LOADER_RX_ID, timeout=frame_timeout)
+            except TimeoutError:
+                if callable(write_summary):
+                    write_summary(address, length, len(data), frames)
+                if not data:
+                    raise
+                # the ECU streams at full bus speed; an adapter that cannot keep up drops frames and the stream "stops"
+                raise TimeoutError(
+                    f"Stream from 0x6F1 at 0x{address:08X} stopped after {len(data)}/{length} bytes (frames lost by the adapter?)"
+                ) from None
+            raw = bytes(frame.data)
+            frames += 1
+            if length - len(data) >= 8 and len(raw) != 8:
+                if callable(write_summary):
+                    write_summary(address, length, len(data), frames)
+                raise TimeoutError(
+                    f"Stream from 0x6F1 at 0x{address:08X} stopped after {len(data)}/{length} bytes (frames lost by the adapter?)"
+                )
+            data.extend(raw)
+    if callable(write_summary):
+        write_summary(address, length, len(data), frames)
     out = bytes(data[:length])
     if len(out) != length:
         raise RuntimeError(f"Short memory read at 0x{address:08X}: got {len(out)}/{length} bytes")
@@ -682,10 +725,17 @@ def read_memory_area(
     collected = bytearray()
     offset = 0
     in_dflash = start < DFLASH_ADDR_START + DFLASH_SIZE and end > DFLASH_ADDR_START
+    bus_obj = getattr(link, "bus", None)
+    is_dpdu_raw = (
+        getattr(link, "interface", "") == "dpdu"
+        and type(bus_obj).__name__ == "DPduBus"
+        and not getattr(bus_obj, "nonraw", None)
+    )
+    max_reads = DPDU_FED_READS_PER_PAYLOAD if is_dpdu_raw else FED_READS_PER_PAYLOAD
     while offset < total:
         reporter.check_cancelled()
         addr = start + offset
-        reads = 1 if in_dflash else min(FED_READS_PER_PAYLOAD, (total - offset) // READ_CHUNK_BYTES)
+        reads = 1 if in_dflash else min(max_reads, (total - offset) // READ_CHUNK_BYTES)
         size = reads * READ_CHUNK_BYTES
         for attempt in range(AREA_READ_RETRIES + 1):
             try:
@@ -711,9 +761,9 @@ def read_memory_area(
                 )
                 time.sleep(2.5)  # a 64 KB stream lasts ~2.1 s: let a broken one run out before the next sync
                 link.drain_rx(max_frames=100_000)
-                recycle = getattr(getattr(link, "bus", None), "recycle_raw_links", None)
-                if callable(recycle):
-                    recycle()
+                drain_quiet = getattr(link, "drain_until_quiet", None)
+                if callable(drain_quiet):
+                    drain_quiet(link.LOADER_RX_ID, quiet_window=0.15, max_wait=2.0)
         if len(chunk) != size:
             raise RuntimeError(f"Short chunk at 0x{addr:08X}: {len(chunk)}")
         with output_path.open("ab") as fh:
@@ -1555,6 +1605,12 @@ def can_backup(
             raise
         except Exception as exc:
             manifest["error"] = str(exc)
+            _hand_back_after_read_error(
+                link,
+                reporter,
+                active_loader=bool(manifest.get("loader_session") or manifest.get("beacon")),
+                return_to_app=return_to_app,
+            )
             raise
         finally:
             _write_json(out_dir / "manifest.json", manifest)
@@ -1606,6 +1662,12 @@ def can_read_opbt(
             raise
         except Exception as exc:
             report["error"] = str(exc)
+            _hand_back_after_read_error(
+                link,
+                reporter,
+                active_loader=bool(report.get("loader_session") or report.get("beacon")),
+                return_to_app=return_to_app,
+            )
             raise
         finally:
             _write_json(out_dir / "read_opbt.json", report)
@@ -1663,6 +1725,12 @@ def can_read_eeprom(
             raise
         except Exception as exc:
             report["error"] = str(exc)
+            _hand_back_after_read_error(
+                link,
+                reporter,
+                active_loader=bool(report.get("loader_session") or report.get("beacon")),
+                return_to_app=return_to_app,
+            )
             raise
         finally:
             _write_json(out_dir / "read_eeprom.json", report)
@@ -1755,6 +1823,12 @@ def can_read_memory(
             raise
         except Exception as exc:
             report["error"] = str(exc)
+            _hand_back_after_read_error(
+                link,
+                reporter,
+                active_loader=bool(report.get("loader_session") or report.get("beacon")),
+                return_to_app=return_to_app,
+            )
             raise
         finally:
             _write_json(out_dir / "read_mem_result.json", report)

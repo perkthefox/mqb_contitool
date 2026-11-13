@@ -91,7 +91,8 @@ from contitool.gui.dialogs.zdc import (
 )
 from contitool.gui.screens import status
 from contitool.gui.screens.status import State
-from contitool.gui.theme import mono_font, set_tone
+from contitool.gui import theme
+from contitool.gui.theme import glyph_pixmap, mono_font, set_tone
 from contitool.gui.widgets.page import (
     Callout,
     Section,
@@ -139,17 +140,29 @@ def _title(key: str) -> str:
 
 
 class _NavRow(QWidget):
-    """Function name with its current state on the right."""
+    """Category vector icon, function name, and status badge on the right."""
 
-    def __init__(self) -> None:
+    def __init__(self, key: str = "cp") -> None:
         super().__init__()
+        self._key = key
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 0, 8, 0)
-        lay.setSpacing(8)
+        lay.setSpacing(9)
+        self.lbl_icon = QLabel()
+        self.lbl_icon.setFixedSize(16, 16)
         self.lbl_name = QLabel()
         self.pill = pill()
+        lay.addWidget(self.lbl_icon, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self.lbl_name, 1)
         lay.addWidget(self.pill, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.set_active(False)
+
+    def set_active(self, active: bool) -> None:
+        self.lbl_icon.setPixmap(glyph_pixmap(self._key, theme.INFO if active else theme.TEXT_SECONDARY, 16))
+        f = self.lbl_name.font()
+        f.setWeight(f.Weight.DemiBold if active else f.Weight.Normal)
+        self.lbl_name.setFont(f)
+        self.lbl_name.setStyleSheet(f"color: {'#FFFFFF' if active else theme.TEXT};")
 
 
 class EcuScreen(QWidget):
@@ -204,15 +217,21 @@ class EcuScreen(QWidget):
     # ────────────────────────────── layout ──────────────────────────────
     def _build_identity(self) -> QWidget:
         self.sec_id = Section()
+        self.sec_id.setObjectName("IdentityCard")
         self.sec_id.body.setContentsMargins(20, 14, 20, 14)
-        self.sec_id.body.setSpacing(8)
+        self.sec_id.body.setSpacing(10)
+        id_badge = QLabel()
+        id_badge.setPixmap(glyph_pixmap("hw", theme.INFO, 20))
         self.lbl_pn = QLabel()
         self.lbl_pn.setObjectName("PartNumber")
+        self.lbl_pn.setFont(mono_font(20, bold=True))
         self.lbl_pn.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.pill_source = pill()
-        self.sec_id.head.insertWidget(0, self.lbl_pn)
+        self.sec_id.head.insertWidget(0, id_badge)
+        self.sec_id.head.insertWidget(1, self.lbl_pn)
         self.sec_id.lbl_title.setVisible(False)
-        self.sec_id.head.insertWidget(1, self.pill_source)
+        self.sec_id.head.insertWidget(2, self.pill_source)
+        self.sec_id.head.setAlignment(id_badge, Qt.AlignmentFlag.AlignVCenter)
         self.sec_id.head.setAlignment(self.pill_source, Qt.AlignmentFlag.AlignVCenter)
         self.btn_export = button("", "GhostBtn", slot=self.export_backup)
         self.btn_restore = button("", "GhostBtn", slot=self.restore_requested.emit)
@@ -226,19 +245,18 @@ class EcuScreen(QWidget):
         self.files_row = QHBoxLayout()  # which areas are loaded, and from which folder
         self.files_row.setSpacing(6)
         self.sec_id.body.addLayout(self.files_row)
-        self.sec_id.body.addWidget(divider())
 
         self.grid_id = QGridLayout()
-        self.grid_id.setHorizontalSpacing(36)
-        self.grid_id.setVerticalSpacing(3)
+        self.grid_id.setHorizontalSpacing(10)
+        self.grid_id.setVerticalSpacing(0)
         self.sec_id.body.addLayout(self.grid_id)
         return self.sec_id
 
     def _build_nav(self) -> QWidget:
         sec = Section()
         sec.hide_head()
-        sec.body.setContentsMargins(6, 4, 6, 6)
-        sec.setFixedWidth(310)
+        sec.body.setContentsMargins(6, 6, 6, 8)
+        sec.setFixedWidth(316)
         self.nav = QListWidget()
         self.nav.setObjectName("Nav")
         self.nav_rows: dict[str, _NavRow] = {}
@@ -255,8 +273,8 @@ class EcuScreen(QWidget):
             for key in keys:
                 item = QListWidgetItem(self.nav)
                 item.setData(Qt.ItemDataRole.UserRole, key)
-                item.setSizeHint(QSize(0, 38))
-                nav_row = _NavRow()
+                item.setSizeHint(QSize(0, 40))
+                nav_row = _NavRow(key)
                 self.nav.setItemWidget(item, nav_row)
                 self.nav_rows[key] = nav_row
                 self._nav_items[key] = item
@@ -328,6 +346,8 @@ class EcuScreen(QWidget):
         key = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
         if key:
             self._key = key
+            for k, nav_row in self.nav_rows.items():
+                nav_row.set_active(k == key)
             self._render_page()
 
     def _refresh_identity(self) -> None:
@@ -347,15 +367,22 @@ class EcuScreen(QWidget):
         clear_layout(self.grid_id)
         rows = status.passport_rows(self.ws)
         for col, (label, value, tone) in enumerate(rows):
+            box = QFrame()
+            box.setObjectName("MetricBox")
+            b_lay = QVBoxLayout(box)
+            b_lay.setContentsMargins(12, 7, 12, 8)
+            b_lay.setSpacing(2)
             cap = QLabel(label.upper())
             cap.setObjectName("GroupLabel")
             val = QLabel(value)
-            val.setFont(mono_font(13))
+            val.setFont(mono_font(12, bold=True))
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             if tone != "muted":
                 set_tone(val, tone)
-            self.grid_id.addWidget(cap, 0, col)
-            self.grid_id.addWidget(val, 1, col)
+            b_lay.addWidget(cap)
+            b_lay.addWidget(val)
+            self.grid_id.addWidget(box, 0, col)
+            self.grid_id.setColumnStretch(col, 0)
         self.grid_id.setColumnStretch(len(rows), 1)
 
         clear_layout(self.files_row)
@@ -419,6 +446,7 @@ class EcuScreen(QWidget):
         for key, nav_row in self.nav_rows.items():
             st = self._state(key)
             nav_row.lbl_name.setText(_title(key))
+            nav_row.set_active(key == self._key)
             set_pill(nav_row.pill, st.text, st.tone)
         if self.nav.currentItem() is not self._nav_items[self._key]:
             self.nav.setCurrentItem(self._nav_items[self._key])

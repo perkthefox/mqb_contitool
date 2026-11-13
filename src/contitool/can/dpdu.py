@@ -139,10 +139,6 @@ ERR_EVT_VCI_HARDWARE_FAULT = 0x00000107
 # Recycling the RawMode TX link periodically keeps the VCI's primitive table bounded while the monitor stays up.
 MAX_RAW_TX_COPS_BEFORE_RECYCLE = 20_000
 RAW_TX_IDLE_RECYCLE_THRESHOLD = 5_000
-# In #28 a 1.5 MB CodeFlash read (~196,608 RX frames + TX echoes) stalled past ~1.0 MB (131,072 monitor results) on
-# D-PDU 27.2 when the RawMode RX monitor primitive ran continuously without ever being reopened.
-MAX_RAW_RX_RESULTS_BEFORE_RECYCLE = 25_000
-RAW_RX_IDLE_RECYCLE_THRESHOLD = 5_000
 SILENT_RAW_RETRY_COOLDOWN = 8.0
 
 
@@ -397,7 +393,6 @@ class DPduBus(can.BusABC):
         # primitive can only be cancelled on its own link
         self._tx_in_flight: dict[int, int] = {}
         self._tx_cop_count = 0
-        self._rx_result_count = 0
         self.hmod = self.h_rx = self.h_tx = self._mon_cop = self._uds_link = 0
         self.uds_refusal = ""  # why the last uds_session() stayed on RawMode: goes into the flash result
         self._nonraw_verified = False  # the fixed-id fallback answered a 10 03 on this module
@@ -409,7 +404,7 @@ class DPduBus(can.BusABC):
         self.nonraw: dict[int, int] = {}  # CAN id we send on -> its link, when the adapter refused RawMode
         self._rx_id: dict[int, int] = {}  # link -> the CAN id its results carry (RawMode puts it in the data)
         self._links: list[int] = []  # every logical link opened, for teardown
-        self._rx_recycle_lock = threading.RLock()
+        self._rx_lock = threading.RLock()
         self._stop = threading.Event()
         self._rx_thread: threading.Thread | None = None
         self._rx_error: BaseException | None = None
@@ -530,7 +525,6 @@ class DPduBus(can.BusABC):
         self._raw_monitor_deaf = False
         self._silent_raw_probe_at = 0.0
         self.uds_only = False
-        self._rx_result_count = 0
 
     # ------------------------------------------------------------------ fallback for adapters without RawMode
     def _try(self, fn: str, *args: Any) -> int:
@@ -642,7 +636,6 @@ class DPduBus(can.BusABC):
         self._cop_keep.clear()
         self.h_rx = self.h_tx = self._mon_cop = self._uds_link = 0
         self._tx_cop_count = 0
-        self._rx_result_count = 0
         self.nonraw.clear()
         self._rx_id.clear()
         self._tx_in_flight.clear()
@@ -848,7 +841,7 @@ class DPduBus(can.BusABC):
 
         If one of them answers live on the bus, switch this session to it permanently; if neither answers (e.g. ECU
         unpowered on a healthy RawMode adapter), restore RawMode transparently and return False."""
-        with self._rx_recycle_lock:
+        with self._rx_lock:
             if self.h_rx:
                 self._drain(self.h_rx)
         if (
@@ -1085,7 +1078,7 @@ class DPduBus(can.BusABC):
         send link stays with the calling thread, which waits for each frame itself."""
         while not self._stop.is_set():
             try:
-                with self._rx_recycle_lock:
+                with self._rx_lock:
                     busy = self._drain_rx_links()
             except FrameError as exc:
                 # One result we would not interpret. The caller retries the read, so the link must stay up.
@@ -1320,8 +1313,6 @@ class DPduBus(can.BusABC):
                     self.spent = True
                     raise can.CanOperationError(tr("VCI закрыл канал D-PDU", "The VCI closed the D-PDU link"))
                 if ev.ItemType == IT_RESULT and ev.pData and (hcll == self.h_rx or hcll in self._rx_id):
-                    if hcll == self.h_rx:
-                        self._rx_result_count += 1
                     self._take_result(C.cast(ev.pData, C.POINTER(ResultData)).contents, self._rx_id.get(hcll))
                 elif ev.ItemType == IT_STATUS and ev.pData and hcll != self.h_rx:
                     if C.cast(ev.pData, C.POINTER(U32)).contents.value in COPST_DONE:
@@ -1375,18 +1366,15 @@ class DPduBus(can.BusABC):
         return self._pending.popleft(), False
 
     def maybe_recycle_tx(self, threshold: int | None = None) -> None:
-        """Recycle worn RawMode TX / RX monitor links — call only between packets, never inside one.
+        """Recycle a worn RawMode TX link — call only between packets, never inside one, while keeping the RX monitor
+        untouched.
 
-        Recycling costs a STOPCOMM / cancel wait of up to a second plus several VCI round trips. In the middle of a
-        RAM-loader packet or an ISO-TP block that gap outlives the receiver's tolerance and breaks the transfer,
-        so the decision belongs at a boundary where a pause is harmless."""
+        Recycling costs a STOPCOMM wait plus several VCI round trips. In the middle of a RAM-loader packet or an
+        ISO-TP block that gap outlives the receiver's tolerance and breaks the transfer, so the decision belongs at a
+        boundary where a pause is harmless."""
         if self.spent or self.nonraw or self.uds_only or not self.h_tx:
             return
-        tx_due = self._tx_cop_count >= (MAX_RAW_TX_COPS_BEFORE_RECYCLE if threshold is None else threshold)
-        rx_due = bool(self.h_rx) and self._rx_result_count >= (
-            MAX_RAW_RX_RESULTS_BEFORE_RECYCLE if threshold is None else RAW_RX_IDLE_RECYCLE_THRESHOLD
-        )
-        if not tx_due and not rx_due:
+        if self._tx_cop_count < (MAX_RAW_TX_COPS_BEFORE_RECYCLE if threshold is None else threshold):
             return
         end = time.monotonic() + 0.25  # let the last frames of the stream finish; they are already on the wire
         while self._tx_in_flight and time.monotonic() < end:
@@ -1394,47 +1382,7 @@ class DPduBus(can.BusABC):
             time.sleep(0.001)
         if self._tx_in_flight:
             return  # still busy: the next boundary tries again, and there are thousands of them before the limit
-        if tx_due:
-            self._recycle_raw_tx()
-        if rx_due:
-            self._recycle_raw_rx()
-
-    def _recycle_raw_rx(self) -> None:
-        """Reopen the RawMode RX monitor at an inter-packet boundary so 1.5 MB streams (#28) never stall it."""
-        with self._rx_recycle_lock:
-            if not self.h_rx or self.nonraw or self.uds_only:
-                return
-            old_rx = self.h_rx
-            self._drain(old_rx)
-            if self._mon_cop:
-                try:
-                    if self._dll.PDUCancelComPrimitive(self.hmod, old_rx, self._mon_cop) == 0:
-                        self._await_cop_done(old_rx, self._mon_cop, MONITOR_CANCEL_WAIT)
-                except Exception:  # noqa: BLE001
-                    pass
-                self._mon_cop = 0
-            self._try("PDUDisconnect", self.hmod, old_rx)
-            self._unwatch(old_rx)
-            self._try("PDUDestroyComLogicalLink", self.hmod, old_rx)
-            if old_rx in self._links:
-                self._links.remove(old_rx)
-            self.h_rx = 0
-            self._rx_result_count = 0
-            self.h_rx = self._open_monitor(self.bitrate)
-
-    def recycle_raw_links(self) -> None:
-        """Force-reopen both RawMode TX and RX monitor links before retrying a stalled memory stream."""
-        if self.spent or self.nonraw or self.uds_only or not self.h_tx or not self.h_rx:
-            return
-        end = time.monotonic() + 0.25
-        while self._tx_in_flight and time.monotonic() < end:
-            self._drain(self.h_tx)
-            time.sleep(0.001)
-        self._rx_error = None
-        if not self._tx_in_flight:
-            self._recycle_raw_tx()
-        self._recycle_raw_rx()
-        self._pending.clear()
+        self._recycle_raw_tx()
 
     def _recycle_raw_tx(self) -> None:
         """Reopen the RawMode TX link while keeping the RX monitor running so VCI primitive tables never overflow."""

@@ -1442,47 +1442,62 @@ def test_unpowered_ecu_on_healthy_rawmode_restores_rawmode_after_silent_probe(mo
     bus.shutdown()
 
 
-def test_rawmode_rx_monitor_recycles_between_packets_and_on_stream_retry_issue_28(monkeypatch, tmp_path: Path) -> None:
-    """Issue #28: 1.5 MB CodeFlash read over D-PDU 27.2 stalled past ~1 MB when the RawMode RX monitor was never
-    recycled. Verify periodic RX monitor recycling, trailing-stream sync drain, and retry link reopening."""
+def test_issue_28_dpdu_stream_pacing_exact_end_frame_and_auto_return_to_app(monkeypatch, tmp_path: Path) -> None:
+    """Issue #28 (2019 Passat GTE, VAS6154A + D-PDU 27.2): verify 16 KB D-PDU bursts without RX monitor reopening,
+    zero per-frame JSONL trace starvation, exact 2-byte `00 00` end-frame check, dropped-frame detection, and
+    automatic return to Application when an in-car backup fails after entering RAM-Loader."""
+    import json
+
     from contitool.can import J533CanLink, workflows
     from contitool.can.transport import LOADER_SYNC
-    from contitool.can.workflows import READ_CHUNK_BYTES
+    from contitool.can.workflows import DPDU_FED_READS_PER_PAYLOAD, READ_CHUNK_BYTES
 
-    # 1. Periodic RX monitor recycle at inter-packet boundary (never mid-stream)
-    monkeypatch.setattr(dpdu, "MAX_RAW_RX_RESULTS_BEFORE_RECYCLE", 25)
+    # 1. D-PDU RawMode splits a 64 KB region into 4 x 16 KB bursts, keeps h_rx open untouched, and logs 1 summary/burst
     api = FakePduApi()
     bus = DPduBus(dll=api)
-    first_mon = bus.h_rx
-    first_tx = bus.h_tx
-    for i in range(30):
-        bus.send(can.Message(arbitration_id=0x6F0, data=i.to_bytes(8, "little"), is_extended_id=False))
-    # Drain TX echoes so _rx_result_count >= 25 while send() itself never recycled mid-stream
-    end = time.monotonic() + 1.0
-    while bus._rx_result_count < 30 and time.monotonic() < end:
-        time.sleep(0.002)
-    assert bus.h_rx == first_mon and bus._rx_result_count >= 30
-    bus.maybe_recycle_tx()
-    assert bus.h_rx != first_mon and bus._rx_result_count == 0
-    assert bus.h_tx == first_tx and not bus.spent
+    initial_mon = bus.h_rx
+    burst_sizes: list[int] = []
 
-    # 2. send_loader_payload flushes >64 queued stale frames AND skips trailing 0xFF..FF stream frames ahead of sync
-    class TrailingStreamBus:
+    def fake_stream(link, _payload, addr, size, **_kw) -> bytes:
+        burst_sizes.append(size)
+        with link.suspend_rx_trace():
+            api._result((0x6F1).to_bytes(4, "big") + b"\xaa" * 8, b"\x00\x00\x00\x00")
+            msg = link.receive_frame(0x6F1, timeout=1.0)
+            assert bytes(msg.data) == b"\xaa" * 8
+        link.write_stream_summary(addr, size, size, size // 8)
+        return bytes((addr + i) & 0xFF for i in range(size))
+
+    monkeypatch.setattr(workflows, "_stream_loader_read_payload", fake_stream)
+    trace_path = tmp_path / "can.jsonl"
+    out_64k = tmp_path / "cflash_64k.bin"
+    with J533CanLink("", interface="dpdu", bus=bus, log_path=trace_path) as link:
+        rep = workflows.read_memory_area(link, 0x00000000, 64 * 1024, out_64k, label="Cflash.bin")
+    assert rep["complete"] and len(out_64k.read_bytes()) == 64 * 1024
+    assert burst_sizes == [DPDU_FED_READS_PER_PAYLOAD * READ_CHUNK_BYTES] * 4
+    assert bus.h_rx == initial_mon and not bus.spent
+    trace_rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert [r["direction"] for r in trace_rows] == ["rx_stream"] * 4
+
+    # 2. _consume_loader_end_frame rejects an 8-byte `00 00 xx...` flash data frame and accepts exact 2-byte `00 00`
+    monkeypatch.undo()
+    with J533CanLink("", interface="dpdu", bus=bus) as link:
+        api._result((0x6F1).to_bytes(4, "big") + b"\x00\x00\xff\xff\xff\xff\xff\xff", b"\x00\x00\x00\x00")
+        with pytest.raises(RuntimeError, match="Unexpected reader closing frame on 0x6F1: 0000ffffffffffff"):
+            workflows._consume_loader_end_frame(link, timeout=0.5, label="reader")
+        api._result((0x6F1).to_bytes(4, "big") + b"\x00\x00", b"\x00\x00\x00\x00")
+        assert workflows._consume_loader_end_frame(link, timeout=0.5, label="reader") == b"\x00\x00"
+
+    # 3. _stream_loader_read_payload fails immediately when an 8-byte frame was lost and early 2-byte `00 00` arrives
+    class DroppedFrameBus:
         def __init__(self) -> None:
-            self.rx = (
-                [can.Message(arbitration_id=0x6F1, data=b"\xff" * 8, is_extended_id=False) for _ in range(200)]
-                + [can.Message(arbitration_id=0x6F1, data=LOADER_SYNC, is_extended_id=False)]
-            )
-            self.sent: list[can.Message] = []
+            self.rx: list[can.Message] = []
 
         def send(self, msg: can.Message, timeout: float | None = None) -> None:
-            self.sent.append(msg)
             if bytes(msg.data) == LOADER_SYNC:
-                # Two delayed stream frames arrive from the VCI batch right before the ECU's LOADER_SYNC echo
                 self.rx = [
-                    can.Message(arbitration_id=0x6F1, data=b"\xff" * 8, is_extended_id=False),
-                    can.Message(arbitration_id=0x6F1, data=b"\xff" * 8, is_extended_id=False),
                     can.Message(arbitration_id=0x6F1, data=LOADER_SYNC, is_extended_id=False),
+                    can.Message(arbitration_id=0x6F1, data=b"\xff" * 8, is_extended_id=False),
+                    can.Message(arbitration_id=0x6F1, data=b"\x00\x00", is_extended_id=False),
                 ]
 
         def recv(self, timeout: float | None = None) -> can.Message | None:
@@ -1491,36 +1506,24 @@ def test_rawmode_rx_monitor_recycles_between_packets_and_on_stream_retry_issue_2
         def shutdown(self) -> None:
             pass
 
-    with J533CanLink("", bus=TrailingStreamBus()) as link:
-        sent_bytes = link.send_loader_payload(b"\x11\x22\x33\x44", inter_frame_delay=0.0)
-        assert sent_bytes > 0
+    with J533CanLink("", bus=DroppedFrameBus()) as link:
+        with pytest.raises(TimeoutError, match=r"stopped after 8/16 bytes"):
+            workflows._stream_loader_read_payload(link, b"\x01\x02\x03\x04", 0x00130000, 16, frame_timeout=0.2)
 
-    # 3. read_memory_area calls bus.recycle_raw_links() before retrying a stalled chunk
-    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
-    recycled_monitors: list[int] = []
-    orig_recycle = bus.recycle_raw_links
-
-    def tracked_recycle() -> None:
-        before = bus.h_rx
-        orig_recycle()
-        recycled_monitors.append((before, bus.h_rx))
-
-    monkeypatch.setattr(bus, "recycle_raw_links", tracked_recycle)
-    calls = 0
-    expected = bytes((i * 13) & 0xFF for i in range(READ_CHUNK_BYTES))
-
-    def flaky_stream(_link, _payload, addr, size, **_kw) -> bytes:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise TimeoutError(f"Stream from 0x6F1 at 0x{addr:08X} stopped after 1024/{size} bytes")
-        return expected
-
-    monkeypatch.setattr(workflows, "_stream_loader_read_payload", flaky_stream)
-    out = tmp_path / "chunk.bin"
-    with J533CanLink("", interface="dpdu", bus=bus) as link:
-        rep = workflows.read_memory_area(link, 0x00000000, READ_CHUNK_BYTES, out, label="CodeFlash")
-    assert rep["complete"] and out.read_bytes() == expected
-    assert len(recycled_monitors) == 1 and recycled_monitors[0][0] != recycled_monitors[0][1]
+    # 4. Failed can_backup after entering RAM-Loader automatically returns gateway to Application (#28 roaring fans)
+    reset_calls: list[bool] = []
+    monkeypatch.setattr(dpdu, "open_session", lambda *_a, **_kw: bus)
+    monkeypatch.setattr(dpdu, "release_session", lambda *_a, **_kw: None)
+    monkeypatch.setattr(workflows, "enter_ram_loader", lambda _link, **_kw: {"loader_ready": True})
+    monkeypatch.setattr(
+        workflows,
+        "read_memory_area",
+        lambda *_a, **_kw: (_ for _ in ()).throw(TimeoutError("Stream from 0x6F1 stopped")),
+    )
+    monkeypatch.setattr(workflows, "_reset_to_application", lambda _link, **_kw: reset_calls.append(True) or {})
+    with pytest.raises(TimeoutError, match="Stream from 0x6F1 stopped"):
+        workflows.can_backup("VAS6154A", interface="dpdu", session_dir=tmp_path / "failed_backup", areas=("cflash",))
+    assert reset_calls == [True]
     bus.shutdown()
+
 
