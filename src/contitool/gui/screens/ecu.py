@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QFontMetrics
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -214,8 +214,8 @@ class EcuScreen(QWidget):
         self.sec_id = QFrame()
         self.sec_id.setObjectName("IdentityBar")
         body = QVBoxLayout(self.sec_id)
-        body.setContentsMargins(24, 12, 24, 12)
-        body.setSpacing(8)
+        body.setContentsMargins(24, 11, 24, 12)
+        body.setSpacing(9)
 
         head = QHBoxLayout()
         head.setSpacing(8)
@@ -225,8 +225,12 @@ class EcuScreen(QWidget):
         self.lbl_pn.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.pill_source = QLabel()
         self.pill_source.setObjectName("Hint")
+        self.lbl_folder = QLabel()
+        self.lbl_folder.setObjectName("Hint")
+        self.lbl_folder.setFont(mono_font(12))
         head.addWidget(self.lbl_pn)
         head.addWidget(self.pill_source, 0, Qt.AlignmentFlag.AlignVCenter)
+        head.addWidget(self.lbl_folder, 0, Qt.AlignmentFlag.AlignVCenter)
         head.addStretch(1)
 
         self.btn_export = button("", slot=self.export_backup)
@@ -238,15 +242,23 @@ class EcuScreen(QWidget):
             head.addWidget(b)
         body.addLayout(head)
 
-        self.files_row = QHBoxLayout()  # which areas are loaded, and from which folder
-        self.files_row.setSpacing(16)
-        body.addLayout(self.files_row)
-        body.addWidget(divider())
+        strip = QFrame()
+        strip.setObjectName("TelemetryStrip")
+        strip_lay = QVBoxLayout(strip)
+        strip_lay.setContentsMargins(14, 8, 14, 8)
+        strip_lay.setSpacing(7)
 
         self.grid_id = QGridLayout()
-        self.grid_id.setHorizontalSpacing(36)
+        self.grid_id.setHorizontalSpacing(32)
         self.grid_id.setVerticalSpacing(2)
-        body.addLayout(self.grid_id)
+        strip_lay.addLayout(self.grid_id)
+
+        strip_lay.addWidget(divider())
+
+        self.files_row = QHBoxLayout()  # rectangular memory-bank status map
+        self.files_row.setSpacing(6)
+        strip_lay.addLayout(self.files_row)
+        body.addWidget(strip)
         return self.sec_id
 
     def _build_nav(self) -> QWidget:
@@ -345,12 +357,34 @@ class EcuScreen(QWidget):
                 nav_row.set_active(k == key)
             self._render_page()
 
+    @staticmethod
+    def _bank_cell(text: str, tone: str, tip: str = "") -> QFrame:
+        cell = QFrame()
+        cell.setObjectName("BankCell")
+        set_tone(cell, tone)
+        if tip:
+            cell.setToolTip(tip)
+        lay = QHBoxLayout(cell)
+        lay.setContentsMargins(8, 2, 8, 2)
+        lay.setSpacing(0)
+        lbl = QLabel(text)
+        lbl.setFont(mono_font(11))
+        if tone == "warn":
+            set_tone(lbl, "warn")
+        lay.addWidget(lbl)
+        return cell
+
     def _refresh_identity(self) -> None:
         self.lbl_pn.setText(self.ws.part_number or tr("Блок не определён", "Unknown ECU"))
         self.pill_source.setText(
             "·  " + (tr("считан по CAN", "read over CAN") if self.ws.source == "can" else tr("открыт из файлов", "opened from files"))
         )
         set_tone(self.pill_source, "info" if self.ws.source == "can" else "muted")
+        folder = self.ws.folder
+        self.lbl_folder.setVisible(bool(folder))
+        if folder:
+            self.lbl_folder.setText(f"·  {folder.name}")
+            self.lbl_folder.setToolTip(str(folder))
         self.btn_export.setText(tr("Экспортировать бэкап…", "Export backup…"))
         self.btn_export.setToolTip(tr("Копирует дампы в том виде, как они считаны, в выбранную папку", "Copies the dumps as read to a folder you pick"))
         self.btn_restore.setText(tr("Залить бэкап в блок…", "Write backup to ECU…"))
@@ -373,39 +407,23 @@ class EcuScreen(QWidget):
         self.grid_id.setColumnStretch(len(rows), 1)
 
         clear_layout(self.files_row)
+        mem_cap = group_label(tr("ПАМЯТЬ", "MEMORY"))
+        self.files_row.addWidget(mem_cap, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.files_row.addSpacing(4)
         for k in KINDS:
             have = self.ws.path(k) is not None
-            item_lbl = QLabel(
-                f"✓ {NAMES[k]}" if have else tr(f"— {NAMES[k]}: нет", f"— {NAMES[k]}: missing")
-            )
-            item_lbl.setFont(mono_font(11))
-            set_tone(item_lbl, "ok" if have else "warn")
-            item_lbl.setToolTip(str(self.ws.path(k) or tr("Файла нет в папке", "Not in the folder")))
-            self.files_row.addWidget(item_lbl)
+            txt = f"✓ {NAMES[k]}" if have else tr(f"— {NAMES[k]}: нет", f"— {NAMES[k]}: missing")
+            tip = str(self.ws.path(k) or tr("Файла нет в папке", "Not in the folder"))
+            self.files_row.addWidget(self._bank_cell(txt, "ok" if have else "warn", tip))
         for k in OPTIONAL_KINDS:
             p_opt = self.ws.path(k)
             if p_opt is not None:
-                item_lbl = QLabel(f"✓ {NAMES[k]}")
-                item_lbl.setFont(mono_font(11))
-                set_tone(item_lbl, "ok")
-                item_lbl.setToolTip(str(p_opt))
-                self.files_row.addWidget(item_lbl)
+                self.files_row.addWidget(self._bank_cell(f"✓ {NAMES[k]}", "ok", str(p_opt)))
             elif k in self.ws.read_warnings:
-                item_lbl = QLabel(tr(f"! {NAMES[k]}: сбой", f"! {NAMES[k]}: warning"))
-                item_lbl.setFont(mono_font(11))
-                set_tone(item_lbl, "warn")
-                item_lbl.setToolTip(self.ws.read_warnings[k])
-                self.files_row.addWidget(item_lbl)
-        folder = self.ws.folder
-        if folder:
-            where = hint(folder.name)
-            where.setFont(mono_font(11))
-            where.setWordWrap(False)
-            where.setToolTip(str(folder))
-            self.files_row.addStretch(1)
-            self.files_row.addWidget(where)
-        else:
-            self.files_row.addStretch(1)
+                self.files_row.addWidget(
+                    self._bank_cell(tr(f"! {NAMES[k]}: сбой", f"! {NAMES[k]}: warning"), "warn", self.ws.read_warnings[k])
+                )
+        self.files_row.addStretch(1)
 
     def _state(self, key: str) -> State:
         if key == "cp":
@@ -453,6 +471,7 @@ class EcuScreen(QWidget):
         if not self.ws.is_open:
             return
         page = QWidget()
+        page.setObjectName("PageCanvas")
         outer = QHBoxLayout(page)
         outer.setContentsMargins(28, 20, 28, 24)
         outer.setSpacing(0)
@@ -513,60 +532,120 @@ class EcuScreen(QWidget):
     def _block(
         self, lay: QVBoxLayout, title: str, state: State | None, text: str, *btns: QPushButton, num: str = ""
     ) -> None:
-        """A bordered part of a page: optional step number, title with right-aligned state, explanation, buttons."""
+        """Structured 2-tone engineering module: header strip + body + inline right action (1 btn) or footer bar (2+ btns)."""
         frame = QFrame()
         frame.setObjectName("Step")
-        g = QGridLayout(frame)
-        g.setContentsMargins(16, 13, 16, 14)
-        g.setHorizontalSpacing(12)
-        g.setVerticalSpacing(7)
-        col = 0
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        hdr = QFrame()
+        hdr.setObjectName("BlockHeader")
+        h = QHBoxLayout(hdr)
+        h.setContentsMargins(15, 7, 15, 7)
+        h.setSpacing(9)
         if num:
             n = QLabel(num)
             n.setObjectName("StepNum")
-            n.setFixedSize(22, 22)
+            n.setFixedSize(20, 20)
             n.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            g.addWidget(n, 0, 0, Qt.AlignmentFlag.AlignTop)
-            col = 1
-        h = QHBoxLayout()
-        h.setSpacing(10)
+            h.addWidget(n, 0, Qt.AlignmentFlag.AlignVCenter)
         t = QLabel(title)
         t.setObjectName("FieldLabel")
         h.addWidget(t)
         h.addStretch(1)
         if state is not None:
             h.addWidget(status_readout(state.text, state.tone), 0, Qt.AlignmentFlag.AlignVCenter)
-        g.addLayout(h, 0, col)
-        r = 1
-        if text:
-            g.addWidget(self._label(text), r, col)
-            r += 1
-        if btns:
-            g.addLayout(row(*btns), r, col)
-        g.setColumnStretch(col, 1)
+        outer.addWidget(hdr)
+
+        if len(btns) == 1 and not num and text:
+            body = QWidget()
+            b_lay = QHBoxLayout(body)
+            b_lay.setContentsMargins(15, 11, 15, 11)
+            b_lay.setSpacing(16)
+            b_lay.addWidget(self._label(text), 1)
+            b_lay.addWidget(btns[0], 0, Qt.AlignmentFlag.AlignVCenter)
+            outer.addWidget(body)
+        else:
+            if text:
+                body = QWidget()
+                b_lay = QVBoxLayout(body)
+                b_lay.setContentsMargins(15, 11, 15, 11)
+                b_lay.setSpacing(6)
+                b_lay.addWidget(self._label(text))
+                outer.addWidget(body)
+            if btns:
+                foot = QFrame()
+                foot.setObjectName("BlockFooter")
+                f_lay = QHBoxLayout(foot)
+                f_lay.setContentsMargins(15, 8, 15, 8)
+                f_lay.setSpacing(8)
+                for b in btns:
+                    f_lay.addWidget(b)
+                f_lay.addStretch(1)
+                outer.addWidget(foot)
         lay.addWidget(frame)
 
     @staticmethod
     def _table(lay: QVBoxLayout, title: str, rows: list[tuple[str, ...]], muted: bool = False) -> None:
-        """Small read-only list: the first column in monospace, a third column muted."""
+        """Striped hardware register / telemetry inspector table with 2-tone header band."""
         frame = QFrame()
         frame.setObjectName("Step")
-        g = QGridLayout(frame)
-        g.setContentsMargins(14, 10, 14, 12)
-        g.setHorizontalSpacing(16)
-        g.setVerticalSpacing(4)
-        g.addWidget(group_label(title.upper()), 0, 0, 1, 3)
-        for r, cells in enumerate(rows, start=1):
-            for c, text in enumerate(cells):
-                lbl = QLabel(text)
-                if c == 0:
-                    lbl.setFont(mono_font(13))
-                elif c == 1:
-                    lbl.setWordWrap(True)  # long descriptions wrap instead of widening the page
-                if muted or c == 2:
-                    lbl.setObjectName("Hint")
-                g.addWidget(lbl, r, c)
-        g.setColumnStretch(1, 1)
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        hdr = QFrame()
+        hdr.setObjectName("BlockHeader")
+        h = QHBoxLayout(hdr)
+        h.setContentsMargins(15, 7, 15, 7)
+        h.setSpacing(8)
+        h.addWidget(group_label(title.upper()))
+        h.addStretch(1)
+        cnt = QLabel(str(len(rows)))
+        cnt.setFont(mono_font(11))
+        cnt.setObjectName("Hint")
+        h.addWidget(cnt)
+        outer.addWidget(hdr)
+
+        col0_font = mono_font(12)
+        fm = QFontMetrics(col0_font)
+        col0_w = min(max((fm.horizontalAdvance(c[0]) for c in rows if c), default=100) + 14, 240)
+        col0_w = max(col0_w, 125)
+
+        for idx, cells in enumerate(rows):
+            r_frame = QFrame()
+            r_frame.setObjectName("TableRow")
+            if idx % 2 == 1:
+                r_frame.setProperty("alt", True)
+            if idx == len(rows) - 1:
+                r_frame.setProperty("last", True)
+            rl = QHBoxLayout(r_frame)
+            rl.setContentsMargins(15, 6, 15, 6)
+            rl.setSpacing(16)
+
+            lbl0 = QLabel(cells[0] if cells else "")
+            lbl0.setFont(col0_font)
+            lbl0.setFixedWidth(col0_w)
+            lbl0.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            if muted:
+                lbl0.setObjectName("Hint")
+            rl.addWidget(lbl0, 0, Qt.AlignmentFlag.AlignTop)
+
+            lbl1 = QLabel(cells[1] if len(cells) > 1 else "")
+            lbl1.setWordWrap(True)
+            lbl1.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            if muted:
+                lbl1.setObjectName("Hint")
+            rl.addWidget(lbl1, 1)
+
+            if len(cells) > 2 and cells[2]:
+                lbl2 = QLabel(cells[2])
+                lbl2.setFont(mono_font(11))
+                lbl2.setObjectName("Hint")
+                lbl2.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+                rl.addWidget(lbl2, 0, Qt.AlignmentFlag.AlignTop)
+            outer.addWidget(r_frame)
         lay.addWidget(frame)
 
     @staticmethod
@@ -608,8 +687,6 @@ class EcuScreen(QWidget):
             ),
             tone="warn",
         )
-        if st.detail:
-            self._text(lay, st.detail, primary=True)
         inf = self.ws.info("dflash")
         bound = [
             (s.spec.ecu_addr, tr(s.spec.short_ru, s.spec.short_en))
@@ -619,7 +696,17 @@ class EcuScreen(QWidget):
         if bound:
             self._table(lay, tr("Привязаны по ключу", "Bound by key"), bound)
         ok, tip = self._need("cflash", "dflash")
-        lay.addLayout(row(self._btn("cp", tr("Адаптировать модули…", "Adapt modules…"), self._bind_modules, "PrimaryBtn", ok, tip)))
+        self._block(
+            lay,
+            tr("Таблица ведомых модулей IKA", "Slave module IKA table"),
+            None,
+            st.detail
+            or tr(
+                "Настройка слотов ведомых модулей в CodeFlash и DataFlash без затрагивания заводских блоков.",
+                "Configure slave module slots in CodeFlash and DataFlash without touching factory modules.",
+            ),
+            self._btn("cp", tr("Адаптировать модули…", "Adapt modules…"), self._bind_modules, "PrimaryBtn", ok, tip),
+        )
         self._note(
             lay,
             tr(
@@ -630,17 +717,14 @@ class EcuScreen(QWidget):
 
     def _page_eng(self, lay: QVBoxLayout) -> None:
         st = self._head(lay, "eng")
-        self._text(
-            lay,
-            tr(
-                "Включает заводские инженерные службы шлюза: функции 0x80/0x81/0x83, ASAM CCP (чтение и запись "
-                "памяти по CAN) и RAM-Loader 0x6F0.",
-                "Enables the gateway's factory engineering services: functions 0x80/0x81/0x83, ASAM CCP (memory "
-                "read and write over CAN) and the 0x6F0 RAM-Loader.",
-            ),
+        desc = tr(
+            "Включает заводские инженерные службы шлюза: функции 0x80/0x81/0x83, ASAM CCP (чтение и запись "
+            "памяти по CAN) и RAM-Loader 0x6F0.",
+            "Enables the gateway's factory engineering services: functions 0x80/0x81/0x83, ASAM CCP (memory "
+            "read and write over CAN) and the 0x6F0 RAM-Loader.",
         )
-        if st.key == "partial":
-            self._text(lay, st.detail, primary=True)
+        if st.key == "partial" and st.detail:
+            desc = f"{desc}\n\n{st.detail}"
         ok, tip = self._need("cflash")
         if st.key == "on":
             btns = [self._btn("eng_off", tr("Выключить", "Turn off"), lambda: self._patch_engineering(True), "", ok, tip)]
@@ -650,7 +734,13 @@ class EcuScreen(QWidget):
                 btns.append(
                     self._btn("eng_off", tr("Вернуть заводское", "Restore factory"), lambda: self._patch_engineering(True), "GhostBtn", ok)
                 )
-        lay.addLayout(row(*btns))
+        self._block(
+            lay,
+            tr("Инженерные службы и RAM-Loader", "Engineering services & RAM-Loader"),
+            None,
+            desc,
+            *btns,
+        )
         self._note(lay, tr(
             "Меняется только CodeFlash; в блок он записывается кнопкой «Записать в блок».",
             "Only CodeFlash changes; it goes into the ECU with “Write to ECU”.",
@@ -845,20 +935,33 @@ class EcuScreen(QWidget):
 
         frame = QFrame()
         frame.setObjectName("Step")
-        g = QGridLayout(frame)
-        g.setContentsMargins(14, 10, 14, 12)
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        hdr = QFrame()
+        hdr.setObjectName("BlockHeader")
+        h = QHBoxLayout(hdr)
+        h.setContentsMargins(15, 7, 15, 7)
+        h.setSpacing(10)
+        t = QLabel(tr("Состояние в блоке", "State in the ECU"))
+        t.setObjectName("FieldLabel")
+        h.addWidget(t)
+        h.addStretch(1)
+        h.addWidget(hint(tr(f"проверено в {self._swap_at}", f"checked at {self._swap_at}")))
+        h.addWidget(btn)
+        outer.addWidget(hdr)
+
+        body = QWidget()
+        g = QGridLayout(body)
+        g.setContentsMargins(15, 11, 15, 12)
         g.setHorizontalSpacing(14)
         g.setVerticalSpacing(7)
-        g.addLayout(
-            row(group_label(tr("СОСТОЯНИЕ В БЛОКЕ", "STATE IN THE ECU")), 1, hint(tr(f"проверено в {self._swap_at}", f"checked at {self._swap_at}")), btn),
-            0, 0, 1, 3,
-        )
         summary = status.swap_live_summary(self._swap_live, self.ws)
         box = Callout("info" if summary.tone == "muted" else summary.tone)
         box.label.setTextFormat(Qt.TextFormat.PlainText)
         box.label.setText(("✓  " if summary.key == "on" else "✕  " if summary.key == "err" else "") + summary.text)
         box.label.setObjectName("FieldLabel")
-        g.addWidget(box, 1, 0, 1, 3)
+        g.addWidget(box, 0, 0, 1, 3)
 
         def code_label(code: int) -> QLabel:
             num = hint(f"{code:08X}")
@@ -866,7 +969,7 @@ class EcuScreen(QWidget):
             return num
 
         states = [(status.swap_live_state(f["status"]), f["fsid"]) for f in self._swap_live]
-        r = 2
+        r = 1
         for st, code in sorted((s for s in states if s[0].key != "off"), key=lambda x: (x[0].key != "on", x[1])):
             g.addWidget(status_readout(st.text, st.tone), r, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             cell = QVBoxLayout()
@@ -894,6 +997,7 @@ class EcuScreen(QWidget):
                 g.addWidget(self._label(status.fec_name(code)), r, 1)
                 g.addWidget(code_label(code), r, 2, Qt.AlignmentFlag.AlignRight)
         g.setColumnStretch(1, 1)
+        outer.addWidget(body)
         lay.addWidget(frame)
 
     def _page_zdc(self, lay: QVBoxLayout) -> None:
@@ -1093,18 +1197,17 @@ class EcuScreen(QWidget):
 
     def _page_dtc(self, lay: QVBoxLayout) -> None:
         self._head(lay, "dtc")
-        self._text(
+        dtc_st = State(tr(f"прочитано в {self._dtc_at}", f"read at {self._dtc_at}"), "info") if self._dtc is not None else None
+        self._block(
             lay,
+            tr("Опрос регистратора событий (UDS 0x19 / 0x14)", "Event memory query (UDS 0x19 / 0x14)"),
+            dtc_st,
             tr(
-                "Коды неисправностей читаются из блока по CAN; в дампах их нет.",
-                "Trouble codes are read from the ECU over CAN; dumps do not contain them.",
+                "Коды неисправностей читаются напрямую из блока по CAN; в файлах дампов они не хранятся.",
+                "Trouble codes are read directly from the ECU over CAN; dump files do not store them.",
             ),
-        )
-        lay.addLayout(
-            row(
-                self._btn("dtc", tr("Прочитать ошибки", "Read codes"), lambda: self._dtc_run(False), "PrimaryBtn"),
-                self._btn("dtc_clear", tr("Стереть ошибки", "Clear codes"), lambda: self._dtc_run(True)),
-            )
+            self._btn("dtc", tr("Прочитать ошибки", "Read codes"), lambda: self._dtc_run(False), "PrimaryBtn"),
+            self._btn("dtc_clear", tr("Стереть ошибки", "Clear codes"), lambda: self._dtc_run(True)),
         )
         if self._dtc is None:
             return

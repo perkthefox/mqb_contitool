@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 
 from contitool.cli.formatting import format_bytes_human, format_eta
 from contitool.gui import theme
-from contitool.gui.theme import dot_icon, mono_font, set_tone
+from contitool.gui.theme import dot_icon, mono_font, set_tone, ui_font
 from contitool.gui.widgets.page import button
 from contitool.gui.worker import OperationRunner
 from contitool.i18n import subscribe_lang_change, tr
@@ -94,13 +94,16 @@ class ExecutionPanel(QFrame):
         self._state = "idle"  # idle | running | ok | err | cancel
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 8, 20, 12)
-        lay.setSpacing(6)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
 
-        hdr = QHBoxLayout()
+        hdr_bar = QFrame()
+        hdr_bar.setObjectName("ConsoleHeader")
+        hdr = QHBoxLayout(hdr_bar)
+        hdr.setContentsMargins(16, 4, 14, 4)
         hdr.setSpacing(8)
         self.lbl_title = QLabel()
-        self.lbl_title.setObjectName("SectionTitle")
+        self.lbl_title.setObjectName("GroupLabel")
         hdr.addWidget(self.lbl_title)
         hdr.addSpacing(6)
         self.btn_short = QPushButton()
@@ -119,10 +122,11 @@ class ExecutionPanel(QFrame):
         self.btn_clear = button("", "GhostBtn", slot=self.clear_logs)
         for b in (self.btn_open_dir, self.btn_copy, self.btn_clear):
             hdr.addWidget(b)
-        lay.addLayout(hdr)
+        lay.addWidget(hdr_bar)
 
         self.txt_short = QTextBrowser()
         self.txt_short.setOpenLinks(False)
+        self.txt_short.setFont(ui_font(12))
         self.txt_full = QPlainTextEdit()
         self.txt_full.setReadOnly(True)
         self.txt_full.setFont(mono_font(12))
@@ -185,7 +189,7 @@ class ExecutionPanel(QFrame):
 
     # ────────────────────────────── text ──────────────────────────────
     def retranslate_ui(self) -> None:
-        self.lbl_title.setText(tr("Журнал", "Log"))
+        self.lbl_title.setText(tr("ЖУРНАЛ ОПЕРАЦИЙ", "OPERATION LOG"))
         self.btn_short.setText(tr("Кратко", "Summary"))
         self.btn_full.setText(tr("Подробно", "Detailed"))
         self.btn_full.setToolTip(tr("Полный технический лог: адреса, UDS, CAN", "Full technical log: addresses, UDS, CAN"))
@@ -330,10 +334,19 @@ class ExecutionPanel(QFrame):
             "err": (theme.ERR, tr("ошибка", "failed")),
             "cancel": (theme.WARN, tr("остановлено", "stopped")),
         }
+        if not self._items:
+            idle = html.escape(
+                tr(
+                    "Журнал операций пуст — ход чтения, записи и диагностики отображается здесь.",
+                    "Operation log is empty — read, write, and diagnostic progress appears here.",
+                )
+            )
+            self.txt_short.setHtml(f"<div style='color:{muted}; padding-top:2px'>{idle}</div>")
+            return
         rows: list[str] = []
         for it in self._items:
             ts = time.strftime("%H:%M:%S", time.localtime(it.started if isinstance(it, _Op) else it.at))
-            time_cell = f"<td width='70' style='color:{muted}; font-family:{mono}'>{ts}</td>"
+            time_cell = f"<td width='70' style=\"color:{muted}; font-family:'{mono}'\">{ts}</td>"
             if isinstance(it, _Note):
                 rows.append(f"<tr>{time_cell}<td colspan='2' style='color:{secondary}'>{html.escape(it.text)}</td></tr>")
                 continue

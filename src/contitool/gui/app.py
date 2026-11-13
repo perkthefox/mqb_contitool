@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
 from contitool import __version__
@@ -21,6 +23,9 @@ def create_window() -> tuple[QApplication, MainWindow]:
     global _APP
     app = QApplication.instance()
     if app is None:
+        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
         app = QApplication(sys.argv)
     assert isinstance(app, QApplication)
     _APP = app

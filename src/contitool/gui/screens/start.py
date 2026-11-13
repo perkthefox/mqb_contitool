@@ -10,11 +10,11 @@ from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from contitool.gui.theme import mono_font
-from contitool.gui.widgets.page import Section, button, clear_layout, divider, group_label, hint
+from contitool.gui.widgets.page import Section, button, clear_layout, group_label, hint
 from contitool.gui.workspace import recent_folders
 from contitool.i18n import subscribe_lang_change, tr
 
-_COLUMN_WIDTH = 860
+_COLUMN_WIDTH = 880
 
 
 class _RecentRow(QFrame):
@@ -22,19 +22,22 @@ class _RecentRow(QFrame):
 
     clicked = Signal()
 
-    def __init__(self, folder: Path) -> None:
+    def __init__(self, folder: Path, *, is_last: bool = False) -> None:
         super().__init__()
         self.setObjectName("ListRow")
+        if is_last:
+            self.setProperty("last", True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(str(folder))
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(10, 9, 10, 9)
+        lay.setContentsMargins(16, 9, 16, 9)
         lay.setSpacing(16)
         text = QVBoxLayout()
         text.setSpacing(2)
         name = QLabel(folder.name)
         name.setObjectName("FieldLabel")
         path = hint()
+        path.setFont(mono_font(11))
         path.setWordWrap(False)
         path.setText(path.fontMetrics().elidedText(str(folder.parent), Qt.TextElideMode.ElideMiddle, 580))
         text.addWidget(name)
@@ -73,7 +76,7 @@ class StartScreen(QWidget):
         self.setAcceptDrops(True)
 
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(32, 36, 32, 24)
+        outer.setContentsMargins(32, 34, 32, 24)
         outer.addStretch(1)
         column = QWidget()
         column.setMaximumWidth(_COLUMN_WIDTH)
@@ -87,20 +90,25 @@ class StartScreen(QWidget):
         self.lbl_title = QLabel()
         self.lbl_title.setObjectName("PageTitle")
         self.lbl_sub = hint()
+        self.lbl_sub.setFont(mono_font(12))
         body.addWidget(self.lbl_title)
         body.addWidget(self.lbl_sub)
-        body.addSpacing(18)
+        body.addSpacing(16)
 
         self.tile_can = Section()
-        self.lbl_can_eyebrow = group_label()
-        self.tile_can.body.insertWidget(0, self.lbl_can_eyebrow)
+        self.lbl_can_meta = QLabel()
+        self.lbl_can_meta.setFont(mono_font(11))
+        self.lbl_can_meta.setObjectName("Hint")
+        self.tile_can.head.addWidget(self.lbl_can_meta)
         self.btn_read = button("", "PrimaryBtn", slot=self.read_can_requested.emit)
         self.btn_restore = button("", slot=self.restore_requested.emit)
         self.btn_wiring = button("", slot=self.wiring_requested.emit)
 
         self.tile_files = Section()
-        self.lbl_files_eyebrow = group_label()
-        self.tile_files.body.insertWidget(0, self.lbl_files_eyebrow)
+        self.lbl_files_meta = QLabel()
+        self.lbl_files_meta.setFont(mono_font(11))
+        self.lbl_files_meta.setObjectName("Hint")
+        self.tile_files.head.addWidget(self.lbl_files_meta)
         self.btn_folder = button("", slot=lambda: self.open_folder_requested.emit(""))
         self.btn_files = button("", slot=self.open_files_requested.emit)
 
@@ -110,27 +118,42 @@ class StartScreen(QWidget):
             (self.tile_can, (self.btn_read, self.btn_restore, self.btn_wiring)),
             (self.tile_files, (self.btn_folder, self.btn_files)),
         ):
-            tile.body.setContentsMargins(20, 18, 20, 18)
-            tile.body.setSpacing(10)
             tile.body.addStretch(1)
-            tile.body.addWidget(divider())
-            buttons = QHBoxLayout()
-            buttons.setSpacing(8)
             for b in actions:
                 b.setCursor(Qt.CursorShape.PointingHandCursor)
-                buttons.addWidget(b)
-            buttons.addStretch(1)
-            tile.body.addLayout(buttons)
+            tile.add_footer(*actions)
             tiles.addWidget(tile, 1)
         body.addLayout(tiles)
 
-        body.addSpacing(24)
+        body.addSpacing(18)
+        self.recent_box = QFrame()
+        self.recent_box.setObjectName("RecentBox")
+        rb_lay = QVBoxLayout(self.recent_box)
+        rb_lay.setContentsMargins(0, 0, 0, 0)
+        rb_lay.setSpacing(0)
+        rb_hdr = QFrame()
+        rb_hdr.setObjectName("BlockHeader")
+        rb_hdr_lay = QHBoxLayout(rb_hdr)
+        rb_hdr_lay.setContentsMargins(16, 7, 16, 7)
         self.lbl_recent = group_label()
-        body.addWidget(self.lbl_recent)
-        body.addSpacing(4)
+        rb_hdr_lay.addWidget(self.lbl_recent)
+        rb_hdr_lay.addStretch(1)
+        rb_lay.addWidget(rb_hdr)
         self.recent_list = QVBoxLayout()
+        self.recent_list.setContentsMargins(0, 0, 0, 0)
         self.recent_list.setSpacing(0)
-        body.addLayout(self.recent_list)
+        rb_lay.addLayout(self.recent_list)
+        body.addWidget(self.recent_box)
+
+        self.drop_hint = QFrame()
+        self.drop_hint.setObjectName("DropHint")
+        dh_lay = QHBoxLayout(self.drop_hint)
+        dh_lay.setContentsMargins(18, 14, 18, 14)
+        self.lbl_drop = hint()
+        self.lbl_drop.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dh_lay.addWidget(self.lbl_drop, 1)
+        body.addWidget(self.drop_hint)
+
         body.addStretch(1)
 
         self._unsub = subscribe_lang_change(lambda _l: self.retranslate_ui())
@@ -139,10 +162,12 @@ class StartScreen(QWidget):
 
     def refresh_recent(self) -> None:
         clear_layout(self.recent_list)
-        folders = recent_folders()
-        self.lbl_recent.setVisible(bool(folders))
-        for folder in folders[:5]:
-            r = _RecentRow(folder)
+        folders = recent_folders()[:5]
+        has_recent = bool(folders)
+        self.recent_box.setVisible(has_recent)
+        self.drop_hint.setVisible(not has_recent)
+        for idx, folder in enumerate(folders):
+            r = _RecentRow(folder, is_last=(idx == len(folders) - 1))
             r.clicked.connect(lambda f=folder: self.open_folder_requested.emit(str(f)))
             self.recent_list.addWidget(r)
 
@@ -154,8 +179,8 @@ class StartScreen(QWidget):
                 "VAG MQB J533 gateway · Continental 3Q0 907 530 · Renesas RH850/F1L",
             )
         )
-        self.lbl_can_eyebrow.setText(tr("РАБОТА ПО ШИНЕ CAN", "CAN BUS CONNECTION"))
-        self.lbl_files_eyebrow.setText(tr("ЛОКАЛЬНЫЕ ДАМПЫ", "LOCAL DUMP FILES"))
+        self.lbl_can_meta.setText(tr("CAN · 500 кбит/с", "CAN · 500 kbit/s"))
+        self.lbl_files_meta.setText(".BIN / .RAW")
         self.tile_can.set_text(
             tr("Блок на стенде или авто", "ECU on bench or car"),
             tr(
@@ -182,7 +207,13 @@ class StartScreen(QWidget):
         self.btn_wiring.setToolTip(tr("Схема подключения к блоку на стенде", "ECU bench wiring diagram"))
         self.btn_folder.setText(tr("Открыть папку…", "Open folder…"))
         self.btn_files.setText(tr("Выбрать файлы…", "Choose files…"))
-        self.lbl_recent.setText(tr("НЕДАВНИЕ", "RECENT"))
+        self.lbl_recent.setText(tr("НЕДАВНИЕ БЛОКИ", "RECENT ECUS"))
+        self.lbl_drop.setText(
+            tr(
+                "Перетащите папку с дампами или файлы .bin в окно программы",
+                "Drop a dump folder or .bin files anywhere in this window",
+            )
+        )
         self.refresh_recent()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:

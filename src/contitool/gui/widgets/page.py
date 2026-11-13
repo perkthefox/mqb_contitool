@@ -23,33 +23,54 @@ from contitool.i18n import tr
 
 
 class Section(QFrame):
-    """Bordered surface with a title row (actions on the right), optional description, and body."""
+    """Structured 2-tone engineering panel: header strip (title + right toolbar), body, and optional footer bar."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("Section")
-        self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(20, 16, 20, 18)
-        self.body.setSpacing(12)
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(0, 0, 0, 0)
+        self._outer.setSpacing(0)
 
-        self.head = QHBoxLayout()
+        self._head_bar = QFrame()
+        self._head_bar.setObjectName("BlockHeader")
+        self.head = QHBoxLayout(self._head_bar)
+        self.head.setContentsMargins(16, 8, 16, 8)
         self.head.setSpacing(8)
         self.lbl_title = QLabel()
         self.lbl_title.setObjectName("SectionTitle")
         self.head.addWidget(self.lbl_title)
         self.head.addStretch(1)
-        self.body.addLayout(self.head)
+        self._outer.addWidget(self._head_bar)
+
+        self._body_wrap = QWidget()
+        self.body = QVBoxLayout(self._body_wrap)
+        self.body.setContentsMargins(16, 13, 16, 15)
+        self.body.setSpacing(10)
 
         self.lbl_desc = QLabel()
         self.lbl_desc.setObjectName("Hint")
         self.lbl_desc.setWordWrap(True)
         self.lbl_desc.setVisible(False)
         self.body.addWidget(self.lbl_desc)
+        self._outer.addWidget(self._body_wrap, 1)
 
     def hide_head(self) -> None:
         """For sections whose heading is carried by their own content."""
-        self.lbl_title.setVisible(False)
-        self.body.removeItem(self.head)
+        self._head_bar.setVisible(False)
+
+    def add_footer(self, *buttons: QWidget) -> QHBoxLayout:
+        """Attach a flush recessed control shelf at the bottom of the panel."""
+        foot = QFrame()
+        foot.setObjectName("BlockFooter")
+        lay = QHBoxLayout(foot)
+        lay.setContentsMargins(16, 9, 16, 9)
+        lay.setSpacing(8)
+        for b in buttons:
+            lay.addWidget(b)
+        lay.addStretch(1)
+        self._outer.addWidget(foot)
+        return lay
 
     def set_text(self, title: str, desc: str = "") -> None:
         self.lbl_title.setText(title)
@@ -197,6 +218,7 @@ class Dialog(QDialog):
         self.body.addWidget(lbl)
         if subtitle:
             self.body.addWidget(hint(subtitle))
+        self.body.addWidget(divider())
         self.resize(width, 10)
 
     def finish(self, *left: QWidget, ok: QPushButton | None = None, cancel_text: str = "") -> None:
