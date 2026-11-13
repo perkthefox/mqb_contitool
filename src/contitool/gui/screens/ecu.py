@@ -29,7 +29,9 @@ from contitool.can import (
     can_activate_swap,
     can_health_check,
     can_learn_mfl_button,
+    can_read_eeprom,
     can_read_gateway_coding,
+    can_read_opbt,
     can_swap_status,
     can_upload_zdc_datasets,
     can_sync_zdc_coding,
@@ -37,6 +39,7 @@ from contitool.can import (
     can_write_dflash,
     can_write_uflash,
 )
+from contitool.cli.formatting import Style, format_eeprom_report, format_opbt_report
 from contitool.core import (
     CFLASH_SIZE,
     FpaDataset,
@@ -47,6 +50,8 @@ from contitool.core import (
     UNSUPPORTED_DATASET_WARNING,
     ZDC_UDS_UPLOAD_MAP,
     ZdcAutoParamConfig,
+    analyze_eeprom,
+    analyze_opbt,
     apply_cflash_rsa_modulus,
     apply_dflash_swap_fecs,
     apply_dflash_swap_rsa_modulus,
@@ -102,11 +107,11 @@ from contitool.gui.widgets.page import (
     set_pill,
 )
 from contitool.gui.worker import OperationRunner
-from contitool.gui.workspace import CANDIDATES, KINDS, NAMES, Workspace
+from contitool.gui.workspace import CANDIDATES, KINDS, NAMES, OPTIONAL_KINDS, Workspace
 from contitool.storage import AREA_FILES, changed_ranges, has_full_read, new_session, record_flashed, unit_of_cflash
 from contitool.i18n import subscribe_lang_change, tr
 
-GROUPS = (("main", ("cp", "eng", "swap", "zdc", "dtc")), ("service", ("boot",)))
+GROUPS = (("main", ("cp", "eng", "swap", "zdc", "dtc")), ("service", ("boot", "hw")))
 
 
 def _restart_note() -> str:
@@ -129,6 +134,7 @@ def _title(key: str) -> str:
         "zdc": tr("Параметрирование", "Parameterization"),
         "dtc": tr("Регистратор DTC", "DTC memory"),
         "boot": tr("Загрузчик и подпись", "Bootloader & signing"),
+        "hw": tr("EEPROM и OPBT", "EEPROM & OPBT"),
     }[key]
 
 
@@ -358,6 +364,16 @@ class EcuScreen(QWidget):
             chip = pill(NAMES[k] if have else tr(f"{NAMES[k]}: нет", f"{NAMES[k]}: missing"), "ok" if have else "warn")
             chip.setToolTip(str(self.ws.path(k) or tr("Файла нет в папке", "Not in the folder")))
             self.files_row.addWidget(chip)
+        for k in OPTIONAL_KINDS:
+            p_opt = self.ws.path(k)
+            if p_opt is not None:
+                chip = pill(NAMES[k], "ok")
+                chip.setToolTip(str(p_opt))
+                self.files_row.addWidget(chip)
+            elif k in self.ws.read_warnings:
+                chip = pill(tr(f"{NAMES[k]}: сбой", f"{NAMES[k]}: warning"), "warn")
+                chip.setToolTip(self.ws.read_warnings[k])
+                self.files_row.addWidget(chip)
         folder = self.ws.folder
         if folder:
             where = hint(tr(f"Папка: {folder.name}", f"Folder: {folder.name}"))
@@ -378,6 +394,8 @@ class EcuScreen(QWidget):
             return status.parameterization(self.ws)
         if key == "boot":
             return status.bootloader(self.ws)
+        if key == "hw":
+            return status.hardware_extras(self.ws)
         if self._dtc is None:
             return State(tr("по запросу", "on request"), "muted")
         groups = self._dtc_groups()
@@ -421,6 +439,7 @@ class EcuScreen(QWidget):
             "zdc": self._page_zdc,
             "dtc": self._page_dtc,
             "boot": self._page_boot,
+            "hw": self._page_hw,
         }
         pages[self._key](lay)
         lay.addStretch(1)
@@ -1180,6 +1199,320 @@ class EcuScreen(QWidget):
             *btns,
         )
 
+    def _page_hw(self, lay: QVBoxLayout) -> None:
+        self._head(lay, "hw")
+        self._text(
+            lay,
+            tr(
+                "Внешняя SPI EEPROM ST M95640 (8 КБ на шине CSIH1) хранит паспорт блока, VIN, кодировку 0x0600, "
+                "список оборудования 0x04A3, данные АКБ BEM и блок состояния безопасности NvM 0x5E. Опционные "
+                "байты RH850/F1L (OPBT0..OPBT8, 36 Б) задают режим отладки JTAG/LPD, сторожевые таймеры WDTA0/1, "
+                "монитор питания CVM и активацию криптомодуля ICU-S.",
+                "The external ST M95640 SPI EEPROM (8 KB on CSIH1) stores the ECU passport, VIN, coding 0x0600, "
+                "installation list 0x04A3, BEM battery data, and the NvM 0x5E security state block. The RH850/F1L "
+                "Option Bytes (OPBT0..OPBT8, 36 B) configure JTAG/LPD debug mode, WDTA0/1 watchdogs, CVM voltage "
+                "monitoring, and ICU-S cryptographic activation.",
+            ),
+        )
+        self._note(
+            lay,
+            tr(
+                "Режим только для чтения и диагностики: запись в OPBT и внешнюю EEPROM намеренно не предусмотрена. "
+                "Некорректное значение OPBT необратимо блокирует запуск и отладку процессора RH850, а записи "
+                "безопасности NvM 0x5E/0x5F в M95640 защищены аппаратными тегами AES-CMAC (ICU-S).",
+                "Diagnostic read-only mode: writing to OPBT or the external EEPROM is intentionally disabled. "
+                "Invalid OPBT values can lock RH850 boot and debug access, and security records NvM 0x5E/0x5F in "
+                "M95640 are paired with hardware ICU-S AES-CMAC tags.",
+            ),
+        )
+        if self.ws.read_warnings:
+            warn_lines = [w for w in self.ws.read_warnings.values() if w]
+            if warn_lines:
+                self._note(lay, "\n\n".join(warn_lines), tone="warn")
+
+        cf_path = self.ws.path("cflash")
+        try:
+            cf_bytes = cf_path.read_bytes() if cf_path is not None else None
+        except OSError:
+            cf_bytes = None
+
+        # ── External SPI EEPROM (ST M95640, 8 KB) ──
+        ee_path = self.ws.path("eeprom")
+        ee_summary = None
+        if ee_path is not None:
+            try:
+                ee_summary = analyze_eeprom(ee_path.read_bytes(), cf_bytes)
+            except (OSError, ValueError):
+                ee_summary = None
+        if ee_summary is not None:
+            ee_state = State(
+                tr("8 КБ загружено", "8 KB loaded"),
+                "ok" if ee_summary.crc_bad_count == 0 and not ee_summary.blank else "warn",
+            )
+        elif "eeprom" in self.ws.read_warnings:
+            ee_state = State(tr("не удалось считать", "read warning"), "warn")
+        else:
+            ee_state = State(tr("не загружен", "not loaded"), "muted")
+
+        ee_btns = [
+            self._btn(
+                "hw_read_eeprom",
+                tr("Считать EEPROM по CAN", "Read EEPROM over CAN"),
+                self._read_eeprom_live,
+                "PrimaryBtn" if ee_path is None else "",
+            ),
+            self._btn(
+                "hw_open_eeprom",
+                tr("Открыть файл…", "Open file…"),
+                lambda: self._pick_optional_file("eeprom"),
+                "GhostBtn",
+            ),
+        ]
+        if ee_path is not None:
+            ee_btns.append(
+                self._btn(
+                    "hw_report_eeprom",
+                    tr("Подробный отчёт EEPROM", "Full EEPROM report"),
+                    self._show_eeprom_report,
+                    "GhostBtn",
+                )
+            )
+        self._block(
+            lay,
+            tr("Внешняя SPI EEPROM (ST M95640, 8 КБ)", "External SPI EEPROM (ST M95640, 8 KB)"),
+            ee_state,
+            tr(
+                "Читается по шине SPI CSIH1 в режиме RAM-Loader (без модификации регистров и памяти) и автоматически "
+                "снимается при полном чтении блока.",
+                "Read over the CSIH1 SPI bus inside RAM-Loader (read-only, restoring all registers) and included "
+                "automatically in a full ECU backup.",
+            ),
+            *ee_btns,
+        )
+        if ee_summary is not None:
+            ee_rows: list[tuple[str, ...]] = []
+            pn_sw = (ee_summary.part_number or "—") + (f"  SW {ee_summary.sw_version}" if ee_summary.sw_version else "")
+            ee_rows.append((tr("Паспорт NvM 0x00", "Passport NvM 0x00"), pn_sw, f"{ee_summary.asam_id or '—'} {ee_summary.odx_version}".strip()))
+            src_lbl = tr("таблица NvM из Cflash", "Cflash NvM table") if ee_summary.from_cflash_table else tr("TLV-сканер", "TLV scan")
+            ee_rows.append(
+                (
+                    tr("Записи и CRC-16", "Records & CRC-16"),
+                    f"CRC OK: {ee_summary.crc_ok_count}, CRC ERR: {ee_summary.crc_bad_count}",
+                    f"{src_lbl}, {tr('пустых', 'erased')}: {ee_summary.erased_count}",
+                )
+            )
+            if ee_summary.vin:
+                ee_rows.append(("VIN (NvM 0x0D)", ee_summary.vin, ""))
+            if ee_summary.long_coding:
+                ee_rows.append((tr("Кодировка 0x0600", "Coding 0x0600"), ee_summary.long_coding.hex().upper(), "NvM 0x21"))
+            if ee_summary.prog_date or ee_summary.prog_counter is not None or ee_summary.workshop_hex:
+                cnt_txt = f"#{ee_summary.prog_counter}" if ee_summary.prog_counter is not None else ""
+                ee_rows.append(
+                    (
+                        tr("Прошивки (F199/F198)", "Flashing (F199/F198)"),
+                        f"{ee_summary.prog_date or '—'} {cnt_txt}".strip(),
+                        ee_summary.workshop_hex or "",
+                    )
+                )
+            if ee_summary.bem_capacity_ah is not None or ee_summary.bem_vendor or ee_summary.bem_serial:
+                cap_txt = f"{ee_summary.bem_capacity_ah} Ah" if ee_summary.bem_capacity_ah is not None else "—"
+                ee_rows.append(
+                    (
+                        tr("АКБ BEM (NvM 0x27)", "BEM battery (0x27)"),
+                        f"{cap_txt}  {ee_summary.bem_vendor}".strip(),
+                        f"SN {ee_summary.bem_serial}" if ee_summary.bem_serial else "",
+                    )
+                )
+            if ee_summary.nvm_5e_present and ee_summary.learned_cp_mask is not None:
+                slots_txt = ", ".join(s.ecu_addr for s in ee_summary.learned_cp_slots) or tr("нет ведомых", "no slaves")
+                m_txt = tr("Мастер CP: обучен", "Master CP: learned") if ee_summary.master_cp_learned else tr("Мастер CP: нет", "Master CP: no")
+                if ee_summary.showroom_mode_active:
+                    m_txt += " · Showroom ON"
+                ee_rows.append(
+                    (
+                        tr("CP в NvM 0x5E", "CP in NvM 0x5E"),
+                        f"0x{ee_summary.learned_cp_mask:03X} ({len(ee_summary.learned_cp_slots)}/12: {slots_txt})",
+                        m_txt,
+                    )
+                )
+                if ee_summary.eng_disable_mask is not None:
+                    f_txt = (
+                        f"0x80={'ON' if ee_summary.feat_80_enabled else 'OFF'}, "
+                        f"0x81={'ON' if ee_summary.feat_81_enabled else 'OFF'}, "
+                        f"0x83={'ON' if ee_summary.feat_83_enabled else 'OFF'}"
+                    )
+                    ee_rows.append(
+                        (
+                            tr("Инженерная маска", "Engineering mask"),
+                            f"0x{ee_summary.eng_disable_mask:04X}",
+                            f_txt,
+                        )
+                    )
+            self._table(lay, tr("Сводка внешней EEPROM", "External EEPROM summary"), ee_rows)
+
+        # ── Renesas RH850/F1L Option Bytes (OPBT0..OPBT8, 36 B) ──
+        op_path = self.ws.path("opbt")
+        op_summary = None
+        if op_path is not None:
+            try:
+                op_summary = analyze_opbt(op_path.read_bytes())
+            except (OSError, ValueError):
+                op_summary = None
+        if op_summary is not None:
+            op_state = State(
+                f"{len(op_summary.words)} × 32-bit",
+                "ok" if op_summary.reserved_bits_ok and not op_summary.blank else "warn",
+            )
+        elif "opbt" in self.ws.read_warnings:
+            op_state = State(tr("не удалось считать", "read warning"), "warn")
+        else:
+            op_state = State(tr("не загружен", "not loaded"), "muted")
+
+        op_btns = [
+            self._btn(
+                "hw_read_opbt",
+                tr("Считать OPBT по CAN", "Read OPBT over CAN"),
+                self._read_opbt_live,
+                "PrimaryBtn" if op_path is None else "",
+            ),
+            self._btn(
+                "hw_open_opbt",
+                tr("Открыть файл…", "Open file…"),
+                lambda: self._pick_optional_file("opbt"),
+                "GhostBtn",
+            ),
+        ]
+        if op_path is not None:
+            op_btns.append(
+                self._btn(
+                    "hw_report_opbt",
+                    tr("Подробный отчёт OPBT", "Full OPBT report"),
+                    self._show_opbt_report,
+                    "GhostBtn",
+                )
+            )
+        self._block(
+            lay,
+            tr("Опционные байты RH850/F1L (OPBT0..OPBT8, 36 Б)", "RH850/F1L Option Bytes (OPBT0..OPBT8, 36 B)"),
+            op_state,
+            tr(
+                "Считываются через окно Extra Area (BFASELR=1 @ 0x01000070) с полным сохранением состояния кэша и буфера предвыборки.",
+                "Read via the Extra Area flash window (BFASELR=1 @ 0x01000070) while saving and restoring I-cache and prefetch state.",
+            ),
+            *op_btns,
+        )
+        if op_summary is not None:
+            op_rows: list[tuple[str, ...]] = [
+                (
+                    "OPBT0",
+                    f"0x{op_summary.opbt0:08X}",
+                    tr("резервные биты OK", "reserved bits OK")
+                    if op_summary.reserved_bits_ok
+                    else tr("нестандартные биты", "non-standard bits"),
+                )
+            ]
+            if op_summary.opbt8 is not None:
+                icus_txt = (
+                    tr("ICU-S активен", "ICU-S active")
+                    if op_summary.icus_activated
+                    else tr("ICU-S выключен (bit 31 = 1)", "ICU-S disabled (bit 31 = 1)")
+                )
+                op_rows.append(("OPBT8 (ICU-S)", f"0x{op_summary.opbt8:08X}", icus_txt))
+            for fld in op_summary.fields:
+                op_rows.append((f"[{fld.bits}] {fld.name}", fld.value_text, f"0x{fld.raw_value:X}"))
+            self._table(lay, tr("Расшифровка OPBT", "Decoded OPBT"), op_rows)
+
+    def _pick_optional_file(self, kind: str) -> None:
+        title = (
+            tr("Файл внешней EEPROM M95640 (8 КБ)", "External M95640 EEPROM dump (8 KB)")
+            if kind == "eeprom"
+            else tr("Файл опционных байтов OPBT (32 / 36 / 256 Б)", "RH850 OPBT dump (32 / 36 / 256 B)")
+        )
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            str(self.ws.folder or Path.cwd()),
+            "Binary (*.bin *.raw);;All Files (*)",
+        )
+        if not chosen:
+            return
+        err = self.ws.replace(kind, Path(chosen))
+        if err is not None:
+            QMessageBox.warning(self, title, err)
+
+    def _adopt_optional_read(self, kind: str, session_file: Path) -> None:
+        if not session_file.is_file():
+            return
+        target = session_file
+        if self.ws.folder is not None and self.ws.folder.is_dir():
+            cand = self.ws.folder / CANDIDATES[kind][0]
+            if not cand.exists():
+                try:
+                    shutil.copy2(session_file, cand)
+                    target = cand
+                except OSError:
+                    target = session_file
+        self.ws.replace(kind, target)
+        self.note.emit(tr(f"Считано и загружено: {target}", f"Read and loaded: {target}"))
+
+    def _read_eeprom_live(self) -> None:
+        if not ensure_ready(self.conn, self):
+            return
+        port, iface = self.conn.port, self.conn.interface
+        sdir = self._session("read_eeprom")
+        out_file = sdir / "Eeprom.bin"
+        cf_path = self.ws.path("cflash")
+        try:
+            cf_bytes = cf_path.read_bytes() if cf_path is not None else None
+        except OSError:
+            cf_bytes = None
+        self.runner.run_task(
+            tr("Чтение внешней EEPROM M95640 (8 КБ)", "Reading external M95640 EEPROM (8 KB)"),
+            lambda rep: can_read_eeprom(
+                port,
+                out_file,
+                interface=iface,
+                session_dir=sdir,
+                cflash_bytes=cf_bytes,
+                reporter=rep,
+            ),
+            on_success=self._here(lambda _res: self._adopt_optional_read("eeprom", out_file)),
+        )
+
+    def _read_opbt_live(self) -> None:
+        if not ensure_ready(self.conn, self):
+            return
+        port, iface = self.conn.port, self.conn.interface
+        sdir = self._session("read_opbt")
+        out_file = sdir / "Opbt.bin"
+        self.runner.run_task(
+            tr("Чтение опционных байтов OPBT (36 Б)", "Reading RH850 Option Bytes OPBT (36 B)"),
+            lambda rep: can_read_opbt(
+                port,
+                out_file,
+                interface=iface,
+                session_dir=sdir,
+                reporter=rep,
+            ),
+            on_success=self._here(lambda _res: self._adopt_optional_read("opbt", out_file)),
+        )
+
+    def _show_eeprom_report(self) -> None:
+        p = self.ws.path("eeprom")
+        if p is None:
+            return
+        cf_path = self.ws.path("cflash")
+        cf_bytes = cf_path.read_bytes() if cf_path is not None and cf_path.is_file() else None
+        txt = format_eeprom_report(analyze_eeprom(p.read_bytes(), cf_bytes), Style(False), str(p))
+        run_dialog(TextResultDialog(self, tr("Подробный отчёт EEPROM", "Full EEPROM report"), txt, self.ws.part_number))
+
+    def _show_opbt_report(self) -> None:
+        p = self.ws.path("opbt")
+        if p is None:
+            return
+        txt = format_opbt_report(analyze_opbt(p.read_bytes()), Style(False), str(p))
+        run_dialog(TextResultDialog(self, tr("Подробный отчёт OPBT", "Full OPBT report"), txt, self.ws.part_number))
+
     # ────────────────────────────── changed dumps ──────────────────────────────
     def _fbl_key_changed(self) -> bool:
         """True when the edited CodeFlash carries another FBL key at 0xA2F7 (written via FACI boot block)."""
@@ -1569,12 +1902,28 @@ class EcuScreen(QWidget):
             on_success=self._here(lambda pre: QTimer.singleShot(0, lambda: self._zdc_upload_plan(df_bytes, pre))),
         )
 
+    def _zdc_blocks_to_upload(self, df_bytes: bytes) -> list[int]:
+        """Upload only the ZDC blocks edited since the base DataFlash read; fall back to all populated blocks when
+        uploading an untouched standalone dump directly."""
+        non_empty = [i for i in sorted(ZDC_UDS_UPLOAD_MAP) if any(b != 0xFF for b in export_zdc_block(df_bytes, i))]
+        orig = self.ws.original.get("dflash")
+        if orig is not None:
+            try:
+                orig_bytes = orig.read_bytes()
+            except OSError:
+                orig_bytes = b""
+            if len(orig_bytes) == len(df_bytes):
+                changed = [i for i in non_empty if export_zdc_block(df_bytes, i) != export_zdc_block(orig_bytes, i)]
+                if changed:
+                    return changed
+        return non_empty
+
     def _zdc_upload_plan(self, df_bytes: bytes, pre: dict[str, Any]) -> None:
         self._swap_live, self._swap_at = list(pre["features"]), time.strftime("%H:%M")
         active = {f["fsid"] for f in pre["features"] if status.swap_live_state(f["status"]).key == "on"}
-        required = fecs_required_by_dataset(df_bytes)
+        blocks = self._zdc_blocks_to_upload(df_bytes)
+        required = fecs_required_by_dataset(df_bytes, blocks=blocks)
         missing = [c for c in required if c not in active]
-        blocks = [i for i in sorted(ZDC_UDS_UPLOAD_MAP) if any(b != 0xFF for b in export_zdc_block(df_bytes, i))]
         coding = bytes(pre["coding"])
         want = sync_gateway_coding_for_zdc(df_bytes, coding, blocks=blocks)
         diff = [i for i in range(len(want)) if want[i] != coding[i]]
@@ -1612,19 +1961,32 @@ class EcuScreen(QWidget):
         box.exec()
         clicked = box.clickedButton()
         if clicked is not None and clicked in (act, only):
-            self._zdc_upload_run(df_bytes, missing if clicked is act else [])
+            self._zdc_upload_run(df_bytes, missing if clicked is act else [], blocks=blocks)
         else:
             self.refresh()
 
-    def _zdc_upload_run(self, df_bytes: bytes, activate: list[int]) -> None:
+    def _zdc_upload_run(self, df_bytes: bytes, activate: list[int], *, blocks: list[int] | None = None) -> None:
         port, iface = self.conn.port, self.conn.interface
         sdir = self._session("zdc_upload")
+        cf_path = self.ws.path("cflash")
+        try:
+            cflash_bytes = cf_path.read_bytes() if cf_path is not None else None
+        except OSError:
+            cflash_bytes = None
 
         def task(rep: Any) -> dict[str, Any]:
             out: dict[str, Any] = {"session_dir": str(sdir)}
             if activate:
                 out["swap"] = can_activate_swap(port, activate, interface=iface, session_dir=sdir / "swap", reporter=rep)
-            out["upload"] = can_upload_zdc_datasets(port, df_bytes, interface=iface, session_dir=sdir / "upload", reporter=rep)
+            out["upload"] = can_upload_zdc_datasets(
+                port,
+                df_bytes,
+                blocks=blocks,
+                cflash_bytes=cflash_bytes,
+                interface=iface,
+                session_dir=sdir / "upload",
+                reporter=rep,
+            )
             out["features"] = can_swap_status(port, interface=iface, reporter=rep)["features"]  # did the ECU take them?
             return out
 

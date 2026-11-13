@@ -1226,3 +1226,74 @@ def test_a_j2534_driver_behind_the_vw_driver_is_named_and_kept_away_from_memory(
     finally:
         dpdu.release_session(bus)
         dpdu.close_session()
+
+
+def test_vci_firmware_update_returning_0x01_on_module_connect_retries_and_connects(monkeypatch) -> None:
+    """Issue #23: when PDUAPI_VW.dll reflashes the VCI inside PDUModuleConnect (~15-50 s), it logs 'UPDATE complete'
+    and returns 0x01 (PDU_ERR_FCT_FAILED); a fresh PDUConstruct/PDUModuleConnect after the VCI restarts succeeds."""
+    monkeypatch.setattr(dpdu, "VCI_RESTART_WAIT", 0.0)
+    monkeypatch.setattr(dpdu, "VCI_UPDATE_MIN_WAIT", 0.0)
+
+    class UpdatingVciApi(FakePduApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.constructs = 0
+
+        def PDUConstruct(self, *_a) -> int:  # noqa: N802
+            self.constructs += 1
+            return 0
+
+        def PDUModuleConnect(self, hmod) -> int:  # noqa: N802
+            self.connected.append(hmod)
+            return 0x01 if len(self.connected) == 1 else 0
+
+    api = UpdatingVciApi()
+    bus = DPduBus(dll=api)
+    assert api.constructs == 2 and api.connected == [0x10000001, 0x10000001]
+    assert api.monitor_started and not bus.spent
+    bus.shutdown()
+
+
+def test_rawcan_resource_lookup_and_0x10000_refusal_fallback() -> None:
+    """Issues #10 & #23: D-PDU 30.3 / 31.1 returns 0x10000 for 0x30030003. Look up the MDF's raw-CAN resource ID via
+    PDUGetResourceIds first, and if RawMode is still refused with 0x10000, fall back cleanly to fixed-id links."""
+    set_lang("en")
+
+    # 1. MDF renumbered RawCAN resource to 0x30030099 -> PDUGetResourceIds resolves it and RawMode opens cleanly
+    class RenumberedRawCanApi(FakePduApi):
+        NEW_RAW_RSC = 0x30030099
+
+        def PDUGetResourceIds(self, hmod, rsc, out) -> int:  # noqa: N802
+            assert rsc._obj.ProtocolId == self.objects["ISO_11898_RAW"]
+            rids = (C.c_uint32 * 1)(self.NEW_RAW_RSC)
+            mod_entry = (dpdu.RscIdItemData * 1)(dpdu.RscIdItemData(hmod, 1, C.cast(rids, C.POINTER(C.c_uint32))))
+            top = dpdu.RscIdItem(0x1100, 1, C.cast(mod_entry, C.POINTER(dpdu.RscIdItemData)))
+            self.keep += [rids, mod_entry, top]
+            out._obj.contents = top
+            return 0
+
+        def PDUCreateComLogicalLink(self, hmod, rsc, resource, tag, phcll, flag) -> int:  # noqa: N802
+            if rsc is None and resource == RAWCAN_OBD6_14:
+                return 0x10000
+            if rsc is None and resource == self.NEW_RAW_RSC:
+                return super().PDUCreateComLogicalLink(hmod, None, RAWCAN_OBD6_14, tag, phcll, flag)
+            return super().PDUCreateComLogicalLink(hmod, rsc, resource, tag, phcll, flag)
+
+    api_renum = RenumberedRawCanApi()
+    bus_renum = DPduBus(dll=api_renum)
+    assert api_renum.monitor_started and not bus_renum.nonraw
+    bus_renum.shutdown()
+
+    # 2. Adapter refuses RawMode altogether with vendor code 0x10000 -> falls back to _open_nonraw fixed-id links
+    class VendorRefusalApi(FakePduApi):
+        def PDUCreateComLogicalLink(self, hmod, rsc, resource, tag, phcll, flag) -> int:  # noqa: N802
+            if rsc is None:
+                return 0x10000
+            return super().PDUCreateComLogicalLink(hmod, rsc, resource, tag, phcll, flag)
+
+    api_fallback = VendorRefusalApi()
+    bus_fallback = DPduBus(dll=api_fallback)
+    assert bus_fallback.nonraw and sorted(bus_fallback.nonraw) == [0x6F0, 0x710]
+    res = can_identify("", bus=bus_fallback)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    bus_fallback.shutdown()

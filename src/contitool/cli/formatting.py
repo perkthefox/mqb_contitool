@@ -17,6 +17,7 @@ from contitool.core.analyzer import (
     UflashSummary,
     check_fec_dataset_support,
 )
+from contitool.core.hw_extra import EepromSummary, OpbtSummary
 from contitool.core.constants import (
     AUTHOR_CREDIT,
     AUTHOR_DRIVE2_URL,
@@ -454,6 +455,158 @@ def format_dflash_report(
                 f"    • #{fsc.slot_idx:02d} @ 0x{fsc.dflash_off:04X}: FeC 0x{fsc.fec_code:08X} {kind_tag} ({desc}){ds_badge}"
             )
 
+    return "\n".join(lines)
+
+
+def format_opbt_report(summary: OpbtSummary, style: Style | None = None, path_label: str = "") -> str:
+    st = style or Style(False)
+    lines = [
+        st.bold(
+            tr(
+                "═══ Опционные байты RH850/F1L (OPBT0..OPBT8 @ Extra Area 0xFF300070) ═══",
+                "═══ RH850/F1L Option Bytes (OPBT0..OPBT8 @ Extra Area 0xFF300070) ═══",
+            )
+        ),
+    ]
+    if path_label:
+        lines.append(f"  {tr('Файл', 'File')}:           {path_label}")
+    res_badge = (
+        st.badge_ok("OK")
+        if summary.reserved_bits_ok
+        else st.badge_warn(tr("НЕСТАНДАРТНЫЕ БИТЫ", "NON-STANDARD BITS"))
+    )
+    jtag_badge = (
+        st.badge_ok(tr("ВКЛЮЧЁН", "ENABLED"))
+        if summary.jtag_enabled
+        else st.dim(tr("ОТКЛЮЧЁН (JP0 GPIO)", "DISABLED (JP0 GPIO)"))
+    )
+    if summary.icus_activated is None:
+        icus_badge = st.dim(tr("Н/Д (32-байтный дамп без OPBT8)", "N/A (32-byte dump without OPBT8)"))
+    elif summary.icus_activated:
+        icus_badge = st.badge_ok(tr("АКТИВЕН (ICU-S включён)", "ACTIVE (ICU-S enabled)"))
+    else:
+        icus_badge = st.badge_warn(tr("НЕ АКТИВИРОВАН (bit 31 = 1)", "NOT ACTIVATED (bit 31 = 1)"))
+
+    lines.extend(
+        [
+            f"  OPBT0:          0x{summary.opbt0:08X}  ({tr('резервные биты', 'reserved bits')}: {res_badge})",
+            f"  OPBT8 (ICU-S):  {('0x' + format(summary.opbt8, '08X')) if summary.opbt8 is not None else '—'}  ({icus_badge})",
+            f"  {tr('Отладка JTAG/LPD', 'JTAG/LPD Debug')}: {jtag_badge}",
+        ]
+    )
+    words_line = "  ".join(f"OPBT{i}=0x{w:08X}" for i, w in enumerate(summary.words))
+    lines.append(f"  {tr('Слова OPBT', 'OPBT Words')}:     {st.dim(words_line)}")
+    lines.append("  " + ("─" * 92))
+    for fld in summary.fields:
+        lines.append(f"  [{fld.bits:>5}] {fld.name:<14} = 0x{fld.raw_value:X}  — {fld.value_text}")
+    return "\n".join(lines)
+
+
+def format_eeprom_report(summary: EepromSummary, style: Style | None = None, path_label: str = "") -> str:
+    st = style or Style(False)
+    lines = [
+        st.bold(
+            tr(
+                "═══ Внешняя SPI EEPROM ST M95640 (8 КБ, CSIH1) — только чтение ═══",
+                "═══ External SPI EEPROM ST M95640 (8 KB, CSIH1) — Read-Only ═══",
+            )
+        ),
+    ]
+    if path_label:
+        lines.append(f"  {tr('Файл', 'File')}:                {path_label}")
+    if summary.blank:
+        lines.append(f"  {tr('Состояние', 'State')}:           {st.badge_warn(tr('ПУСТАЯ (все 0xFF)', 'BLANK (all 0xFF)'))}")
+        return "\n".join(lines)
+
+    crc_badge = (
+        st.badge_ok(f"{summary.crc_ok_count} CRC OK")
+        if summary.crc_bad_count == 0
+        else st.badge_warn(f"{summary.crc_ok_count} OK / {summary.crc_bad_count} ERR")
+    )
+    tbl_src = (
+        tr("таблица NvM из Cflash", "Cflash NvM table")
+        if summary.from_cflash_table
+        else tr("автономный TLV-сканер", "standalone TLV scan")
+    )
+    lines.append(
+        f"  {tr('Целостность записей', 'Record Integrity')}: {crc_badge} "
+        f"({tbl_src}, {tr('пустых', 'erased')}: {summary.erased_count})"
+    )
+    if summary.rdsr is not None:
+        lines.append(
+            f"  RDSR (0x05):         0x{summary.rdsr.raw:02X} "
+            f"(BP={summary.rdsr.bp_bits}, SRWD={int(summary.rdsr.srwd)} — {summary.rdsr.protected_range})"
+        )
+    pn_sw = f"{summary.part_number or '—'}" + (f"  (SW {summary.sw_version})" if summary.sw_version else "")
+    lines.extend(
+        [
+            f"  {tr('Паспорт NvM 0x00', 'Passport NvM 0x00')}:    {st.bold(pn_sw)}",
+            f"  ASAM / ODX:          {summary.asam_id or '—'}  •  {summary.odx_version or '—'}",
+        ]
+    )
+    if summary.vin:
+        lines.append(f"  VIN:                 {summary.vin}")
+    if summary.prog_date or summary.prog_counter is not None:
+        cnt = f" ({tr('счётчик прошивок', 'flash counter')}: {summary.prog_counter})" if summary.prog_counter is not None else ""
+        lines.append(f"  {tr('Дата программирования', 'Programming Date')}: {summary.prog_date or '—'}{cnt}")
+    if summary.workshop_hex:
+        lines.append(f"  {tr('Код мастерской (F198)', 'Workshop Code (F198)')}: {summary.workshop_hex}")
+    if summary.long_coding:
+        lines.append(f"  {tr('Кодировка (DID 0600)', 'Coding (DID 0600)')}:   {summary.long_coding.hex().upper()}")
+    if summary.verbauliste:
+        lines.append(f"  {tr('Список блоков (04A3)', 'Install List (04A3)')}:  {summary.verbauliste.hex().upper()}")
+    if summary.bem_capacity_ah is not None or summary.bem_vendor or summary.bem_serial:
+        cap = f"{summary.bem_capacity_ah} Ah" if summary.bem_capacity_ah is not None else "—"
+        lines.append(
+            f"  {tr('АКБ / BEM (NvM 0x27)', 'Battery / BEM (0x27)')}: {cap}  •  "
+            f"{summary.bem_vendor or '—'}  •  SN {summary.bem_serial or '—'}"
+        )
+    if summary.stored_dtcs:
+        dtc_str = ", ".join(f"0x{code:06X} (0x{st_b:02X})" for code, st_b in summary.stored_dtcs[:8])
+        if len(summary.stored_dtcs) > 8:
+            dtc_str += f" (+{len(summary.stored_dtcs) - 8})"
+        lines.append(f"  {tr('Записи ошибок DTC', 'Stored DTC Entries')}:  {dtc_str}")
+
+    lines.append("")
+    lines.append(
+        st.bold(
+            tr(
+                "  ── Защита компонентов и инженерные флаги в M95640 (NvM 0x5E / 0x5F) ──",
+                "  ── Component Protection & Engineering Flags in M95640 (NvM 0x5E / 0x5F) ──",
+            )
+        )
+    )
+    if summary.nvm_5e_present and summary.learned_cp_mask is not None:
+        slot_labels = ", ".join(f"#{s.slot} {s.ecu_addr}" for s in summary.learned_cp_slots) or tr("нет", "none")
+        m_lbl = (
+            st.badge_ok(tr("обучен", "learned"))
+            if summary.master_cp_learned
+            else st.dim(tr("не обучен", "not learned"))
+        )
+        sr_lbl = (
+            st.badge_warn(tr("АКТИВЕН", "ACTIVE"))
+            if summary.showroom_mode_active
+            else st.dim(tr("выкл", "off"))
+        )
+        lines.append(
+            f"  {tr('Маска обученных CP', 'Learned CP Mask')}:   0x{summary.learned_cp_mask:03X} "
+            f"({len(summary.learned_cp_slots)}/12: {slot_labels})"
+        )
+        lines.append(
+            f"  {tr('Мастер CP / Showroom', 'Master CP / Showroom')}: {m_lbl}  •  "
+            f"Showroom: {sr_lbl} (cnt={summary.showroom_counter})"
+        )
+        if summary.eng_disable_mask is not None:
+            f_str = (
+                f"0x80={'ON' if summary.feat_80_enabled else 'OFF'}, "
+                f"0x81={'ON' if summary.feat_81_enabled else 'OFF'}, "
+                f"0x83={'ON' if summary.feat_83_enabled else 'OFF'}"
+            )
+            lines.append(
+                f"  {tr('Инженерная маска', 'Engineering Mask')}:    0x{summary.eng_disable_mask:04X} ({f_str})"
+            )
+    else:
+        lines.append(f"  NvM 0x5E:            {st.dim(tr('не найдена или пуста', 'not found or erased'))}")
     return "\n".join(lines)
 
 

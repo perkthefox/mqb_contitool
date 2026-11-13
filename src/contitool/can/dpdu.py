@@ -48,6 +48,7 @@ ERR_FCT_FAILED = 0x01  # "the call failed": from PDUModuleConnect it is a module
 ERR_INVALID_PARAMETERS = 0x50
 VW_MODULE_TYPE_ID = 14  # a Volkswagen VCI (VAS 6154 / 6154A); 12 is some other vendor's J2534 driver
 VCI_RESTART_WAIT = 4.0
+VCI_UPDATE_MIN_WAIT = 5.0  # PDUModuleConnect reflashing the VCI ("UPDATE complete") takes ~15-50 s and ends with 0x01
 # Driver versions (major.minor) that run without asking: 27.2 is verified on hardware (backup, write, UDS flash) and
 # ships with ContiTool in dpdu/. On 30.3, 31.0 and 31.1 the VCI stops answering partway through a UDS flash (around
 # block 550 of 2,975, every report so far), so those and anything unknown need the user's explicit go-ahead.
@@ -408,7 +409,9 @@ class DPduBus(can.BusABC):
         # hCoP -> the ctypes objects its PDUStartComPrimitive pointed at, kept until it finishes: ODIS builds them on a
         # stack frame that outlives the primitive, and nothing guarantees this driver copies them all at the call
         self._cop_keep: dict[int, tuple] = {}
+        self._vci_updated = False
         for attempt in (1, 2):
+            self._vci_updated = False
             self._call("PDUConstruct", None, None)
             try:
                 self._open(bitrate, module_wait)
@@ -416,9 +419,9 @@ class DPduBus(can.BusABC):
                 break
             except can.CanError as exc:
                 self._teardown()
-                if attempt == 2 or exc.error_code != ERR_COMM_PC_TO_VCI_FAILED:
+                if attempt == 2 or (exc.error_code != ERR_COMM_PC_TO_VCI_FAILED and not self._vci_updated):
                     raise
-                time.sleep(VCI_RESTART_WAIT)  # the session after a dropped one always connected in the logs
+                time.sleep(VCI_RESTART_WAIT)  # the session after a dropped or reflashed VCI always connected in the logs
             except Exception:
                 self._teardown()
                 raise
@@ -440,7 +443,12 @@ class DPduBus(can.BusABC):
         for hmod, name, vendor, is_vw in self._modules(module_wait):
             self.hmod, self.module_label, self.module_vendor, self.module_is_vci = hmod, name, vendor, is_vw
             try:
+                t_conn = time.monotonic()
                 if self._call("PDUModuleConnect", hmod, also_ok=(ERR_FCT_FAILED,)) != 0:
+                    if is_vw and time.monotonic() - t_conn >= VCI_UPDATE_MIN_WAIT:
+                        # PDUAPI_VW.dll reflashed the VCI ("VAS6154_ERROR: UPDATE complete") and ends the call with 0x01;
+                        # a fresh PDUConstruct/PDUModuleConnect after the VCI restarts connects cleanly (#23).
+                        self._vci_updated = True
                     raise can.CanOperationError(f"PDUModuleConnect: D-PDU error 0x{ERR_FCT_FAILED:02X}",
                                                 error_code=ERR_FCT_FAILED)
                 self._open_links(bitrate)
@@ -1050,13 +1058,32 @@ class DPduBus(can.BusABC):
                                                     "VAS 6154 / VNCI not found: is it plugged in and ODIS closed?"))
             time.sleep(0.5)
 
+    def _rawcan_resource_id(self) -> int:
+        """Ask the MDF for the raw-CAN resource on pins 6/14 when 0x30030003 was renumbered (e.g. D-PDU 30.3+)."""
+        bus, proto = self._object_id(OBJT_BUSTYPE, NONRAW_BUS), self._object_id(OBJT_PROTOCOL, NONRAW_PROTOCOL)
+        pin_ids = [self._object_id(OBJT_PINTYPE, t) for _, t in NONRAW_PINS]
+        if bus is None or proto is None or any(p is None for p in pin_ids):
+            return 0
+        pins = (PinData * len(NONRAW_PINS))(*(PinData(n, pid) for (n, _), pid in zip(NONRAW_PINS, pin_ids)))
+        rsc = RscData(bus, proto, len(pins), C.cast(pins, C.POINTER(PinData)))
+        return self._find_resource_id(rsc)
+
     def _create(self, flags: tuple[int, int, int, int]) -> int:
         h, fl = U32(0), (U8 * 4)(*flags)
-        # Any refusal means the same thing — this module has no raw CAN on OBD pins 6/14 — so say that instead of
-        # the bare code. Seen as 0x50 from a VAS 5054A and as 0x01 from another vendor's driver.
-        rc = self._call("PDUCreateComLogicalLink", self.hmod, None, RAWCAN_OBD6_14, None, C.byref(h),
-                        C.byref(FlagData(4, fl)), also_ok=(ERR_INVALID_PARAMETERS, ERR_FCT_FAILED))
-        if rc:
+        rc = int(self._dll.PDUCreateComLogicalLink(self.hmod, None, RAWCAN_OBD6_14, None, C.byref(h),
+                                                   C.byref(FlagData(4, fl))))
+        if rc != 0 and rc != ERR_COMM_PC_TO_VCI_FAILED:
+            rid = self._rawcan_resource_id()
+            if rid and rid != RAWCAN_OBD6_14:
+                rc = int(self._dll.PDUCreateComLogicalLink(self.hmod, None, rid, None, C.byref(h),
+                                                           C.byref(FlagData(4, fl))))
+        if rc == ERR_COMM_PC_TO_VCI_FAILED:
+            self.spent = True
+            raise can.CanOperationError(f"PDUCreateComLogicalLink: D-PDU error 0x{rc:02X}", error_code=rc)
+        # Any other refusal means the same thing — this module has no raw CAN on OBD pins 6/14 — so let _open_links try
+        # the ODIS-style fixed-id fallback and, if that is refused too, say so in plain words. Seen as 0x50 from a
+        # VAS 5054A, 0x01 from another vendor's driver, and 0x10000 on D-PDU 30.3 / 31.1 (#10, #23).
+        if rc != 0 or not h.value:
             raise RawModeUnavailable(
                 tr(
                     f"Адаптер «{self.module_label}» не даёт сырой канал CAN (ошибка 0x{rc:02X}). ContiTool "
@@ -1068,7 +1095,7 @@ class DPduBus(can.BusABC):
                     "VNCI clones provide — the refusal comes from the adapter itself. Try another D-PDU driver in "
                     "the Connection window; if that is refused too, this adapter cannot be used.",
                 ),
-                error_code=rc,
+                error_code=rc or ERR_FCT_FAILED,
             )
         self._links.append(h.value)
         return h.value

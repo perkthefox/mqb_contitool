@@ -1,5 +1,33 @@
 # Changelog / История изменений
 
+## 2.1.0 — 2026-11-13
+
+### 🇷🇺 Добавлено
+- **Чтение и расшифровка внешней SPI EEPROM (`ST M95640`, 8 КБ) и опционных байтов `OPBT` (`OPBT0..OPBT8`, 36 Б):** выполняются в режиме «только чтение» через аппаратные апплеты RH850/F1L (`CSIH1` и окно `Extra Area`) без привязки к версии прошивки шлюза.
+  - Полное чтение блока по CAN автоматически сохраняет `Eeprom.bin` и `Opbt.bin` вместе с основными дампами (`--no-extras` в CLI отключает это). Если `EEPROM` или `OPBT` прочитать не удалось, основной бэкап (`CodeFlash`, `Uflash`, `DataFlash`) не прерывается — ContiTool сохраняет его и выводит предупреждение (Warning).
+  - На экране блока добавлен раздел **«EEPROM и OPBT»** с расшифровкой паспорта `NvM 0x00`, VIN, кодировки `0x0600`, списка оборудования `0x04A3`, АКБ `BEM`, блока безопасности `NvM 0x5E` (маска обученных слотов CP, `Master CP`, `Showroom`, инженерные флаги `0x80/0x81/0x83`), проверкой `CRC-16/CCITT-FALSE` по всем записям и битовой расшифровкой `OPBT0` / `OPBT8 (ICU-S)`.
+  - В CLI добавлены команды `can read-eeprom`, `can read-opbt` и флаги `inspect --eeprom` / `--opbt`.
+- **Редактор профилей движения (`FPA`):** добавлена поддержка целевых режимов `On` / `Off` (`0x0300`) и непрерывного 15-ступенчатого слайдера жёсткости подвески `DCC` (`Step 1..15`, атрибут `0xFFFE` в профиле `Individual`).
+
+### 🇷🇺 Исправлено
+- **Редактор профилей движения (`FPA`, #24):** исправлен каталог функциональных групп `CharismaFunctions` (`0x01..0x1C` — `Motor`, `Getriebe`, `Lenkung`, `DCC`, `ACC`, `Kurvenlicht`, `Klima`, `Bussound` и др.), порядок целевых режимов (`8: On`, `9: Off`, `10: Snow`), Big-Endian формула байта `PaCo` (`12 - (pbit - 1) // 8`) и список силовых групп `KL15` (`0x04 EDS` больше не помечается как требующая перезапуска двигателя).
+- **Загрузка параметрии ZDC по CAN (#26):** по UDS теперь выгружаются только реально изменённые блоки датасета вместо перезаписи всех непустых блоков; адреса `RequestDownload (0x34)` определяются динамически из таблицы прошивки `CodeFlash` (если дамп открыт), а при отказе `7F 34 31` / `7F 34 70` выводится понятное объяснение с предложением записать `DataFlash` через RAM-Loader.
+- **VAS 6154 / VNCI (D-PDU, #10, #23):** после автоматического обновления прошивки адаптера драйвером D-PDU добавлено повторное переподключение при перезагрузке USB-интерфейса VCI; ID ресурса `RawCAN` теперь определяется из `MDF`-файла драйвера с резервным перебором `0x10000`.
+- **Неподдерживаемые шлюзы `5Q0` и `Lear` (#8, #13, #14, #15):** проверка аппаратной платформы добавлена непосредственно перед входом в RAM-Loader во всех CAN-операциях, чтобы исключить неинформативную ошибку `7F 22 31` на блоках MPC5607B / MPC5748G.
+
+### 🇬🇧 Added
+- **Read-only backup and decoding of external SPI EEPROM (`ST M95640`, 8 KB) and RH850 Option Bytes (`OPBT0..OPBT8`, 36 B):** read over Diagnosis CAN via firmware-independent RH850/F1L hardware applets (`CSIH1` SPI and `Extra Area` window) that restore all peripheral registers before returning.
+  - Full CAN backups automatically include `Eeprom.bin` and `Opbt.bin` alongside the main flash areas (`--no-extras` in CLI skips them). If `EEPROM` or `OPBT` cannot be read, the main backup (`CodeFlash`, `Uflash`, `DataFlash`) does not abort — ContiTool saves it cleanly and shows a Warning.
+  - Added the **“EEPROM & OPBT”** service page in the GUI with full decoding of `NvM 0x00` passport, VIN, coding `0x0600`, installation list `0x04A3`, `BEM` battery data, `NvM 0x5E` security state (learned CP slot mask, `Master CP`, `Showroom`, `0x80/0x81/0x83` engineering flags), per-record `CRC-16/CCITT-FALSE` verification, and `OPBT0` / `OPBT8 (ICU-S)` bitfields.
+  - Added CLI subcommands `can read-eeprom`, `can read-opbt`, and `inspect --eeprom` / `--opbt`.
+- **Driving-profile editor (`FPA`):** added support for `On` / `Off` (`0x0300`) target modes and the 15-step continuous `DCC` damping slider (`Step 1..15`, `0xFFFE` in `Individual`).
+
+### 🇬🇧 Fixed
+- **Driving-profile editor (`FPA`, #24):** fixed the `CharismaFunctions` group catalog (`0x01..0x1C` — `Engine`, `Gearbox`, `Steering`, `DCC`, `ACC`, `AFS`, `Climatronic`, `Interior sound`, etc.), target mode mapping (`8: On`, `9: Off`, `10: Snow`), Big-Endian `PaCo` byte indexing (`12 - (pbit - 1) // 8`), and `KL15` powertrain group tagging (`0x04 EDS` is no longer flagged as requiring an ignition cycle).
+- **ZDC dataset upload over CAN (#26):** UDS upload now sends only the ZDC blocks actually modified since the base `DataFlash` read; `RequestDownload (0x34)` addresses are resolved dynamically from the open `CodeFlash` image when available, and `7F 34 31` / `7F 34 70` rejections report a clear explanation suggesting RAM-Loader `DataFlash` write.
+- **VAS 6154 / VNCI (D-PDU, #10, #23):** added reconnect retries while the VCI reboots over USB right after a D-PDU firmware update, and dynamic `RawCAN` resource ID lookup from the driver's `MDF` file with fallback to `0x10000`.
+- **Unsupported `5Q0` and `Lear` gateways (#8, #13, #14, #15):** added an upfront platform check inside `enter_ram_loader` across all CAN workflows so MPC5607B / MPC5748G units report a clear unsupported-hardware error instead of failing with `7F 22 31`.
+
 ## 2.0.4 — 2026-11-11
 
 ### 🇷🇺 Добавлено

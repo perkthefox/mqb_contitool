@@ -15,7 +15,9 @@ from contitool.can import (
     can_backup,
     can_health_check,
     can_learn_mfl_button,
+    can_read_eeprom,
     can_read_memory,
+    can_read_opbt,
     can_turnkey_read_patch_flash,
     can_upload_zdc_datasets,
     can_verify,
@@ -32,7 +34,9 @@ from contitool.cli.formatting import (
     format_banks_table,
     format_cflash_report,
     format_dflash_report,
+    format_eeprom_report,
     format_guide_text,
+    format_opbt_report,
     format_startup_banner,
     format_uflash_report,
 )
@@ -48,6 +52,8 @@ from contitool.core import (
     analyze_dflash,
     analyze_dflash_datasets,
     analyze_dflash_swap,
+    analyze_eeprom,
+    analyze_opbt,
     analyze_uflash,
     apply_cflash_patch,
     apply_cflash_rsa_modulus,
@@ -132,18 +138,20 @@ def cmd_guide(args: argparse.Namespace) -> int:
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
-    if not (args.cflash or args.dflash or args.uflash):
+    if not (args.cflash or args.dflash or args.uflash or args.eeprom or args.opbt):
         raise ValueError(
             tr(
-                "Укажите хотя бы один дамп: --cflash, --dflash или --uflash",
-                "Provide at least one dump path: --cflash, --dflash, or --uflash",
+                "Укажите хотя бы один дамп: --cflash, --dflash, --uflash, --eeprom или --opbt",
+                "Provide at least one dump path: --cflash, --dflash, --uflash, --eeprom, or --opbt",
             )
         )
     st = _out_style(args)
     blocks: list[str] = []
+    cflash_bytes: bytes | None = None
     if args.cflash:
         p = clean_user_path(args.cflash)
-        blocks.append(format_cflash_report(analyze_cflash(p.read_bytes()), st, str(p)))
+        cflash_bytes = p.read_bytes()
+        blocks.append(format_cflash_report(analyze_cflash(cflash_bytes), st, str(p)))
     if args.uflash:
         p = clean_user_path(args.uflash)
         blocks.append(format_uflash_report(analyze_uflash(p.read_bytes()), st, str(p)))
@@ -159,6 +167,12 @@ def cmd_inspect(args: argparse.Namespace) -> int:
                 dataset_summary=analyze_dflash_datasets(raw_df),
             )
         )
+    if args.eeprom:
+        p = clean_user_path(args.eeprom)
+        blocks.append(format_eeprom_report(analyze_eeprom(p.read_bytes(), cflash_bytes), st, str(p)))
+    if args.opbt:
+        p = clean_user_path(args.opbt)
+        blocks.append(format_opbt_report(analyze_opbt(p.read_bytes()), st, str(p)))
     print("\n\n".join(blocks))
     return 0
 
@@ -840,8 +854,40 @@ def cmd_can(args: argparse.Namespace) -> int:
                 if answer not in ("y", "yes", "д", "да"):
                     print(tr("Отменено.", "Cancelled."))
                     return 1
-            res = can_backup(args.port, interface=args.interface, session_dir=session_dir, reporter=rep)
+            res = can_backup(
+                args.port,
+                interface=args.interface,
+                session_dir=session_dir,
+                include_extras=not getattr(args, "no_extras", False),
+                reporter=rep,
+            )
             print(f"✓ Backup folder: {res['session_dir']}")
+            for w_msg in res.get("warnings") or []:
+                print(f"⚠ {w_msg}", file=sys.stderr)
+        elif action == "read-eeprom":
+            out_bin = clean_user_path(args.out_file) if args.out_file else (session_dir / "Eeprom.bin")
+            cf_bytes = clean_user_path(args.input).read_bytes() if args.input else None
+            res = can_read_eeprom(
+                args.port,
+                out_bin,
+                interface=args.interface,
+                session_dir=session_dir,
+                cflash_bytes=cf_bytes,
+                reporter=rep,
+            )
+            print(format_eeprom_report(analyze_eeprom(out_bin.read_bytes(), cf_bytes), _out_style(args), str(out_bin)))
+            print(f"✓ Eeprom.bin -> {out_bin} | Session: {res['session_dir']}")
+        elif action == "read-opbt":
+            out_bin = clean_user_path(args.out_file) if args.out_file else (session_dir / "Opbt.bin")
+            res = can_read_opbt(
+                args.port,
+                out_bin,
+                interface=args.interface,
+                session_dir=session_dir,
+                reporter=rep,
+            )
+            print(format_opbt_report(analyze_opbt(out_bin.read_bytes()), _out_style(args), str(out_bin)))
+            print(f"✓ Opbt.bin -> {out_bin} | Session: {res['session_dir']}")
         elif action == "read-mem":
             if args.address is None or args.length is None:
                 raise ValueError(
@@ -1009,10 +1055,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_gde = _add("guide", tr("Показать краткую памятку (программатор 64 КБ, распиновка T20, ключи IKA)", "Show bench reference guide (64 KB programmer rule, T20 pinout, IKA keys)"))
     p_gde.set_defaults(func=cmd_guide)
 
-    p_ins = _add("inspect", tr("Проверить дампы CodeFlash, DataFlash (12 банков CP + SWaP) и/или Uflash", "Inspect CodeFlash, DataFlash (12 CP banks + SWaP), and/or Uflash dumps"))
+    p_ins = _add("inspect", tr("Проверить дампы CodeFlash, DataFlash, Uflash, внешней EEPROM M95640 и/или OPBT", "Inspect CodeFlash, DataFlash, Uflash, external M95640 EEPROM, and/or OPBT dumps"))
     p_ins.add_argument("--cflash", help=tr("Путь к CodeFlash.bin (1.5 МБ) или FD_0DATA", "Path to CodeFlash.bin (1.5 MB) or FD_0DATA"))
     p_ins.add_argument("--dflash", help=tr("Путь к DataFlash.bin (64 КБ)", "Path to DataFlash.bin (64 KB)"))
     p_ins.add_argument("--uflash", help=tr("Путь к Uflash.bin (32 КБ)", "Path to Uflash.bin (32 KB)"))
+    p_ins.add_argument("--eeprom", help=tr("Путь к Eeprom.bin / m95640.bin (8 КБ SPI EEPROM)", "Path to Eeprom.bin / m95640.bin (8 KB SPI EEPROM)"))
+    p_ins.add_argument("--opbt", help=tr("Путь к Opbt.bin (32/36 Б) или ExtraArea.bin (256 Б)", "Path to Opbt.bin (32/36 B) or ExtraArea.bin (256 B)"))
     p_ins.set_defaults(func=cmd_inspect)
 
     p_bcp = _add("bind-cp", tr("Под ключ: пропатчить CodeFlash + записать 16Б ключи IKA в DataFlash", "Turnkey: patch CodeFlash + write 16B IKA keys into DataFlash"))
@@ -1190,7 +1238,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_can = _add("can", tr("Работа со шлюзом по Diagnosis CAN (500 кбит/с, нужен CAN-терминатор или резистор 120 Ом)", "Live Diagnosis CAN operations (500 kbit/s, CAN termination or a 120 Ohm resistor required)"))
     p_can.add_argument(
         "can_action",
-        choices=("ports", "verify", "backup", "read-mem", "write-uflash", "write-dflash", "write-cflash", "zdc-upload", "learn-mfl", "health", "turnkey"),
+        choices=("ports", "verify", "backup", "read-mem", "read-eeprom", "read-opbt", "write-uflash", "write-dflash", "write-cflash", "zdc-upload", "learn-mfl", "health", "turnkey"),
     )
     p_can.add_argument("--port", help=tr("Порт адаптера (напр. COM4 или /dev/cu.usbmodem...)", "Adapter port (e.g. COM4 or /dev/cu.usbmodem...)"))
     p_can.add_argument("--interface", choices=iface_choices, default="slcan")
@@ -1206,7 +1254,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_can.add_argument("-o", "--output-dir", help=tr("Папка для сохранения бэкапов и отчётов (по умолчанию contitool_runs рядом с программой)", "Base output directory (default: contitool_runs next to the program)"))
     p_can.add_argument("--address", type=lambda x: int(x, 0), help=tr("Начальный адрес для read-mem (напр. 0xFF200000)", "Start address for read-mem (e.g. 0xFF200000)"))
     p_can.add_argument("--length", type=lambda x: int(x, 0), help=tr("Длина в байтах для read-mem (напр. 0x10000)", "Byte length for read-mem (e.g. 0x10000)"))
-    p_can.add_argument("--out-file", help=tr("Путь к выходному файлу для read-mem", "Output file path for read-mem"))
+    p_can.add_argument("--out-file", help=tr("Путь к выходному файлу для read-mem / read-eeprom / read-opbt", "Output file path for read-mem / read-eeprom / read-opbt"))
+    p_can.add_argument("--no-extras", action="store_true", help=tr("Не читать внешнюю EEPROM M95640 и OPBT при полном backup", "Skip external M95640 EEPROM and OPBT during full backup"))
     p_can.add_argument("--restore-stock", action="store_true", help=tr("Вернуть заводскую проверку RSA в write-uflash", "Restore stock RSA check in write-uflash"))
     p_can.add_argument("--raw-image", action="store_true", help=tr("Записать входной Uflash без автопатча", "Write raw Uflash image without auto-patching"))
     p_can.add_argument("--full-rewrite", action="store_true", help=tr("Перезаписать все пользовательские блоки DataFlash (для write-dflash)", "Rewrite all user DataFlash blocks (for write-dflash)"))

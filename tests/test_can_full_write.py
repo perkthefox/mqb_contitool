@@ -119,6 +119,48 @@ class SimulatedRh850FaciMcu:
         self.wdta_kicks = {0xFFED0000: 0, 0xFFED1000: 0}
         self.interrupts_disabled = False
 
+        # Extra Area (OPBT0..OPBT8 @ 0xFF300070..0xFF300093 when BFASELR == 1) & I-cache/CFCNT
+        self.bfaselr = 0
+        self.cfcnt = 0
+        self.icctrl = 0x00000001
+        self.extra_area = bytearray(b"\xff" * 256)
+        opbt_words = (0x9AA7FFEF, 0, 0, 0, 0, 0, 0, 0, 0x0FFFFFFF)
+        struct.pack_into("<9I", self.extra_area, 0x70, *opbt_words)
+
+        # Port 10 & CSIH1 + external 8 KB ST M95640 SPI EEPROM (read-only peripheral model)
+        self.port10_regs: dict[int, int] = {
+            0xFFC10028: 0x0800,  # P10 (P10.11 CS# idle high)
+            0xFFC10328: 0xFFFF,  # PM10
+            0xFFC10428: 0x0000,  # PMC10
+            0xFFC10528: 0x0000,  # PFC10
+            0xFFC10628: 0x0000,  # PFCE10
+            0xFFC10A28: 0x0000,  # PFCAE10
+            0xFFC14028: 0x0000,  # PIBC10
+            0xFFC14128: 0x0000,  # PBDC10
+            0xFFC14228: 0x0000,  # PIPC10
+            0xFFC14528: 0x0000,  # PODC10
+        }
+        self.csih1_ctl0 = 0x00
+        self.csih1_str0 = 0x00
+        self.csih1_ctl1 = 0x0000
+        self.csih1_ctl2 = 0xE000
+        self.csih1_mctl0 = 0x00
+        self.csih1_tx0h = 0x0000
+        self.csih1_rx0h = 0x0000
+        self.csih1_cfg0 = 0x00000000
+        self.csih1_brs0 = 0x0000
+        self.eeprom_rdsr = 0x8C
+        self.eeprom_miso_stuck_zero = False
+        self.eeprom = bytearray(b"\xff" * 0x2000)
+        self.eeprom[0x00:0x5E] = b"\x00" * 94
+        self.eeprom[0x1C:0x20] = b"5504"
+        self.eeprom[0x20:0x2B] = b"3Q0907530AR"
+        self.eeprom[0x2C:0x39] = b"EV_GatewConti"
+        self.eeprom[0x46:0x4F] = b"013020A01"
+        self._spi_cs_low = False
+        self._spi_phase = "IDLE"
+        self._spi_addr = 0
+
     def read_phys(self, addr: int, length: int) -> bytes:
         addr &= 0xFFFFFFFF
         if 0 <= addr and addr + length <= CFLASH_SIZE:
@@ -167,6 +209,40 @@ class SimulatedRh850FaciMcu:
         if addr in (0xFFED0008, 0xFFED1008) and length == 1:
             base = addr & 0xFFFFF000
             return bytes([self.wdta_ref[base]])
+        if addr == 0xFFC59008 and length == 1:
+            return bytes([self.bfaselr])
+        if addr == 0xFFBC0700 and length == 1:
+            return bytes([self.cfcnt])
+        if 0xFF300000 <= addr and addr + length <= 0xFF300100:
+            assert self.bfaselr == 1, "Extra Area 0xFF300000 read requires BFASELR == 1!"
+            off = addr - 0xFF300000
+            return bytes(self.extra_area[off : off + length])
+        if addr == 0xFFC10228 and length == 2:  # PPR10
+            p10 = self.port10_regs[0xFFC10028]
+            pm10 = self.port10_regs[0xFFC10328]
+            # Output pins reflect P10; input pins idle high unless MISO stuck low
+            ppr = (p10 & (~pm10 & 0xFFFF)) | (pm10 & (0xFFFE if self.eeprom_miso_stuck_zero else 0xFFFF))
+            return struct.pack("<H", ppr)
+        if addr in self.port10_regs and length == 2:
+            return struct.pack("<H", self.port10_regs[addr])
+        if addr == 0xFFD82000 and length == 1:
+            return bytes([self.csih1_ctl0])
+        if addr == 0xFFD82004 and length == 1:
+            return bytes([self.csih1_str0])
+        if addr == 0xFFD82010 and length == 2:
+            return struct.pack("<H", self.csih1_ctl1)
+        if addr == 0xFFD82014 and length == 2:
+            return struct.pack("<H", self.csih1_ctl2)
+        if addr == 0xFFD8207F and length == 1:
+            return bytes([self.csih1_mctl0])
+        if addr == 0xFFD8300C and length == 2:
+            return struct.pack("<H", self.csih1_tx0h)
+        if addr == 0xFFD83014 and length == 2:
+            return struct.pack("<H", self.csih1_rx0h)
+        if addr == 0xFFD83044 and length == 4:
+            return struct.pack("<I", self.csih1_cfg0)
+        if addr == 0xFFD83068 and length == 2:
+            return struct.pack("<H", self.csih1_brs0)
         raise AssertionError(f"Unhandled MMIO/memory read at 0x{addr:08X} ({length} B)")
 
     def write_phys(self, addr: int, data: bytes) -> None:
@@ -233,7 +309,79 @@ class SimulatedRh850FaciMcu:
                 self._wdta_armed[base] = False
                 self.wdta_kicks[base] += 1
                 return
+        if addr == 0xFFC59008 and ln == 1:
+            assert data[0] in (0, 1), f"Invalid BFASELR value: 0x{data[0]:02X}"
+            self.bfaselr = data[0]
+            return
+        if addr == 0xFFBC0700 and ln == 1:
+            self.cfcnt = data[0] & 1
+            return
+        if addr in self.port10_regs and ln == 2:
+            self.port10_regs[addr] = int.from_bytes(data, "little")
+            cs_gpio_out = ((self.port10_regs[0xFFC10428] & 0x0800) == 0) and ((self.port10_regs[0xFFC10328] & 0x0800) == 0)
+            cs_now_low = cs_gpio_out and ((self.port10_regs[0xFFC10028] & 0x0800) == 0)
+            if cs_now_low and not self._spi_cs_low:
+                self._spi_phase = "CMD"
+            elif not cs_now_low:
+                self._spi_phase = "IDLE"
+            self._spi_cs_low = cs_now_low
+            return
+        if addr == 0xFFD82000 and ln == 1:
+            self.csih1_ctl0 = data[0]
+            return
+        if addr == 0xFFD82008 and ln == 2:  # CSIH1STCR0 clear status
+            self.csih1_str0 = 0x00
+            return
+        if addr == 0xFFD82010 and ln == 2:
+            self.csih1_ctl1 = int.from_bytes(data, "little")
+            return
+        if addr == 0xFFD82014 and ln == 2:
+            self.csih1_ctl2 = int.from_bytes(data, "little")
+            return
+        if addr == 0xFFD8207F and ln == 1:
+            self.csih1_mctl0 = data[0]
+            return
+        if addr == 0xFFD83044 and ln == 4:
+            self.csih1_cfg0 = int.from_bytes(data, "little")
+            return
+        if addr == 0xFFD83068 and ln == 2:
+            self.csih1_brs0 = int.from_bytes(data, "little")
+            return
+        if addr == 0xFFD8300C and ln == 2:  # CSIH1TX0H
+            tx_val = int.from_bytes(data, "little")
+            self.csih1_tx0h = tx_val
+            if (self.csih1_ctl0 & 0xE0) == 0xE0:
+                self.csih1_rx0h = self._clock_m95640_byte(tx_val & 0xFF)
+            return
         raise AssertionError(f"Unhandled MMIO/memory write at 0x{addr:08X} ({ln} B): {data.hex()}")
+
+    def _clock_m95640_byte(self, tx: int) -> int:
+        if self.eeprom_miso_stuck_zero or not self._spi_cs_low:
+            return 0x00
+        if self._spi_phase == "CMD":
+            assert tx not in (0x01, 0x02, 0x06), f"Illegal SPI write/WREN opcode 0x{tx:02X} sent to M95640!"
+            if tx == 0x05:
+                self._spi_phase = "RDSR"
+            elif tx == 0x03:
+                self._spi_phase = "ADDR_HI"
+            else:
+                raise AssertionError(f"Unexpected M95640 SPI command 0x{tx:02X}")
+            return 0xFF
+        if self._spi_phase == "RDSR":
+            return self.eeprom_rdsr
+        if self._spi_phase == "ADDR_HI":
+            self._spi_addr = (tx & 0x1F) << 8
+            self._spi_phase = "ADDR_LO"
+            return 0xFF
+        if self._spi_phase == "ADDR_LO":
+            self._spi_addr |= tx & 0xFF
+            self._spi_phase = "DATA"
+            return 0xFF
+        if self._spi_phase == "DATA":
+            b_out = self.eeprom[self._spi_addr & 0x1FFF]
+            self._spi_addr = (self._spi_addr + 1) & 0x1FFF
+            return b_out
+        return 0xFF
 
     def _handle_faci_cmd(self, width: int, val: int) -> None:
         if width == 1 and val == 0x50:
@@ -408,10 +556,32 @@ class SimulatedRh850FaciMcu:
                     pc += 4
                     continue
 
-            # nop (0x0000)
-            if hw0 == 0x0000:
+            # nop (0x0000) / synci (0x001C)
+            if hw0 in (0x0000, 0x001C):
                 pc += 2
                 continue
+
+            # Extended system register instructions: stsr / ldsr
+            if (hw0 & 0x07E0) == 0x07E0:
+                hw1_sys = struct.unpack_from("<H", self.ram, ram_off + 2)[0]
+                if (hw1_sys & 0x07FF) == 0x0040:  # stsr regID, reg2, selID
+                    sr_id = hw0 & 0x1F
+                    dst_r = (hw0 >> 11) & 0x1F
+                    sel_id = (hw1_sys >> 11) & 0x1F
+                    assert (sr_id, sel_id) == (24, 4), f"Unsupported stsr ({sr_id}, {sel_id})"
+                    if dst_r != 0:
+                        regs[dst_r] = self.icctrl
+                    pc += 4
+                    continue
+                if (hw1_sys & 0x07FF) == 0x0020:  # ldsr reg1, regID, selID
+                    src_r = hw0 & 0x1F
+                    sr_id = (hw0 >> 11) & 0x1F
+                    sel_id = (hw1_sys >> 11) & 0x1F
+                    assert (sr_id, sel_id) == (24, 4), f"Unsupported ldsr ({sr_id}, {sel_id})"
+                    # Hardware auto-clears ICHCLR (bit 8) once I-cache invalidate completes
+                    self.icctrl = regs[src_r] & ~0x0100
+                    pc += 4
+                    continue
 
             # Format III short conditional branch: ddddd 1011 ddd cccc
             if ((hw0 >> 7) & 0xF) == 0b1011:
@@ -529,6 +699,22 @@ class SimulatedRh850FaciMcu:
                     regs[reg2] = (regs[reg1] + (imm16 << 16)) & 0xFFFFFFFF
                 pc += 4
                 continue
+            if op6 == 0b110100:  # ori imm16_u, reg1, reg2
+                imm16 = struct.unpack_from("<H", self.ram, ram_off + 2)[0]
+                res = regs[reg1] | imm16
+                z_flag = res == 0
+                if reg2 != 0:
+                    regs[reg2] = res
+                pc += 4
+                continue
+            if op6 == 0b110101:  # xori imm16_u, reg1, reg2
+                imm16 = struct.unpack_from("<H", self.ram, ram_off + 2)[0]
+                res = regs[reg1] ^ imm16
+                z_flag = res == 0
+                if reg2 != 0:
+                    regs[reg2] = res
+                pc += 4
+                continue
             if op6 == 0b110110:  # andi imm16_u, reg1, reg2
                 imm16 = struct.unpack_from("<H", self.ram, ram_off + 2)[0]
                 res = regs[reg1] & imm16
@@ -586,6 +772,7 @@ class SimulatedRh850FaciMcu:
             raise AssertionError(f"Unsupported opcode 0x{hw0:04X} @ PC=0x{pc:08X}")
 
         assert self.fentryr == 0x0000, f"Stub returned without exiting P/E mode (FENTRYR=0x{self.fentryr:04X})!"
+        assert self.bfaselr == 0, f"Stub returned with Extra Area still mapped (BFASELR=0x{self.bfaselr:02X})!"
         assert not self.interrupts_disabled, "Stub returned with interrupts still disabled (di without ei)!"
         if check_callee_saved:
             for r_idx, exp in saved_snapshot.items():

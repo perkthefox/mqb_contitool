@@ -51,7 +51,7 @@ ZDC_REGION_END = 0x3040
 _SPEC_BY_IDX: dict[int, tuple[int, str, int, int, str, str]] = {spec[0]: spec for spec in ZDC_DATASET_SPECS}
 
 # Powertrain & Start-Stop logical SG IDs subject to WLTP Kl.15 reset in S075
-POWERTRAIN_KL15_SG_IDS: frozenset[int] = frozenset({0x21, 0x03, 0x01, 0x02, 0x04, 0x12, 0x4C})
+POWERTRAIN_KL15_SG_IDS: frozenset[int] = frozenset({0x21, 0x01, 0x02, 0x03, 0x12, 0x4C})
 
 
 def zdc_crc32_le(payload: bytes | bytearray | memoryview) -> int:
@@ -248,6 +248,49 @@ def populated_zdc_blocks(df: bytes) -> list[int]:
         if any(b != 0xFF for b in payload) and int.from_bytes(payload[-4:], "little") == zdc_crc32_le(payload[:-4]):
             out.append(idx)
     return out
+
+
+def parse_cflash_zdc_upload_map(
+    cflash_bytes: bytes | None,
+) -> dict[int, tuple[int, int, bool, int, int]]:
+    """Extract the 7-entry UDS `0x34` ZDC descriptor table (`idx -> (uds_addr, uds_len, enabled, df_off, df_alloc)`)
+    from a Continental RH850 `Cflash.bin` (or raw Application binary), or `{}` when unavailable.
+
+    Earlier gateway firmwares (e.g. `3Q0907530B` SW `5286`, `ODX 013020`) use different virtual UDS addresses or
+    lengths for some ZDC blocks than later `013026` firmwares (`SW 5366`/`5388`). Reading the descriptor table out of
+    the ECU's own Application avoids `7F 34 31` (`requestOutOfRange`) when uploading blocks whose layout moved."""
+    if not cflash_bytes or len(cflash_bytes) < 84:
+        return {}
+    anchor = b"\x00\x0a\x00\x00\x80\x00"
+    pos = 0
+    while (pos := cflash_bytes.find(anchor, pos)) >= 0:
+        if pos + 84 > len(cflash_bytes):
+            break
+        rows = [struct.unpack_from("<IHHHH", cflash_bytes, pos + i * 12) for i in range(7)]
+        r0, r1 = rows[0], rows[1]
+        if (
+            r0[0] == 0x00000A00
+            and r0[1] == 0x0080
+            and r0[3] == 0x0080
+            and r0[4] == 0x0080
+            and r1[0] == 0x00000A80
+            and r1[1] == 0x0100
+            and r1[3] == 0x0100
+            and all(
+                flg in (0, 1)
+                and 0x0A00 <= uaddr <= 0x20000
+                and 8 <= ulen <= dfalloc <= 0x4000
+                and 0x0080 <= dfoff
+                and dfoff + dfalloc <= 0x10000
+                for uaddr, ulen, flg, dfoff, dfalloc in rows
+            )
+        ):
+            return {
+                i: (uaddr, ulen, bool(flg), dfoff, dfalloc)
+                for i, (uaddr, ulen, flg, dfoff, dfalloc) in enumerate(rows)
+            }
+        pos += 2
+    return {}
 
 
 # A parameterization file as ODIS writes it (GetParametrizeData, arbeits_datei_*.xml): CRLF, one space per level,
@@ -1109,18 +1152,25 @@ class FpaDataset:
                 continue
             allowed = indiv_masks[lidx]
             base_mode = donor_targets[lidx] or 2
-            if pid == 1:  # Comfort
-                cand = 1 if (allowed & (1 << 1)) or fg in (0x0B, 0x09) else 2
+            if fg == 0x07 and allowed == 0xFFFE:  # 15-step continuous DCC slider (e.g. PC00: Comfort=3, Normal=8, Sport=13)
+                cand = {1: 3, 2: 8, 3: 13, 5: 8, 6: 15}.get(pid, base_mode)
+            elif pid == 1:  # Comfort
+                cand = 1 if (allowed & (1 << 1)) or fg in (0x07, 0x09, 0x0C, 0x0D) else base_mode
             elif pid == 3:  # Sport
-                cand = 3 if (allowed & (1 << 3)) or fg in (0x21, 0x03, 0x01, 0x05, 0x0B, 0x0E, 0x08, 0x09) else base_mode
+                if (allowed & (1 << 3)) or fg in (0x21, 0x01, 0x03, 0x05, 0x06, 0x07, 0x09, 0x0A, 0x0B, 0x14, 0x15):
+                    cand = 3
+                elif fg in (0x23, 0x24) and (allowed & (1 << 8)):
+                    cand = 8
+                else:
+                    cand = base_mode
             elif pid == 4:  # Offroad
-                cand = 4 if (allowed & (1 << 4)) or fg in (0x21, 0x03, 0x09, 0x1C, 0x2C, 0x08) else base_mode
+                cand = 4 if (allowed & (1 << 4)) or fg in (0x21, 0x01, 0x03, 0x09, 0x0B, 0x0D, 0x0E, 0x17, 0x1C, 0x2C, 0x2D) else base_mode
             elif pid == 5:  # Eco
-                cand = 5 if (allowed & (1 << 5)) or fg in (0x21, 0x03, 0x01, 0x02, 0x24, 0x0A, 0x09) else base_mode
+                cand = 5 if (allowed & (1 << 5)) or fg in (0x21, 0x01, 0x02, 0x03, 0x08, 0x09, 0x12) else base_mode
             elif pid == 6:  # Race / Cupra: use 6 where explicitly allowed, otherwise Sport (3) so no ECU rejects it
                 cand = 6 if (allowed & (1 << 6)) else (3 if base_mode == 3 or (allowed & (1 << 3)) else base_mode)
             elif pid in (8, 9, 10):  # Snow / Allroad
-                cand = 8 if (allowed & (1 << 8)) else (4 if (allowed & (1 << 4)) else base_mode)
+                cand = 10 if (allowed & (1 << 10)) else (4 if (allowed & (1 << 4)) else base_mode)
             else:
                 cand = base_mode
             s031[slot * 30 + lidx] = cand
@@ -1812,8 +1862,8 @@ def analyze_gateway_coding_consistency(
             ru, en = FPA_SG_CATALOG.get(sg, (f"Блок 0x{sg:02X}", f"ECU 0x{sg:02X}"))
             pbit = s079[i]
             if 1 <= pbit <= 32:
-                # 1-based PaCo bit mapped across DID 0x0600 Bytes 9..12
-                c_byte = 9 + (pbit - 1) // 8
+                # 1-based PaCo bit mapped across DID 0x0600 Bytes 9..12 (big-endian u32: firmware bswap32 @ 0x65E30)
+                c_byte = 12 - (pbit - 1) // 8
                 c_bit = (pbit - 1) % 8
                 c_en = bool(coding30[c_byte] & (1 << c_bit)) if has_coding and coding30 is not None else None
             else:
@@ -1855,15 +1905,18 @@ def _s075_filter_for(group_id: int, original: FpaDataset | None) -> list[int] | 
     return None
 
 
-def fecs_required_by_dataset(df: bytes) -> list[int]:
+def fecs_required_by_dataset(df: bytes, blocks: Iterable[int] | None = None) -> list[int]:
     """SWaP features the datasets in `df` rely on: MKE (0x10000300) when ZDC #1 holds a dataset, and the feature code of
-    every FPA profile in the menu (slots 1..9): the gateway offers a slot to the head unit only with its FeC active."""
+    every FPA profile in the menu (slots 1..9): the gateway offers a slot to the head unit only with its FeC active.
+    When `blocks` is given, only requirements of those ZDC block indexes are included."""
+    only = None if blocks is None else set(blocks)
     out: list[int] = []
-    if check_fec_dataset_support(df, 0x10000300).supported:
+    if (only is None or 1 in only) and check_fec_dataset_support(df, 0x10000300).supported:
         out.append(0x10000300)
-    fpa = FpaDataset.from_dflash(df)
-    if fpa.crc_ok and not fpa.is_passive_base:
-        out += [s.fec_code for s in fpa.slots() if 1 <= s.slot <= 9 and s.selectable and s.fec_code]
+    if only is None or 4 in only:
+        fpa = FpaDataset.from_dflash(df)
+        if fpa.crc_ok and not fpa.is_passive_base:
+            out += [s.fec_code for s in fpa.slots() if 1 <= s.slot <= 9 and s.selectable and s.fec_code]
     return out
 
 

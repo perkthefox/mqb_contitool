@@ -274,3 +274,88 @@ def test_unsupported_5q0_and_lear_gateways_are_explained_and_blocked(monkeypatch
         app.processEvents()
     assert backups == []
     win.close()
+
+
+def test_ram_loader_entry_refuses_5q0_and_lear_gateways_with_clear_reason(monkeypatch) -> None:
+    """Issues #8, #13, #14, #15: CLI / direct enter_ram_loader on a 5Q0 or Lear gateway gets 7F 22 31 at Stage 1;
+    probe VAG identification DIDs, reset the ECU out of FBL (11 01), and report the unsupported hardware instead of a
+    cryptic 7f2231 after a wasted retry."""
+    from contitool.can import J533CanLink, workflows
+
+    set_lang("en")
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+
+    class PowerPcGateway:
+        def __init__(self, ident_map: dict[int, bytes]) -> None:
+            self.ident_map = ident_map
+            self.rx: list[bytes] = []
+            self._tx_buf = bytearray()
+            self._tx_expected = 0
+            self.stage1_attempts = 0
+            self.resets = 0
+
+        def _reply(self, payload: bytes) -> None:
+            if len(payload) <= 7:
+                self.rx.append(bytes([len(payload)]) + payload.ljust(7, b"\xaa"))
+                return
+            self.rx.append(bytes([0x10 | (len(payload) >> 8), len(payload) & 0xFF]) + payload[:6])
+            for seq, off in enumerate(range(6, len(payload), 7), start=1):
+                self.rx.append(bytes([0x20 | (seq & 0x0F)]) + payload[off : off + 7].ljust(7, b"\xaa"))
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            if msg.arbitration_id != 0x710:
+                return
+            d = bytes(msg.data)
+            pci = d[0] >> 4
+            if pci == 0:
+                self._on_uds(d[1 : 1 + (d[0] & 0x0F)])
+            elif pci == 1:
+                self._tx_expected = ((d[0] & 0x0F) << 8) | d[1]
+                self._tx_buf = bytearray(d[2:8])
+                self.rx.append(b"\x30\x00\x00\xaa\xaa\xaa\xaa\xaa")
+            elif pci == 2:
+                self._tx_buf.extend(d[1:8])
+                if len(self._tx_buf) >= self._tx_expected:
+                    req = bytes(self._tx_buf[: self._tx_expected])
+                    self._tx_expected = 0
+                    self._on_uds(req)
+
+        def _on_uds(self, req: bytes) -> None:
+            if req[0] == 0x10:
+                self._reply(bytes([0x50, req[1], 0x00, 0x32, 0x01, 0xF4]))
+            elif req[0] == 0x27 and req[1] in (0x03, 0x11):
+                self._reply(bytes([0x67, req[1], 0x11, 0x22, 0x33, 0x44]))
+            elif req[0] == 0x27:
+                self._reply(bytes([0x67, req[1]]))
+            elif req[0] == 0x31:
+                self._reply(bytes.fromhex("71010203"))
+            elif req[0] == 0x2E:
+                self._reply(b"\x6e" + req[1:3])
+            elif req[0] == 0x11:
+                self.resets += 1
+                self._reply(bytes([0x51, req[1]]))
+            elif req[0] == 0x22:
+                if len(req) > 3:  # multi-DID Stage 1
+                    self.stage1_attempts += 1
+                    self._reply(b"\x7f\x22\x31")
+                else:
+                    did = int.from_bytes(req[1:3], "big")
+                    self._reply(b"\x62" + req[1:3] + self.ident_map[did] if did in self.ident_map else b"\x7f\x22\x31")
+
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            if self.rx:
+                return can.Message(arbitration_id=0x77A, data=self.rx.pop(0), is_extended_id=False)
+            return None
+
+        def shutdown(self) -> None:
+            pass
+
+    bus_5q0 = PowerPcGateway({0xF187: b"5Q0907530AM", 0xF189: b"2265", 0xF19E: b"EV_GatewConti"})
+    with J533CanLink("fake", bus=bus_5q0) as link, pytest.raises(RuntimeError, match="Continental 5Q0.*MPC5607B"):
+        workflows.enter_ram_loader(link)
+    assert bus_5q0.stage1_attempts == 1 and bus_5q0.resets == 1  # no wasted second retry, cleanly reset out of FBL
+
+    bus_lear = PowerPcGateway({0xF187: b"3Q0907530AA", 0xF189: b"4368", 0xF19E: b"EV_GatewLear"})
+    with J533CanLink("fake", bus=bus_lear) as link, pytest.raises(RuntimeError, match="Lear.*PowerPC"):
+        workflows.enter_ram_loader(link)
+    assert bus_lear.stage1_attempts == 1 and bus_lear.resets == 1

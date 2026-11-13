@@ -23,11 +23,15 @@ from contitool.core.constants import (
     DFLASH_SWAP_CRC_OFF,
     DFLASH_SWAP_NVM_OFF,
     DFLASH_SWAP_PAY_SIZE,
+    EEPROM_SIZE,
+    EXTRA_AREA_SIZE,
     FBL_EXP_OFFSET,
     FBL_MOD_OFFSET,
     FBL_PRESENCE_MAGIC,
     FSC_SIGNED_BODY_SIZE,
     GATEWAY_SWAP_SLOT_ORDER,
+    OPBT_LEGACY_SIZE,
+    OPBT_SIZE,
     OTP_ENG_FLAG_OFFSET,
     PATCH_A167_NOP,
     PATCH_CCP_BLACKLIST_NOP,
@@ -47,6 +51,14 @@ from contitool.core.constants import (
     ZDC_PASSPORT_EQUIP_OFF,
     ZDC_PASSPORT_PN_OFF,
     ZDC_PASSPORT_VER_OFF,
+)
+from contitool.core.hw_extra import (
+    EepromSummary,
+    OpbtSummary,
+    analyze_eeprom,
+    analyze_opbt,
+    is_plausible_eeprom_bytes,
+    is_plausible_opbt_bytes,
 )
 from contitool.i18n import get_lang, tr
 
@@ -840,7 +852,7 @@ class DetectedDumpFile:
     """Auto-detected metadata for foolproof Drag & Drop file inputs in GUI."""
 
     path: Path
-    kind: str  # "cflash", "fd_0data", "dflash", "uflash", "truncated_dflash", "rsa_key", "unknown"
+    kind: str  # "cflash", "fd_0data", "dflash", "uflash", "eeprom", "opbt", "truncated_dflash", "rsa_key", "unknown"
     valid: bool
     summary_text: str
     cflash_info: CflashSummary | None = None
@@ -848,6 +860,8 @@ class DetectedDumpFile:
     dflash_swap: DflashSwapSummary | None = None
     dflash_datasets: DflashDatasetSummary | None = None
     uflash_info: UflashSummary | None = None
+    eeprom_info: EepromSummary | None = None
+    opbt_info: OpbtSummary | None = None
 
 
 def detect_dump_file(path: Path) -> DetectedDumpFile:
@@ -925,6 +939,48 @@ def detect_dump_file(path: Path) -> DetectedDumpFile:
                 "ERROR: Truncated 32 KB dump (likely R7F7010343AFP instead of 64 KB R7F7010543)!",
             ),
         )
+    if sz == EEPROM_SIZE and is_plausible_eeprom_bytes(raw, filename=path.name):
+        try:
+            einfo = analyze_eeprom(raw)
+            pn = f" • {einfo.part_number}" if einfo.part_number else ""
+            sw = f" SW {einfo.sw_version}" if einfo.sw_version else ""
+            cp_lbl = (
+                f" • CP mask 0x{einfo.learned_cp_mask:03X}"
+                if einfo.learned_cp_mask is not None
+                else ""
+            )
+            label = tr(
+                f"EEPROM M95640 8 КБ{pn}{sw}{cp_lbl}",
+                f"EEPROM M95640 8 KB{pn}{sw}{cp_lbl}",
+            )
+            return DetectedDumpFile(
+                path=path,
+                kind="eeprom",
+                valid=True,
+                summary_text=label,
+                eeprom_info=einfo,
+            )
+        except Exception as exc:
+            return DetectedDumpFile(path=path, kind="eeprom", valid=False, summary_text=str(exc))
+    if sz in (OPBT_LEGACY_SIZE, OPBT_SIZE, EXTRA_AREA_SIZE) and is_plausible_opbt_bytes(raw):
+        try:
+            oinfo = analyze_opbt(raw)
+            jtag = "JTAG ON" if oinfo.jtag_enabled else "JTAG OFF"
+            icus = (
+                ""
+                if oinfo.icus_activated is None
+                else (" • ICU-S ON" if oinfo.icus_activated else " • ICU-S OFF")
+            )
+            label = f"OPBT ({sz} B) • OPBT0=0x{oinfo.opbt0:08X} • {jtag}{icus}"
+            return DetectedDumpFile(
+                path=path,
+                kind="opbt",
+                valid=True,
+                summary_text=label,
+                opbt_info=oinfo,
+            )
+        except Exception as exc:
+            return DetectedDumpFile(path=path, kind="opbt", valid=False, summary_text=str(exc))
     if path.suffix.lower() in (".json", ".pem") or sz == 128:
         return DetectedDumpFile(
             path=path,

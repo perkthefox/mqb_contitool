@@ -37,6 +37,8 @@ from contitool.cli.formatting import (
     Style,
     format_cflash_report,
     format_dflash_report,
+    format_eeprom_report,
+    format_opbt_report,
     format_uflash_report,
 )
 from contitool.core import (
@@ -49,6 +51,8 @@ from contitool.core import (
     analyze_dflash,
     analyze_dflash_datasets,
     analyze_dflash_swap,
+    analyze_eeprom,
+    analyze_opbt,
     analyze_uflash,
 )
 from contitool.gui.connection import CanConnection, ConnectionDialog, ensure_ready
@@ -320,8 +324,8 @@ class MainWindow(QMainWindow):
                 self,
                 tr("Это не дампы шлюза", "Not gateway dumps"),
                 tr(
-                    "Ни один файл не опознан как CodeFlash, DataFlash или Uflash этого шлюза.",
-                    "None of the files is a CodeFlash, DataFlash or Uflash of this gateway.",
+                    "Ни один файл не опознан как CodeFlash, DataFlash, Uflash, EEPROM или OPBT этого шлюза.",
+                    "None of the files is a CodeFlash, DataFlash, Uflash, EEPROM or OPBT dump of this gateway.",
                 ),
             )
         elif rejected:
@@ -384,8 +388,28 @@ class MainWindow(QMainWindow):
         def done(res: dict[str, Any]) -> None:
             folder = Path(str(res.get("session_dir", sdir)))
             self._report_missing(self.ws.open_folder(folder, source="can"), folder)
+            area_warns = res.get("area_warnings")
+            if isinstance(area_warns, dict) and area_warns:
+                self.ws.read_warnings.update({k: str(v) for k, v in area_warns.items() if v})
+                self.ws.changed.emit()
+            warns = [str(w) for w in (res.get("warnings") or []) if w]
+            if warns:
+                QTimer.singleShot(0, lambda w=warns: self._show_backup_warnings(w))
 
         self.runner.run_task(tr("Чтение памяти блока", "Reading the ECU memory"), task, on_success=done)
+
+    def _show_backup_warnings(self, warnings: list[str]) -> None:
+        QMessageBox.warning(
+            self,
+            tr("Предупреждение при чтении EEPROM / OPBT", "EEPROM / OPBT read warning"),
+            tr(
+                "Основная память шлюза (CodeFlash, Uflash, DataFlash) успешно считана и сохранена, "
+                "однако дополнительные области прочитать не удалось:\n\n",
+                "The gateway's main flash areas (CodeFlash, Uflash, DataFlash) were read and saved "
+                "successfully, however optional hardware areas could not be read:\n\n",
+            )
+            + "\n\n".join(f"• {w}" for w in warnings),
+        )
 
     def _adapter_in_use(self) -> str:
         if self.runner.is_busy:
@@ -608,6 +632,8 @@ class MainWindow(QMainWindow):
             return
         plain = Style(False)
         sections: list[str] = []
+        cf_path = self.ws.path("cflash")
+        cf_raw = cf_path.read_bytes() if cf_path is not None and cf_path.is_file() else None
         for kind, build in (
             ("cflash", lambda raw, p: format_cflash_report(analyze_cflash(raw), plain, p)),
             ("uflash", lambda raw, p: format_uflash_report(analyze_uflash(raw), plain, p)),
@@ -621,6 +647,8 @@ class MainWindow(QMainWindow):
                     dataset_summary=analyze_dflash_datasets(raw),
                 ),
             ),
+            ("eeprom", lambda raw, p: format_eeprom_report(analyze_eeprom(raw, cf_raw), plain, p)),
+            ("opbt", lambda raw, p: format_opbt_report(analyze_opbt(raw), plain, p)),
         ):
             path = self.ws.path(kind)
             if path is not None:
@@ -770,10 +798,12 @@ class EcuFoundDialog(Dialog):
             self.body.addWidget(
                 hint(
                     tr(
-                        "Будет снята полная копия памяти: CodeFlash, Uflash и DataFlash, около полутора минут. "
-                        "Блок перейдёт в режим загрузчика и потом вернётся в обычный режим; в память ничего не пишется.",
-                        "A full memory copy will be taken: CodeFlash, Uflash and DataFlash, about a minute and a half. "
-                        "The ECU switches to its loader and back to normal afterwards; nothing is written to its memory.",
+                        "Будет снята полная копия памяти: CodeFlash, Uflash, DataFlash, а также внешняя EEPROM и OPBT "
+                        "(около полутора минут). Блок перейдёт в режим загрузчика и потом вернётся в обычный режим; "
+                        "в память ничего не пишется.",
+                        "A full memory copy will be taken: CodeFlash, Uflash, DataFlash, plus external EEPROM and OPBT "
+                        "(about a minute and a half). The ECU switches to its loader and back to normal afterwards; "
+                        "nothing is written to its memory.",
                     )
                 )
             )

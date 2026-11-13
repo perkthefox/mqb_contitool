@@ -26,6 +26,7 @@ from typing import Any
 RUNS = "contitool_runs"
 DUMPS, WRITES, BASE_READ = "dumps", "writes", "base_read"
 AREA_FILES = ("Cflash.bin", "Dflash.bin", "Uflash.bin")
+OPTIONAL_AREA_FILES = ("Eeprom.bin", "Opbt.bin")
 FAZIT_OFFSET, HW_PN_OFFSET = 0xA240, 0xA25A  # in CodeFlash: 23 ASCII, 11 ASCII
 
 
@@ -114,6 +115,7 @@ def keep_as_base(read_dir: Path) -> Path:
 
 
 AREA_SIZES = {"Cflash.bin": 0x180000, "Dflash.bin": 0x10000, "Uflash.bin": 0x8000}
+OPTIONAL_AREA_SIZES = {"Eeprom.bin": 0x2000, "Opbt.bin": 36}
 
 
 def has_full_read(unit_dir: Path) -> bool:
@@ -134,11 +136,12 @@ def latest_area(unit_dir: Path, name: str) -> Path | None:
     """The newest full-size copy of one area (Cflash.bin, ...) the gateway is known to hold: base_read, then the later
     reads and writes (dumps/<date>_read, <date>_flashed) by date. None for an unidentified gateway or without one."""
     dumps = unit_dir / DUMPS
-    if unit_dir.name == "unknown" or not dumps.is_dir():
+    expected_sz = AREA_SIZES.get(name) or OPTIONAL_AREA_SIZES.get(name)
+    if unit_dir.name == "unknown" or expected_sz is None or not dumps.is_dir():
         return None
     dirs = sorted((d for d in dumps.iterdir() if d.is_dir() and (d.name == BASE_READ or re.search(r"_(read|flashed)(_\d+)?$", d.name))),
                   key=lambda d: "" if d.name == BASE_READ else d.name)
-    hits = [d / name for d in dirs if (d / name).is_file() and (d / name).stat().st_size == AREA_SIZES[name]]
+    hits = [d / name for d in dirs if (d / name).is_file() and (d / name).stat().st_size == expected_sz]
     return hits[-1] if hits else None
 
 
@@ -166,7 +169,7 @@ def record_flashed(unit_dir: Path, files: dict[str, Path], session: Path, base_f
     base = dumps / BASE_READ
     if not base.exists():
         before = {p.name.replace("_before", ""): p for p in session.rglob("*_before.bin")}
-        src = {name: before.get(name) or base_fallback.get(name) for name in AREA_FILES}
+        src = {name: before.get(name) or base_fallback.get(name) for name in (*AREA_FILES, *OPTIONAL_AREA_FILES)}
         src = {k: v for k, v in src.items() if v is not None and v.is_file()}
         if src:
             base.mkdir(parents=True)

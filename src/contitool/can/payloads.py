@@ -9,6 +9,15 @@ from functools import reduce
 import hashlib
 import struct
 
+from contitool.can.hw_applets import (
+    EEPROM_M95640_READER_STUB,
+    EXPECTED_EEPROM_READER_STUB_SHA256,
+    EXPECTED_OPBT_READER_STUB_SHA256,
+    OPBT_READER_STUB,
+    build_m95640_reader_payload,
+    build_opbt_reader_payload,
+)
+
 from contitool.i18n import tr
 
 LOADER_SYNC = b"\x84\x00\x00\x00\x00"

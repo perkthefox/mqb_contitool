@@ -107,9 +107,9 @@ flowchart LR
 ### Вариант 1 — Готовая программа (рекомендуется)
 
 Скачайте архив из раздела **Releases**:
-- **Windows**: распакуйте `ContiTool-v2.0.4-windows-amd64.zip` и запустите **`ContiTool.exe`**.
-- **macOS**: откройте `ContiTool-v2.0.4-macos-arm64.dmg` (или `.zip`) и запустите **`ContiTool.app`**.
-- **Linux**: распакуйте `ContiTool-v2.0.4-linux-x86_64.tar.gz` и запустите **`ContiTool/ContiTool`**.
+- **Windows**: распакуйте `ContiTool-v2.1.0-windows-amd64.zip` и запустите **`ContiTool.exe`**.
+- **macOS**: откройте `ContiTool-v2.1.0-macos-arm64.dmg` (или `.zip`) и запустите **`ContiTool.app`**.
+- **Linux**: распакуйте `ContiTool-v2.1.0-linux-x86_64.tar.gz` и запустите **`ContiTool/ContiTool`**.
 
 Установка Python и сторонних библиотек не требуется.
 

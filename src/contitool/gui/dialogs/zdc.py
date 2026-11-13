@@ -633,6 +633,9 @@ class FpaEditorDialog(Dialog):
 
     # ── Tab 4: Individual Setup Menu ──
 
+    _S033_MODE_BITS: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 8, 9)
+    _SLIDER_CAPABLE_FGS: frozenset[int] = frozenset({0x07, 0x0D, 0x22, 0x2A, 0x2B})
+
     def _build_tab_individual(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -646,8 +649,20 @@ class FpaEditorDialog(Dialog):
                 )
             )
         )
-        self.tbl_s033 = QTableWidget(0, 6)
-        self.tbl_s033.setHorizontalHeaderLabels(["Comfort", "Normal", "Sport", "Offroad", "Eco", "Race"])
+        self.tbl_s033 = QTableWidget(0, 9)
+        self.tbl_s033.setHorizontalHeaderLabels(
+            [
+                "Comfort",
+                "Normal",
+                "Sport",
+                "Offroad",
+                "Eco",
+                "Race",
+                tr("Вкл", "On"),
+                tr("Выкл", "Off"),
+                tr("Слайдер 1–15", "Slider 1–15"),
+            ]
+        )
         self.tbl_s033.setAlternatingRowColors(True)
         self.tbl_s033.verticalHeader().setDefaultSectionSize(30)
         self.tbl_s033.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -1161,7 +1176,7 @@ class FpaEditorDialog(Dialog):
         elif idx == 4:
             self._refresh_coding_tab()
 
-    def _rebuild_matrix_tabs(self) -> None:
+    def _rebuild_s031_table(self) -> None:
         groups = self.fpa.logical_groups()
         act_slots = [s for s in self.fpa.slots() if s.selectable]
 
@@ -1169,12 +1184,25 @@ class FpaEditorDialog(Dialog):
         self.tbl_s031.setColumnCount(len(act_slots))
         self.tbl_s031.setHorizontalHeaderLabels([_slot_short_name(s.slot) for s in act_slots])
         self.tbl_s031.setVerticalHeaderLabels([name for _lidx, _fg, name in groups])
-        for r, (lidx, _fg, _name) in enumerate(groups):
+        dcc_step_notes = {
+            1: tr(" (мягче)", " (softest)"),
+            3: " (Comfort)",
+            8: " (Normal)",
+            13: " (Sport)",
+            15: tr(" (жёстче)", " (stiffest)"),
+        }
+        for r, (lidx, fg, _name) in enumerate(groups):
+            is_slider = fg in self._SLIDER_CAPABLE_FGS and self.fpa.get_individual_mask(lidx) == 0xFFFE
             for c, st in enumerate(act_slots):
                 cmb = QComboBox()
                 cur_m = self.fpa.get_target_mode(st.slot, lidx)
-                for mval, (mru, men) in FPA_TARGET_MODE_NAMES.items():
-                    cmb.addItem(men if get_lang() == "en" else mru, mval)
+                if is_slider:
+                    cmb.addItem(tr("Не задействован", "Off / Unused"), 0)
+                    for step in range(1, 16):
+                        cmb.addItem(f"{tr('Ступень', 'Step')} {step}{dcc_step_notes.get(step, '')}", step)
+                else:
+                    for mval, (mru, men) in FPA_TARGET_MODE_NAMES.items():
+                        cmb.addItem(men if get_lang() == "en" else mru, mval)
                 if cmb.findData(cur_m) < 0:
                     cmb.addItem(f"{cur_m}", cur_m)
                 cmb.setCurrentIndex(max(0, cmb.findData(cur_m)))
@@ -1184,18 +1212,44 @@ class FpaEditorDialog(Dialog):
                 self.tbl_s031.setCellWidget(r, c, cmb)
         self.tbl_s031.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
 
+    def _populate_s033_row(self, r: int, lidx: int, fg: int) -> None:
+        mask = self.fpa.get_individual_mask(lidx)
+        is_slider = mask == 0xFFFE
+        slider_col = len(self._S033_MODE_BITS)
+        for c, bit in enumerate(self._S033_MODE_BITS):
+            it = self.tbl_s033.item(r, c)
+            if it is None:
+                it = QTableWidgetItem("")
+                self.tbl_s033.setItem(r, c, it)
+            it.setData(Qt.ItemDataRole.UserRole, (r, lidx, fg, bit))
+            if is_slider:
+                it.setFlags(Qt.ItemFlag.NoItemFlags)
+                it.setCheckState(Qt.CheckState.Unchecked)
+            else:
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(Qt.CheckState.Checked if (mask & (1 << bit)) else Qt.CheckState.Unchecked)
+
+        sl_it = self.tbl_s033.item(r, slider_col)
+        if sl_it is None:
+            sl_it = QTableWidgetItem("")
+            self.tbl_s033.setItem(r, slider_col, sl_it)
+        sl_it.setData(Qt.ItemDataRole.UserRole, (r, lidx, fg, -1))
+        if fg in self._SLIDER_CAPABLE_FGS or is_slider:
+            sl_it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            sl_it.setCheckState(Qt.CheckState.Checked if is_slider else Qt.CheckState.Unchecked)
+        else:
+            sl_it.setFlags(Qt.ItemFlag.NoItemFlags)
+            sl_it.setCheckState(Qt.CheckState.Unchecked)
+
+    def _rebuild_matrix_tabs(self) -> None:
+        self._rebuild_s031_table()
+        groups = self.fpa.logical_groups()
         self.tbl_s033.blockSignals(True)
         try:
             self.tbl_s033.setRowCount(len(groups))
             self.tbl_s033.setVerticalHeaderLabels([name for _lidx, _fg, name in groups])
-            for r, (lidx, _fg, _name) in enumerate(groups):
-                mask = self.fpa.get_individual_mask(lidx)
-                for c, bit in enumerate((1, 2, 3, 4, 5, 6)):
-                    it = QTableWidgetItem("")
-                    it.setData(Qt.ItemDataRole.UserRole, (lidx, bit))
-                    it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
-                    it.setCheckState(Qt.CheckState.Checked if (mask & (1 << bit)) else Qt.CheckState.Unchecked)
-                    self.tbl_s033.setItem(r, c, it)
+            for r, (lidx, fg, _name) in enumerate(groups):
+                self._populate_s033_row(r, lidx, fg)
         finally:
             self.tbl_s033.blockSignals(False)
 
@@ -1203,8 +1257,29 @@ class FpaEditorDialog(Dialog):
         meta = item.data(Qt.ItemDataRole.UserRole)
         if not meta:
             return
-        lidx, bit = meta
+        r, lidx, fg, bit = meta
+        if bit == -1:
+            to_slider = item.checkState() == Qt.CheckState.Checked
+            self.fpa.set_individual_mask(lidx, 0xFFFE if to_slider else 0x000E)
+            if fg == 0x07:
+                for st in self.fpa.slots():
+                    cur = self.fpa.get_target_mode(st.slot, lidx)
+                    if cur == 0:
+                        continue
+                    if to_slider and cur in (1, 2, 3, 6):
+                        self.fpa.set_target_mode(st.slot, lidx, {1: 3, 2: 8, 3: 13, 6: 15}[cur])
+                    elif not to_slider:
+                        self.fpa.set_target_mode(st.slot, lidx, 1 if cur <= 5 else (2 if cur <= 10 else 3))
+            self.tbl_s033.blockSignals(True)
+            try:
+                self._populate_s033_row(r, lidx, fg)
+            finally:
+                self.tbl_s033.blockSignals(False)
+            self._rebuild_s031_table()
+            return
         mask = self.fpa.get_individual_mask(lidx)
+        if mask == 0xFFFE:
+            return
         if item.checkState() == Qt.CheckState.Checked:
             mask |= 1 << bit
         else:

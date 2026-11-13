@@ -985,3 +985,171 @@ def test_s075_off_puts_back_a_factory_filter_when_the_dump_already_passed_everyt
     loaded = FpaDataset(bytes(fpa.buf))  # a dump written by an older ContiTool with the pass-through on
     fpa.set_kl15_persistence(persist_powertrain=False, original=loaded)
     assert bytes(fpa.sec_bytes(75)) == factory
+
+
+def test_fpa_sg_catalog_paco_big_endian_coding_and_dcc_slider_gui(synth_dflash: bytes) -> None:
+    """Issue #24: FPA subsystem IDs match VAG CharismaFunctions, PaCo bits map big-endian across 0x0600 bytes 9..12
+    (firmware bswap32 @ 0x65E30), and the Individual table exposes On/Off (bits 8/9) and 15-step DCC slider (0xFFFE)."""
+    from contitool.core.zdc_templates import FPA_SG_CATALOG, FPA_TARGET_MODE_NAMES
+
+    set_lang("en")
+    assert "Engine" in FPA_SG_CATALOG[0x01][1]
+    assert "Start-Stop" in FPA_SG_CATALOG[0x02][1]
+    assert "Gearbox" in FPA_SG_CATALOG[0x03][1]
+    assert "Power Steering" in FPA_SG_CATALOG[0x05][1]
+    assert "DCC" in FPA_SG_CATALOG[0x07][1]
+    assert "Climatronic" in FPA_SG_CATALOG[0x08][1]
+    assert "ACC" in FPA_SG_CATALOG[0x09][1]
+    assert "Soundaktor" in FPA_SG_CATALOG[0x0A][1]
+    assert "AFS" in FPA_SG_CATALOG[0x0B][1]
+    assert "Ambient" in FPA_SG_CATALOG[0x0C][1]
+    assert "Pre-Tensioners" in FPA_SG_CATALOG[0x0E][1]
+    assert "Freewheeling" in FPA_SG_CATALOG[0x12][1]
+    assert "4Motion" in FPA_SG_CATALOG[0x17][1]
+    assert "ESC" in FPA_SG_CATALOG[0x1C][1]
+    assert "Exhaust Flap" in FPA_SG_CATALOG[0x23][1]
+    assert "Engine Sound" in FPA_SG_CATALOG[0x24][1]
+    assert "HDC" in FPA_SG_CATALOG[0x2C][1]
+    assert "HHC" in FPA_SG_CATALOG[0x2D][1]
+    assert "PDC" in FPA_SG_CATALOG[0x2E][1]
+    assert "eBKV" in FPA_SG_CATALOG[0x36][1]
+    assert FPA_TARGET_MODE_NAMES[8][1] == "On"
+    assert FPA_TARGET_MODE_NAMES[9][1] == "Off"
+
+    # Real 30-byte 0x0600 coding from issues #24/#26: bytes 9..12 = 00 00 58 1C -> bswap32 = 0x1C580000? No:
+    # bswap32(0x1C580000 LE) = 0x0000581C -> active 1-based PaCo bits are 3, 4, 5, 12, 13, 15.
+    coding = bytes.fromhex("020300047F085900FB0000581C0F00010001070000000000000000000000")
+    df_awd = apply_fpa_dataset(synth_dflash, build_fpa_preset_block("awd_dcc"))
+    rep = analyze_gateway_coding_consistency(df_awd, coding)
+    by_sg = {p.sg_id: p for p in rep.paco_ecus}
+    assert (by_sg[0x12].coding_byte, by_sg[0x12].coding_bit, by_sg[0x12].coding_enabled) == (12, 2, True)   # Freilauf (pbit 3)
+    assert (by_sg[0x01].coding_byte, by_sg[0x01].coding_bit, by_sg[0x01].coding_enabled) == (12, 3, True)   # Engine (pbit 4)
+    assert (by_sg[0x03].coding_byte, by_sg[0x03].coding_bit, by_sg[0x03].coding_enabled) == (12, 4, True)   # Gearbox (pbit 5)
+    assert (by_sg[0x05].coding_byte, by_sg[0x05].coding_bit, by_sg[0x05].coding_enabled) == (11, 3, True)   # Steering (pbit 12)
+    assert (by_sg[0x09].coding_byte, by_sg[0x09].coding_bit, by_sg[0x09].coding_enabled) == (11, 4, True)   # ACC (pbit 13)
+    assert (by_sg[0x02].coding_byte, by_sg[0x02].coding_bit, by_sg[0x02].coding_enabled) == (11, 6, True)   # Start-Stop (pbit 15)
+    assert (by_sg[0x07].coding_byte, by_sg[0x07].coding_bit, by_sg[0x07].coding_enabled) == (12, 7, False)  # DCC (pbit 8)
+    assert (by_sg[0x08].coding_byte, by_sg[0x08].coding_bit, by_sg[0x08].coding_enabled) == (10, 1, False)  # Climatronic (pbit 18)
+    assert (by_sg[0x17].coding_byte, by_sg[0x17].coding_bit, by_sg[0x17].coding_enabled) == (9, 0, False)   # Haldex (pbit 25)
+
+    # Headless FpaEditorDialog check: PC00 15-step DCC slider (0xFFFE) & Engine Sound On/Off (0x0300)
+    app, win = create_window()
+    try:
+        df_pc00 = apply_fpa_dataset(synth_dflash, build_fpa_preset_block("fwd_dcc"))
+        dlg = FpaEditorDialog(df_pc00)
+        dlg._rebuild_matrix_tabs()
+        groups = dlg.fpa.logical_groups()
+        dcc_row = next(r for r, (_li, fg, _n) in enumerate(groups) if fg == 0x07)
+        snd_row = next(r for r, (_li, fg, _n) in enumerate(groups) if fg == 0x24)
+
+        # DCC row in PC00 is 0xFFFE: Slider 1-15 (col 8) checked, discrete columns disabled
+        assert dlg.tbl_s033.item(dcc_row, 8).checkState() == Qt.CheckState.Checked
+        assert not (dlg.tbl_s033.item(dcc_row, 0).flags() & Qt.ItemFlag.ItemIsEnabled)
+        cmb_dcc_comfort = dlg.tbl_s031.cellWidget(dcc_row, 0)
+        assert "Step 3 (Comfort)" in cmb_dcc_comfort.currentText()
+
+        # Engine Sound row in PC00 is 0x0300: On (col 6) and Off (col 7) checked
+        assert dlg.tbl_s033.item(snd_row, 6).checkState() == Qt.CheckState.Checked
+        assert dlg.tbl_s033.item(snd_row, 7).checkState() == Qt.CheckState.Checked
+
+        # Toggling Slider 1-15 off switches DCC cleanly to 3-mode discrete (0x000E, Comfort=1/Normal=2/Sport=3)
+        dlg.tbl_s033.item(dcc_row, 8).setCheckState(Qt.CheckState.Unchecked)
+        dcc_lidx = groups[dcc_row][0]
+        assert dlg.fpa.get_individual_mask(dcc_lidx) == 0x000E
+        assert (dlg.fpa.get_target_mode(1, dcc_lidx), dlg.fpa.get_target_mode(2, dcc_lidx), dlg.fpa.get_target_mode(3, dcc_lidx)) == (1, 2, 3)
+
+        # Toggling Slider 1-15 back on restores 0xFFFE and steps 3 / 8 / 13
+        dlg.tbl_s033.item(dcc_row, 8).setCheckState(Qt.CheckState.Checked)
+        assert dlg.fpa.get_individual_mask(dcc_lidx) == 0xFFFE
+        assert (dlg.fpa.get_target_mode(1, dcc_lidx), dlg.fpa.get_target_mode(2, dcc_lidx), dlg.fpa.get_target_mode(3, dcc_lidx)) == (3, 8, 13)
+        dlg.close()
+    finally:
+        win.close()
+        app.processEvents()
+
+
+def test_selective_zdc_upload_cflash_descriptor_map_and_7f3431_message(
+    synth_cflash: bytes,
+    synth_dflash: bytes,
+    synth_uflash: bytes,
+    tmp_path: Path,
+) -> None:
+    """Issue #26: editing only FPA (ZDC #4) uploads only ZDC #4 (never untouched SSA/MKE/BEM), reads custom ZDC UDS
+    descriptors out of Cflash.bin when present, and explains 7F 34 31 clearly when a gateway rejects a block."""
+    import struct
+
+    from contitool.core.zdc import fecs_required_by_dataset, parse_cflash_zdc_upload_map
+
+    set_lang("en")
+    base_df = inject_ssa_preset(inject_mke_preset(inject_bem_preset(synth_dflash, "2222"), "86"))
+    base_df = apply_zdc_passport(base_df, dataset_pn="V03935263PZ", dataset_ver="0001")
+    edited_df = apply_fpa_dataset(base_df, build_fpa_preset_block("fwd_dcc"))
+
+    app, win = create_window()
+    try:
+        folder = tmp_path / "issue26_ws"
+        folder.mkdir()
+        (folder / "Cflash.bin").write_bytes(synth_cflash)
+        (folder / "Dflash.bin").write_bytes(base_df)
+        (folder / "Uflash.bin").write_bytes(synth_uflash)
+        win.open_folder(str(folder))
+        app.processEvents()
+
+        # Untouched standalone Dflash falls back to uploading all populated blocks
+        assert win.ecu_screen._zdc_blocks_to_upload(base_df) == [1, 2, 6]
+
+        # Simulate saving only FPA (ZDC #4) into ContiTool_edited/Dflash.bin
+        edited_path = win.ws.edit_path("dflash")
+        edited_path.parent.mkdir(parents=True, exist_ok=True)
+        edited_path.write_bytes(edited_df)
+        win.ws.commit("dflash", edited_path)
+
+        blocks = win.ecu_screen._zdc_blocks_to_upload(edited_df)
+        assert blocks == [4]  # ONLY ZDC #4 changed; untouched MKE (#1), SSA (#2), BEM (#6) are not re-uploaded
+        req_fecs = fecs_required_by_dataset(edited_df, blocks=blocks)
+        assert 0x10000300 not in req_fecs  # untouched MKE does not demand SWaP activation during an FPA-only upload
+        assert 0x10001100 in req_fecs
+    finally:
+        win.close()
+        app.processEvents()
+
+    # Firmware descriptor table in Cflash.bin overrides ZDC #2 address (e.g. 0x2480 instead of 0x2880 on older ODX)
+    custom_rows = [
+        (0x00000A00, 0x0080, 1, 0x0080, 0x0080),
+        (0x00000A80, 0x0100, 1, 0x0100, 0x0100),
+        (0x00002480, 0x0800, 1, 0x0200, 0x0800),  # ZDC #2 SSA at 0x2480!
+        (0x00002C80, 0x0400, 1, 0x0A00, 0x0400),
+        (0x00000B80, 0x1100, 1, 0x1340, 0x1100),
+        (0x00003E00, 0x012E, 1, 0x1200, 0x0140),
+        (0x00001C80, 0x0800, 1, 0x2440, 0x0C00),
+    ]
+    fake_cf = bytearray(synth_cflash)
+    tbl_bytes = b"".join(struct.pack("<IHHHH", *r) for r in custom_rows)
+    fake_cf[0x01E500 : 0x01E500 + len(tbl_bytes)] = tbl_bytes
+    parsed_map = parse_cflash_zdc_upload_map(bytes(fake_cf))
+    assert parsed_map[2][:2] == (0x00002480, 0x0800)
+
+    class OlderOdxGateway(FakeZdcGateway):
+        def _handle_uds(self, req: bytes) -> None:
+            if req[0] == 0x34:
+                addr = int.from_bytes(req[3:7], "big")
+                size = int.from_bytes(req[7:11], "big")
+                if addr == 0x00002880:  # rejects 013026 SSA address with 7F 34 31, accepts 0x00002480!
+                    self._reply(b"\x7f\x34\x31")
+                    return
+                if (addr, size) == (0x00002480, 0x0800):
+                    self._cur_addr = addr
+                    self._cur_buf = bytearray()
+                    self._reply(b"\x74\x20\x00\xfc")
+                    return
+            super()._handle_uds(req)
+
+    # Without Cflash.bin, 7F 34 31 produces an actionable error naming ZDC #2 and Write the whole DataFlash
+    with pytest.raises(RuntimeError, match="ZDC #2.*7F 34 31.*Write the whole DataFlash"):
+        can_upload_zdc_datasets("fake", base_df, blocks=[2], bus=OlderOdxGateway())
+
+    # With Cflash.bin, ContiTool uses 0x00002480 from the ECU's own firmware table and succeeds!
+    gw_old = OlderOdxGateway()
+    res_ok = can_upload_zdc_datasets("fake", base_df, blocks=[2], cflash_bytes=bytes(fake_cf), bus=gw_old)
+    assert res_ok["complete"] is True
+    assert res_ok["uploaded_blocks"] == [{"idx": 2, "code": "SSA_REASONS", "uds_addr": "0x00002480", "size": 0x0800}]
