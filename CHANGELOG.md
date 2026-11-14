@@ -1,5 +1,13 @@
 # Changelog / История изменений
 
+## Не выпущено / Unreleased
+
+### 🇷🇺 Исправлено
+- **VAS 6154 / VNCI (D-PDU): чтение и запись памяти на адаптерах, у которых RawMode «молчит».** У части VAS6154A канал CAN1 в RawMode не выходит на шину, пока на нём хотя бы раз не запущен канал протокола, а после запуска принимает только идентификатор ответа этого канала. ContiTool считал, что такой адаптер не даёт канал заводского RAM-Loader. Теперь, если RawMode не ответил, ContiTool запускает CAN1 коротким аппаратным каналом `ISO_15765` (~35 мс; VCI при этом шлёт функциональный `0x700 02 3E 80`) и остаётся на raw CAN. Запуск повторяется на паре `0x6F0/0x6F1` перед обменом с RAM-Loader и на `0x710/0x77A` перед UDS, поэтому ответы RAM-Loader на `0x6F1` доходят. Чтение памяти проверено, запись идёт по тому же каналу. Адаптеры, у которых RawMode работает сразу, это не затрагивает. Для диагностики в `can.jsonl` добавлены строки `tx_echo`: эхо VCI для коротких кадров и кадров, которые он отправил сам.
+
+### 🇬🇧 Fixed
+- **VAS 6154 / VNCI (D-PDU): memory reads and writes on adapters whose RawMode stays silent.** Some VAS6154A units keep CAN1 off the bus in RawMode until a protocol link has been started on it once, and afterwards receive only that link's response id. ContiTool reported such an adapter as having no factory RAM-Loader channel. Now, when RawMode gets no answer, ContiTool starts CAN1 with a short hardware `ISO_15765` link (~35 ms; the VCI sends a functional `0x700 02 3E 80`) and stays on raw CAN. The start is repeated on `0x6F0/0x6F1` before RAM-Loader traffic and on `0x710/0x77A` before UDS, so the RAM-Loader's answers on `0x6F1` arrive. Memory reads are verified; writes use the same channel. Adapters whose RawMode works straight away are not affected. For diagnosis, `can.jsonl` gains `tx_echo` lines: the VCI's echo of short frames and of frames it sent on its own.
+
 ## 2.1.3 — 2026-11-18
 
 ### 🇷🇺 Исправлено

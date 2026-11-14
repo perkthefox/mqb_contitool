@@ -128,6 +128,9 @@ OBJT_PROTOCOL, OBJT_BUSTYPE, OBJT_COMPARAM, OBJT_PINTYPE = 0x8021, 0x8022, 0x802
 # Fallback for adapters whose firmware refuses RawMode: one link per request/response id pair, described the way
 # ODIS describes its own (bus + protocol + pins, resource PDU_ID_UNDEF) with the ids set in the URID table.
 NONRAW_PAIRS = ((0x710, 0x77A), (0x6F0, 0x6F1))  # diagnostics, then the factory RAM-loader
+# A VCI that needs CAN1 primed filters the raw monitor to the priming link's response id, so CAN1 is primed with the
+# pair of whatever id we are about to send on: the UDS pair, or the RAM-loader's.
+PRIME_PAIRS = {tx: (tx, rx) for tx, rx in NONRAW_PAIRS}
 NONRAW_BUS, NONRAW_PROTOCOL = "ISO_11898_2_DWCAN", "ISO_11898_RAW"
 NONRAW_PINS = ((6, "HI"), (14, "LOW"))
 NONRAW_VERIFY_WAIT = 2.0  # the gateway answers 10 03 in under a millisecond; this only has to outlast the driver
@@ -398,7 +401,16 @@ class DPduBus(can.BusABC):
         self._nonraw_verified = False  # the fixed-id fallback answered a 10 03 on this module
         self._raw_rx_verified = False  # RawMode monitor delivered at least one real (non-echo) bus frame
         self._raw_monitor_deaf = False  # RawMode opened (rc=0) on this module, yet its monitor saw 0 bus frames
+        # This VCI keeps CAN1 off the bus in RawMode (every frame only echoed) until a protocol link has been started
+        # on it once; the raw links are primed with a short ISO_15765 link whenever they are opened afresh.
+        self._raw_needs_prime = False
+        # CAN1 was started here but the ECU stayed silent (unpowered, or sitting in the RAM-Loader, which does not
+        # answer on 0x710): priming is neither proven nor ruled out, so reopened raw links keep getting it.
+        self._raw_prime_unproven = False
+        self._primed_ids: tuple[int, int] | None = None  # the pair CAN1 was last primed with (its receive filter)
         self._silent_raw_probe_at = 0.0
+        # Set by a logging link: the VCI's echoes of our own frames, kept as (time, raw, flags) for its trace.
+        self.echo_trace: collections.deque | None = None
         self.uds_only = False  # adapter only works through ODIS's hardware ISO_15765 link (no RawMode / nonraw)
         self._tx_started = False
         self.nonraw: dict[int, int] = {}  # CAN id we send on -> its link, when the adapter refused RawMode
@@ -517,6 +529,18 @@ class DPduBus(can.BusABC):
             self._call("PDUConnect", self.hmod, self.h_tx)
             self._start(self.h_tx, COPT_STARTCOMM, b"", 0, 0)
             self._tx_started = True
+            if self._prime_key() in _prime_modules:
+                self._raw_needs_prime = True  # proven on this VCI earlier in this process: no silent first request
+            if self._raw_needs_prime:
+                # Without a check: after `11 01` the ECU may still be booting, and the start alone unlocks CAN1.
+                if not self._prime_raw() and not self._prime_raw():
+                    # Unprimed links would echo every frame and look healthy: better no link than a mute one.
+                    raise can.CanOperationError(tr(
+                        "D-PDU: не удалось запустить CAN1 каналом ISO-TP, raw CAN остался бы без связи с блоком",
+                        "D-PDU: could not start CAN1 with an ISO-TP link, raw CAN would not reach the ECU",
+                    ))
+            elif self._raw_prime_unproven:
+                self._prime_raw()
         except RawModeUnavailable as refused:
             self._close_links()
             if not self._open_nonraw(bitrate, verify=verify):
@@ -649,6 +673,7 @@ class DPduBus(can.BusABC):
         self._cop_keep.clear()
         self.h_rx = self.h_tx = self._mon_cop = self._uds_link = 0
         self._tx_cop_count = 0
+        self._primed_ids = None
         self.nonraw.clear()
         self._rx_id.clear()
         self._tx_in_flight.clear()
@@ -702,8 +727,9 @@ class DPduBus(can.BusABC):
         finally:
             self._try("PDUDestroyItem", items)
 
-    def _uds_control(self, hcll: int, cop_type: int, timeout: float) -> None:
+    def _uds_control(self, hcll: int, cop_type: int, timeout: float) -> bool:
         """STARTCOMM / STOPCOMM on the UDS link, then poll its own events until that primitive finishes.
+        True if the VCI reported it finished; False if it was refused, cancelled or still running at `timeout`.
 
         Not `_start` + `_drain`: those treat a refusal or an error event as a dead adapter, while here it only
         means this link variant does not work and the caller moves on."""
@@ -712,7 +738,7 @@ class DPduBus(can.BusABC):
         cop = U32(0)
         if self._try("PDUStartComPrimitive", self.hmod, hcll, cop_type, 0, None, C.byref(ctrl), None,
                      C.byref(cop)) != 0 or not cop.value:
-            return
+            return False
         hcop, end = cop.value, time.monotonic() + timeout  # ctrl and tx stay referenced until this returns
         while time.monotonic() < end:
             item = C.POINTER(EventItem)()
@@ -720,11 +746,12 @@ class DPduBus(can.BusABC):
                 self._wait(hcll, 0.001)
                 continue
             ev = item.contents
-            done = (ev.ItemType == IT_STATUS and bool(ev.pData) and ev.hCop == hcop
-                    and C.cast(ev.pData, C.POINTER(U32)).contents.value in COPST_DONE)
+            status = (C.cast(ev.pData, C.POINTER(U32)).contents.value
+                      if ev.ItemType == IT_STATUS and ev.pData and ev.hCop == hcop else None)
             self._try("PDUDestroyItem", item)
-            if done:
-                return
+            if status in COPST_DONE:
+                return status == COPST_DONE[0]
+        return False
 
     def _close_uds_link(self) -> None:
         hcll = self._uds_link
@@ -773,8 +800,11 @@ class DPduBus(can.BusABC):
         self._rx_thread.start()
 
     def _open_uds_link(self, bus: int, protos: list[int], hi: int, low: int, tx_id: int, rx_id: int,
-                       *, verify: bool = True) -> bool:
-        """Open and live-verify (`3E 00`) an ISO 15765-2/3 link so VCI firmware segments 514-byte `0x36` blocks."""
+                       *, verify: bool = True, must_start: bool = False) -> bool:
+        """Open and live-verify (`3E 00`) an ISO 15765-2/3 link so VCI firmware segments 514-byte `0x36` blocks.
+
+        Without `verify` nothing is asked of the ECU; `must_start` then still requires the VCI to report the link's
+        STARTCOMM finished (priming depends on that start alone)."""
         pins = (PinData * 2)(PinData(6, hi), PinData(14, low))
         for proto in protos:
             rsc = RscData(bus, proto, 2, C.cast(pins, C.POINTER(PinData)))
@@ -813,8 +843,12 @@ class DPduBus(can.BusABC):
                 self.uds_refusal = f"PDUConnect 0x{rc:X}"
                 self._close_uds_link()
                 continue
-            self._uds_control(hcll, COPT_STARTCOMM, 1.0)
+            started = self._uds_control(hcll, COPT_STARTCOMM, 1.0)
             self._confirm_watch(hcll)
+            if must_start and not started:
+                self.uds_refusal = "STARTCOMM did not finish"
+                self._close_uds_link()
+                continue
             if not verify:
                 self.uds_refusal = ""
                 return True
@@ -842,6 +876,88 @@ class DPduBus(can.BusABC):
         self.uds_only = True
         self.spent = False
         return True
+
+    def _prime_raw(self, ids: tuple[int, int] = (0x710, 0x77A)) -> bool:
+        """Start and close a hardware ISO_15765 link on CAN1 while the RawMode links stay open.
+
+        Some VCIs keep CAN1 off the bus in RawMode (every frame only comes back as a TX echo) until a protocol link
+        has been started on it once. Starting one (~35 ms; the VCI sends a functional `0x700 02 3E 80` as it starts)
+        unlocks the channel, and the link's response id (`ids`: request, response) becomes the raw monitor's receive
+        filter. The unlock outlasts a recycled TX link while the monitor stays open, but is lost once every raw link
+        is closed, so `_open_links` repeats this whenever it opens them afresh. Must run while no receive thread
+        drains the links."""
+        bus = self._object_id(OBJT_BUSTYPE, NONRAW_BUS)
+        hi, low = self._object_id(OBJT_PINTYPE, "HI"), self._object_id(OBJT_PINTYPE, "LOW")
+        protos = [p for name in UDS_PROTOCOLS if (p := self._object_id(OBJT_PROTOCOL, name)) is not None]
+        if bus is None or hi is None or low is None or not protos:
+            return False
+        try:
+            opened = self._open_uds_link(bus, protos, hi, low, ids[0], ids[1], verify=False, must_start=True)
+        except can.CanError:
+            opened = False
+        self._close_uds_link()
+        self.spent = False
+        if opened:
+            self._primed_ids = ids
+        return opened
+
+    def _prime_paused(self, ids: tuple[int, int] = (0x710, 0x77A), *, restart: bool = False) -> bool:
+        """`_prime_raw` while the receive thread may be up: stop it for the prime, and start it again after if it
+        was running (or `restart`)."""
+        restart = restart or self._rx_thread is not None
+        self._stop.set()
+        self._wake_all()
+        if self._rx_thread is not None:
+            self._rx_thread.join(timeout=2.0)
+            self._rx_thread = None
+        try:
+            return self._prime_raw(ids)
+        finally:
+            self._rx_error = None
+            self._stop.clear()
+            if restart:
+                self._rx_thread = threading.Thread(target=self._rx_loop, name="dpdu-rx", daemon=True)
+                self._rx_thread.start()
+
+    def _prime_for(self, tx_id: int) -> None:
+        """Before a frame to 0x710 or 0x6F0 on a primed VCI: switch CAN1's receive filter to that frame's pair.
+
+        Otherwise the RAM-Loader's answers on 0x6F1 are filtered out after the UDS prime. A switch costs one short
+        ISO_15765 start (~35 ms), only when the traffic moves between the application and the loader."""
+        want = PRIME_PAIRS.get(tx_id)
+        if want is None or want == self._primed_ids:
+            return
+        if not (self._raw_needs_prime or self._raw_prime_unproven) or self.nonraw or self.uds_only:
+            return
+        if self._prime_paused(want) or self._prime_paused(want):
+            return
+        self.spent = True  # a monitor filtering out the answers would only look like a silent ECU
+        raise can.CanOperationError(tr(
+            f"D-PDU: не удалось переключить приём CAN1 на 0x{want[1]:03X} (запуск канала ISO-TP не удался)",
+            f"D-PDU: could not switch CAN1 reception to 0x{want[1]:03X} (starting the ISO-TP link failed)",
+        ))
+
+    def _prime_key(self) -> tuple[str, str]:
+        return self.channel_key, self.module_label
+
+    def _raw_answers_after_prime(self) -> bool:
+        """Prime CAN1 and ask `3E 00` through the RawMode links: True if the ECU answers on 0x77A."""
+        primed = self._prime_paused(restart=True)
+        self._raw_prime_unproven = primed
+        if not primed:
+            return False
+        self._pending.clear()
+        try:
+            self.send(can.Message(arbitration_id=0x710, is_extended_id=False, data=bytes.fromhex("023E00AAAAAAAAAA")))
+        except can.CanError:
+            return False
+        end = time.monotonic() + NONRAW_VERIFY_WAIT
+        while time.monotonic() < end:
+            if any(m.arbitration_id == 0x77A for m in list(self._pending)):
+                self._pending.clear()
+                return True
+            time.sleep(RX_POLL)
+        return False
 
     def _refresh_last_module(self) -> None:
         global last_module
@@ -871,6 +987,22 @@ class DPduBus(can.BusABC):
         if self._silent_raw_probe_at and now - self._silent_raw_probe_at < SILENT_RAW_RETRY_COOLDOWN:
             return False
         self._silent_raw_probe_at = now
+        # The VCI that needs priming finishes every frame at once (it only echoes it). A frame still unfinished now
+        # went onto a bus where nothing acknowledges it (ECU unpowered, wiring): starting CAN1 cures nothing there,
+        # and the check frame would only wait out the send timeout behind it.
+        try:
+            if self.h_tx:
+                self._drain(self.h_tx)
+        except can.CanError:
+            pass
+        if not self._raw_needs_prime and not self._tx_in_flight and self._raw_answers_after_prime():
+            # RawMode itself is fine on this VCI once CAN1 is started: stay on it, memory reads included.
+            self._raw_needs_prime = True
+            self._raw_prime_unproven = False
+            _prime_modules.add(self._prime_key())
+            self.spent = False
+            self._refresh_last_module()
+            return True
         self._pause_raw()
         try:
             if self._open_nonraw(self.bitrate, verify=True):
@@ -1142,6 +1274,8 @@ class DPduBus(can.BusABC):
             raw = tr("только UDS ISO-TP", "UDS ISO-TP only")
         elif self.nonraw:
             raw = tr("без raw CAN", "no raw CAN")
+        elif self._raw_needs_prime:
+            raw = tr("raw CAN после запуска канала ISO-TP", "raw CAN after starting an ISO-TP link")
         else:
             raw = "raw CAN"
         return f"{self.module_label} ({self.module_vendor or '?'}), {kind}, {raw}"
@@ -1344,6 +1478,8 @@ class DPduBus(can.BusABC):
         raw = bytes(r.pDataBytes[: min(r.NumDataBytes, 4128)]) if r.NumDataBytes else b""
         flags = bytes(r.RxFlag.pFlagData[: r.RxFlag.NumFlagBytes]) if r.RxFlag.NumFlagBytes else b""
         if len(flags) >= 4 and flags[3] & 0x01:
+            if self.echo_trace is not None:
+                self.echo_trace.append((time.time(), raw, flags))
             return  # the VCI's echo of a frame we sent
         if rx_id is not None:
             # A link with fixed ids carries the payload alone; the id is the one its URID table was set to.
@@ -1440,6 +1576,7 @@ class DPduBus(can.BusABC):
                 ))
             payload, tx_link, flag = bytes(msg.data), link, (0, 0, 0, 0)
         else:
+            self._prime_for(msg.arbitration_id)
             payload, tx_link = msg.arbitration_id.to_bytes(4, "big") + bytes(msg.data), self.h_tx
             # 29-bit sending mirrors the RxFlag layout (byte 2 bit 0); only 11-bit sending is verified on hardware
             flag = (0, 0, 1 if msg.is_extended_id else 0, 0)
@@ -1566,6 +1703,9 @@ class DPduBus(can.BusABC):
 
 # ------------------------------------------------------------------ the one kept-open link of this process
 _session: DPduBus | None = None
+# (driver, module) whose RawMode proved to need priming: a link reopened later in this process starts primed, also
+# when the ECU cannot confirm it again (it may be sitting in the RAM-Loader by then).
+_prime_modules: set[tuple[str, str]] = set()
 last_module = ""  # DPduBus.describe() of the last module connected: the problem report names it
 
 

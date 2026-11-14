@@ -167,6 +167,70 @@ def test_can_link_service_loader_entry_and_native_reader() -> None:
         assert sample == bytes(range(32))
 
 
+def test_gateway_silent_after_trigger_preserves_entry_failure_and_reset_result(monkeypatch, tmp_path) -> None:
+    """Stage 1 answers, the trigger gets flow control, then neither CAN ID answers.
+    The failed recovery must not replace the original loader failure in the log or backup manifest."""
+    import json
+
+    import pytest
+
+    from contitool.can import transport, workflows
+    from contitool.i18n import set_lang
+    from contitool.progress import OperationReporter
+
+    set_lang("en")
+    clock = [0.0]
+    monkeypatch.setattr(transport.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(workflows.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    _, _, trigger = build_service_loader_uds_steps()
+
+    class SilentAfterTrigger(_MockGatewayBus):
+        triggers = 0
+
+        def _handle_uds(self, req: bytes) -> None:
+            if self.triggers:
+                return
+            if req == trigger:
+                self.triggers += 1
+                return
+            super()._handle_uds(req)
+
+        def send(self, message: can.Message, timeout: float = 1.0) -> None:
+            if message.arbitration_id == 0x6F0:
+                self.tx_frames.append((message.arbitration_id, bytes(message.data)))
+                return
+            super().send(message, timeout)
+
+        def recv(self, timeout: float = 0.0):
+            frame = super().recv(timeout)
+            if frame is None:
+                clock[0] += timeout
+            return frame
+
+        def shutdown(self) -> None:
+            pass
+
+    bus = SilentAfterTrigger()
+    monkeypatch.setattr(can.interface, "Bus", lambda **_kwargs: bus)
+    logs = []
+    reporter = OperationReporter(on_log=logs.append)
+    with pytest.raises(RuntimeError) as err:
+        workflows.can_backup("mock", session_dir=tmp_path, reporter=reporter)
+
+    message = str(err.value)
+    assert "readiness check failed after the UDS 27 12 trigger" in message
+    assert "No CAN frame from 0x6F1" in message
+    assert "Automatic communication recovery also failed" in message
+    assert "No CAN frame from 0x77A" in message
+    assert "10 seconds" in message
+    assert any(e.level == "warning" and "reset could not be completed" in e.message for e in logs)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert manifest["error"] == message
+    assert not manifest["complete"] and not manifest["flash_commands_sent"] and not manifest["areas"]
+    assert bus.triggers == 1  # no second key attempt while the gateway is unreachable
+    assert [raw for arb, raw in bus.tx_frames if arb == 0x6F0] == [LOADER_SYNC] * 3
+
+
 # F15B as a gateway answers it after a 2.0.1d write: the factory record, then date + serial 01..06 + status.
 F15B_AFTER_201D = bytes.fromhex("00010100000000000000" "26110901020304050600")
 

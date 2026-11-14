@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 from collections.abc import Iterator
 import contextlib
 import ctypes
@@ -156,6 +157,11 @@ def _tune_slcan_bus(bus: Any) -> None:
     bus._read = _bulk_read
 
 
+# D-PDU: echoes kept on the bus between two trace writes, and `tx_echo` lines per link at most.
+ECHO_TRACE_QUEUE = 512
+ECHO_TRACE_LIMIT = 400
+
+
 class J533CanLink:
     """Clean, logged CAN bus link for Continental J533 Diagnosis CAN (500 kbit/s)."""
 
@@ -222,8 +228,57 @@ class J533CanLink:
                 _tune_slcan_bus(self.bus)
             self._owns_bus = True
         self._timer_held = _acquire_win_timer()
+        # D-PDU: what the VCI echoes back for the frames we send, so the trace shows what it put on the bus.
+        self._echo_lines = 0
+        self._echo_owner = self._log_file is not None and "echo_trace" in getattr(self.bus, "__dict__", {})
+        if self._echo_owner:
+            self.bus.echo_trace = collections.deque(maxlen=ECHO_TRACE_QUEUE)
+
+    def _flush_echoes(self) -> None:
+        """Write the VCI's echoes into `can.jsonl` as `tx_echo` lines (diagnostics, capped per link).
+
+        Full 8-byte frames to 0x710 and 0x6F0 are skipped. What stays is short frames (the loader sync) and frames
+        the VCI sent on its own, such as the `0x700 02 3E 80` of each CAN1 start."""
+        echoes = getattr(self.bus, "echo_trace", None) if self._echo_owner else None
+        if echoes is None or self._log_file is None:
+            return
+        while echoes:
+            try:
+                at, raw, flags = echoes.popleft()
+            except IndexError:
+                return
+            arb_id = int.from_bytes(raw[:4], "big") & 0x1FFFFFFF if len(raw) >= 4 else None
+            payload = raw[4:] if len(raw) >= 4 else raw
+            if arb_id in (self.UDS_TX_ID, self.LOADER_TX_ID) and len(payload) == 8:
+                continue
+            if self._echo_lines >= ECHO_TRACE_LIMIT:
+                continue
+            self._echo_lines += 1
+            self._log_file.write(
+                json.dumps(
+                    {
+                        "time": at,
+                        "direction": "tx_echo",
+                        "id": f"0x{arb_id:x}" if arb_id is not None else None,
+                        "dlc": len(payload),
+                        "data": payload.hex(),
+                        "flags": flags.hex(),
+                    }
+                )
+                + "\n"
+            )
 
     def close(self) -> None:
+        if getattr(self, "_echo_owner", False):
+            try:
+                self._flush_echoes()
+            except Exception:
+                pass
+            try:
+                self.bus.echo_trace = None
+            except Exception:
+                pass
+            self._echo_owner = False
         if getattr(self, "_timer_held", False):
             _release_win_timer()
             self._timer_held = False
@@ -252,6 +307,8 @@ class J533CanLink:
         self.close()
 
     def _write_trace(self, direction: str, arb_id: int, dlc: int, data: bytes) -> None:
+        if getattr(self, "_echo_owner", False):
+            self._flush_echoes()
         if self._log_file is not None and not (direction == "rx" and self._rx_trace_suspended):
             self._log_file.write(
                 json.dumps(
