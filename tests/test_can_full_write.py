@@ -124,8 +124,12 @@ class SimulatedRh850FaciMcu:
         self.cfcnt = 0
         self.icctrl = 0x00000001
         self.extra_area = bytearray(b"\xff" * 256)
+        self.extra_area[0x50:0x60] = self.cflash[0xAB00:0xAB10]
         opbt_words = (0x9AA7FFEF, 0, 0, 0, 0, 0, 0, 0, 0x0FFFFFFF)
         struct.pack_into("<9I", self.extra_area, 0x70, *opbt_words)
+        self.chip_id = bytearray(
+            bytes.fromhex("53594E4C4F542D30312001FF10002000050607FFFFFFFFFFFFFFFFFFFFFFFFFF")
+        )
 
         # Port 10 & CSIH1 + external 8 KB ST M95640 SPI EEPROM (read-only peripheral model)
         self.port10_regs: dict[int, int] = {
@@ -217,6 +221,9 @@ class SimulatedRh850FaciMcu:
             assert self.bfaselr == 1, "Extra Area 0xFF300000 read requires BFASELR == 1!"
             off = addr - 0xFF300000
             return bytes(self.extra_area[off : off + length])
+        if 0xFFCD00E0 <= addr and addr + length <= 0xFFCD0100:
+            off = addr - 0xFFCD00E0
+            return bytes(self.chip_id[off : off + length])
         if addr == 0xFFC10228 and length == 2:  # PPR10
             p10 = self.port10_regs[0xFFC10028]
             pm10 = self.port10_regs[0xFFC10328]

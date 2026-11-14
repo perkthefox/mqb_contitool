@@ -46,7 +46,7 @@
    - Live 1-click **Русский ⇄ English** language toggle in the header.
 2. **Full Bench-Programmer Replacement Over Diagnosis CAN (`500 kbit/s` — No ECU Opening Needed)**:
    - Automatic adapter discovery for `CANable` / `SLCAN`, `SocketCAN`, `PCAN`, `Vector`, `Kvaser` and, on Windows, `J2534 PassThru` (Tactrix, Mongoose…) plus `VAS 6154` / `VNCI 6154A` through the ODIS D-PDU driver (using adapter-managed hardware `ISO-TP` for UDS flashing) with a one-click link check, automatic detection/rejection of unsupported `5Q0` and `Lear` (`PowerPC`) gateways, built-in **20-pin J533 `T20`** wiring diagram, and CAN termination confirmation (`VAS 6154` / `VNCI` and `J2534` adapters terminate the bus themselves). While an operation runs, no second link to the adapter is opened. On Windows, verified D-PDU driver `27.2` ships bundled in `dpdu/VW_PDUAPI_27.2` and runs out of the box; versions `30` and newer require an explicit confirmation (on connect the driver reflashes the VCI to its own version). Memory reads need a native USB adapter: serial SLCAN clones (CH340 etc.) lose frames.
-   - Full read-only CAN backup of **`Cflash.bin` (`1.5 MB` in `~61 s` via batched `FED_READER`)** + **`Uflash.bin` (`32 KB`)** + **`Dflash.bin` (`64 KB`, deterministic `FACI Blank Check` read)** + **`Eeprom.bin` (`8 KB`, external `ST M95640` SPI EEPROM, read-only)** + **`Opbt.bin` (`36 B`, `OPBT0..OPBT8`, read-only)** with `SHA-256` manifests, plus arbitrary physical address range reading (`can read-mem` — flash, `Local RAM`, MMIO registers).
+   - Full read-only CAN backup of **`Cflash.bin` (`1.5 MB` in `~61 s` via batched `FED_READER`)** + **`Uflash.bin` (`32 KB`)** + **`Dflash.bin` (`64 KB`, deterministic `FACI Blank Check` read)** + **`Eeprom.bin` (`8 KB`, external `ST M95640` SPI EEPROM, read-only)** + **`Opbt.bin` (`36 B`, `OPBT0..OPBT8`, `Extra Area IDCODE @ 0xFF300050`, and `CHIP ID @ 0xFFCD00E0`, read-only)** with `SHA-256` manifests, plus arbitrary physical address range reading (`can read-mem` — flash, `Local RAM`, MMIO registers).
    - Direct differential CAN writing of **`DataFlash.bin` (`64 KB`, `0xFF200000..0xFF20FFFF`)** via a native RAM `FACI` driver (`FENTRYR = 0xAA80`, `64`-byte blocks, full 16-word programming of `ZDC < 0x3040` preventing `DTC 000401`, `R_FDL` hardware `ECC` preservation, `ICUSB 0xF800..0xFFFF` guard, automatic `0x0600` coding sync, and full `64 KB` readback verification).
    - Atomic RAM `FACI` programming of the **`Uflash` (`32 KB`)** bootloader with automatic pre-backup, full `32 KB` readback verification, and live `RSA` status probe.
    - Complete **`CodeFlash.bin` (`1.5 MB`)** programming: boot blocks `0x00000000..0x0000BFFF` (including `Sector 5` with `FBL RSA` modulus at `0x0000A2F7` and automatic preservation of the MCU's 128-bit `SELFID` at `0x0000AB00`) are written via `FACI`, and `FD_0DATA` is flashed via standard UDS (or pure `--raw-faci`) with full `1.5 MB` readback verification, Application health check (`10 03` / `3E 00`), and `DTC` reading/clearing.
@@ -107,9 +107,9 @@ flowchart LR
 ### Option 1 — Standalone Executables (Recommended)
 
 Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.1.0-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.1.0-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.1.0-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+- **Windows**: extract `ContiTool-v2.1.1-windows-amd64.zip` and launch **`ContiTool.exe`**.
+- **macOS**: open `ContiTool-v2.1.1-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
+- **Linux**: extract `ContiTool-v2.1.1-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
 
 ### Option 2 — Run from Source (`Python 3.12+`)
 

@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import dataclasses
+from itertools import takewhile
+import json
+from pathlib import Path
+import re
 import struct
+from typing import Any
 
 from contitool.core.constants import (
+    CHIP_ID_SIZE,
     EEPROM_SIZE,
+    EXTRA_AREA_IDCODE_OFFSET,
     EXTRA_AREA_SIZE,
+    IDCODE_SIZE,
     OPBT_LEGACY_SIZE,
     OPBT_SIZE,
     SLAVE_SLOTS,
@@ -18,6 +26,158 @@ from contitool.i18n import tr
 # RH850/F1L User's Manual: Hardware (Table 35.34) — OPBT0 reserved bits that must be 1 on a programmed device
 OPBT0_REQUIRED_ONES_MASK = 0x9A20FECF
 OPBT_EXTRA_AREA_OFFSET = 0x70
+_LOT_ASCII_RE = re.compile(r"[A-Z0-9][A-Z0-9._-]{4,10}[A-Z0-9]")
+
+
+def normalize_idcode_bytes(raw: Any) -> bytes:
+    """Return 16-byte IDCODE if present and non-blank (not all 0xFF or all 0x00), else b''."""
+    if isinstance(raw, str):
+        s = raw.replace(" ", "").replace(":", "").replace("-", "").strip()
+        try:
+            raw = bytes.fromhex(s)
+        except ValueError:
+            return b""
+    elif not isinstance(raw, (bytes, bytearray, memoryview)):
+        return b""
+    b = bytes(raw)
+    if len(b) != IDCODE_SIZE or all(x == 0xFF for x in b) or all(x == 0x00 for x in b):
+        return b""
+    return b
+
+
+def format_idcode(raw: Any, *, spaced: bool = True) -> str:
+    """Format 16-byte RH850 IDCODE as uppercase hex (`01 23 45 ...` or `012345...`)."""
+    b = normalize_idcode_bytes(raw)
+    if not b:
+        return ""
+    return " ".join(f"{x:02X}" for x in b) if spaced else b.hex().upper()
+
+
+def normalize_chip_id_bytes(raw: Any) -> bytes:
+    """Return raw RH850 SCDS Chip ID (`0xFFCD00E0`, 16..32 B) if non-blank (not all 0xFF/0x00), else b''."""
+    if isinstance(raw, str):
+        s = raw.replace(" ", "").replace(":", "").replace("-", "").strip()
+        try:
+            raw = bytes.fromhex(s)
+        except ValueError:
+            return b""
+    elif not isinstance(raw, (bytes, bytearray, memoryview)):
+        return b""
+    b = bytes(raw)
+    if not (16 <= len(b) <= CHIP_ID_SIZE):
+        return b""
+    if all(x == 0xFF for x in b) or all(x == 0x00 for x in b):
+        return b""
+    return b
+
+
+def chip_id_lot_ascii(raw: Any) -> str:
+    """Extract printable ASCII wafer/lot prefix from RH850 SCDS Chip ID (`0xFFCD00E0..0xFFCD00E9`), e.g. 'SYNLOT-01'."""
+    b = normalize_chip_id_bytes(raw)
+    if len(b) < 8:
+        return ""
+    lead = bytes(takewhile(lambda x: 0x20 <= x <= 0x7E, b[:12]))
+    if len(lead) < 6:
+        return ""
+    s = lead.decode("ascii").strip()
+    return s if _LOT_ASCII_RE.fullmatch(s) else ""
+
+
+def format_chip_id(raw: Any, *, spaced: bool = True, include_lot: bool = False) -> str:
+    """Format RH850 SCDS Chip ID (`0xFFCD00E0`), trimming trailing 0xFF padding beyond the 16-byte minimum."""
+    b = normalize_chip_id_bytes(raw)
+    if not b:
+        return ""
+    trimmed = b.rstrip(b"\xff")
+    if len(trimmed) < 16:
+        trimmed = b[:16]
+    hex_str = " ".join(f"{x:02X}" for x in trimmed) if spaced else trimmed.hex().upper()
+    if include_lot:
+        lot = chip_id_lot_ascii(b)
+        if lot:
+            return f"{hex_str} ({lot})"
+    return hex_str
+
+
+def discover_hw_identity(*search_dirs: Path, has_opbt_file: bool = False) -> tuple[bytes, bytes]:
+    """Discover `(extra_idcode, chip_id)` from companion files and session manifests in `search_dirs`."""
+    extra_idcode = b""
+    chip_id = b""
+
+    dirs: list[Path] = []
+    for d in search_dirs:
+        if d and d.is_dir() and d not in dirs:
+            dirs.append(d)
+            if d.parent.name == "dumps":
+                base = d.parent / "base_read"
+                if base.is_dir() and base not in dirs:
+                    dirs.append(base)
+                try:
+                    sibs = sorted(d.parent.iterdir(), key=lambda p: p.name, reverse=True)
+                except OSError:
+                    sibs = []
+                for sib in sibs:
+                    if sib.is_dir() and "_read" in sib.name and sib not in dirs:
+                        dirs.append(sib)
+
+    for d in dirs:
+        if not extra_idcode:
+            for ename in ("ExtraArea.bin", "extra-area.bin", "extra_area.bin", "Opbt.bin", "opbt.bin"):
+                ep = d / ename
+                if ep.is_file():
+                    try:
+                        eraw = ep.read_bytes()
+                    except OSError:
+                        continue
+                    if len(eraw) == EXTRA_AREA_SIZE:
+                        extra_idcode = normalize_idcode_bytes(
+                            eraw[EXTRA_AREA_IDCODE_OFFSET : EXTRA_AREA_IDCODE_OFFSET + IDCODE_SIZE]
+                        )
+                        if extra_idcode:
+                            break
+        if not chip_id:
+            for cname in ("ChipId.bin", "chip_id.bin", "chip-id.bin"):
+                cp = d / cname
+                if cp.is_file():
+                    try:
+                        chip_id = normalize_chip_id_bytes(cp.read_bytes())
+                    except OSError:
+                        continue
+                    if chip_id:
+                        break
+        opbt_present = has_opbt_file or any((d / n).is_file() for n in ("Opbt.bin", "opbt.bin"))
+        for jname in ("read_opbt.json", "manifest.json"):
+            jp = d / jname
+            if not jp.is_file():
+                continue
+            try:
+                jdata = json.loads(jp.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(jdata, dict):
+                continue
+            areas = jdata.get("areas") if isinstance(jdata.get("areas"), dict) else {}
+            opbt_d = (
+                areas.get("opbt")
+                if isinstance(areas.get("opbt"), dict)
+                else jdata.get("opbt")
+                if isinstance(jdata.get("opbt"), dict)
+                else {}
+            )
+            gw_id = jdata.get("gateway_identity") if isinstance(jdata.get("gateway_identity"), dict) else {}
+            if not extra_idcode:
+                cand_id = opbt_d.get("idcode") or (
+                    (gw_id.get("idcode") or jdata.get("idcode")) if opbt_present else None
+                )
+                extra_idcode = normalize_idcode_bytes(cand_id)
+            if not chip_id:
+                chip_id = normalize_chip_id_bytes(
+                    opbt_d.get("chip_id") or gw_id.get("chip_id") or jdata.get("chip_id")
+                )
+        if extra_idcode and chip_id:
+            break
+
+    return extra_idcode, chip_id
 
 
 def crc16_ccitt_false(data: bytes) -> int:
@@ -66,6 +226,12 @@ class OpbtSummary:
     cvm_low_enabled: bool
     icus_activated: bool | None  # None when OPBT8 is absent (32-byte legacy dump)
     fields: tuple[OpbtField, ...]
+    idcode: bytes = b""
+    chip_id: bytes = b""
+
+    @property
+    def chip_id_lot(self) -> str:
+        return chip_id_lot_ascii(self.chip_id)
 
 
 def is_plausible_opbt_bytes(raw: bytes) -> bool:
@@ -85,12 +251,19 @@ def is_plausible_opbt_bytes(raw: bytes) -> bool:
     return all(w in (0x00000000, 0xFFFFFFFF) for w in words[2:8])
 
 
-def analyze_opbt(raw: bytes) -> OpbtSummary:
+def analyze_opbt(
+    raw: bytes,
+    *,
+    extra_idcode: bytes | str | None = None,
+    chip_id: bytes | str | None = None,
+) -> OpbtSummary:
     """Decode 32-byte (OPBT0..7), 36-byte (OPBT0..8), or 256-byte Extra Area dumps per RH850/F1L Table 35.34."""
     from_extra = False
     if len(raw) == EXTRA_AREA_SIZE:
         from_extra = True
         opbt_bytes = raw[OPBT_EXTRA_AREA_OFFSET : OPBT_EXTRA_AREA_OFFSET + OPBT_SIZE]
+        if not extra_idcode:
+            extra_idcode = raw[EXTRA_AREA_IDCODE_OFFSET : EXTRA_AREA_IDCODE_OFFSET + IDCODE_SIZE]
     elif len(raw) in (OPBT_LEGACY_SIZE, OPBT_SIZE):
         opbt_bytes = raw
     else:
@@ -234,6 +407,8 @@ def analyze_opbt(raw: bytes) -> OpbtSummary:
         cvm_low_enabled=cvm_ld,
         icus_activated=icus_active,
         fields=tuple(fields),
+        idcode=normalize_idcode_bytes(extra_idcode),
+        chip_id=normalize_chip_id_bytes(chip_id),
     )
 
 

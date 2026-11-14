@@ -71,6 +71,7 @@ from contitool.core import (
     check_key_warnings,
     clean_user_path,
     clear_dflash_slots,
+    discover_hw_identity,
     erase_zdc_block,
     export_zdc_block,
     generate_rsa1024_e3_keypair,
@@ -172,7 +173,14 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         blocks.append(format_eeprom_report(analyze_eeprom(p.read_bytes(), cflash_bytes), st, str(p)))
     if args.opbt:
         p = clean_user_path(args.opbt)
-        blocks.append(format_opbt_report(analyze_opbt(p.read_bytes()), st, str(p)))
+        extra_idcode, chip_id = discover_hw_identity(p.parent, has_opbt_file=True)
+        blocks.append(
+            format_opbt_report(
+                analyze_opbt(p.read_bytes(), extra_idcode=extra_idcode, chip_id=chip_id),
+                st,
+                str(p),
+            )
+        )
     print("\n\n".join(blocks))
     return 0
 
@@ -886,7 +894,18 @@ def cmd_can(args: argparse.Namespace) -> int:
                 session_dir=session_dir,
                 reporter=rep,
             )
-            print(format_opbt_report(analyze_opbt(out_bin.read_bytes()), _out_style(args), str(out_bin)))
+            op_meta = res.get("opbt") if isinstance(res.get("opbt"), dict) else {}
+            print(
+                format_opbt_report(
+                    analyze_opbt(
+                        out_bin.read_bytes(),
+                        extra_idcode=op_meta.get("idcode"),
+                        chip_id=op_meta.get("chip_id"),
+                    ),
+                    _out_style(args),
+                    str(out_bin),
+                )
+            )
             print(f"✓ Opbt.bin -> {out_bin} | Session: {res['session_dir']}")
         elif action == "read-mem":
             if args.address is None or args.length is None:

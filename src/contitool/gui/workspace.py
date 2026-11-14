@@ -8,7 +8,11 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, Signal
 
-from contitool.core import DetectedDumpFile, detect_dump_file
+from contitool.core import (
+    DetectedDumpFile,
+    detect_dump_file,
+    discover_hw_identity,
+)
 
 KINDS = ("cflash", "dflash", "uflash")
 OPTIONAL_KINDS = ("eeprom", "opbt")
@@ -58,6 +62,8 @@ class Workspace(QObject):
         self.current: dict[str, Path] = {}
         self.written: dict[str, bytes] = {}  # kind -> SHA-256 of the file written to the ECU
         self.read_warnings: dict[str, str] = {}  # optional kind -> non-fatal CAN read warning
+        self.extra_idcode: bytes = b""  # 16-byte RH850 IDCODE from Extra Area (0xFF300050)
+        self.chip_id: bytes = b""  # 32-byte RH850 SCDS Chip ID (0xFFCD00E0)
         self._info: dict[str, DetectedDumpFile] = {}
 
     # ── state ──
@@ -98,6 +104,16 @@ class Workspace(QObject):
                 return c.hw_pn
         return e.part_number if e else ""
 
+    @property
+    def idcode(self) -> bytes:
+        inf = self.info("cflash")
+        if inf and inf.cflash_info and inf.cflash_info.idcode:
+            return inf.cflash_info.idcode
+        op = self.info("opbt")
+        if op and op.opbt_info and op.opbt_info.idcode:
+            return op.opbt_info.idcode
+        return self.extra_idcode
+
     # ── loading ──
     def open_folder(self, folder: Path, source: str = "files") -> list[str]:
         """Load the first matching dump of each kind. Returns names of kinds that were not found."""
@@ -125,6 +141,7 @@ class Workspace(QObject):
     def _open(self, folder: Path, files: dict[str, Path], source: str) -> list[str]:
         self.folder, self.source = folder, source
         self.original, self.current, self.written, self.read_warnings, self._info = {}, {}, {}, {}, {}
+        self.extra_idcode, self.chip_id = b"", b""
         missing = []
         for kind in KINDS:
             p = files.get(kind)
@@ -151,10 +168,34 @@ class Workspace(QObject):
                             self.read_warnings[kind] = area_warns[kind]
             except (OSError, ValueError):
                 pass
+        self._load_hw_identity(folder)
         if self.is_open:
             _remember_recent(folder)
         self.changed.emit()
         return missing
+
+    def _load_hw_identity(self, *search_dirs: Path) -> None:
+        op = self._info.get("opbt")
+        if op and op.opbt_info:
+            if op.opbt_info.idcode and not self.extra_idcode:
+                self.extra_idcode = op.opbt_info.idcode
+            if op.opbt_info.chip_id and not self.chip_id:
+                self.chip_id = op.opbt_info.chip_id
+
+        found_idcode, found_chip_id = discover_hw_identity(
+            *search_dirs,
+            has_opbt_file="opbt" in self.current,
+        )
+        if not self.extra_idcode and found_idcode:
+            self.extra_idcode = found_idcode
+        if not self.chip_id and found_chip_id:
+            self.chip_id = found_chip_id
+
+        if op and op.opbt_info:
+            if self.extra_idcode and not op.opbt_info.idcode:
+                op.opbt_info.idcode = self.extra_idcode
+            if self.chip_id and not op.opbt_info.chip_id:
+                op.opbt_info.chip_id = self.chip_id
 
     def replace(self, kind: str, path: Path) -> str | None:
         """Use another file for one slot (as a new original). Returns an error text or None."""
@@ -165,6 +206,10 @@ class Workspace(QObject):
         self.written.pop(kind, None)
         self.read_warnings.pop(kind, None)
         self._info[kind] = det
+        if kind == "opbt":
+            self.extra_idcode, self.chip_id = b"", b""
+            same_dir = self.folder is not None and path.parent.resolve() == self.folder.resolve()
+            self._load_hw_identity(path.parent, *([self.folder] if same_dir and self.folder else []))
         self.changed.emit()
         return None
 
@@ -187,11 +232,19 @@ class Workspace(QObject):
         for kind, p in self.original.items():
             self.current[kind] = p
             self._info[kind] = detect_dump_file(p)
+        self.extra_idcode, self.chip_id = b"", b""
+        op_orig = self.original.get("opbt")
+        if op_orig is not None:
+            same_dir = self.folder is not None and op_orig.parent.resolve() == self.folder.resolve()
+            self._load_hw_identity(op_orig.parent, *([self.folder] if same_dir and self.folder else []))
+        elif self.folder:
+            self._load_hw_identity(self.folder)
         self.changed.emit()
 
     def close(self) -> None:
         self.folder = None
         self.original, self.current, self.written, self.read_warnings, self._info = {}, {}, {}, {}, {}
+        self.extra_idcode, self.chip_id = b"", b""
         self.changed.emit()
 
 

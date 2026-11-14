@@ -15,6 +15,7 @@ from contitool.core.constants import (
     APP_BASE,
     APP_SIZE,
     CAVE_SIZE,
+    CFLASH_IDCODE_OFFSET,
     CFLASH_SIZE,
     DFLASH_FSC_BASE_OFF,
     DFLASH_FSC_PAY_SIZE,
@@ -30,6 +31,7 @@ from contitool.core.constants import (
     FBL_PRESENCE_MAGIC,
     FSC_SIGNED_BODY_SIZE,
     GATEWAY_SWAP_SLOT_ORDER,
+    IDCODE_SIZE,
     OPBT_LEGACY_SIZE,
     OPBT_SIZE,
     OTP_ENG_FLAG_OFFSET,
@@ -59,6 +61,7 @@ from contitool.core.hw_extra import (
     analyze_opbt,
     is_plausible_eeprom_bytes,
     is_plausible_opbt_bytes,
+    normalize_idcode_bytes,
 )
 from contitool.i18n import get_lang, tr
 
@@ -331,6 +334,7 @@ class CflashSummary:
     swap_rsa_mod: bytes = b""
     fbl_rsa_mod: bytes = b""
     fbl_rsa_exp_ok: bool = True
+    idcode: bytes = b""  # 16-byte RH850 SELFID / IDCODE @ 0x0000AB00..0x0000AB0F
 
 
 @dataclasses.dataclass
@@ -473,6 +477,7 @@ def analyze_cflash(raw: bytes) -> CflashSummary:
         res.a167_otp_byte = prefix[OTP_ENG_FLAG_OFFSET]
         res.fbl_rsa_mod = bytes(prefix[FBL_MOD_OFFSET : FBL_MOD_OFFSET + 128])
         res.fbl_rsa_exp_ok = bytes(prefix[FBL_EXP_OFFSET : FBL_EXP_OFFSET + 128]) == ((b"\x00" * 127) + b"\x03")
+        res.idcode = normalize_idcode_bytes(prefix[CFLASH_IDCODE_OFFSET : CFLASH_IDCODE_OFFSET + IDCODE_SIZE])
 
     app_ro = bytes(app)
     res.sw_ver = app_sw_version(app_ro)

@@ -17,7 +17,7 @@ from contitool.core.analyzer import (
     UflashSummary,
     check_fec_dataset_support,
 )
-from contitool.core.hw_extra import EepromSummary, OpbtSummary
+from contitool.core.hw_extra import EepromSummary, OpbtSummary, format_chip_id, format_idcode
 from contitool.core.constants import (
     AUTHOR_CREDIT,
     AUTHOR_DRIVE2_URL,
@@ -311,6 +311,7 @@ def format_cflash_report(summary: CflashSummary, style: Style | None = None, pat
         [
             f"  {tr('Номер блока / HW', 'Part Number / HW')}:  {st.bold(summary.hw_pn or '—')}  ({summary.hw_ver or '—'})",
             f"  FAZIT:             {summary.fazit or '—'}",
+            *([f"  IDCODE (0xAB00):   {format_idcode(summary.idcode)}"] if summary.idcode else []),
             f"  SHA-256:           {summary.sha256[:24]}…",
             f"  App CRC-16:        {crc_badge}",
             f"  {tr('Режим CP (KSCHUTZ)', 'CP Mode (KSCHUTZ)')}: {cp_str}",
@@ -502,6 +503,8 @@ def format_opbt_report(summary: OpbtSummary, style: Style | None = None, path_la
         [
             f"  OPBT8 (ICU-S):  {('0x' + format(summary.opbt8, '08X')) if summary.opbt8 is not None else '—'}  ({icus_badge})",
             f"  {tr('Отладка JTAG/LPD', 'JTAG/LPD Debug')}: {jtag_badge}",
+            *([f"  IDCODE (0xFF300050): {format_idcode(summary.idcode)}"] if summary.idcode else []),
+            *([f"  CHIP ID (0xFFCD00E0): {format_chip_id(summary.chip_id, include_lot=True)}"] if summary.chip_id else []),
         ]
     )
     words_line = "  ".join(f"OPBT{i}=0x{w:08X}" for i, w in enumerate(summary.words))

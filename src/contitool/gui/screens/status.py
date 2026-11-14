@@ -6,7 +6,14 @@ import dataclasses
 import functools
 from pathlib import Path
 
-from contitool.core import KNOWN_GATEWAY_FECS, STOCK_FBL_MODULUS, STOCK_SWAP_MODULUS, check_fec_dataset_support
+from contitool.core import (
+    KNOWN_GATEWAY_FECS,
+    STOCK_FBL_MODULUS,
+    STOCK_SWAP_MODULUS,
+    check_fec_dataset_support,
+    format_chip_id,
+    format_idcode,
+)
 from contitool.can.workflows import SWAP_STATUS_ACTIVE
 from contitool.core.analyzer import analyze_dflash_swap
 from contitool.gui.workspace import Workspace
@@ -364,6 +371,12 @@ def passport_rows(ws: Workspace) -> list[tuple[str, str, str]]:
                 rows.append((tr("Номер ПО (EEPROM)", "SW part (EEPROM)"), e.part_number, "muted"))
             if e.sw_version:
                 rows.append((tr("Версия ПО (EEPROM)", "Software (EEPROM)"), e.sw_version, "muted"))
+    idcode = getattr(ws, "idcode", b"") or (cf.cflash_info.idcode if cf and cf.cflash_info else b"")
+    if idcode:
+        rows.append(("IDCODE", format_idcode(idcode), "muted"))
+    chip_id = getattr(ws, "chip_id", b"")
+    if chip_id:
+        rows.append(("CHIP ID", format_chip_id(chip_id, include_lot=True), "muted"))
     return rows
 
 

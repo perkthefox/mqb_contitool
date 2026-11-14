@@ -61,9 +61,12 @@ from contitool.core import (
     bind_cp_turnkey,
     build_odis_zdc_file,
     build_signed_fsc,
+    chip_id_lot_ascii,
     clear_dflash_slots,
     export_zdc_block,
     fecs_required_by_dataset,
+    format_chip_id,
+    format_idcode,
     generate_rsa1024_e3_keypair,
     load_rsa1024_key_material,
     parameterize_dflash_for_fecs,
@@ -257,6 +260,12 @@ class EcuScreen(QWidget):
         self.grid_id.setHorizontalSpacing(22)
         self.grid_id.setVerticalSpacing(2)
         body.addLayout(self.grid_id)
+
+        self.grid_mcu_id = QGridLayout()
+        self.grid_mcu_id.setContentsMargins(0, 0, 0, 0)
+        self.grid_mcu_id.setHorizontalSpacing(28)
+        self.grid_mcu_id.setVerticalSpacing(2)
+        body.addLayout(self.grid_mcu_id)
         return self.sec_id
 
     def _build_nav(self) -> QWidget:
@@ -426,8 +435,15 @@ class EcuScreen(QWidget):
         self.btn_close.setText(tr("Закрыть", "Close"))
 
         clear_layout(self.grid_id)
+        clear_layout(self.grid_mcu_id)
+        for c in range(12):
+            self.grid_id.setColumnStretch(c, 0)
+        for c in range(4):
+            self.grid_mcu_id.setColumnStretch(c, 0)
         rows = status.passport_rows(self.ws)
-        for col, (label, value, tone) in enumerate(rows):
+        top_rows = [r for r in rows if r[0] not in ("IDCODE", "CHIP ID")]
+        mcu_rows = [r for r in rows if r[0] in ("IDCODE", "CHIP ID")]
+        for col, (label, value, tone) in enumerate(top_rows):
             cap = QLabel(label.upper())
             cap.setObjectName("GroupLabel")
             val = QLabel(value)
@@ -437,7 +453,20 @@ class EcuScreen(QWidget):
                 set_tone(val, tone)
             self.grid_id.addWidget(cap, 0, col)
             self.grid_id.addWidget(val, 1, col)
-        self.grid_id.setColumnStretch(len(rows), 1)
+        self.grid_id.setColumnStretch(len(top_rows), 1)
+
+        self.grid_mcu_id.setContentsMargins(0, 6 if (top_rows and mcu_rows) else 0, 0, 0)
+        for col, (label, value, tone) in enumerate(mcu_rows):
+            cap = QLabel(label.upper())
+            cap.setObjectName("GroupLabel")
+            val = QLabel(value)
+            val.setFont(mono_font(11))
+            val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            if tone != "muted":
+                set_tone(val, tone)
+            self.grid_mcu_id.addWidget(cap, 0, col)
+            self.grid_mcu_id.addWidget(val, 1, col)
+        self.grid_mcu_id.setColumnStretch(len(mcu_rows), 1)
 
         self.lbl_dumps_hdr.setText(tr("ФАЙЛЫ ПАМЯТИ", "MEMORY DUMPS"))
         clear_layout(self.dumps_list)
@@ -1505,12 +1534,16 @@ class EcuScreen(QWidget):
                     )
             self._table(lay, tr("Сводка внешней EEPROM", "External EEPROM summary"), ee_rows)
 
-        # ── Renesas RH850/F1L Option Bytes (OPBT0..OPBT8, 36 B) ──
+        # ── Renesas RH850/F1L Option Bytes (OPBT0..OPBT8, 36 B) & MCU Identity ──
         op_path = self.ws.path("opbt")
         op_summary = None
         if op_path is not None:
             try:
-                op_summary = analyze_opbt(op_path.read_bytes())
+                op_summary = analyze_opbt(
+                    op_path.read_bytes(),
+                    extra_idcode=self.ws.extra_idcode,
+                    chip_id=self.ws.chip_id,
+                )
             except (OSError, ValueError):
                 op_summary = None
         if op_summary is not None:
@@ -1554,15 +1587,39 @@ class EcuScreen(QWidget):
             ),
             *op_btns,
         )
+
+        cf_inf = self.ws.info("cflash")
+        cf_idcode = cf_inf.cflash_info.idcode if (cf_inf and cf_inf.cflash_info) else b""
+        extra_idcode = op_summary.idcode if op_summary is not None else self.ws.extra_idcode
+        chip_id = op_summary.chip_id if op_summary is not None else self.ws.chip_id
+        mcu_id_rows: list[tuple[str, ...]] = []
+        if cf_idcode:
+            mcu_id_rows.append(("IDCODE (CFlash @ 0x0000AB00)", format_idcode(cf_idcode), "SELFID / FACI (16 B)"))
+        if extra_idcode:
+            if cf_idcode:
+                id_note = (
+                    tr("совпадает с CFlash (0xAB00)", "matches CFlash (0xAB00)")
+                    if extra_idcode == cf_idcode
+                    else tr("НЕ СОВПАДАЕТ с CFlash!", "MISMATCH vs CFlash!")
+                )
+            else:
+                id_note = "Extra Area + 0x50 (16 B)"
+            mcu_id_rows.append(("IDCODE (Extra Area @ 0xFF300050)", format_idcode(extra_idcode), id_note))
+        if chip_id:
+            lot = (op_summary.chip_id_lot if op_summary is not None else "") or chip_id_lot_ascii(chip_id)
+            lot_note = f"Lot: {lot} (SCDS 32 B)" if lot else "SCDS @ 0xFFCD00E0 (32 B)"
+            mcu_id_rows.append(("CHIP ID (@ 0xFFCD00E0)", format_chip_id(chip_id), lot_note))
+
         if op_summary is not None:
             op_rows: list[tuple[str, ...]] = [
+                *mcu_id_rows,
                 (
                     "OPBT0",
                     f"0x{op_summary.opbt0:08X}",
                     tr("резервные биты OK", "reserved bits OK")
                     if op_summary.reserved_bits_ok
                     else tr("нестандартные биты", "non-standard bits"),
-                )
+                ),
             ]
             if len(op_summary.words) >= 2:
                 op_rows.append(("OPBT1", f"0x{op_summary.words[1]:08X}", tr("тактирование / PLL0", "clock / PLL0")))
@@ -1576,6 +1633,8 @@ class EcuScreen(QWidget):
             for fld in op_summary.fields:
                 op_rows.append((f"[{fld.bits}] {fld.name}", fld.value_text, f"0x{fld.raw_value:X}"))
             self._table(lay, tr("Расшифровка OPBT", "Decoded OPBT"), op_rows)
+        elif mcu_id_rows:
+            self._table(lay, tr("Идентификаторы процессора RH850", "RH850 MCU Identifiers"), mcu_id_rows)
 
     def _pick_optional_file(self, kind: str) -> None:
         title = (
@@ -1601,12 +1660,17 @@ class EcuScreen(QWidget):
         target = session_file
         if self.ws.folder is not None and self.ws.folder.is_dir():
             cand = self.ws.folder / CANDIDATES[kind][0]
-            if not cand.exists():
-                try:
+            try:
+                if session_file.resolve() != cand.resolve():
                     shutil.copy2(session_file, cand)
-                    target = cand
-                except OSError:
-                    target = session_file
+                target = cand
+                if kind == "opbt":
+                    meta_src = session_file.parent / "read_opbt.json"
+                    meta_dst = self.ws.folder / "read_opbt.json"
+                    if meta_src.is_file() and meta_src.resolve() != meta_dst.resolve():
+                        shutil.copy2(meta_src, meta_dst)
+            except OSError:
+                target = session_file
         self.ws.replace(kind, target)
         self.note.emit(tr(f"Считано и загружено: {target}", f"Read and loaded: {target}"))
 
@@ -1665,7 +1729,12 @@ class EcuScreen(QWidget):
         p = self.ws.path("opbt")
         if p is None:
             return
-        txt = format_opbt_report(analyze_opbt(p.read_bytes()), Style(False), str(p))
+        oinfo = analyze_opbt(
+            p.read_bytes(),
+            extra_idcode=self.ws.extra_idcode,
+            chip_id=self.ws.chip_id,
+        )
+        txt = format_opbt_report(oinfo, Style(False), str(p))
         run_dialog(TextResultDialog(self, tr("Подробный отчёт OPBT", "Full OPBT report"), txt, self.ws.part_number))
 
     # ────────────────────────────── changed dumps ──────────────────────────────

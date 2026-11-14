@@ -679,7 +679,14 @@ class MainWindow(QMainWindow):
                 ),
             ),
             ("eeprom", lambda raw, p: format_eeprom_report(analyze_eeprom(raw, cf_raw), plain, p)),
-            ("opbt", lambda raw, p: format_opbt_report(analyze_opbt(raw), plain, p)),
+            (
+                "opbt",
+                lambda raw, p: format_opbt_report(
+                    analyze_opbt(raw, extra_idcode=self.ws.extra_idcode, chip_id=self.ws.chip_id),
+                    plain,
+                    p,
+                ),
+            ),
         ):
             path = self.ws.path(kind)
             if path is not None:

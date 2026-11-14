@@ -62,13 +62,18 @@ from contitool.core.constants import (
     APP_BASE,
     APP_SIZE,
     CFLASH_ADDR_START,
+    CFLASH_IDCODE_OFFSET,
     CFLASH_SIZE,
+    CHIP_ID_ADDR,
+    CHIP_ID_SIZE,
     DFLASH_ADDR_START,
     DFLASH_SIZE,
     DFLASH_SWAP_NVM_OFF,
     EEPROM_SIZE,
+    EXTRA_AREA_IDCODE_OFFSET,
     EXTRA_AREA_SIZE,
     FBL_PRESENCE_MAGIC,
+    IDCODE_SIZE,
     OPBT_SIZE,
     UFLASH_ADDR_START,
     UFLASH_RSA_CMP_OFFSET,
@@ -127,8 +132,8 @@ FED_READS_PER_PAYLOAD = 16  # 64 KB per upload outside DataFlash; verified: full
 # queue fall seconds behind past ~1 MB; 4 x 4 KB (16 KB = 2,048 frames, ~0.65 s) drains the queue cleanly between bursts.
 DPDU_FED_READS_PER_PAYLOAD = 4
 AREA_READ_RETRIES = 2
-SELFID_OFFSET = 0x0000AB00
-SELFID_SIZE = 16
+SELFID_OFFSET = CFLASH_IDCODE_OFFSET
+SELFID_SIZE = IDCODE_SIZE
 FBL_META_START = 0x0000C000  # FBL logistic block up to APP_BASE: presence magic, programming data
 FAZIT_OFFSET = 0x0000A240  # CodeFlash boot area: the same string the ECU answers on UDS 22 F17C
 FAZIT_SIZE = 23
@@ -1360,6 +1365,7 @@ def read_opbt_in_loader(
 
     extra_area = hdr[0x100 : 0x100 + EXTRA_AREA_SIZE]
     opbt_bytes = extra_area[OPBT_EXTRA_AREA_OFFSET : OPBT_EXTRA_AREA_OFFSET + OPBT_SIZE]
+    extra_idcode = extra_area[EXTRA_AREA_IDCODE_OFFSET : EXTRA_AREA_IDCODE_OFFSET + IDCODE_SIZE]
     if not is_plausible_opbt_bytes(opbt_bytes):
         raise RuntimeError(
             tr(
@@ -1368,7 +1374,14 @@ def read_opbt_in_loader(
             )
         )
 
-    oinfo = analyze_opbt(opbt_bytes)
+    chip_id = b""
+    try:
+        chip_id = read_memory_bytes(link, CHIP_ID_ADDR, CHIP_ID_SIZE)
+    except (*LINK_ERRORS, RuntimeError, ValueError):
+        with contextlib.suppress(*LINK_ERRORS):
+            link.drain_rx(quick=True)
+
+    oinfo = analyze_opbt(opbt_bytes, extra_idcode=extra_idcode, chip_id=chip_id)
     output_path.write_bytes(opbt_bytes)
     sha = _digest(opbt_bytes)
     reporter.progress(OPBT_SIZE, OPBT_SIZE, unit="B", detail="Opbt.bin")
@@ -1388,6 +1401,8 @@ def read_opbt_in_loader(
         "payload_sha256": EXPECTED_OPBT_READER_STUB_SHA256,
         "opbt0": f"0x{oinfo.opbt0:08X}",
         "opbt8": f"0x{oinfo.opbt8:08X}" if oinfo.opbt8 is not None else None,
+        "idcode": oinfo.idcode.hex().upper() if oinfo.idcode else None,
+        "chip_id": oinfo.chip_id.hex().upper() if oinfo.chip_id else None,
         "jtag_enabled": oinfo.jtag_enabled,
         "icus_activated": oinfo.icus_activated,
         "bfaselr_initial": bfaselr_initial,
@@ -1589,6 +1604,7 @@ def can_backup(
             if "cflash" in manifest["areas"] and manifest["areas"]["cflash"].get("complete"):
                 cf_raw = cflash_cache if cflash_cache is not None else (out_dir / "Cflash.bin").read_bytes()
                 cf_info = analyze_cflash(cf_raw)
+                opbt_area = manifest["areas"].get("opbt") if isinstance(manifest["areas"].get("opbt"), dict) else {}
                 manifest["gateway_identity"] = {
                     "sw_pn": cf_info.sw_pn,
                     "sw_ver": cf_info.sw_ver,
@@ -1596,6 +1612,8 @@ def can_backup(
                     "hw_pn": cf_info.hw_pn,
                     "hw_ver": cf_info.hw_ver,
                     "fazit": cf_info.fazit,
+                    "idcode": cf_info.idcode.hex().upper() if cf_info.idcode else opbt_area.get("idcode"),
+                    "chip_id": opbt_area.get("chip_id"),
                     "crc_ok": cf_info.crc_ok,
                     "cp_mode": cf_info.hook_mode,
                 }

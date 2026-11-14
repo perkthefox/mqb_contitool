@@ -1,5 +1,19 @@
 # Changelog / История изменений
 
+## 2.1.1 — 2026-11-14
+
+### 🇷🇺 Добавлено
+- **Отображение и чтение аппаратных идентификаторов процессора RH850/F1L (`IDCODE` и `CHIP ID`):**
+  - **128-битный `IDCODE` (`SELFID`, 16 Б):** автоматически извлекается из `CodeFlash` (`0x0000AB00..0x0000AB0F`), а также из `Extra Area` (`0xFF300050..0xFF30005F`, смещение `+0x50`) при чтении `OPBT` по CAN или открытии 256-байтного дампа `ExtraArea.bin` с автоматической сверкой совпадения обоих значений.
+  - **Кремниевый `CHIP ID` (`0xFFCD00E0..0xFFCD00FF`, 32 Б в блоке `SCDS0`):** автоматически вычитывается в режиме `RAM-Loader` при чтении `OPBT` (`can read-opbt`) и полном чтении блока (`can backup`), сохраняется в `manifest.json` / `read_opbt.json` и отображается с расшифровкой ASCII-кода партии пластины (`Wafer / Lot`).
+  - Оба идентификатора выводятся отдельной строкой в верхней панели паспорта блока, в сводной таблице раздела **«EEPROM и OPBT»**, в подробном отчёте GUI и в выводе команд CLI (`inspect` и `can read-opbt`).
+
+### 🇬🇧 Added
+- **RH850/F1L silicon hardware identifier readout and display (`IDCODE` & `CHIP ID`):**
+  - **128-bit `IDCODE` (`SELFID`, 16 B):** automatically extracted from `CodeFlash` (`0x0000AB00..0x0000AB0F`) as well as `Extra Area` (`0xFF300050..0xFF30005F`, offset `+0x50`) during CAN `OPBT` reads or from 256-byte `ExtraArea.bin` dumps, with automatic cross-verification between `CodeFlash` and `Extra Area`.
+  - **Silicon `CHIP ID` (`0xFFCD00E0..0xFFCD00FF`, 32 B in `SCDS0`):** automatically read inside `RAM-Loader` during `OPBT` reads (`can read-opbt`) and full ECU backups (`can backup`), recorded in `manifest.json` / `read_opbt.json`, and formatted alongside its decoded ASCII wafer/lot tag.
+  - Both identifiers are shown in a dedicated row of the top ECU identity bar, in the **“EEPROM & OPBT”** register summary table, in the full GUI report, and in CLI output (`inspect` and `can read-opbt`).
+
 ## 2.1.0 — 2026-11-13
 
 ### 🇷🇺 Добавлено

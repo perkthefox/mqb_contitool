@@ -158,6 +158,7 @@ def test_opbt_decoder_and_plausibility_across_all_formats(tmp_path: Path) -> Non
     raw36 = make_synthetic_opbt36()
     raw32 = raw36[:OPBT_LEGACY_SIZE]
     extra256 = bytearray(b"\xff" * EXTRA_AREA_SIZE)
+    extra256[0x50:0x60] = bytes.fromhex("0123456789ABCDEF1032547698BADCFE")
     extra256[0x70 : 0x70 + OPBT_SIZE] = raw36
 
     for raw, exp_words, exp_icus in (
@@ -178,6 +179,16 @@ def test_opbt_decoder_and_plausibility_across_all_formats(tmp_path: Path) -> Non
         assert info.memcdiv_div4 is True
         assert info.cvm_high_enabled is True and info.cvm_low_enabled is False
         assert info.icus_activated is exp_icus
+        if len(raw) == EXTRA_AREA_SIZE:
+            assert info.idcode == bytes.fromhex("0123456789ABCDEF1032547698BADCFE")
+
+    from contitool.core import chip_id_lot_ascii, normalize_chip_id_bytes, normalize_idcode_bytes
+
+    assert normalize_idcode_bytes(b"\x00" * 16) == b""
+    assert normalize_idcode_bytes(b"\xff" * 16) == b""
+    assert normalize_idcode_bytes(12345) == b""
+    assert normalize_chip_id_bytes(True) == b""
+    assert chip_id_lot_ascii(b"SYNLOT-02\x00" + b"\x11\x22\x33\x44\x55\x66" + b"\xff" * 16) == "SYNLOT-02"
 
     # OPBT8 bit 31 == 1 -> ICU-S inactive
     inactive = analyze_opbt(make_synthetic_opbt36(opbt8=0xFFFFFFFF))
@@ -332,6 +343,19 @@ def test_can_backup_includes_extras_and_emits_non_fatal_warning_on_failure(
     assert (base_dir / "Dflash.bin").read_bytes() == synth_dflash
     assert (base_dir / "Opbt.bin").read_bytes() == make_synthetic_opbt36()
     assert (base_dir / "Eeprom.bin").read_bytes() == ee_expected
+    assert res_ok["areas"]["opbt"]["idcode"] == "0123456789ABCDEF1032547698BADCFE"
+    assert res_ok["areas"]["opbt"]["chip_id"] == "53594E4C4F542D30312001FF10002000050607FFFFFFFFFFFFFFFFFFFFFFFFFF"
+    assert res_ok["gateway_identity"]["idcode"] == "0123456789ABCDEF1032547698BADCFE"
+    assert res_ok["gateway_identity"]["chip_id"] == "53594E4C4F542D30312001FF10002000050607FFFFFFFFFFFFFFFFFFFFFFFFFF"
+
+    # `--no-extras` backup does NOT claim Extra Area IDCODE was read
+    dir_no_extras = tmp_path / "unit_no_ex" / "dumps" / "2026-11-13_read"
+    dir_no_extras.mkdir(parents=True)
+    res_no_ex = can_backup("mock0", session_dir=dir_no_extras, include_extras=False)
+    assert res_no_ex["complete"] is True
+    assert "opbt" not in res_no_ex["areas"]
+    assert res_no_ex["gateway_identity"]["idcode"] == "0123456789ABCDEF1032547698BADCFE"
+    assert res_no_ex["gateway_identity"]["chip_id"] is None
 
     # Standalone `can_read_opbt` and `can_read_eeprom` also succeed
     op_single = tmp_path / "single_opbt.bin"
@@ -401,6 +425,20 @@ def test_cli_inspect_and_gui_hw_screen_and_warnings(
     (folder / "Uflash.bin").write_bytes(synth_uflash)
     (folder / "Eeprom.bin").write_bytes(ee_raw)
     (folder / "Opbt.bin").write_bytes(op_raw)
+    (folder / "manifest.json").write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "areas": {
+                    "opbt": {
+                        "idcode": "0123456789ABCDEF1032547698BADCFE",
+                        "chip_id": "53594E4C4F542D30312001FF10002000050607FFFFFFFFFFFFFFFFFFFFFFFFFF",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     # 1. CLI `inspect --eeprom ... --opbt ...`
     rc = cli_main(
@@ -420,6 +458,8 @@ def test_cli_inspect_and_gui_hw_screen_and_warnings(
     assert "0x9AA7FFEF" in out
     assert "0xFEFFFBDB" in out
     assert "0x0FFFFFFF" in out
+    assert "01 23 45 67 89 AB CD EF 10 32 54 76 98 BA DC FE" in out
+    assert "SYNLOT-01" in out
 
     # 2. GUI Workspace & `hw` page with both EEPROM + OPBT loaded
     set_lang("ru")
@@ -430,6 +470,52 @@ def test_cli_inspect_and_gui_hw_screen_and_warnings(
     assert win.ws.path("opbt") == folder / "Opbt.bin"
     hw_state = status.hardware_extras(win.ws)
     assert hw_state.tone == "ok" and hw_state.text == "EEPROM + OPBT"
+    p_rows = {lbl: val for lbl, val, _t in status.passport_rows(win.ws)}
+    assert p_rows["IDCODE"] == "01 23 45 67 89 AB CD EF 10 32 54 76 98 BA DC FE"
+    assert p_rows["CHIP ID"] == "53 59 4E 4C 4F 54 2D 30 31 20 01 FF 10 00 20 00 05 06 07 (SYNLOT-01)"
+
+    # Replacing OPBT with an external standalone file clears the previous folder's Extra Area IDCODE / CHIP ID
+    ext_dir = tmp_path / "external_opbt"
+    ext_dir.mkdir()
+    ext_op = ext_dir / "Opbt.bin"
+    ext_op.write_bytes(op_raw)
+    assert win.ws.replace("opbt", ext_op) is None
+    assert win.ws.extra_idcode == b""
+    assert win.ws.chip_id == b""
+
+    # Adopting a live CAN OPBT read copies `read_opbt.json` into the workspace folder so reopening preserves CHIP ID
+    win.open_folder(str(tmp_path / "warn_dump_pre")) if (tmp_path / "warn_dump_pre").exists() else None
+    adopt_ws_dir = tmp_path / "adopt_ws"
+    adopt_ws_dir.mkdir()
+    (adopt_ws_dir / "Cflash.bin").write_bytes(synth_cflash)
+    win.open_folder(str(adopt_ws_dir))
+    app.processEvents()
+    assert win.ws.extra_idcode == b""
+    assert win.ws.chip_id == b""
+    sdir = tmp_path / "session_read_opbt"
+    sdir.mkdir()
+    (sdir / "Opbt.bin").write_bytes(op_raw)
+    (sdir / "read_opbt.json").write_text(
+        json.dumps(
+            {
+                "opbt": {
+                    "idcode": "0123456789ABCDEF1032547698BADCFE",
+                    "chip_id": "53594E4C4F542D30312001FF10002000050607FFFFFFFFFFFFFFFFFFFFFFFFFF",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    win.ecu_screen._adopt_optional_read("opbt", sdir / "Opbt.bin")
+    app.processEvents()
+    assert (adopt_ws_dir / "Opbt.bin").is_file()
+    assert (adopt_ws_dir / "read_opbt.json").is_file()
+    assert win.ws.extra_idcode == bytes.fromhex("0123456789ABCDEF1032547698BADCFE")
+    assert win.ws.chip_id.startswith(b"SYNLOT-01 ")
+
+    # Reopen from scratch: persisted `read_opbt.json` restores both Extra Area IDCODE and CHIP ID
+    win.open_folder(str(folder))
+    app.processEvents()
 
     win.ecu_screen.select("hw")
     app.processEvents()

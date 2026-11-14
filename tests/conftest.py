@@ -39,6 +39,7 @@ def make_synthetic_cflash() -> bytes:
     prefix[0xA240:0xA257] = b"TST-SYN01.01.260000001 "
     prefix[0xA257:0xA25A] = b"527"
     prefix[0xA25A:0xA265] = b"3Q0907530AR"
+    prefix[0xAB00:0xAB10] = bytes.fromhex("0123456789ABCDEF1032547698BADCFE")
     prefix[FBL_EXP_OFFSET : FBL_EXP_OFFSET + 128] = (b"\x00" * 127) + b"\x03"
     prefix[FBL_MOD_OFFSET : FBL_MOD_OFFSET + 128] = STOCK_FBL_MODULUS
     struct.pack_into("<I", prefix, 0xC000, FBL_PRESENCE_MAGIC)
