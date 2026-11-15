@@ -1,5 +1,15 @@
 # Changelog / История изменений
 
+## 2.1.2 — 2026-11-15
+
+### 🇷🇺 Исправлено
+- **Запись `Uflash` и `CodeFlash` через `FACI` на новых шлюзах `3Q0907530G` HW `527` (`A3C09035702`, #31):** устранена ошибка `FACI status error: marker=2, FSTATR=0x0000C000` на блоках свежей ревизии Vitesco (`3Q0907530AR` / `AS`, `SW 5502+`), где вывод `FLMD0` остаётся в `Low` при `FLMDCNT = 0`. Перед входом в режим `Code Flash P/E` стабы `FACI` теперь программно выставляют `FLMDCNT = 1` через защищённую последовательность `FLMDPCMD = 0xA5` с ожиданием `FPMON.FWE == 1` (`0xFFA10000` бит 7) и фиксации `FENTRYR == 0x0001`, сбрасывают застарелый `ILGLERR`, обслуживают сторожевые таймеры `WDTA0` / `WDTA1` при стирании и программировании страниц, а при выходе гарантированно возвращают `FENTRYR = 0x0000`, очищают кэш инструкций (`CFCNT` + `synci`) и снимают `FLMDCNT = 0` даже в случае ошибки.
+- **Диагностика ошибок `FACI` при записи флеш-памяти:** в `uflash_write_result.json` / `cflash_write_result.json` и текст ошибки добавлен снимок регистров контроллера (`FPMON`, `FLMDPS`, `FASTAT`, `FENTRYR`, `FPCKAR`).
+
+### 🇬🇧 Fixed
+- **`Uflash` and `CodeFlash` `FACI` programming on newer `3Q0907530G` HW `527` gateways (`A3C09035702`, #31):** fixed `FACI status error: marker=2, FSTATR=0x0000C000` on late Vitesco hardware revisions (`3Q0907530AR` / `AS`, `SW 5502+`) where `FLMD0` remains `Low` while `FLMDCNT = 0`. Before entering `Code Flash P/E`, both `FACI` stubs now assert `FLMDCNT = 1` via the `FLMDPCMD = 0xA5` protected write sequence, poll `FPMON.FWE == 1` (`0xFFA10000` bit 7) and `FENTRYR == 0x0001`, clear any stale `ILGLERR` latch, service `WDTA0` / `WDTA1` during block erase and page programming, and unconditionally restore `FENTRYR = 0x0000`, flush the code flash cache (`CFCNT` + `synci`), and clear `FLMDCNT = 0` on both completion and error paths.
+- **`FACI` flash-write error diagnostics:** `uflash_write_result.json` / `cflash_write_result.json` and raised error messages now capture a snapshot of the `FACI` state registers (`FPMON`, `FLMDPS`, `FASTAT`, `FENTRYR`, `FPCKAR`).
+
 ## 2.1.1 — 2026-11-14
 
 ### 🇷🇺 Добавлено

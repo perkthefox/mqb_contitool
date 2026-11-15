@@ -19,6 +19,28 @@ BFASELR = 0xFFC59008
 EXTRA_AREA_BASE = 0xFF300000
 FLASH_CFCNT = 0xFFBC0700
 
+FLMDCNT = 0xFFA00000
+FLMDPCMD = 0xFFA00004
+FLMDPS = 0xFFA00008
+FLID_BASE = 0xFFA08000
+FACI_BASE = 0xFFA10000
+FACI_CMD = 0xFFA20000
+
+FACI_FPMON_OFF = 0x00
+FACI_FASTAT_OFF = 0x10
+FACI_FAREASELC_OFF = 0x20
+FACI_FSADDR_OFF = 0x30
+FACI_FEADDR_OFF = 0x34
+FACI_FSTATR_OFF = 0x80
+FACI_FENTRYR_OFF = 0x84
+FACI_FPROTR_OFF = 0x88
+FACI_FPCKAR_OFF = 0xE4
+
+PAYLOAD_ENTRY_ADDR = 0xFEDF8138
+SELFID_CODEFLASH_ADDR = 0x0000AB00
+UFLASH_BASE_ADDR = 0x01000000
+UFLASH_END_ADDR = 0x01007FFF
+
 WDTA0_BASE = 0xFFED0000
 WDTA1_BASE = 0xFFED1000
 
@@ -89,9 +111,13 @@ class _Rh850Builder:
     """Minimal deterministic V850E3v5 instruction emitter with constant-width label branches."""
 
     def __init__(self) -> None:
-        self._items: list[bytes | tuple[str, str, int]] = []
+        self._items: list[bytes | tuple[object, ...]] = []
         self._labels: dict[str, int] = {}
         self._pc = 0
+
+    @property
+    def pc(self) -> int:
+        return self._pc
 
     def _emit(self, raw: bytes) -> None:
         self._items.append(raw)
@@ -122,6 +148,25 @@ class _Rh850Builder:
             raise ValueError(f"Invalid register r{reg}")
         self._emit(struct.pack("<HI", 0x0620 | reg, imm32 & 0xFFFFFFFF))
 
+    def mov_imm5(self, imm5: int, reg: int) -> None:
+        if not 1 <= reg <= 31 or not -16 <= imm5 <= 15:
+            raise ValueError(f"Invalid mov_imm5({imm5}, r{reg})")
+        self._emit(struct.pack("<H", 0x0200 | (imm5 & 0x1F) | ((reg & 0x1F) << 11)))
+
+    def mov_u16(self, val16: int, reg: int) -> None:
+        if not 1 <= reg <= 31 or not 0 <= val16 <= 0xFFFF:
+            raise ValueError(f"Invalid mov_u16(0x{val16:X}, r{reg})")
+        if val16 <= 15:
+            self.mov_imm5(val16, reg)
+        else:
+            self.ori(val16, 0, reg)
+
+    def mov_label_addr(self, label: str, reg: int, base_addr: int = PAYLOAD_ENTRY_ADDR) -> None:
+        if not 1 <= reg <= 31:
+            raise ValueError(f"Invalid register r{reg}")
+        self._items.append(("mov_label", label, reg, base_addr))
+        self._pc += 6
+
     def mov_reg(self, src: int, dst: int) -> None:
         self._emit(struct.pack("<H", 0x0000 | (src & 0x1F) | ((dst & 0x1F) << 11)))
 
@@ -132,6 +177,9 @@ class _Rh850Builder:
 
     def addi(self, imm16: int, src: int, dst: int) -> None:
         self._emit(struct.pack("<HH", 0x0600 | (src & 0x1F) | ((dst & 0x1F) << 11), imm16 & 0xFFFF))
+
+    def movhi(self, imm16: int, src: int, dst: int) -> None:
+        self._emit(struct.pack("<HH", 0x0640 | (src & 0x1F) | ((dst & 0x1F) << 11), imm16 & 0xFFFF))
 
     def andi(self, imm16: int, src: int, dst: int) -> None:
         self._emit(struct.pack("<HH", 0x06C0 | (src & 0x1F) | ((dst & 0x1F) << 11), imm16 & 0xFFFF))
@@ -179,6 +227,12 @@ class _Rh850Builder:
             raise ValueError("ld.bu destination cannot be r0")
         self._emit(struct.pack("<HH", 0x0780 | (base & 0x1F) | ((dst & 0x1F) << 11), 0x0001))
 
+    def ld_bu(self, disp: int, base: int, dst: int) -> None:
+        if not 1 <= dst <= 31:
+            raise ValueError("ld.bu destination cannot be r0")
+        op_low = (disp & 1) << 5
+        self._emit(struct.pack("<HH", 0x0780 | op_low | (base & 0x1F) | ((dst & 0x1F) << 11), (disp & 0xFFFE) | 1))
+
     def st_b(self, src: int, disp: int, base: int) -> None:
         self._emit(struct.pack("<HH", 0x0740 | (base & 0x1F) | ((src & 0x1F) << 11), disp & 0xFFFF))
 
@@ -215,6 +269,18 @@ class _Rh850Builder:
         self._emit(self._bcond9_raw(_COND_BE, 6))
         self.jr(label)
 
+    def be_short(self, label: str) -> None:
+        self._items.append(("bcond9", label, self._pc, _COND_BE))
+        self._pc += 2
+
+    def bne_short(self, label: str) -> None:
+        self._items.append(("bcond9", label, self._pc, _COND_BNE))
+        self._pc += 2
+
+    def br_short(self, label: str) -> None:
+        self._items.append(("bcond9", label, self._pc, _COND_BR))
+        self._pc += 2
+
     def save_context(self) -> None:
         """Disable interrupts, sync I-cache, and save r20..r29, ep (r30), and lp (r31) on stack."""
         self.di()
@@ -237,10 +303,27 @@ class _Rh850Builder:
             if isinstance(item, bytes):
                 out.extend(item)
                 continue
-            kind, target_name, pc = item
+            kind = item[0]
+            if kind == "mov_label":
+                _, target_name, reg, base_addr = item
+                if target_name not in self._labels:
+                    raise KeyError(f"Undefined label: {target_name}")
+                addr = (int(base_addr) + self._labels[str(target_name)]) & 0xFFFFFFFF
+                out.extend(struct.pack("<HI", 0x0620 | int(reg), addr))
+                continue
+            if kind == "bcond9":
+                _, target_name, pc, cond = item
+                if target_name not in self._labels:
+                    raise KeyError(f"Undefined branch target: {target_name}")
+                disp = self._labels[str(target_name)] - int(pc)
+                if (disp & 1) != 0 or not (-256 <= disp <= 254):
+                    raise ValueError(f"bcond9 displacement out of range for {target_name}: {disp}")
+                out.extend(self._bcond9_raw(int(cond), disp))
+                continue
+            _, target_name, pc = item
             if target_name not in self._labels:
                 raise KeyError(f"Undefined branch target: {target_name}")
-            disp = self._labels[target_name] - pc
+            disp = self._labels[str(target_name)] - int(pc)
             if (disp & 1) != 0 or not (-0x200000 <= disp <= 0x1FFFFE):
                 raise ValueError(f"{kind} displacement out of range: {disp}")
             u22 = disp & 0x3FFFFF
@@ -615,7 +698,335 @@ def build_m95640_reader_payload(length: int = 0x2000) -> bytes:
     return b.build()
 
 
+def _emit_faci_wdt_subroutine(b: _Rh850Builder, label_name: str = "SUB_WDT") -> None:
+    """Compact WDTA0 + WDTA1 VAC refresh using shared `0xFFED0000` base (`r11..r13` scratch)."""
+    b.label(label_name)
+    b.movhi(0xFFED, 0, 11)
+    b.mov_u16(0x00AC, 13)
+    for off in (0x0000, 0x1000):
+        b.st_b(13, off, 11)
+        b.ld_bu(off + 0x08, 11, 12)
+        b.subr(13, 12)
+        b.st_b(12, off + 0x04, 11)
+    b.jmp_lp()
+
+
+def _emit_flmd_subroutine(b: _Rh850Builder, label_name: str = "SUB_SET_FLMD") -> None:
+    """Set `FLMDCNT` (`0xFFA00000`) to `r6` (`0` or `1`) via `FLMDPCMD = 0xA5`; leaves `FLMDPS & 1` in `r12`."""
+    b.label(label_name)
+    b.movhi(0xFFA0, 0, 11)
+    b.mov_u16(0x00A5, 14)
+    b.mov_imm5(-1, 13)
+    b.mov_reg(6, 12)
+    b.subr(13, 12)  # r12 = ~r6
+    b.mov_imm5(15, 13)
+    b.label("_FLMD_RETRY")
+    b.st_w(14, 0x04, 11)
+    b.st_w(6, 0x00, 11)
+    b.st_w(12, 0x00, 11)
+    b.st_w(6, 0x00, 11)
+    b.ld_w(0x08, 11, 12)
+    b.andi(0x0001, 12, 12)
+    b.be_short("_FLMD_DONE")
+    b.add_imm5(-1, 13)
+    b.bne_short("_FLMD_RETRY")
+    b.label("_FLMD_DONE")
+    b.jmp_lp()
+
+
+def _emit_exit_pe_subroutine(b: _Rh850Builder, label_name: str = "SUB_EXIT_PE") -> None:
+    """Clear `FASTAT`/`FSTATR`, reset `FAREASELC = 0x3B00`, write `FENTRYR = 0xAA00`, and poll Read mode."""
+    b.label(label_name)
+    b.mov_u16(0x0010, 12)
+    b.st_b(12, FACI_FASTAT_OFF, 17)
+    b.st_b(19, 0x00, 16)
+    b.mov_u16(0x3B00, 12)
+    b.st_h(12, FACI_FAREASELC_OFF, 17)
+    b.mov_u16(0xAA00, 12)
+    b.st_h(12, FACI_FENTRYR_OFF, 17)
+    b.movhi(0x0001, 0, 13)
+    b.label("_EXIT_PE_WAIT")
+    b.ld_hu(FACI_FENTRYR_OFF, 17, 12)
+    b.cmp_imm5(0, 12)
+    b.be_short("_EXIT_PE_DONE")
+    b.add_imm5(-1, 13)
+    b.bne_short("_EXIT_PE_WAIT")
+    b.label("_EXIT_PE_DONE")
+    b.synci()
+    b.jmp_lp()
+
+
+def _emit_wait_frdy_subroutine(b: _Rh850Builder, label_name: str = "SUB_WAIT_FRDY") -> None:
+    """Poll `FSTATR.FRDY` (`0x8000`) while refreshing `WDTA0`/`WDTA1`; set `r18 = FSTATR` and `Z = (err == 0)`."""
+    b.label(label_name)
+    b.mov_reg(31, 20)
+    b.mov_u16(4096, 21)
+    b.label("_FRDY_POLL")
+    b.ld_w(FACI_FSTATR_OFF, 17, 18)
+    b.andi(0x8000, 18, 11)
+    b.bne_short("_FRDY_DONE")
+    b.add_imm5(-1, 21)
+    b.bne_short("_FRDY_POLL")
+    b.jarl("SUB_WDT")
+    b.mov_u16(4096, 21)
+    b.br_short("_FRDY_POLL")
+    b.label("_FRDY_DONE")
+    b.andi(0x7000, 18, 11)
+    b.mov_reg(20, 31)
+    b.jmp_lp()
+
+
+def _build_faci_code_stub(*, is_uflash: bool) -> tuple[bytes, int]:
+    """Build deterministic RH850/F1L FACI CodeFlash / Extended User Area writer applet.
+
+    Result & diagnostic block at `0xFEDE9000` (`5 x u32` = 20 bytes):
+      - `+0x00` (`u32`): `marker` (`1`=OK, `2`=`FENTRYR` timeout, `3`=Erase err, `4`=Program err, `5`=`FPMON.FWE` low)
+      - `+0x04` (`u32`): `fstatr` (`0xFFA10080`)
+      - `+0x08` (`u32`): `last_offset`
+      - `+0x0C` (`4x u8`): `fpmon` (`+0x0C`), `flmdps` (`+0x0D`), `fastat` (`+0x0E`), reserved (`+0x0F`)
+      - `+0x10` (`2x u16`): `fentryr` (`+0x10`), `fpckar` (`+0x12`)
+    """
+    b = _Rh850Builder()
+    saved_regs = (20, 21, 22, 31) if is_uflash else (20, 21, 22, 23, 31)
+    frame_bytes = len(saved_regs) * 4
+    b.di()
+    b.synci()
+    b.addi(-frame_bytes, 3, 3)
+    for idx, reg in enumerate(saved_regs):
+        b.st_w(reg, idx * 4, 3)
+
+    # r7 = RESULT_BASE, r15 = 0xD0, r16 = FACI_CMD, r17 = FACI_BASE, r18 = fstatr_snap, r19 = 0x50, r10 = marker
+    b.mov_imm(RESULT_BASE, 7)
+    b.movhi(0xFFA2, 0, 16)
+    b.movhi(0xFFA1, 0, 17)
+    b.mov_u16(0x00D0, 15)
+    b.mov_u16(0x0050, 19)
+    b.mov_imm5(2, 10)
+    b.mov_imm5(0, 18)
+    b.st_w(10, 0x00, 7)
+    b.mov_imm5(-1, 11)
+    b.st_w(11, 0x08, 7)
+    b.st_w(0, 0x0C, 7)
+    b.st_w(0, 0x10, 7)
+
+    b.jarl("SUB_WDT")
+
+    # 1. Ensure FACI starts in Read mode (FENTRYR == 0) before loading SELFID
+    b.ld_hu(FACI_FENTRYR_OFF, 17, 12)
+    b.cmp_imm5(0, 12)
+    b.be_short("PRE_READ_OK")
+    b.jarl("SUB_EXIT_PE")
+    b.label("PRE_READ_OK")
+
+    # 2. Enable FLMDCNT = 1 and poll FPMON.FWE (bit 7 == 1)
+    b.mov_imm5(1, 6)
+    b.jarl("SUB_SET_FLMD")
+    b.st_b(12, 0x0D, 7)
+
+    b.mov_u16(10000, 13)
+    b.label("_WAIT_FPMON")
+    b.ld_bu_0(17, 12)
+    b.st_b(12, 0x0C, 7)
+    b.andi(0x0080, 12, 12)
+    b.bne_short("FPMON_OK")
+    b.add_imm5(-1, 13)
+    b.bne_short("_WAIT_FPMON")
+    b.ld_w(FACI_FSTATR_OFF, 17, 18)
+    b.mov_imm5(5, 10)
+    b.jr("CLEANUP")
+    b.label("FPMON_OK")
+
+    # 3. Load 128-bit SELFID into FLID0..FLID3 + mandatory dummy ld.w of FLID3
+    if is_uflash:
+        b.mov_u16(SELFID_CODEFLASH_ADDR, 11)
+    else:
+        b.mov_label_addr("PAYLOAD_DATA", 23, PAYLOAD_ENTRY_ADDR)
+        for w_off in (0x00, 0x04, 0x08, 0x0C):
+            b.ld_w(w_off, 23, 12)
+            b.cmp_imm5(0, 12)
+            b.bne_short("USE_HDR_FLID")
+        b.mov_u16(SELFID_CODEFLASH_ADDR, 11)
+        b.br_short("COPY_FLID")
+        b.label("USE_HDR_FLID")
+        b.mov_reg(23, 11)
+        b.label("COPY_FLID")
+
+    b.addi(-0x8000, 17, 12)  # 0xFFA10000 - 0x8000 = 0xFFA08000 (FLID_BASE)
+    b.mov_imm5(4, 13)
+    b.label("_FLID_LOOP")
+    b.ld_w(0, 11, 14)
+    b.st_w(14, 0, 12)
+    b.add_imm5(4, 11)
+    b.add_imm5(4, 12)
+    b.add_imm5(-1, 13)
+    b.bne_short("_FLID_LOOP")
+    b.ld_w(-4, 12, 14)
+
+    # 4. Enter CodeFlash / Extended User Area P/E mode (FENTRYR = 0xAA01) and poll FENTRYR == 0x0001
+    b.mov_u16(0xAA01, 12)
+    b.st_h(12, FACI_FENTRYR_OFF, 17)
+    b.mov_u16(1000, 13)
+    b.label("_WAIT_PE_ENTRY")
+    b.ld_hu(FACI_FENTRYR_OFF, 17, 12)
+    b.st_h(12, 0x10, 7)
+    b.cmp_imm5(1, 12)
+    b.be_short("PE_ENTERED")
+    b.add_imm5(-1, 13)
+    b.bne_short("_WAIT_PE_ENTRY")
+    b.ld_w(FACI_FSTATR_OFF, 17, 18)
+    b.mov_imm5(2, 10)
+    b.br_short("CLEANUP")
+
+    b.label("PE_ENTERED")
+    b.synci()
+    b.ld_w(FACI_FSTATR_OFF, 17, 12)
+    b.andi(0x4000, 12, 12)
+    b.be_short("UNLOCK_FPROTR")
+    b.mov_u16(0x0010, 12)
+    b.st_b(12, FACI_FASTAT_OFF, 17)
+    b.st_b(19, 0x00, 16)
+
+    # 5. Unlock FPROTR = 0x5501 and configure FAREASELC
+    b.label("UNLOCK_FPROTR")
+    b.mov_u16(0x5501, 12)
+    b.st_h(12, FACI_FPROTR_OFF, 17)
+    if is_uflash:
+        b.mov_u16(0x3B02, 12)
+    else:
+        b.ld_w(0x10, 23, 12)
+    b.st_h(12, FACI_FAREASELC_OFF, 17)
+
+    # 6. Block Erase
+    if is_uflash:
+        b.movhi(0x0100, 0, 8)
+        b.addi(0x7FFF, 8, 12)
+    else:
+        b.ld_w(0x14, 23, 11)
+        b.cmp_imm5(0, 11)
+        b.be_short("SKIP_ERASE")
+        b.ld_w(0x18, 23, 8)
+        b.ld_w(0x1C, 23, 12)
+
+    b.st_w(8, 0x08, 7)
+    b.st_w(8, FACI_FSADDR_OFF, 17)
+    b.st_w(12, FACI_FEADDR_OFF, 17)
+    b.jarl("SUB_WDT")
+    b.st_b(19, 0x00, 16)
+    b.mov_u16(0x0020, 12)
+    b.st_b(12, 0x00, 16)
+    b.st_b(15, 0x00, 16)
+    b.jarl("SUB_WAIT_FRDY")
+    b.be_short("SKIP_ERASE")
+    b.mov_imm5(3, 10)
+    b.br_short("CLEANUP")
+
+    # 7. 256-byte Page Programming
+    b.label("SKIP_ERASE")
+    pages_imm_offset = -1
+    if is_uflash:
+        b.mov_label_addr("PAYLOAD_DATA", 9, PAYLOAD_ENTRY_ADDR)
+        pages_imm_offset = b.pc
+        b.mov_imm(99, 22)
+    else:
+        b.ld_w(0x20, 23, 8)
+        b.ld_w(0x24, 23, 22)
+        b.cmp_imm5(0, 22)
+        b.be_short("ALL_OK")
+        b.addi(0x28, 23, 9)
+
+    b.label("PAGE_LOOP")
+    b.jarl("SUB_WDT")
+    b.st_w(8, 0x08, 7)
+    b.st_w(8, FACI_FSADDR_OFF, 17)
+    b.addi(0x00FF, 8, 12)
+    b.st_w(12, FACI_FEADDR_OFF, 17)
+    b.st_b(19, 0x00, 16)
+    for cmd_byte in (0xE8, 0x80):
+        b.mov_u16(cmd_byte, 12)
+        b.st_b(12, 0x00, 16)
+    b.mov_u16(128, 13)
+    b.label("_HW_LOOP")
+    b.ld_hu(0, 9, 12)
+    b.st_h(12, 0x00, 16)
+    b.label("_WAIT_DBFULL")
+    b.ld_w(FACI_FSTATR_OFF, 17, 14)
+    b.andi(0x0400, 14, 14)
+    b.bne_short("_WAIT_DBFULL")
+    b.add_imm5(2, 9)
+    b.add_imm5(-1, 13)
+    b.bne_short("_HW_LOOP")
+
+    b.st_b(15, 0x00, 16)
+    b.jarl("SUB_WAIT_FRDY")
+    b.be_short("NEXT_PAGE")
+    b.mov_imm5(4, 10)
+    b.br_short("CLEANUP")
+
+    b.label("NEXT_PAGE")
+    b.addi(0x0100, 8, 8)
+    b.add_imm5(-1, 22)
+    b.bne_short("PAGE_LOOP")
+
+    b.label("ALL_OK")
+    b.mov_imm5(1, 10)
+
+    # 8. Cleanup: snapshot diagnostics, exit P/E mode, flush CFCNT + synci, restore FLMDCNT = 0
+    b.label("CLEANUP")
+    b.st_w(18, 0x04, 7)
+    b.ld_bu(FACI_FASTAT_OFF, 17, 11)
+    b.st_b(11, 0x0E, 7)
+    b.ld_hu(FACI_FPCKAR_OFF, 17, 11)
+    b.st_h(11, 0x12, 7)
+
+    b.ld_hu(FACI_FENTRYR_OFF, 17, 11)
+    b.cmp_imm5(0, 11)
+    b.be_short("_AFTER_PE_EXIT")
+    b.jarl("SUB_EXIT_PE")
+    b.label("_AFTER_PE_EXIT")
+
+    b.movhi(0xFFBC, 0, 11)
+    b.mov_imm5(1, 12)
+    b.st_b(12, 0x0700, 11)
+    b.ld_bu(0x0700, 11, 12)
+    b.st_b(0, 0x0700, 11)
+    b.ld_bu(0x0700, 11, 12)
+    b.synci()
+
+    b.mov_imm5(0, 6)
+    b.jarl("SUB_SET_FLMD")
+
+    b.jarl("SUB_WDT")
+    b.st_w(10, 0x00, 7)
+    for idx, reg in enumerate(saved_regs):
+        b.ld_w(idx * 4, 3, reg)
+    b.addi(frame_bytes, 3, 3)
+    b.ei()
+    b.jmp_lp()
+
+    _emit_exit_pe_subroutine(b, "SUB_EXIT_PE")
+    _emit_flmd_subroutine(b, "SUB_SET_FLMD")
+    _emit_wait_frdy_subroutine(b, "SUB_WAIT_FRDY")
+    _emit_faci_wdt_subroutine(b, "SUB_WDT")
+    b.label("PAYLOAD_DATA")
+    return b.build(), pages_imm_offset
+
+
+def build_uflash_faci_stub() -> tuple[bytes, int]:
+    """Build one-shot RH850/F1L Extended User Area FACI writer stub and its `mov pages, r22` offset."""
+    return _build_faci_code_stub(is_uflash=True)
+
+
+def build_cflash_faci_stub() -> bytes:
+    """Build parameterized RH850/F1L CodeFlash / Extended User Area FACI writer stub."""
+    stub, _ = _build_faci_code_stub(is_uflash=False)
+    return stub
+
+
 OPBT_READER_STUB = build_opbt_reader_payload()
 EEPROM_M95640_READER_STUB = build_m95640_reader_payload()
+UFLASH_FACI_STUB, UFLASH_STUB_PAGES_IMM_OFFSET = build_uflash_faci_stub()
+CFLASH_FACI_STUB = build_cflash_faci_stub()
 EXPECTED_OPBT_READER_STUB_SHA256 = "a5b1a7a12a8547e164ab0f4357257e6d422cec1780240d1c5716f4ac02f74067"
 EXPECTED_EEPROM_READER_STUB_SHA256 = "aeda839eeba9d6f307fe06f9278181b9feb11cb361125508f0cff2304ba63830"
+EXPECTED_UFLASH_FACI_STUB_SHA256 = "a7667b232516aca547885d5069d8e2ee12046bf4da6344396ef376060dcc3f32"
+EXPECTED_CFLASH_FACI_STUB_SHA256 = "f7ee469253d89afbfc8bc73f884ec639962f404cd684fea1a20595e5847f9187"

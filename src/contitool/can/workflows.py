@@ -1872,10 +1872,12 @@ def _execute_faci_payloads(
     *,
     label: str,
     status_words: int = 3,
+    has_faci_diag: bool = False,
+    packets_out: list[dict[str, Any]] | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> list[dict[str, Any]]:
     """Send 1..N FACI RAM-loader packets, verify 00 00 reply and FSTATR status at 0xFEDE9000."""
-    packets_log: list[dict[str, Any]] = []
+    packets_log: list[dict[str, Any]] = packets_out if packets_out is not None else []
     total = len(payloads)
     for idx, payload in enumerate(payloads, start=1):
         reporter.check_cancelled()
@@ -1889,7 +1891,7 @@ def _execute_faci_payloads(
         marker = int.from_bytes(status_raw[0:4], "little")
         fstatr = int.from_bytes(status_raw[4:8], "little")
         last_offset = int.from_bytes(status_raw[8:12], "little") if status_words >= 3 else 0
-        entry = {
+        entry: dict[str, Any] = {
             "packet_index": idx,
             "payload_bytes": len(payload),
             "payload_sha256": _digest(payload),
@@ -1900,10 +1902,29 @@ def _execute_faci_payloads(
         }
         packets_log.append(entry)
         if marker != 1 or (fstatr & 0x7000) != 0:
+            diag_suffix = ""
+            if has_faci_diag:
+                diag_raw = read_memory_bytes(link, 0xFEDE900C, 8)
+                fpmon = diag_raw[0]
+                flmdps = diag_raw[1]
+                fastat = diag_raw[2]
+                fentryr = int.from_bytes(diag_raw[4:6], "little")
+                fpckar = int.from_bytes(diag_raw[6:8], "little")
+                entry["faci_diag"] = {
+                    "fpmon": fpmon,
+                    "flmdps": flmdps,
+                    "fastat": fastat,
+                    "fentryr": fentryr,
+                    "fpckar": fpckar,
+                }
+                diag_suffix = (
+                    f" (FPMON=0x{fpmon:02X}, FENTRYR=0x{fentryr:04X}, "
+                    f"FASTAT=0x{fastat:02X}, FPCKAR=0x{fpckar:04X}, FLMDPS=0x{flmdps:02X})"
+                )
             raise RuntimeError(
                 tr(
-                    f"{pkt_label}: ошибка FACI: marker={marker}, FSTATR=0x{fstatr:08X}, last_offset=0x{last_offset:08X}",
-                    f"{pkt_label} FACI status error: marker={marker}, FSTATR=0x{fstatr:08X}, last_offset=0x{last_offset:08X}",
+                    f"{pkt_label}: ошибка FACI: marker={marker}, FSTATR=0x{fstatr:08X}, last_offset=0x{last_offset:08X}{diag_suffix}",
+                    f"{pkt_label} FACI status error: marker={marker}, FSTATR=0x{fstatr:08X}, last_offset=0x{last_offset:08X}{diag_suffix}",
                 )
             )
     return packets_log
@@ -2030,15 +2051,17 @@ def can_write_uflash(
                     ),
                 )
                 result["flash_commands_sent"] = True
+                result["packets"] = []
                 with reporter.uninterruptible():  # a cancel held back by the write must not skip its record
                     pkt_logs = _execute_faci_payloads(
                         link,
                         payloads,
                         label="FACI Uflash Packet",
-                        status_words=2 if len(payloads) == 1 and pages <= 122 else 3,
+                        status_words=3,
+                        has_faci_diag=True,
+                        packets_out=result["packets"],
                         reporter=reporter,
                     )
-                    result["packets"] = pkt_logs
                     result["loader_response"] = pkt_logs[-1]["loader_response"]
                     result["marker"] = pkt_logs[-1]["marker"]
                     result["fstatr"] = pkt_logs[-1]["fstatr"]
@@ -2683,6 +2706,7 @@ def _program_cflash_blocks_in_loader(
             payloads,
             label=f"FACI CodeFlash Block #{blk_idx} (0x{start:06X})",
             status_words=3,
+            has_faci_diag=True,
             reporter=reporter,
         )
         logs.append(

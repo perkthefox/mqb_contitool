@@ -100,7 +100,17 @@ class SimulatedRh850FaciMcu:
         # Hardware peripheral state
         self.flid = [0, 0, 0, 0]
         self.flid3_dummy_read = False
+        self.flmdcnt = 0  # FBL startup disables FLMDCNT (0xFFA00000 = 0)
+        self.flmdps = 0
+        self._flmd_step = 0
+        self._flmd_target = 0
+        self.flmd_history: list[int] = []
+        self.hw527_flmd0_low = True  # Vitesco HW 527 PCB keeps FLMD0 Low unless FLMDCNT == 1
+        self.flmd0_stuck_low = False
+        self.fpckar = 0x0028
         self.fentryr = 0x0000
+        self._fentryr_pending_mode: int | None = None
+        self._fentryr_pending_polls = 0
         self.fprotr = 0x0000
         self.fareaselc = 0x3B00
         self.fsaddr = 0x00000000
@@ -197,19 +207,36 @@ class SimulatedRh850FaciMcu:
         if self.RAM_BASE <= addr and addr + length <= self.RAM_BASE + self.RAM_SIZE:
             off = addr - self.RAM_BASE
             return bytes(self.ram[off : off + length])
+        if addr == 0xFFA00000 and length in (1, 4):
+            return bytes([self.flmdcnt]) if length == 1 else struct.pack("<I", self.flmdcnt)
+        if addr == 0xFFA00008 and length in (1, 4):
+            return bytes([self.flmdps]) if length == 1 else struct.pack("<I", self.flmdps)
         if 0xFFA08000 <= addr <= 0xFFA0800C and length == 4:
             idx = (addr - 0xFFA08000) // 4
             if idx == 3:
                 self.flid3_dummy_read = True
             return struct.pack("<I", self.flid[idx])
+        if addr == 0xFFA10000 and length == 1:
+            fwe = (not self.flmd0_stuck_low) and (self.flmdcnt == 1 or not self.hw527_flmd0_low)
+            return bytes([0x80 if fwe else 0x00])
+        if addr == 0xFFA10010 and length == 1:
+            return bytes([self.fcstatr])
         if addr == 0xFFA10080 and length == 4:
             return struct.pack("<I", self.fstatr)
         if addr == 0xFFA10084 and length == 2:
+            if self._fentryr_pending_mode is not None:
+                if self._fentryr_pending_polls > 0:
+                    self._fentryr_pending_polls -= 1
+                else:
+                    self.fentryr = self._fentryr_pending_mode
+                    self._fentryr_pending_mode = None
             return struct.pack("<H", self.fentryr)
         if addr == 0xFFA100D4 and length == 1:
             return bytes([self.fbcstat])
         if addr == 0xFFA100D8 and length == 4:
             return struct.pack("<I", self.fpsaddr)
+        if addr == 0xFFA100E4 and length == 2:
+            return struct.pack("<H", self.fpckar)
         if addr in (0xFFED0008, 0xFFED1008) and length == 1:
             base = addr & 0xFFFFF000
             return bytes([self.wdta_ref[base]])
@@ -259,6 +286,31 @@ class SimulatedRh850FaciMcu:
             off = addr - self.RAM_BASE
             self.ram[off : off + ln] = data
             return
+        if addr == 0xFFA00004 and ln in (1, 4):
+            val = int.from_bytes(data, "little")
+            if val == 0xA5:
+                self._flmd_step = 1
+                self.flmdps = 0
+            else:
+                self._flmd_step = 0
+                self.flmdps = 1
+            return
+        if addr == 0xFFA00000 and ln == 4:
+            val = int.from_bytes(data, "little")
+            if self._flmd_step == 1 and val in (0, 1):
+                self._flmd_target = val
+                self._flmd_step = 2
+            elif self._flmd_step == 2 and val == ((~self._flmd_target) & 0xFFFFFFFF):
+                self._flmd_step = 3
+            elif self._flmd_step == 3 and val == self._flmd_target:
+                self.flmdcnt = self._flmd_target
+                self.flmdps = 0
+                self._flmd_step = 0
+                self.flmd_history.append(self.flmdcnt)
+            else:
+                self.flmdps = 1
+                self._flmd_step = 0
+            return
         if 0xFFA08000 <= addr <= 0xFFA0800C and ln == 4:
             assert self.fentryr == 0x0000, "FLID must be loaded in Read mode before P/E entry!"
             idx = (addr - 0xFFA08000) // 4
@@ -269,16 +321,35 @@ class SimulatedRh850FaciMcu:
             assert (val & 0xFF00) == 0xAA00, f"FENTRYR missing 0xAA00 key: 0x{val:04X}"
             mode = val & 0x00FF
             assert mode in (0x00, 0x01, 0x80), f"Invalid FENTRYR mode: 0x{val:04X}"
-            if mode in (0x01, 0x80):
+            if mode == 0x00:
+                assert (self.fcstatr & 0x10) == 0, "Cannot exit P/E mode while FASTAT.CMDLK is still set!"
+                self.fentryr = 0x0000
+                self.fprotr = 0x0000
+                self._fentryr_pending_mode = None
+                self._fentryr_pending_polls = 0
+            elif mode == 0x80:
                 expected_flid = list(struct.unpack("<4I", self.cflash[0xAB00:0xAB10]))
                 assert self.flid == expected_flid, f"FLID mismatch on P/E entry: {self.flid} != {expected_flid}"
-            self.fentryr = mode
+                self._fentryr_pending_mode = 0x0080
+                self._fentryr_pending_polls = 1
+            elif mode == 0x01:
+                expected_flid = list(struct.unpack("<4I", self.cflash[0xAB00:0xAB10]))
+                fwe = (not self.flmd0_stuck_low) and (self.flmdcnt == 1 or not self.hw527_flmd0_low)
+                if self.flid == expected_flid and fwe:
+                    self._fentryr_pending_mode = 0x0001
+                    self._fentryr_pending_polls = 1
+                else:
+                    self.fentryr = 0x0000
+                    self._fentryr_pending_mode = None
+                    self._fentryr_pending_polls = 0
             self._cmd_seq.clear()
             return
         if addr == 0xFFA10088 and ln == 2:
-            assert self.fentryr == 0x0001, (
-                f"Writing FPROTR while FENTRYR=0x{self.fentryr:04X} raises ILGLERR on RH850/F1L!"
-            )
+            if self.fentryr != 0x0001:
+                # Writing FPROTR before FENTRYR latches 0x0001 raises ILGLERR + CMDLK on RH850/F1L
+                self.fstatr = 0x0000C000
+                self.fcstatr |= 0x10
+                return
             val = int.from_bytes(data, "little")
             assert val == 0x5501, f"Unexpected FPROTR value: 0x{val:04X}"
             self.fprotr = 1
@@ -295,7 +366,10 @@ class SimulatedRh850FaciMcu:
             self.feaddr = int.from_bytes(data, "little")
             return
         if addr == 0xFFA10010 and ln == 1:
-            self.fcstatr = data[0]
+            if data[0] == 0x10:
+                self.fcstatr = 0x00
+            else:
+                self.fcstatr = data[0]
             self._cmd_seq.clear()
             return
         if addr == 0xFFA20000 and ln in (1, 2):
@@ -392,8 +466,13 @@ class SimulatedRh850FaciMcu:
 
     def _handle_faci_cmd(self, width: int, val: int) -> None:
         if width == 1 and val == 0x50:
-            # Clear Status command
-            self.fstatr = 0x00008000
+            # Clear Status command (only clears ILGLERR once FASTAT.CMDLK is cleared)
+            if (self.fcstatr & 0x10) == 0:
+                self.fstatr = 0x00008000
+            self._cmd_seq.clear()
+            return
+        if (self.fcstatr & 0x10) != 0:
+            self.fstatr = 0x0000C000
             self._cmd_seq.clear()
             return
         self._cmd_seq.append((width, val))
@@ -421,7 +500,9 @@ class SimulatedRh850FaciMcu:
                     )
                     self.cflash[self.fsaddr : self.feaddr + 1] = b"\xff" * (self.feaddr - self.fsaddr + 1)
             else:
-                raise AssertionError("Erase issued outside P/E mode!")
+                self.fstatr = 0x0000C000
+                self.fcstatr |= 0x10
+                return
             self.fstatr = 0x00008000
             return
 
@@ -780,6 +861,7 @@ class SimulatedRh850FaciMcu:
 
         assert self.fentryr == 0x0000, f"Stub returned without exiting P/E mode (FENTRYR=0x{self.fentryr:04X})!"
         assert self.bfaselr == 0, f"Stub returned with Extra Area still mapped (BFASELR=0x{self.bfaselr:02X})!"
+        assert self.flmdcnt == 0, f"Stub returned without restoring FLMDCNT=0 (FLMDCNT={self.flmdcnt})!"
         assert not self.interrupts_disabled, "Stub returned with interrupts still disabled (di without ei)!"
         if check_callee_saved:
             for r_idx, exp in saved_snapshot.items():
@@ -884,8 +966,7 @@ class SimulatedJ533CanBus:
             return
 
         # Execute real RH850 FACI machine code stub (`DFLASH_READER_STUB`, `DFLASH_FACI_STUB`, `CFLASH_FACI_STUB`, or `UFLASH_FACI_STUB`)!
-        is_uflash_legacy = code.startswith(UFLASH_FACI_STUB[:32])
-        self.mcu.execute_loader_payload(code, check_callee_saved=not is_uflash_legacy)
+        self.mcu.execute_loader_payload(code)
         for frame_data in self.mcu.streamed_frames:
             self._reply(0x6F1, frame_data)
         self._reply(0x6F1, b"\x00\x00")
@@ -1060,7 +1141,7 @@ def test_cflash_and_uflash_faci_stubs_execute_cleanly_on_rh850_simulator(
     real_size[0x4000:0x622C] = b"\x55" * 0x222C  # 99 pages, as every 3Q0907530 Uflash seen
     uf_pkts, uf_pages = build_uflash_faci_payloads(bytes(real_size))
     assert len(uf_pkts) == 1 and uf_pages == 99
-    st = mcu.execute_loader_payload(uf_pkts[0], check_callee_saved=False)  # legacy stub, verified on hardware (99 pages)
+    st = mcu.execute_loader_payload(uf_pkts[0])
     assert st["marker"] == 1 and st["fstatr"] == 0x8000
     assert bytes(mcu.uflash) == bytes(real_size)
 
@@ -1403,3 +1484,69 @@ def test_writing_an_edited_backup_keeps_the_records_the_ecu_updated_itself(synth
     same[0x2000] ^= 0xF0  # both changed it the same way: nothing to refuse
     _, _, conflicts = merge_dflash_edits(bytes(current), base, bytes(same))
     assert not conflicts
+
+
+def test_hw527_flmd_enable_and_faci_diagnostics(
+    synth_cflash: bytes,
+    synth_uflash: bytes,
+    synth_dflash: bytes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #31: Vitesco HW 527 keeps FLMD0 Low when FLMDCNT=0; CodeFlash/Uflash stubs must set FLMDCNT=1,
+    poll FPMON.FWE and FENTRYR==0x0001, service WDTA0/WDTA1, restore FLMDCNT=0, and report FACI diagnostics."""
+    import json
+    import time
+
+    from contitool.i18n import set_lang
+
+    set_lang("en")
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+    selfid = bytes.fromhex("112233445566778899AABBCCDDEEFF01")
+    mcu = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash, selfid=selfid)
+    assert mcu.hw527_flmd0_low is True
+    assert mcu.flmdcnt == 0
+    sim_bus = SimulatedJ533CanBus(mcu)
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: sim_bus)
+
+    # 1. If FLMD0 is physically held Low even with FLMDCNT=1, stub exits cleanly with marker=5 + faci_diag
+    mcu.flmd0_stuck_low = True
+    fail_dir = tmp_path / "s_flmd_stuck"
+    with pytest.raises(RuntimeError, match="marker=5.*FPMON=0x00.*FENTRYR=0x0000.*FPCKAR=0x0028"):
+        can_write_uflash("mock0", session_dir=fail_dir, skip_full_backup=True)
+    assert bytes(mcu.uflash) == synth_uflash
+    assert mcu.flmdcnt == 0
+    assert mcu.flmd_history == [1, 0]
+    saved_res = json.loads((fail_dir / "uflash_write_result.json").read_text(encoding="utf-8"))
+    assert saved_res["packets"][0]["faci_diag"] == {
+        "fpmon": 0x00,
+        "flmdps": 0x00,
+        "fastat": 0x00,
+        "fentryr": 0x0000,
+        "fpckar": 0x0028,
+    }
+
+    # 2. Normal HW 527 operation: FLMDCNT=1 pulls FLMD0 High (FPMON=0x80), Uflash writes & verifies cleanly
+    mcu.flmd0_stuck_low = False
+    mcu.flmd_history.clear()
+    mcu.wdta_kicks = {0xFFED0000: 0, 0xFFED1000: 0}
+    ok_dir = tmp_path / "s_hw527_ok"
+    rep = can_write_uflash("mock0", session_dir=ok_dir, skip_full_backup=True)
+    assert rep["complete"] is True
+    assert rep["marker"] == 1
+    assert mcu.flmdcnt == 0
+    assert mcu.flmd_history == [1, 0]
+    assert mcu.wdta_kicks[0xFFED0000] >= rep["pages_written"] + 2
+    assert mcu.wdta_kicks[0xFFED1000] >= rep["pages_written"] + 2
+
+    # 3. Wrong explicit FLID in CFLASH_FACI_STUB fails cleanly at P/E entry poll (marker=2) and restores FLMDCNT=0
+    mcu.flmd_history.clear()
+    bad_pkts = build_cflash_faci_block_payloads(
+        0x00A000,
+        bytes(mcu.cflash[0x00A000:0x00C000]),
+        flid_16b=b"\xee" * 16,
+    )
+    st_bad = mcu.execute_loader_payload(bad_pkts[0])
+    assert st_bad["marker"] == 2
+    assert mcu.flmdcnt == 0
+    assert mcu.flmd_history == [1, 0]

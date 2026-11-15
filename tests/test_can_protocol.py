@@ -42,9 +42,17 @@ def test_payload_digests_and_sa2_vectors() -> None:
 
 
 def test_uflash_one_shot_builder(synth_uflash: bytes) -> None:
+    from contitool.can import UFLASH_FACI_STUB
+
     payload, pages = build_uflash_one_shot_payload(synth_uflash)
     assert 1 <= pages <= 122
-    assert len(payload) == 436 + pages * 256
+    assert len(payload) == len(UFLASH_FACI_STUB) + pages * 256
+    max_uf = bytearray(synth_uflash)
+    max_uf[: 122 * 256] = b"\x55" * (122 * 256)
+    max_uf[122 * 256 :] = b"\xff" * (0x8000 - 122 * 256)
+    max_payload, max_pages = build_uflash_one_shot_payload(bytes(max_uf))
+    assert max_pages == 122
+    assert len(build_loader_packet(max_payload)) <= 0x7DB8 + 3
 
 
 class _MockGatewayBus:
