@@ -46,6 +46,7 @@ from contitool.core.fpke import (
     analyze_fpke_dflash,
     analyze_fpke_extra_area,
     build_fd11_proof,
+    is_fpke_dflash,
     validate_fpke_extra_area,
 )
 from contitool.i18n import tr
@@ -1592,6 +1593,105 @@ def fpke_read_region_in_session(
 # ────────────────────────────── High-Level Workflows ──────────────────────────────
 
 
+def _read_verified_extra_area(
+    link: FpkeCanLink,
+    *,
+    length: int = FPKE_EXTRA_SIZE,
+    label: str = "Extra Area",
+    attempts: int = 6,
+    retry_delay: float = 0.30,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> tuple[bytes, dict[str, Any]]:
+    """Read RH850 Extra Area (`0xFF300000`) with automatic retry across transient `R_EEL_Handler` DataFlash P/E windows.
+
+    While KL15 keepalive is active, the cluster's background `R_EEL_Handler` / `R_FDL_Handler` task periodically enters
+    RV40F DataFlash Program/Erase mode (`FENTRYD = 1`) for ~50–300 ms. During that window `0xFF300000` temporarily
+    aliases DataFlash (`0xFF200000` VB 0) instead of Extra Area, failing `validate_fpke_extra_area()`. Passive retry
+    lets `R_EEL_Handler` finish cleanly without touching FACI registers.
+    """
+    last_exc: RuntimeError | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        reporter.check_cancelled()
+        raw, meta = fpke_read_region_in_session(
+            link,
+            mode="bflash",
+            source=FPKE_EXTRA_ADDR,
+            length=length,
+            use_stream=False,
+            label=label,
+            reporter=reporter,
+        )
+        try:
+            if len(raw) >= 0x80:
+                validate_fpke_extra_area(raw)
+            if attempt > 1:
+                meta["eel_contention_retries"] = attempt - 1
+            return raw, meta
+        except RuntimeError as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            reporter.can_log(
+                tr(
+                    f"Фоновое обращение приборки к DataFlash (EEL) во время чтения Extra Area — повтор ({attempt}/{attempts - 1})…",
+                    f"Cluster background DataFlash (EEL) activity during Extra Area read — retrying ({attempt}/{attempts - 1})…",
+                )
+            )
+            end_wait = time.monotonic() + retry_delay
+            while time.monotonic() < end_wait:
+                reporter.check_cancelled()
+                time.sleep(min(0.05, max(0.01, end_wait - time.monotonic())))
+    assert last_exc is not None
+    raise RuntimeError(
+        tr(
+            f"Не удалось считать корректную область Extra Area (0xFF300000) после {attempts} попыток ({last_exc}). Повторите чтение.",
+            f"Failed to read valid Extra Area (0xFF300000) after {attempts} attempts ({last_exc}). Please retry.",
+        )
+    ) from last_exc
+
+
+def _read_verified_dflash(
+    link: FpkeCanLink,
+    *,
+    chunk_size: int = 500,
+    use_stream: bool = False,
+    label: str = "DataFlash",
+    attempts: int = 3,
+    retry_delay: float = 0.35,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> tuple[bytes, dict[str, Any]]:
+    """Read 64 KiB FPK_E DataFlash (`0xFF200000`), retrying if background `R_EEL_Handler` was mid-erase during the read."""
+    raw = b""
+    meta: dict[str, Any] = {}
+    for attempt in range(1, max(1, attempts) + 1):
+        reporter.check_cancelled()
+        raw, meta = fpke_read_region_in_session(
+            link,
+            mode="direct",
+            source=FPKE_DFLASH_ADDR,
+            length=FPKE_DFLASH_SIZE,
+            chunk_size=chunk_size,
+            use_stream=use_stream,
+            label=label,
+            reporter=reporter,
+        )
+        if is_fpke_dflash(raw) or attempt >= attempts:
+            if attempt > 1:
+                meta["eel_contention_retries"] = attempt - 1
+            return raw, meta
+        reporter.can_log(
+            tr(
+                f"Фоновое обновление пула EEL во время чтения DataFlash — повторное чтение ({attempt}/{attempts - 1})…",
+                f"Cluster background EEL pool update during DataFlash read — re-reading ({attempt}/{attempts - 1})…",
+            )
+        )
+        end_wait = time.monotonic() + retry_delay
+        while time.monotonic() < end_wait:
+            reporter.check_cancelled()
+            time.sleep(min(0.05, max(0.01, end_wait - time.monotonic())))
+    return raw, meta
+
+
 def can_fpke_full_read(
     port: str,
     *,
@@ -1657,32 +1757,30 @@ def can_fpke_full_read(
                 total_steps,
                 tr("Чтение конфигурации процессора и проверка IDCODE", "Reading MCU configuration & verifying IDCODE"),
             )
-            initial_extra, _ = fpke_read_region_in_session(
+            initial_extra, initial_extra_meta = _read_verified_extra_area(
                 link,
-                mode="bflash",
-                source=FPKE_EXTRA_ADDR,
-                length=FPKE_EXTRA_SIZE,
-                use_stream=False,
                 label="Extra Area (initial)",
                 reporter=reporter,
             )
-            validate_fpke_extra_area(initial_extra)
             candidate_idcode = bytes(initial_extra[0x50:0x60])
 
             idst_before = fpke_read_memory_0x23(link, IDST_ADDR, 4)
             idst_after = fpke_idauth(link, candidate_idcode)
             if idst_after != b"\x00\x00\x00\x00":
+                with contextlib.suppress(Exception):
+                    fpke_idauth(link, b"\x00" * 16)
                 raise RuntimeError(f"Hardware IDAUTH rejected candidate IDCODE: IDST={idst_after.hex()}")
-            extra_bytes, extra_read_meta = fpke_read_region_in_session(
-                link,
-                mode="bflash",
-                source=FPKE_EXTRA_ADDR,
-                length=FPKE_EXTRA_SIZE,
-                use_stream=False,
-                label="Extra Area",
-                reporter=reporter,
-            )
-            idst_relock = fpke_idauth(link, b"\x00" * 16)
+            try:
+                extra_bytes, extra_read_meta = _read_verified_extra_area(
+                    link,
+                    label="Extra Area",
+                    reporter=reporter,
+                )
+            except RuntimeError:
+                # `initial_extra` already passed structural validation and hardware IDAUTH accepted its IDCODE
+                extra_bytes, extra_read_meta = initial_extra, dict(initial_extra_meta, fallback_to_initial=True)
+            finally:
+                idst_relock = fpke_idauth(link, b"\x00" * 16)
             validate_fpke_extra_area(extra_bytes)
             atomic_write(extra_path, extra_bytes)
             extra_info = analyze_fpke_extra_area(extra_bytes)
@@ -1707,11 +1805,8 @@ def can_fpke_full_read(
                 total_steps,
                 tr("Чтение DataFlash (64 КБ)", "Reading DataFlash (64 KB)"),
             )
-            dflash_bytes, dflash_read_meta = fpke_read_region_in_session(
+            dflash_bytes, dflash_read_meta = _read_verified_dflash(
                 link,
-                mode="direct",
-                source=FPKE_DFLASH_ADDR,
-                length=FPKE_DFLASH_SIZE,
                 chunk_size=dflash_chunk,
                 use_stream=use_stream,
                 label="DataFlash",
@@ -1916,20 +2011,37 @@ def can_fpke_read_region(
                 idauth_meta = {"idst_before": idst_before.hex(), "idst_after_idcode": idst_after.hex()}
 
             reporter.step(2, 2, tr(f"Чтение памяти 0x{eff_source:08X} ({eff_length:,} Б)", f"Reading memory 0x{eff_source:08X} ({eff_length:,} B)"))
-            data, read_meta = fpke_read_region_in_session(
-                link,
-                mode=hw_mode,
-                source=eff_source,
-                length=eff_length,
-                chunk_size=chunk_size,
-                use_stream=use_stream and mode != "known-key",
-                label=mode.upper(),
-                reporter=reporter,
-            )
-
-            if idcode_bytes is not None and idauth_meta is not None:
-                idst_relock = fpke_idauth(link, b"\x00" * 16)
-                idauth_meta["idst_after_relock"] = idst_relock.hex()
+            try:
+                if eff_source == FPKE_EXTRA_ADDR and eff_length >= 0x80 and hw_mode == "bflash":
+                    data, read_meta = _read_verified_extra_area(
+                        link,
+                        length=eff_length,
+                        label=mode.upper(),
+                        reporter=reporter,
+                    )
+                elif eff_source == FPKE_DFLASH_ADDR and eff_length == FPKE_DFLASH_SIZE and hw_mode == "direct":
+                    data, read_meta = _read_verified_dflash(
+                        link,
+                        chunk_size=chunk_size,
+                        use_stream=use_stream and mode != "known-key",
+                        label=mode.upper(),
+                        reporter=reporter,
+                    )
+                else:
+                    data, read_meta = fpke_read_region_in_session(
+                        link,
+                        mode=hw_mode,
+                        source=eff_source,
+                        length=eff_length,
+                        chunk_size=chunk_size,
+                        use_stream=use_stream and mode != "known-key",
+                        label=mode.upper(),
+                        reporter=reporter,
+                    )
+            finally:
+                if idcode_bytes is not None and idauth_meta is not None:
+                    idst_relock = fpke_idauth(link, b"\x00" * 16)
+                    idauth_meta["idst_after_relock"] = idst_relock.hex()
 
             if eff_source == FPKE_EXTRA_ADDR and len(data) >= 0x80:
                 validate_fpke_extra_area(data)

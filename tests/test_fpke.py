@@ -1247,3 +1247,35 @@ def test_fpke_eel_append_field_editing_and_donor_transfer_workflow(tmp_path: Pat
     assert win.fpke_screen.write_bar.isHidden() is True
     assert win.fpke_screen.dflash_info["metadata"]["vin"] == "TARGETVIN00000002"
     win.close()
+
+
+def test_fpke_extra_area_retries_on_transient_eel_dflash_aliasing(tmp_path: Path) -> None:
+    class TransientEelContentionBus(FakeFpkeBus):
+        """Simulates RV40F hardware aliasing 0xFF300000 -> DataFlash VB 0 while R_EEL_Handler is in FENTRYD mode."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.extra_reads = 0
+
+        def _read_region_slice(self, addr: int, size: int) -> bytes:
+            if FPKE_EXTRA_ADDR <= addr < FPKE_EXTRA_ADDR + FPKE_EXTRA_SIZE:
+                self.extra_reads += 1
+                # Reproduce hardware trace 01-09-22: 1st read OK, 2nd & 3rd reads hit EEL FENTRYD (VB 0), 4th read OK
+                if self.extra_reads in (2, 3):
+                    return self.dflash[:size]
+            return super()._read_region_slice(addr, size)
+
+    bus = TransientEelContentionBus()
+    rep = can_fpke_full_read(
+        "fake",
+        session_dir=tmp_path / "eel_retry",
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        use_stream=True,
+        bus=bus,
+    )
+    assert bus.extra_reads == 4
+    assert rep["extra"]["eel_contention_retries"] == 2
+    assert rep["idauth"]["accepted"] is True
+    assert rep["idauth"]["idst_after_relock"] == "01000000"
+    assert (tmp_path / "eel_retry" / "ExtraArea.bin").read_bytes() == bus.extra
