@@ -27,6 +27,8 @@ contitool_runs/
 *.jsonl
 *.private.pem
 *_keypair.json
+*_immo_passport.json
+*_transfer_plan.json
 
 # OS files
 .DS_Store

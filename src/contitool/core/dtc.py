@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contitool.core.dtc_fpke import FPKE_DTCS
 from contitool.core.dtc_j533 import J533_DTCS
 from contitool.i18n import tr
 
@@ -19,6 +20,12 @@ _STATUS_WORDS = (
 _FAILED_ANY = 0x01 | 0x02 | 0x04 | 0x08 | 0x20
 
 
+def sae_code(code: int) -> str:
+    """Format a 24-bit UDS DTC as ISO 15031-6 / SAE J2012-DA (`P`/`C`/`B`/`U` + 6 hex digits)."""
+    prefix = "PCBU"[(code >> 22) & 0x03]
+    return f"{prefix}{(code >> 20) & 0x03}{(code >> 16) & 0x0F:X}{(code >> 8) & 0xFF:02X}{code & 0xFF:02X}"
+
+
 def describe(code: int) -> tuple[str, str]:
     """(ODIS display code, description). Codes outside the MQB gateway table get an empty display code."""
     hit = J533_DTCS.get(code)
@@ -26,6 +33,15 @@ def describe(code: int) -> tuple[str, str]:
         return "", tr("Нет описания для этого блока", "No description for this ECU")
     display, ru, en = hit
     return display, tr(ru, en)
+
+
+def describe_fpke(code: int) -> tuple[str, str]:
+    """(ODIS display code, description) for Continental MQB instrument clusters (FPK / Kombi)."""
+    hit = FPKE_DTCS.get(code)
+    if hit is None:
+        return sae_code(code), tr("Неизвестный код неисправности приборной панели", "Unknown cluster trouble code")
+    display, ru, en = hit
+    return display or sae_code(code), tr(ru, en)
 
 
 def group(status: int) -> str:

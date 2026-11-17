@@ -164,8 +164,8 @@ class StartScreen(QWidget):
         self.lbl_title.setText(tr("Открыть блок", "Open an ECU"))
         self.lbl_sub.setText(
             tr(
-                "Шлюз VAG MQB J533 — Continental 3Q0 907 530 (Renesas RH850/F1L)",
-                "VAG MQB J533 gateway — Continental 3Q0 907 530 (Renesas RH850/F1L)",
+                "Continental VAG MQB — шлюз J533 (3Q0 907 530) и приборная панель FPK_E",
+                "Continental VAG MQB — J533 gateway (3Q0 907 530) and FPK_E instrument cluster",
             )
         )
         self.lbl_can_eyebrow.setText(tr("ПОДКЛЮЧЕНИЕ ПО CAN (500 КБИТ/С)", "CAN CONNECTION (500 KBIT/S)"))
@@ -173,15 +173,15 @@ class StartScreen(QWidget):
         self.tile_can.set_text(
             tr("Блок на стенде или в авто", "ECU on bench or car"),
             tr(
-                "Полная копия памяти по CAN: CodeFlash, DataFlash, Uflash, внешняя EEPROM и OPBT. После чтения блок откроется сам.",
-                "Full memory backup over CAN: CodeFlash, DataFlash, Uflash, external EEPROM and OPBT. Opens once read.",
+                "Тип блока определяется по UDS автоматически. После чтения памяти блок откроется в рабочем окне.",
+                "The ECU type is detected over UDS automatically. Opens in its workspace once memory is read.",
             ),
         )
         self.tile_files.set_text(
             tr("Дампы на диске", "Dumps on disk"),
             tr(
-                "Папка с CodeFlash, DataFlash и Uflash или отдельные файлы. Папку или файлы .bin можно также перетащить прямо в окно.",
-                "A folder with CodeFlash, DataFlash and Uflash, or separate files. Drop a folder or .bin files anywhere in this window.",
+                "Папка с дампами блока или отдельные файлы .bin. Папку или файлы можно также перетащить прямо в окно.",
+                "A folder with ECU dumps or separate .bin files. Drop a folder or files anywhere in this window.",
             ),
         )
         self.btn_read.setText(tr("Считать блок", "Read the ECU"))
@@ -189,11 +189,16 @@ class StartScreen(QWidget):
         self.btn_restore.setToolTip(
             tr(
                 "Восстановить блок из ранее сохранённого бэкапа (в том числе если блок остался в загрузчике FBL)",
-                "Write a previously saved backup back into this ECU (including when stuck in FBL bootloader)",
+                "Write a previously saved backup back into the ECU (including when stuck in FBL bootloader)",
             )
         )
-        self.btn_wiring.setText(tr("Схема", "Wiring"))
-        self.btn_wiring.setToolTip(tr("Схема подключения к блоку на стенде", "ECU bench wiring diagram"))
+        self.btn_wiring.setText(tr("Справка", "Help"))
+        self.btn_wiring.setToolTip(
+            tr(
+                "Схемы подключения на стенде и справочная информация",
+                "Bench wiring diagrams and reference guide",
+            )
+        )
         self.btn_folder.setText(tr("Открыть папку…", "Open folder…"))
         self.btn_files.setText(tr("Выбрать файлы…", "Choose files…"))
         self.lbl_recent.setText(tr("НЕДАВНИЕ БЛОКИ", "RECENT ECUS"))

@@ -149,7 +149,7 @@ def test_builtin_terminator_hides_the_checkbox(monkeypatch) -> None:
 
     dlg.list.setCurrentRow(1)  # CANable: back to what the user confirmed themselves (nothing yet)
     assert dlg.chk_120ohm.isVisibleTo(dlg) and not dlg.chk_120ohm.isChecked() and not dlg.btn_ok.isEnabled()
-    assert "120 Ω resistor between Pin 19 CAN-H" in dlg.chk_120ohm.text()
+    assert "120 Ω resistor between CAN-H and CAN-L" in dlg.chk_120ohm.text()
     assert "only a reminder" in dlg.lbl_term_help.text()
 
     dlg.list.setCurrentRow(0)
@@ -189,7 +189,10 @@ def test_unverified_dpdu_driver_needs_an_explicit_go_ahead(monkeypatch) -> None:
 
 
 def test_dialog_keeps_its_size_and_never_scrolls_sideways(monkeypatch) -> None:
-    """Long texts wrap and the folder path is shortened: opening the wiring diagram scrolls down, nothing widens."""
+    """Long texts wrap and the folder path is shortened; Help button opens GuideDialog with both T20 and T18 diagrams."""
+    from contitool.gui.dialogs.guide import GuideDialog
+    from contitool.gui.widgets.pinout_card import KombiPinoutCard, PinoutCard
+
     set_lang("ru")
     app, win = create_window()
     monkeypatch.setattr(connection, "discover_adapters", lambda: FOUND)
@@ -198,11 +201,29 @@ def test_dialog_keeps_its_size_and_never_scrolls_sideways(monkeypatch) -> None:
     dlg.show()
     app.processEvents()
     size = dlg.size()
-    dlg._toggle_pinout(True)
+    dlg._toggle_manual(True)
     app.processEvents()
     assert dlg.size() == size
     assert dlg._scroll.widget().minimumSizeHint().width() <= dlg._scroll.viewport().width()
     assert dlg._scroll.widget().width() <= dlg._scroll.viewport().width()
+    assert dlg.btn_help.text() == "Справка"
+
+    opened_guides: list[GuideDialog] = []
+    monkeypatch.setattr(connection, "run_dialog", lambda gd: opened_guides.append(gd) or 0)
+    dlg.btn_help.click()
+    assert len(opened_guides) == 1
+    gd = opened_guides[0]
+    gd.show()
+    app.processEvents()
+    assert len(gd.findChildren(PinoutCard)) == 1
+    assert len(gd.findChildren(KombiPinoutCard)) == 1
+    assert gd._scroll.widget().minimumSizeHint().width() <= gd._scroll.viewport().width()
+    assert gd._scroll.widget().width() <= gd._scroll.viewport().width()
+    gd.btn_tab_kombi.click()
+    app.processEvents()
+    assert gd.pinout_stack.currentIndex() == 1
+    assert gd._scroll.widget().width() <= gd._scroll.viewport().width()
+    gd.close()
     dlg.close()
     win.close()
 

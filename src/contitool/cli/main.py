@@ -10,10 +10,14 @@ import traceback
 
 from contitool import __version__
 from contitool.can import (
-    can_identify,
+    FPKE_DEFAULT_FRAME_DELAY,
+    FPKE_NATIVE_INTERFACES,
     SUPPORTED_CAN_INTERFACES,
     can_backup,
+    can_fpke_full_read,
+    can_fpke_read_region,
     can_health_check,
+    can_identify,
     can_learn_mfl_button,
     can_read_eeprom,
     can_read_memory,
@@ -25,8 +29,9 @@ from contitool.can import (
     can_write_dflash,
     can_write_uflash,
     default_session_dir,
-    discover_serial_ports,
     discover_j2534,
+    discover_serial_ports,
+    verify_fpke_self_tests,
 )
 from contitool.cli.formatting import (
     CliProgressDisplay,
@@ -53,8 +58,16 @@ from contitool.core import (
     analyze_dflash_datasets,
     analyze_dflash_swap,
     analyze_eeprom,
+    analyze_fpke_dflash,
+    analyze_fpke_extra_area,
     analyze_opbt,
     analyze_uflash,
+    compare_fpke_immo_passports,
+    extract_fpke_immo_passport,
+    format_fpke_immo_comparison,
+    format_fpke_report,
+    format_fpke_transfer_plan,
+    plan_fpke_a_to_b_transfer,
     apply_cflash_patch,
     apply_cflash_rsa_modulus,
     apply_dflash_swap_fecs,
@@ -1041,6 +1054,169 @@ def cmd_can(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fpke(args: argparse.Namespace) -> int:
+    action = args.fpke_action
+    if action == "check":
+        verify_fpke_self_tests()
+        print(tr("✓ Все самопроверки модуля FPK_E (SW 83A, 83A920700E) пройдены успешно.", "✓ All FPK_E (SW 83A, 83A920700E) self-tests passed."))
+        return 0
+
+    if action == "inspect":
+        if not args.dflash and not args.extra:
+            raise ValueError(
+                tr(
+                    "Для fpke inspect укажите --dflash ПУТЬ_К_DFLASH.bin и/или --extra ПУТЬ_К_EXTRA.bin",
+                    "fpke inspect requires --dflash PATH_TO_DFLASH.bin and/or --extra PATH_TO_EXTRA.bin",
+                )
+            )
+        cf_bytes = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+        df_info = analyze_fpke_dflash(clean_user_path(args.dflash).read_bytes(), cf_bytes) if args.dflash else None
+        ex_info = analyze_fpke_extra_area(clean_user_path(args.extra).read_bytes()) if args.extra else None
+        print(format_fpke_report(dflash_info=df_info, extra_info=ex_info))
+        return 0
+
+    if action == "export-immo":
+        import json
+
+        if not args.dflash:
+            raise ValueError(tr("Для fpke export-immo укажите --dflash ПУТЬ_К_DFLASH.bin", "fpke export-immo requires --dflash PATH_TO_DFLASH.bin"))
+        cf_bytes = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+        passport = extract_fpke_immo_passport(clean_user_path(args.dflash).read_bytes(), cf_bytes)
+        payload = json.dumps(passport, ensure_ascii=False, indent=2) + "\n"
+        if args.output:
+            out_p = clean_user_path(args.output)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(payload, encoding="utf-8")
+            print(tr(f"✓ Immo-паспорт сохранён: {out_p}", f"✓ Immo passport saved: {out_p}"))
+        else:
+            print(payload, end="")
+        return 0
+
+    if action == "compare-immo":
+        import json
+
+        if not args.dflash or not args.dflash_b:
+            raise ValueError(
+                tr(
+                    "Для fpke compare-immo укажите --dflash ПУТЬ_A и --dflash-b ПУТЬ_B",
+                    "fpke compare-immo requires --dflash PATH_A and --dflash-b PATH_B",
+                )
+            )
+        p_a = clean_user_path(args.dflash)
+        p_b = clean_user_path(args.dflash_b)
+        cf_a = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+        cf_b = clean_user_path(args.cflash_b).read_bytes() if args.cflash_b else None
+        pass_a = json.loads(p_a.read_text(encoding="utf-8")) if p_a.suffix.lower() == ".json" else extract_fpke_immo_passport(p_a.read_bytes(), cf_a)
+        pass_b = json.loads(p_b.read_text(encoding="utf-8")) if p_b.suffix.lower() == ".json" else extract_fpke_immo_passport(p_b.read_bytes(), cf_b)
+        cmp_res = compare_fpke_immo_passports(pass_a, pass_b)
+        print(format_fpke_immo_comparison(cmp_res, pass_a, pass_b))
+        return 0 if cmp_res["semantic_match"] else 2
+
+    if action == "plan-transfer":
+        import json
+
+        if not args.dflash or not args.dflash_b:
+            raise ValueError(
+                tr(
+                    "Для fpke plan-transfer укажите --dflash ДОНОР_A.bin и --dflash-b РЕЦИПИЕНТ_B.bin",
+                    "fpke plan-transfer requires --dflash DONOR_A.bin and --dflash-b RECIPIENT_B.bin",
+                )
+            )
+        cf_a = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+        cf_b = clean_user_path(args.cflash_b).read_bytes() if args.cflash_b else None
+        plan = plan_fpke_a_to_b_transfer(
+            clean_user_path(args.dflash).read_bytes(),
+            clean_user_path(args.dflash_b).read_bytes(),
+            donor_cflash=cf_a,
+            recipient_cflash=cf_b,
+        )
+        print(format_fpke_transfer_plan(plan))
+        if args.output:
+            out_p = clean_user_path(args.output)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(tr(f"\n✓ План переноса сохранён: {out_p}", f"\n✓ Transfer plan saved: {out_p}"))
+        return 0
+
+    if not args.port:
+        raise ValueError(
+            tr(
+                "Укажите порт нативного CAN-адаптера через --port (список портов: contitool can ports)",
+                "Specify native CAN adapter port via --port (list available ports with: contitool can ports)",
+            )
+        )
+    if args.interface not in FPKE_NATIVE_INTERFACES:
+        raise ValueError(
+            tr(
+                f"Приборная панель FPK_E поддерживает только нативные CAN-адаптеры ({', '.join(FPKE_NATIVE_INTERFACES)}). "
+                f"Интерфейс «{args.interface}» не поддерживается.",
+                f"FPK_E instrument cluster only supports native CAN adapters ({', '.join(FPKE_NATIVE_INTERFACES)}). "
+                f"Interface “{args.interface}” is not supported.",
+            )
+        )
+
+    base_out = clean_user_path(args.output_dir) if args.output_dir else None
+    out_file = clean_user_path(args.output) if args.output else None
+    cf_bytes = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+    disp = _make_cli_display(args)
+    rep = disp.create_reporter()
+    try:
+        if args.mode == "report":
+            sdir = out_file.parent if out_file is not None else default_session_dir(base_out, "fpke_read")
+            res = can_fpke_full_read(
+                args.port,
+                interface=args.interface,
+                session_dir=sdir,
+                frame_delay=args.frame_delay,
+                wake_seconds=args.wake_seconds,
+                dflash_chunk=args.chunk,
+                use_stream=args.stream,
+                read_uflash=args.read_uflash,
+                read_bflash=args.read_bflash,
+                read_cflash=args.read_cflash,
+                cflash_bytes=cf_bytes,
+                reporter=rep,
+            )
+            print(
+                format_fpke_report(
+                    dflash_info=res.get("secrets"),
+                    extra_info=res.get("extra_area"),
+                    idauth_info=res.get("idauth"),
+                )
+            )
+            print(f"\n✓ Session: {res['session_dir']} | Report: {res['report_path']}")
+        else:
+            sdir = out_file.parent if out_file is not None else default_session_dir(base_out, f"fpke_{args.mode}")
+            res = can_fpke_read_region(
+                args.port,
+                mode=args.mode,
+                interface=args.interface,
+                source=args.source,
+                length=args.length,
+                chunk_size=args.chunk,
+                frame_delay=args.frame_delay,
+                wake_seconds=args.wake_seconds,
+                use_stream=args.stream,
+                idcode_hex=args.idcode,
+                fd11_key_hex=args.fd11_key,
+                output_path=out_file,
+                session_dir=sdir,
+                reporter=rep,
+            )
+            if "secrets" in res or "extra_analysis" in res:
+                print(
+                    format_fpke_report(
+                        dflash_info=res.get("secrets"),
+                        extra_info=res.get("extra_analysis"),
+                        idauth_info=res.get("idauth"),
+                    )
+                )
+            print(f"\n✓ Output: {res['output']} | Report: {res['report_path']}")
+    finally:
+        disp.finish()
+    return 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="contitool",
@@ -1297,6 +1473,49 @@ def build_arg_parser() -> argparse.ArgumentParser:
                 "Allow an unverified installed D-PDU driver version (it reflashes the VCI to its own version)"),
     )
     p_can.set_defaults(func=cmd_can)
+
+    p_fpke = _add(
+        "fpke",
+        tr(
+            "Работа с приборной панелью VAG / Audi FPK_E (Kombi, 83A920700E, RH850/D1L): чтение по нативному CAN и разбор EEL T01",
+            "VAG / Audi FPK_E (Kombi, 83A920700E, RH850/D1L) instrument cluster: native CAN reading & EEL T01 analysis",
+        ),
+    )
+    p_fpke.add_argument(
+        "fpke_action",
+        choices=("check", "inspect", "read", "export-immo", "compare-immo", "plan-transfer"),
+        help=tr(
+            "Действие: check, inspect, read, export-immo, compare-immo, plan-transfer",
+            "Action: check, inspect, read, export-immo, compare-immo, plan-transfer",
+        ),
+    )
+    p_fpke.add_argument("--port", help=tr("Порт нативного CAN-адаптера (CANable / SLCAN / candleLight)", "Native CAN adapter port (CANable / SLCAN / candleLight)"))
+    p_fpke.add_argument("--interface", choices=FPKE_NATIVE_INTERFACES, default="slcan")
+    p_fpke.add_argument(
+        "--mode",
+        choices=("report", "dflash", "cflash", "extra", "uflash", "bflash", "direct", "known-key"),
+        default="report",
+        help=tr("Режим чтения по CAN (по умолчанию report: Extra Area + IDAUTH + DFlash + секреты)", "CAN read mode (default report: Extra Area + IDAUTH + DFlash + secrets)"),
+    )
+    p_fpke.add_argument("--dflash", "--donor-dflash", dest="dflash", help=tr("Путь к Dflash.bin (64 КБ) / Донор A", "Path to Dflash.bin (64 KB) / Donor A"))
+    p_fpke.add_argument("--dflash-b", "--recipient-dflash", dest="dflash_b", help=tr("Второй дамп Dflash.bin / Реципиент B (для compare-immo / plan-transfer)", "Second Dflash.bin / Recipient B (for compare-immo / plan-transfer)"))
+    p_fpke.add_argument("--extra", help=tr("Путь к ExtraArea.bin (256 Б) для inspect", "Path to ExtraArea.bin (256 B) for inspect"))
+    p_fpke.add_argument("--cflash", "--donor-cflash", dest="cflash", help=tr("Опциональный путь к Cflash.bin (2 МБ) / Донор A", "Optional Cflash.bin (2 MB) / Donor A"))
+    p_fpke.add_argument("--cflash-b", "--recipient-cflash", dest="cflash_b", help=tr("Опциональный путь к Cflash.bin Реципиента B", "Optional Cflash.bin for Recipient B"))
+    p_fpke.add_argument("--source", type=lambda x: int(x, 0), help=tr("Переопределить адрес чтения (напр. 0xFF200000)", "Override source address (e.g. 0xFF200000)"))
+    p_fpke.add_argument("--length", type=lambda x: int(x, 0), help=tr("Переопределить длину чтения в байтах", "Override read length in bytes"))
+    p_fpke.add_argument("--chunk", type=lambda x: int(x, 0), default=500, help=tr("Размер блока UDS 0x23 (1..500, по умолчанию 500)", "UDS 0x23 chunk size (1..500, default 500)"))
+    p_fpke.add_argument("--frame-delay", type=float, default=FPKE_DEFAULT_FRAME_DELAY, help=tr("Пауза между кадрами потока (с, по умолчанию 0.00035)", "Inter-frame delay for block stream (s, default 0.00035)"))
+    p_fpke.add_argument("--wake-seconds", type=float, default=4.0, help=tr("Время пробуждения приборки CAN-посылками (по умолчанию 4.0 с)", "CAN keepalive wake duration (default 4.0 s)"))
+    p_fpke.add_argument("--stream", action="store_true", help=tr("Использовать быстрый поток RSCAN0 TM17 (0x6F1) с авто-откатом на UDS 0x23", "Use fast RSCAN0 TM17 (0x6F1) stream with auto-fallback to UDS 0x23"))
+    p_fpke.add_argument("--read-uflash", action="store_true", help=tr("В режиме report также считать UFlash (32 КБ)", "Also read UFlash (32 KB) in report mode"))
+    p_fpke.add_argument("--read-bflash", action="store_true", help=tr("В режиме report также считать BFlash (96 КБ)", "Also read BFlash (96 KB) in report mode"))
+    p_fpke.add_argument("--read-cflash", action="store_true", help=tr("В режиме report также считать CodeFlash (2 МБ)", "Also read CodeFlash (2 MB) in report mode"))
+    p_fpke.add_argument("--idcode", help=tr("Опциональный 16-байтный IDCODE (32 hex) для проверки IDAUTH", "Optional 16-byte IDCODE (32 hex) for IDAUTH verification"))
+    p_fpke.add_argument("--fd11-key", help=tr("Известный 16-байтный ключ FD11 (32 hex) для режима known-key", "Known 16-byte FD11 key (32 hex) for known-key mode"))
+    p_fpke.add_argument("-o", "--output", help=tr("Путь к выходному файлу .bin", "Output .bin file path"))
+    p_fpke.add_argument("--output-dir", help=tr("Папка для сохранения сессии", "Base output directory for session"))
+    p_fpke.set_defaults(func=cmd_fpke)
 
     return ap
 

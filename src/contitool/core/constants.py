@@ -162,6 +162,14 @@ T20_BENCH_PINS: tuple[tuple[int, str, str, str], ...] = (
     (9, "Diag CAN-L", "Диагностическая шина CAN Low (500 кбит/с): включён терминатор или резистор 120 Ом к Pin 19!", "Diagnosis CAN Low (500 kbit/s): terminator on or a 120 Ω resistor to Pin 19!"),
 )
 
+# T18 18-pin MQB Kombi / FPK_E (J285) bench connector wiring reference
+T18_KOMBI_BENCH_PINS: tuple[tuple[int, str, str, str], ...] = (
+    (1, "KL30 (+12V)", "Постоянное питание +12 В (аккумулятор / ЛБП; пробуждение по CAN)", "Permanent +12V battery / bench PSU (wake-up over CAN)"),
+    (10, "KL31 (GND)", "Масса (минус блока питания и GND CAN-адаптера)", "Ground (PSU minus & CAN adapter GND)"),
+    (18, "CAN-H", "Шина CAN приборной панели High (500 кбит/с)", "Instrument cluster CAN High (500 kbit/s)"),
+    (17, "CAN-L", "Шина CAN приборной панели Low (500 кбит/с): терминатор или резистор 120 Ом к Pin 18!", "Instrument cluster CAN Low (500 kbit/s): terminator on or a 120 Ω resistor to Pin 18!"),
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class SlotSpec:

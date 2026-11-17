@@ -27,7 +27,6 @@ from contitool.can import SUPPORTED_CAN_INTERFACES, FoundAdapter, can_identify, 
 from contitool.can import dpdu
 from contitool.gui.theme import set_tone
 from contitool.gui.widgets.page import Dialog, button, group_label, hint, row, run_dialog
-from contitool.gui.widgets.pinout_card import PinoutCard
 from contitool.gui.worker import OperationWorker
 from contitool.i18n import tr
 from contitool.report import Failure
@@ -106,7 +105,7 @@ def _let_finish(worker: OperationWorker | None) -> None:
     worker.finished.connect(lambda w=worker: (_ORPHANS.discard(w), w.deleteLater()))
 
 
-DIALOG_SIZE = (720, 760)  # the dialog keeps it; texts come and go with the adapter, the body scrolls
+DIALOG_SIZE = (720, 560)  # the dialog keeps it; texts come and go with the adapter, the body scrolls
 
 
 def _link(text: str, slot: Any) -> Any:
@@ -185,8 +184,8 @@ class ConnectionDialog(Dialog):
             parent,
             tr("Подключение к блоку", "ECU connection"),
             tr(
-                "Шлюз на стенде подключается к адаптеру по шине Diagnosis CAN (500 кбит/с) через разъём T20.",
-                "The bench gateway talks to the adapter over Diagnosis CAN (500 kbit/s) via the T20 connector.",
+                "Блок на стенде подключается к адаптеру по шине CAN (500 кбит/с).",
+                "The bench ECU connects to the adapter over CAN (500 kbit/s).",
             ),
             width=DIALOG_SIZE[0],
         )
@@ -235,11 +234,11 @@ class ConnectionDialog(Dialog):
         self.body.addWidget(self.chk_120ohm)
         self.lbl_term_help = hint(tr(
             "На каждом конце шины CAN нужен резистор 120 Ом: без него сигнал отражается и кадры теряются. На "
-            "столе шина состоит только из шлюза и адаптера, поэтому включите терминатор в адаптере (обычно "
+            "столе шина состоит только из блока и адаптера, поэтому включите терминатор в адаптере (обычно "
             "это перемычка или переключатель) или поставьте резистор 120 Ом между CAN-H и "
             "CAN-L.<br><b>Галочка — только напоминание: ContiTool ничего не измеряет.</b>",
             "Each end of a CAN bus needs a 120 Ω resistor: without it the signal reflects and frames get "
-            "lost. On the bench the bus is just the gateway and the adapter, so switch on the adapter's "
+            "lost. On the bench the bus is just the ECU and the adapter, so switch on the adapter's "
             "terminator (usually a jumper or a switch) or fit a 120 Ω resistor between CAN-H and "
             "CAN-L.<br><b>The checkbox is only a reminder: ContiTool measures nothing.</b>",
         ))
@@ -258,11 +257,14 @@ class ConnectionDialog(Dialog):
             "<b>Close ODIS and VCTool.</b> They must stay closed while ContiTool is working.",
         ))
         self.body.addWidget(self.lbl_vnci)
-        self.btn_pinout = _link("", self._toggle_pinout)
-        self.body.addLayout(row(self.btn_pinout))
-        self.pinout_card = PinoutCard(stacked=True)
-        self.pinout_card.setVisible(False)
-        self.body.addWidget(self.pinout_card)
+        self.btn_help = _link(tr("Справка", "Help"), self._open_help)
+        self.btn_help.setToolTip(
+            tr(
+                "Открыть справку со схемами подключения к разъёму T20 шлюза J533 и к разъёму T18 приборной панели Kombi",
+                "Open help with bench wiring diagrams for the J533 gateway (T20) and Kombi cluster (T18)",
+            )
+        )
+        self.body.addLayout(row(self.btn_help))
 
         self.out_dir = conn.out_dir
         self.lbl_outdir = PathLabel()
@@ -276,12 +278,10 @@ class ConnectionDialog(Dialog):
 
         self.btn_ok = button(tr("Готово", "Done"), "PrimaryBtn", slot=self._save)
         self.finish(ok=self.btn_ok)
-        # One size that holds the opened wiring diagram: what is taller scrolls, nothing is ever wider.
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.resize(*DIALOG_SIZE)
         self._fit_screen()
 
-        self._toggle_pinout(False)
         self._toggle_manual(self._manual_open)
         self.refresh()
 
@@ -364,10 +364,10 @@ class ConnectionDialog(Dialog):
         self.btn_manual.setText(tr("Нет в списке? Указать вручную ", "Not listed? Enter manually ") + ("▾" if show else "▸"))
         self._sync()
 
-    def _toggle_pinout(self, show: bool | None = None) -> None:
-        show = self.pinout_card.isHidden() if show is None else show
-        self.pinout_card.setVisible(show)
-        self.btn_pinout.setText(tr("Схема подключения T20 ", "T20 wiring diagram ") + ("▾" if show else "▸"))
+    def _open_help(self) -> None:
+        from contitool.gui.dialogs.guide import GuideDialog
+
+        run_dialog(GuideDialog(self))
 
     def _unverified_driver(self) -> str | None:
         """Version of the picked D-PDU driver when it needs the user's go-ahead, else None."""
@@ -396,9 +396,9 @@ class ConnectionDialog(Dialog):
         iface, port, _title = self.selection()
         builtin = iface in BUILTIN_TERMINATION  # VAS 6154 / VNCI and J2534 terminate the bus themselves: nothing to ask
         self.chk_120ohm.setText(tr(
-            "Терминатор CAN включён (в адаптере или резистор 120 Ом между Pin 19 CAN-H и Pin 9 CAN-L), "
+            "Терминатор CAN включён (в адаптере или резистор 120 Ом между CAN-H и CAN-L), "
             "питание +12 В стабильное",
-            "CAN termination is on (in the adapter or a 120 Ω resistor between Pin 19 CAN-H and Pin 9 CAN-L),"
+            "CAN termination is on (in the adapter or a 120 Ω resistor between CAN-H and CAN-L),"
             " +12 V supply is stable",
         ))
         self.chk_120ohm.setVisible(not builtin)

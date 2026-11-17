@@ -146,11 +146,18 @@ class _Style(QProxyStyle):
             self._draw_radio(option, painter)
             return
         if element == QStyle.PrimitiveElement.PE_IndicatorArrowDown and isinstance(widget, QComboBox):
-            c = QRectF(option.rect).center()
+            r = QRectF(option.rect)
+            c = QPointF(r.center().x() - 2.0, r.center().y())
             painter.save()
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setPen(QPen(QColor(TEXT_SECONDARY), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawPolyline([QPointF(c.x() - 3.8, c.y() - 1.8), QPointF(c.x(), c.y() + 2.0), QPointF(c.x() + 3.8, c.y() - 1.8)])
+            if widget.isEditable():
+                painter.setPen(QPen(QColor("#2F3440"), 1.0))
+                painter.drawLine(QPointF(r.left() - 3.0, r.top() - 2.0), QPointF(r.left() - 3.0, r.bottom() + 2.0))
+            col = TEXT if (widget.isEnabled() and widget.underMouse()) else (TEXT_SECONDARY if widget.isEnabled() else TEXT_MUTED)
+            painter.setPen(
+                QPen(QColor(col), 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            )
+            painter.drawPolyline([QPointF(c.x() - 4.0, c.y() - 1.8), QPointF(c.x(), c.y() + 2.2), QPointF(c.x() + 4.0, c.y() - 1.8)])
             painter.restore()
             return
         if element not in self._CHECKS:
@@ -180,6 +187,30 @@ class _Style(QProxyStyle):
                 [QPointF(x + s * 0.24, y + s * 0.52), QPointF(x + s * 0.43, y + s * 0.70), QPointF(x + s * 0.76, y + s * 0.32)]
             )
         painter.restore()
+
+    def drawComplexControl(self, control, option, painter, widget=None) -> None:  # noqa: N802 (Qt override)
+        super().drawComplexControl(control, option, painter, widget)
+        if control == QStyle.ComplexControl.CC_ComboBox and isinstance(widget, QComboBox):
+            r = QRectF(widget.rect())
+            dd_w = 28.0
+            dd_rect = QRectF(r.right() - dd_w, r.top() + 1.0, dd_w - 1.0, r.height() - 2.0)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            if widget.isEditable():
+                path = QPainterPath()
+                path.addRoundedRect(dd_rect.adjusted(0.0, 1.0, -1.0, -1.0), 5.0, 5.0)
+                painter.fillPath(path, QColor(BG_CONTROL if widget.isEnabled() else BG_INPUT))
+                painter.setPen(QPen(QColor("#2F3440"), 1.0))
+                painter.drawLine(QPointF(dd_rect.left(), r.top() + 4.0), QPointF(dd_rect.left(), r.bottom() - 4.0))
+            c = dd_rect.center()
+            col = TEXT if (widget.isEnabled() and widget.underMouse()) else (TEXT_SECONDARY if widget.isEnabled() else TEXT_MUTED)
+            painter.setPen(
+                QPen(QColor(col), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            )
+            painter.drawPolyline(
+                [QPointF(c.x() - 4.2, c.y() - 1.8), QPointF(c.x(), c.y() + 2.4), QPointF(c.x() + 4.2, c.y() - 1.8)]
+            )
+            painter.restore()
 
     @staticmethod
     def _draw_radio(option, painter) -> None:  # noqa: ANN001 (Qt option types)
@@ -597,9 +628,22 @@ def build_stylesheet() -> str:
 
     QPushButton#Chip {{
         background-color: #1A1C22; border: 1px solid #2A2E38; border-radius: 6px;
-        padding: 4px 11px; min-height: 18px; color: {TEXT_SECONDARY}; font-size: 12px;
+        padding: 3px 10px; min-height: 17px; color: {TEXT_SECONDARY}; font-size: 12px;
     }}
     QPushButton#Chip:hover {{ background-color: #22252D; border-color: #3A3F4D; color: {TEXT}; }}
+    QPushButton#Chip:checked {{
+        background-color: #1B273D; border-color: #3B6FD4; color: #90B8FF; font-weight: bold;
+    }}
+    QFrame#ProcDeck QPushButton {{
+        padding: 4px 11px;
+        min-height: 18px;
+        font-size: 12px;
+    }}
+    QFrame#DpadWell QPushButton {{
+        padding: 3px 8px;
+        min-height: 17px;
+        font-size: 12px;
+    }}
 
     QPushButton#TabBtn {{
         background: transparent; border: 1px solid transparent; border-radius: 5px;
@@ -638,7 +682,25 @@ def build_stylesheet() -> str:
     QLineEdit[tone="err"] {{ border-color: {ERR}; }}
     QLineEdit[drag="true"] {{ border: 1px dashed {ACCENT_HOVER}; background-color: #161E2E; }}
     QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{ color: {TEXT_MUTED}; border-color: {BORDER_SUBTLE}; }}
-    QComboBox::drop-down {{ border: none; width: 24px; }}
+    QLineEdit QToolButton, QLineEdit QToolButton:hover, QLineEdit QToolButton:pressed {{
+        background: transparent;
+        border: none;
+        border-radius: 0px;
+        padding: 0px;
+        margin: 0px;
+        min-height: 0px;
+        min-width: 0px;
+    }}
+    QComboBox QLineEdit, QComboBox QLineEdit:hover, QComboBox QLineEdit:focus {{
+        background: transparent;
+        border: none;
+        border-radius: 0px;
+        padding: 0px 4px 0px 0px;
+        margin: 0px;
+        min-height: 0px;
+    }}
+    QComboBox {{ padding-right: 26px; }}
+    QComboBox:editable {{ padding-right: 26px; }}
     QComboBox QAbstractItemView {{
         background-color: {BG_SECTION}; border: 1px solid {BORDER_STRONG}; border-radius: 7px; padding: 4px;
         selection-background-color: {ACCENT}; selection-color: #FFFFFF; outline: 0;
@@ -646,6 +708,47 @@ def build_stylesheet() -> str:
     QComboBox QAbstractItemView::item {{ min-height: 24px; padding: 3px 8px; border-radius: 4px; }}
     QCheckBox, QRadioButton {{ spacing: 8px; color: {TEXT}; background: transparent; min-height: 20px; }}
     QCheckBox:disabled, QRadioButton:disabled {{ color: {TEXT_MUTED}; }}
+
+    /* ── Sliders & Bench Readout Surfaces ── */
+    QSlider::groove:horizontal {{
+        background-color: #262A33;
+        height: 4px;
+        border-radius: 2px;
+    }}
+    QSlider::sub-page:horizontal {{
+        background-color: {ACCENT_HOVER};
+        height: 4px;
+        border-radius: 2px;
+    }}
+    QSlider::sub-page:horizontal:disabled {{
+        background-color: #363C4A;
+    }}
+    QSlider::handle:horizontal {{
+        background-color: #F1F3F5;
+        border: 2px solid {ACCENT_HOVER};
+        width: 12px;
+        height: 12px;
+        margin: -5px 0;
+        border-radius: 7px;
+    }}
+    QSlider::handle:horizontal:hover {{
+        background-color: #FFFFFF;
+        border-color: #6EA5FA;
+    }}
+    QSlider::handle:horizontal:disabled {{
+        background-color: #686E7A;
+        border-color: #3E4350;
+    }}
+    QFrame#ResultStrip {{
+        background-color: {BG_INPUT};
+        border: 1px solid #252830;
+        border-radius: 6px;
+    }}
+    QFrame#DpadWell {{
+        background-color: #15171C;
+        border: 1px solid #262A33;
+        border-radius: 8px;
+    }}
 
     /* ── Tabs ── */
     QTabWidget::pane {{

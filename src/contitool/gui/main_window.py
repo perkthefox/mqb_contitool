@@ -29,8 +29,10 @@ from contitool.can import (
     can_backup,
     can_cure_fbl_fingerprint,
     can_flash_frf,
+    can_fpke_full_read,
     can_identify,
     can_restore_backup,
+    close_active_fpke_link,
     unsupported_ecu_reason,
 )
 from contitool.cli.formatting import (
@@ -55,11 +57,13 @@ from contitool.core import (
     analyze_opbt,
     analyze_uflash,
 )
+from contitool.core.fpke import detect_fpke_files, is_fpke_ident
 from contitool.gui.connection import CanConnection, ConnectionDialog, ensure_ready
 from contitool.gui.dialogs.guide import GuideDialog
 from contitool.gui.dialogs.problem_report import ProblemReportDialog
 from contitool.gui.dialogs.restore import RestoreDialog
 from contitool.gui.screens.ecu import EcuScreen
+from contitool.gui.screens.fpke import FpkeScreen
 from contitool.gui.screens.start import StartScreen
 from contitool.gui.screens.terminal import TerminalScreen
 from contitool.gui import theme
@@ -105,25 +109,30 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.start_screen = StartScreen()
         self.ecu_screen = EcuScreen(self.ws, self.conn, self.runner)
+        self.fpke_screen = FpkeScreen(self.conn, self.runner)
         self.stack.addWidget(self.start_screen)
         self.stack.addWidget(self.ecu_screen)
+        self.stack.addWidget(self.fpke_screen)
 
         self.start_screen.read_can_requested.connect(self.read_over_can)
         self.start_screen.restore_requested.connect(self.restore_backup)
         self.start_screen.open_folder_requested.connect(self.open_folder)
         self.start_screen.open_files_requested.connect(self.open_files)
         self.start_screen.files_dropped.connect(self._load_paths)
-        self.start_screen.wiring_requested.connect(self.show_connection)
+        self.start_screen.wiring_requested.connect(self.show_guide)
         self.ecu_screen.report_requested.connect(self.show_report)
         self.ecu_screen.close_requested.connect(self.close_ecu)
         self.ecu_screen.restore_requested.connect(self.restore_backup)
         self.ecu_screen.terminal_requested.connect(self._open_in_terminal)
+        self.fpke_screen.close_requested.connect(self.close_ecu)
 
         self.console = ExecutionPanel(self.runner)
         self.console.setMinimumHeight(120)
         self.console.setVisible(False)
         self.ecu_screen.note.connect(self.console.note)
         self.ecu_screen.note.connect(lambda _m: self._ensure_console_visible())
+        self.fpke_screen.note.connect(self.console.note)
+        self.fpke_screen.note.connect(lambda _m: self._ensure_console_visible())
         self.splitter.addWidget(self.stack)
         self.splitter.addWidget(self.console)
         self.splitter.setStretchFactor(0, 1)
@@ -141,6 +150,8 @@ class MainWindow(QMainWindow):
 
         self.ws.changed.connect(self._refresh_header)
         self.ws.changed.connect(self._refresh_screen)
+        self.fpke_screen.changed.connect(self._refresh_header)
+        self.fpke_screen.changed.connect(self._refresh_screen)
         self.conn.changed.connect(self._refresh_header)
         self.console.btn_toggle_log.toggled.connect(self._set_console_visible)
         self.console.btn_hide.clicked.connect(lambda: self._set_console_visible(False))
@@ -228,7 +239,7 @@ class MainWindow(QMainWindow):
         self.act_read = act(self.read_over_can, "Ctrl+R")
         self.act_folder = act(self.open_folder, QKeySequence.StandardKey.Open)
         self.act_files = act(self.open_files, "Ctrl+Shift+O")
-        self.act_export = act(lambda: self.ecu_screen.export_backup())
+        self.act_export = act(lambda: self.fpke_screen.export_backup() if self.fpke_screen.is_open else self.ecu_screen.export_backup())
         self.act_restore = act(self.restore_backup)
         self.act_frf = act(lambda: self.flash_frf())
         self.act_report = act(self.show_report, "Ctrl+I")
@@ -264,12 +275,19 @@ class MainWindow(QMainWindow):
         self.menu_help.addAction(self.act_about)
 
     def _refresh_header(self) -> None:
-        open_ = self.ws.is_open
-        self.tab_ecu.setText(tr("Блок", "ECU") + (f" {self.ws.part_number}" if open_ and self.ws.part_number else ""))
-        self.tab_term.setText(tr("CAN-терминал", "CAN terminal"))
-        self.act_report.setEnabled(open_)
-        self.act_export.setEnabled(open_)
-        self.act_close.setEnabled(open_)
+        if self.fpke_screen.is_open:
+            self.tab_ecu.setText(tr("Блок", "ECU") + f" {self.fpke_screen.part_number}")
+            self.tab_term.setText(tr("CAN-терминал", "CAN terminal"))
+            self.act_report.setEnabled(True)
+            self.act_export.setEnabled(bool(self.fpke_screen.files))
+            self.act_close.setEnabled(True)
+        else:
+            open_ = self.ws.is_open
+            self.tab_ecu.setText(tr("Блок", "ECU") + (f" {self.ws.part_number}" if open_ and self.ws.part_number else ""))
+            self.tab_term.setText(tr("CAN-терминал", "CAN terminal"))
+            self.act_report.setEnabled(open_)
+            self.act_export.setEnabled(open_)
+            self.act_close.setEnabled(open_)
         if self.conn.port or self.conn.title:
             self.btn_conn.setText(self.conn.display())
             self.btn_conn.setIcon(dot_icon(theme.OK if self.conn.ready else theme.WARN, 6))
@@ -288,6 +306,8 @@ class MainWindow(QMainWindow):
         term = mode == "terminal" and not self.runner.is_busy
         if not term:
             self.terminal.disconnect_bus()
+        elif self.fpke_screen.is_open:
+            self.terminal.set_target_ecu("fpke")
         self.modes.setCurrentWidget(self.terminal if term else self.splitter)
         (self.tab_term if term else self.tab_ecu).setChecked(True)
         self.console.status_divider.setVisible(not term)
@@ -305,8 +325,12 @@ class MainWindow(QMainWindow):
         self.tab_term.setToolTip(tr("Недоступно, пока идёт операция", "Unavailable while an operation runs") if busy else "")
 
     def _refresh_screen(self) -> None:
-        self.stack.setCurrentWidget(self.ecu_screen if self.ws.is_open else self.start_screen)
-        if not self.ws.is_open:
+        if self.fpke_screen.is_open:
+            self.stack.setCurrentWidget(self.fpke_screen)
+        elif self.ws.is_open:
+            self.stack.setCurrentWidget(self.ecu_screen)
+        else:
+            self.stack.setCurrentWidget(self.start_screen)
             self.start_screen.refresh_recent()
 
     def _set_console_visible(self, show: bool) -> None:
@@ -331,7 +355,19 @@ class MainWindow(QMainWindow):
             self, tr("Папка с дампами блока", "Folder with the ECU dumps"), str(Path.cwd())
         )
         if chosen:
-            self._report_missing(self.ws.open_folder(Path(chosen)), Path(chosen))
+            folder_path = Path(chosen)
+            fpke_files = detect_fpke_files([folder_path])
+            if fpke_files:
+                if self.ws.is_open:
+                    self.ws.close()
+                self.fpke_screen.open_from_files(fpke_files, folder=folder_path, source="disk")
+                self._refresh_header()
+                self._refresh_screen()
+                return
+            missing = self.ws.open_folder(folder_path)
+            if self.ws.is_open and self.fpke_screen.is_open:
+                self.fpke_screen.close_kombi()
+            self._report_missing(missing, folder_path)
 
     def open_files(self) -> None:
         self.set_mode("ecu")
@@ -348,22 +384,34 @@ class MainWindow(QMainWindow):
         if len(paths) == 1 and paths[0].is_dir():
             self.open_folder(str(paths[0]))
             return
-        rejected = self.ws.open_files([p for p in paths if p.is_file()])
-        if not self.ws.is_open:
-            QMessageBox.warning(
-                self,
-                tr("Это не дампы шлюза", "Not gateway dumps"),
-                tr(
-                    "Ни один файл не опознан как CodeFlash, DataFlash, Uflash, EEPROM или OPBT этого шлюза.",
-                    "None of the files is a CodeFlash, DataFlash, Uflash, EEPROM or OPBT dump of this gateway.",
-                ),
-            )
-        elif rejected:
-            QMessageBox.information(
-                self,
-                tr("Часть файлов пропущена", "Some files were skipped"),
-                tr(f"Не опознаны: {', '.join(rejected)}", f"Not recognised: {', '.join(rejected)}"),
-            )
+        file_list = [p for p in paths if p.is_file()]
+        fpke_files = detect_fpke_files(file_list)
+        if fpke_files:
+            if self.ws.is_open:
+                self.ws.close()
+            self.fpke_screen.open_from_files(fpke_files, folder=file_list[0].parent if file_list else None, source="disk")
+            self._refresh_header()
+            self._refresh_screen()
+            return
+        rejected = self.ws.open_files(file_list)
+        if self.ws.is_open:
+            if self.fpke_screen.is_open:
+                self.fpke_screen.close_kombi()
+            if rejected:
+                QMessageBox.information(
+                    self,
+                    tr("Часть файлов пропущена", "Some files were skipped"),
+                    tr(f"Не опознаны: {', '.join(rejected)}", f"Not recognised: {', '.join(rejected)}"),
+                )
+            return
+        QMessageBox.warning(
+            self,
+            tr("Это не дампы шлюза", "Not gateway dumps"),
+            tr(
+                "Ни один файл не опознан как CodeFlash, DataFlash, Uflash, EEPROM или OPBT этого шлюза.",
+                "None of the files is a CodeFlash, DataFlash, Uflash, EEPROM or OPBT dump of this gateway.",
+            ),
+        )
 
     def _report_missing(self, missing: list[str], folder: Path) -> None:
         if not self.ws.is_open:
@@ -399,12 +447,50 @@ class MainWindow(QMainWindow):
         )
 
     def _confirm_read(self, ident: dict[str, Any]) -> None:
+        is_kombi = ident.get("ecu_kind") == "fpke" or is_fpke_ident(ident.get("ident") or [])
         dlg = EcuFoundDialog(ident, self.conn, self)
         if run_dialog(dlg) and not dlg.unsupported:
             if dlg.restore_chosen:
                 self.restore_backup()
+            elif is_kombi:
+                self._read_fpke_over_can(ident)
             else:
                 self._backup_over_can(ident)
+
+    def _read_fpke_over_can(self, ident: dict[str, Any]) -> None:
+        """Read Kombi FPK_E Extra Area + IDAUTH + DataFlash 64 KB over CAN, then open the dedicated Kombi screen."""
+        port, iface = self.conn.port, self.conn.interface
+        ident_list = list(ident.get("ident") or [])
+        sdir = new_session(self.conn.out_dir, unit_of_ident(ident_list), "fpke_read", dumps=True)
+
+        def task(rep: Any) -> dict[str, Any]:
+            res = can_fpke_full_read(
+                port,
+                interface=iface,
+                session_dir=sdir,
+                ident=ident_list,
+                keep_open=True,
+                reporter=rep,
+            )
+            res["session_dir"] = str(keep_as_base(sdir))
+            return res
+
+        def done(res: dict[str, Any]) -> None:
+            folder = Path(str(res.get("session_dir", sdir)))
+            detected = detect_fpke_files([folder])
+            if self.ws.is_open:
+                self.ws.close()
+            self.fpke_screen.ident_items = ident_list
+            self.fpke_screen.idauth_info = res.get("idauth")
+            self.fpke_screen.open_from_files(detected, folder=folder, source="can")
+            self._refresh_header()
+            self._refresh_screen()
+
+        self.runner.run_task(
+            tr("Чтение памяти блока", "Reading the ECU memory"),
+            task,
+            on_success=done,
+        )
 
     def _backup_over_can(self, ident: dict[str, Any]) -> None:
         """Into the gateway's own dumps/ folder; its first complete read becomes its base_read (storage.py)."""
@@ -469,6 +555,9 @@ class MainWindow(QMainWindow):
         )
 
     def close_ecu(self) -> None:
+        if self.fpke_screen.is_open:
+            self.fpke_screen.close_kombi()
+            return
         if not self.ws.is_open:
             return
         pending = [k for k in ("cflash", "dflash", "uflash") if self.ws.pending(k)]
@@ -659,6 +748,9 @@ class MainWindow(QMainWindow):
 
     def show_report(self) -> None:
         """Full offline analysis of every loaded dump, as plain text."""
+        if self.fpke_screen.is_open:
+            self.fpke_screen.show_report()
+            return
         if not self.ws.is_open:
             return
         plain = Style(False)
@@ -753,6 +845,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._unsub()
+        close_active_fpke_link()
         self.terminal.disconnect_bus()
         for session in list(self.terminal._closing):  # a QThread destroyed while running aborts the process
             session.wait()
@@ -763,15 +856,23 @@ class EcuFoundDialog(Dialog):
     """The ECU that answered on CAN, before its memory is read."""
 
     def __init__(self, ident: dict[str, Any], conn: CanConnection, parent: QWidget | None = None) -> None:
+        is_kombi = ident.get("ecu_kind") == "fpke" or is_fpke_ident(ident.get("ident") or [])
         unsupported = str(ident.get("unsupported") or unsupported_ecu_reason(ident.get("ident", [])) or "")
-        in_fbl = bool(ident.get("in_fbl")) and not unsupported
+        in_fbl = bool(ident.get("in_fbl")) and not unsupported and not is_kombi
         self.unsupported = unsupported
         self.restore_chosen = False
         if unsupported:
             title = tr("Блок не поддерживается", "Unsupported ECU")
-            subtitle = tr(
-                f"На {conn.display()} ответил шлюз неподдерживаемой аппаратной платформы.",
-                f"An unsupported gateway hardware platform answered on {conn.display()}.",
+            subtitle = (
+                tr(
+                    f"На {conn.display()} ответила приборная панель Kombi FPK_E.",
+                    f"A Kombi FPK_E instrument cluster answered on {conn.display()}.",
+                )
+                if is_kombi
+                else tr(
+                    f"На {conn.display()} ответил шлюз неподдерживаемой аппаратной платформы.",
+                    f"An unsupported gateway hardware platform answered on {conn.display()}.",
+                )
             )
         elif in_fbl:
             title = tr("Блок в режиме загрузчика (FBL)", "ECU in bootloader mode (FBL)")
@@ -833,6 +934,19 @@ class EcuFoundDialog(Dialog):
                 slot=self._choose_restore,
             )
             self.finish(self.btn_read_anyway, ok=self.btn_ok)
+        elif is_kombi:
+            self.body.addWidget(
+                hint(
+                    tr(
+                        "Будут считаны DataFlash (64 КБ) и область конфигурации процессора (IDCODE). "
+                        "После чтения блок откроется сам; в память ничего не пишется.",
+                        "DataFlash (64 KB) and the MCU configuration area (IDCODE) will be read. "
+                        "The ECU opens once reading finishes; nothing is written to its memory.",
+                    )
+                )
+            )
+            self.btn_ok = button(tr("Считать блок", "Read the ECU"), "PrimaryBtn", slot=self.accept)
+            self.finish(ok=self.btn_ok)
         else:
             self.body.addWidget(
                 hint(

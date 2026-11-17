@@ -47,7 +47,21 @@ def _uds_presets() -> list[str]:
         "22 F1 89  # " + tr("версия ПО", "software version"),
         "22 F1 8C  # " + tr("серийный номер", "serial number"),
         "22 F1 90  # VIN",
+        "22 02 ED  # " + tr("статус иммо (FPK)", "immo status (FPK)"),
+        "22 03 DE  # " + tr("счётчик CP (FPK)", "CP counter (FPK)"),
         "19 02 FF  # " + tr("ошибки (DTC)", "trouble codes (DTC)"),
+        "14 FF FF FF  # " + tr("сброс ошибок (DTC)", "clear DTCs"),
+        "11 02  # " + tr("перезагрузка блока", "ECU reset"),
+    ]
+
+
+def _frame_presets() -> list[str]:
+    return [
+        "00 00 03 00  # " + tr("3C0: зажигание KL15 ВКЛ", "3C0: ignition KL15 ON"),
+        "00 00 00 00  # " + tr("3C0: зажигание KL15 ВЫКЛ", "3C0: ignition KL15 OFF"),
+        "07 00 01 00  # " + tr("5BF: кнопка руля OK", "5BF: steering wheel OK"),
+        "02 00 01 00  # " + tr("5BF: кнопка руля Меню", "5BF: steering wheel Menu"),
+        "02 10 03 AA AA AA AA AA  # " + tr("UDS 10 03 (SingleFrame)", "UDS 10 03 (SingleFrame)"),
     ]
 
 
@@ -237,7 +251,11 @@ class TerminalScreen(QWidget):
 
     def _build_trace(self) -> QWidget:
         self.sec_trace = Section()
+        self.sec_trace.head.setContentsMargins(18, 10, 18, 8)
         self.sec_trace.body.setSpacing(10)
+        self.lbl_filter = QLabel()
+        self.lbl_filter.setObjectName("Hint")
+        set_tone(self.lbl_filter, "muted")
         self.ed_filter = QLineEdit()
         self.ed_filter.setFixedWidth(220)
         self.ed_filter.setClearButtonEnabled(True)
@@ -246,8 +264,8 @@ class TerminalScreen(QWidget):
         self.btn_pause.setCheckable(True)
         self.btn_clear = button("", "GhostBtn", slot=self._clear)
         self.btn_save = button("", "GhostBtn", slot=self._save)
-        for w in (self.ed_filter, self.btn_pause, self.btn_clear, self.btn_save):
-            self.sec_trace.head.addWidget(w)
+        for w in (self.lbl_filter, self.ed_filter, self.btn_pause, self.btn_clear, self.btn_save):
+            self.sec_trace.head.addWidget(w, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.model = TraceModel(self)
         self.proxy = _IdFilter(self)
@@ -301,15 +319,22 @@ class TerminalScreen(QWidget):
         # raw frame: ID + up to 8 bytes
         self.ed_id = self._id_edit("710")
         self.cmb_frame = self._data_combo()
+        self.cmb_frame.activated.connect(self._on_frame_preset_activated)
         self.lbl_id = QLabel()
         self.lbl_data_frame = QLabel()
         self.pages.addWidget(self._fields(self.lbl_id, self.ed_id, self.lbl_data_frame, self.cmb_frame))
-        # UDS request over ISO-TP: request ID, response ID, service bytes
+        # UDS request over ISO-TP: target preset, request ID, response ID, service bytes
+        self.cmb_target = QComboBox()
+        self.cmb_target.addItem("", ("710", "77A"))
+        self.cmb_target.addItem("", ("714", "77E"))
+        self.cmb_target.currentIndexChanged.connect(self._on_target_changed)
         self.ed_tx = self._id_edit("710")
         self.ed_rx = self._id_edit("77A")
         self.cmb_uds = self._data_combo()
         self.lbl_tx, self.lbl_rx, self.lbl_data_uds = QLabel(), QLabel(), QLabel()
-        self.pages.addWidget(self._fields(self.lbl_tx, self.ed_tx, self.lbl_rx, self.ed_rx, self.lbl_data_uds, self.cmb_uds))
+        self.pages.addWidget(
+            self._fields(self.cmb_target, self.lbl_tx, self.ed_tx, self.lbl_rx, self.ed_rx, self.lbl_data_uds, self.cmb_uds)
+        )
         row.addWidget(self.pages, 1)
 
         self.btn_send = button("", "PrimaryBtn", slot=self._send)
@@ -326,10 +351,31 @@ class TerminalScreen(QWidget):
         self._on_mode(self.btn_mode_uds.isChecked(), save=False)
         return self.sec_send
 
+    def _on_target_changed(self, idx: int) -> None:
+        pair = self.cmb_target.itemData(idx)
+        if isinstance(pair, tuple) and len(pair) == 2:
+            self.ed_tx.setText(pair[0])
+            self.ed_rx.setText(pair[1])
+
+    def set_target_ecu(self, kind: str) -> None:
+        """Select default UDS IDs for gateway (`j533` -> 710/77A) or instrument cluster (`fpke` -> 714/77E)."""
+        idx = 1 if kind == "fpke" else 0
+        self.cmb_target.setCurrentIndex(idx)
+        self._on_target_changed(idx)
+
+    def _on_frame_preset_activated(self, _idx: int) -> None:
+        txt = self.cmb_frame.currentText()
+        if "#" in txt:
+            comment = txt.split("#", 1)[1].strip()
+            if comment.startswith("3C0:"):
+                self.ed_id.setText("3C0")
+            elif comment.startswith("5BF:"):
+                self.ed_id.setText("5BF")
+
     def _id_edit(self, value: str) -> QLineEdit:
         ed = QLineEdit(value)
         ed.setFont(mono_font(13))
-        ed.setFixedWidth(84)
+        ed.setFixedWidth(74)
         ed.returnPressed.connect(self._send)
         return ed
 
@@ -349,7 +395,8 @@ class TerminalScreen(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
         for it in items:
-            lay.addWidget(it, 1 if isinstance(it, QComboBox) else 0)
+            stretch = 1 if (isinstance(it, QComboBox) and it.isEditable()) else 0
+            lay.addWidget(it, stretch)
         return w
 
     # ────────────────────────────── text & state ──────────────────────────────
@@ -358,7 +405,8 @@ class TerminalScreen(QWidget):
         for i, br in enumerate(BITRATES):
             self.cmb_bitrate.setItemText(i, tr(f"{br // 1000} кбит/с", f"{br // 1000} kbit/s"))
         self.sec_trace.set_text(tr("Трафик", "Traffic"))
-        self.ed_filter.setPlaceholderText(tr("Фильтр ID: 710, 77A или -17F00010", "Filter IDs: 710, 77A or -17F00010"))
+        self.lbl_filter.setText(tr("Фильтр ID:", "Filter ID:"))
+        self.ed_filter.setPlaceholderText(tr("710, 77A или -17F00010", "710, 77A or -17F00010"))
         self.ed_filter.setToolTip(
             tr(
                 "Через запятую: ID — показывать только их, -ID — скрыть. По умолчанию скрыт 17F00010: "
@@ -375,11 +423,13 @@ class TerminalScreen(QWidget):
         self.sec_send.set_text(tr("Отправка", "Send"))
         self.btn_mode_frame.setText(tr("CAN-кадр", "CAN frame"))
         self.btn_mode_uds.setText(tr("UDS-запрос", "UDS request"))
+        self.cmb_target.setItemText(0, tr("Шлюз (710/77A)", "Gateway (710/77A)"))
+        self.cmb_target.setItemText(1, tr("Панель (714/77E)", "Cluster (714/77E)"))
         self.lbl_id.setText("ID")
-        self.lbl_data_frame.setText(tr("Данные", "Data"))
+        self.lbl_data_frame.setText(tr("Данные / шаблон", "Data / preset"))
         self.lbl_tx.setText(tr("Запрос", "Request"))
         self.lbl_rx.setText(tr("Ответ", "Reply"))
-        self.lbl_data_uds.setText(tr("Сервис", "Service"))
+        self.lbl_data_uds.setText(tr("Сервис / шаблон", "Service / preset"))
         self.cmb_frame.lineEdit().setPlaceholderText("02 10 03")
         self.cmb_uds.lineEdit().setPlaceholderText("22 F1 90")
         self.btn_send.setText(tr("Отправить", "Send"))
@@ -474,8 +524,8 @@ class TerminalScreen(QWidget):
     def _load_history(self, cmb: QComboBox, mode: str) -> None:
         text = cmb.currentText()
         items = self._history(mode)
-        if mode == "uds":
-            items += [p for p in _uds_presets() if p not in items]
+        presets = _uds_presets() if mode == "uds" else _frame_presets()
+        items += [p for p in presets if p not in items]
         cmb.clear()
         cmb.addItems(items)
         cmb.setEditText(text)
@@ -496,6 +546,10 @@ class TerminalScreen(QWidget):
         """Open the adapter (or an already open python-can `bus`, used by tests) and start receiving."""
         if self.session is not None:
             return
+        if bus is None:
+            from contitool.can.fpke import close_active_fpke_link
+
+            close_active_fpke_link()
         s = CanSession(self.conn.port, self.conn.interface, int(self.cmb_bitrate.currentData()), bus=bus, parent=self)
         s.opened.connect(self._on_opened)
         s.closed.connect(self._on_closed)

@@ -47,7 +47,14 @@ from contitool.can.payloads import (
     fbl_sa2,
     verify_payload_self_tests,
 )
+from contitool.can.fpke import (
+    FPKE_KEEPALIVE_PATTERN,
+    FPKE_NATIVE_INTERFACES,
+    FPKE_UDS_RX_ID,
+    FPKE_UDS_TX_ID,
+)
 from contitool.can.transport import TRANSPORT_ERRORS, J533CanLink, UdsNegativeResponse
+from contitool.core.fpke import is_fpke_ident
 from contitool.core.analyzer import (
     analyze_cflash,
     analyze_dflash_swap,
@@ -977,6 +984,7 @@ ECU_IDENT_DIDS: tuple[tuple[int, str, str], ...] = (
     (0xF180, "Версия загрузчика", "Boot software version"),
     (0xF1A3, "Версия оборудования", "Hardware version"),
     (0xF197, "Система", "System name"),
+    (0xF190, "VIN", "VIN"),
     (0xF18C, "Серийный номер", "Serial number"),
     (0xF17C, "FAZIT", "FAZIT"),
     (0xF19E, "Вариант ODX", "ODX variant"),
@@ -991,6 +999,8 @@ def _is_vag_part_number(value: str) -> bool:
 
 def unsupported_ecu_reason(ident: list[dict[str, str]]) -> str | None:
     """Explain why an identified gateway is not a supported Continental 3Q0 RH850/F1L unit, or None if supported."""
+    if is_fpke_ident(ident):
+        return None
     vals = {item["did"]: item["value"].strip() for item in ident}
     part = "".join(vals.get("F187", "").split()).upper()
     hw_part = "".join(vals.get("F191", "").split()).upper()
@@ -1050,18 +1060,86 @@ def unsupported_ecu_reason(ident: list[dict[str, str]]) -> str | None:
     return None
 
 
+def _send_fpke_keepalive_burst(link: J533CanLink) -> None:
+    for arb_id, ka_data in FPKE_KEEPALIVE_PATTERN:
+        with contextlib.suppress(*LINK_ERRORS):
+            link.send_frame(arb_id, ka_data)
+        time.sleep(0.002)
+
+
+def _probe_fpke_uds_with_wake(
+    link: J533CanLink,
+    *,
+    bus: Any | None,
+    interface: str,
+    reporter: OperationReporter,
+) -> tuple[bool, bool]:
+    """Wake and probe Kombi / FPK_E on `0x714 -> 0x77E` without breaking the 200 ms keepalive cadence."""
+    link.UDS_TX_ID = FPKE_UDS_TX_ID
+    link.UDS_RX_ID = FPKE_UDS_RX_ID
+    if bus is not None or interface not in FPKE_NATIVE_INTERFACES:
+        try:
+            link.request_uds(b"\x10\x03", 0x50, timeout=0.4 if bus is not None else 1.0)
+            return True, False
+        except LINK_ERRORS as fpke_exc:
+            if _is_fbl_session_nrc(fpke_exc):
+                return True, True
+            return False, False
+
+    # Fast check first in case the cluster is already awake on the bus
+    _send_fpke_keepalive_burst(link)
+    try:
+        link.request_uds(b"\x10\x03", 0x50, timeout=0.18)
+        with contextlib.suppress(*LINK_ERRORS):
+            link.request_uds(b"\x3e\x00", 0x7E, timeout=0.18)
+        return True, False
+    except LINK_ERRORS as fpke_exc:
+        if _is_fbl_session_nrc(fpke_exc):
+            return True, True
+
+    reporter.info(
+        tr(
+            "Пробуждение и опрос приборной панели Kombi / FPK_E (0x714 → 0x77E)…",
+            "Waking and probing Kombi / FPK_E instrument cluster (0x714 → 0x77E)…",
+        )
+    )
+    # Maintain uninterrupted ~200 ms keepalive cycles for 4.2 s while polling `10 03` inside the 180 ms window
+    for cycle in range(21):
+        reporter.check_cancelled()
+        _send_fpke_keepalive_burst(link)
+        if cycle in (4, 9, 14, 20):
+            try:
+                link.request_uds(b"\x10\x03", 0x50, timeout=0.18)
+                with contextlib.suppress(*LINK_ERRORS):
+                    link.request_uds(b"\x3e\x00", 0x7E, timeout=0.18)
+                return True, False
+            except LINK_ERRORS as fpke_exc:
+                if _is_fbl_session_nrc(fpke_exc):
+                    return True, True
+        else:
+            time.sleep(0.19)
+    return False, False
+
+
 def can_identify(
     port: str,
     *,
     interface: str = "slcan",
+    target: str = "auto",
     bus: Any | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
-    """Check that the gateway answers on Diagnosis CAN and read its identification (UDS 10 03 + 22 xx xx).
+    """Check that the gateway or Kombi answers on Diagnosis CAN and read its identification (UDS 10 03 + 22 xx xx).
 
     Read-only: no reset, no RAM-Loader. Identifiers the ECU rejects are left out. `bus` is for tests."""
-    result: dict[str, Any] = {"responding": False, "ident": []}
+    from contitool.can.fpke import close_active_fpke_link, open_or_reuse_fpke_link
+
+    if bus is None:
+        close_active_fpke_link()
+    result: dict[str, Any] = {"responding": False, "ident": [], "ecu_kind": "fpke" if target == "fpke" else "j533"}
     in_fbl = False
+    probed_fpke = False
+    keep_fpke_alive = False
     with J533CanLink(port, interface=interface, bus=bus) as link:
         if link.interface == "dpdu" and callable(getattr(link.bus, "describe", None)):
             reporter.info(tr("Модуль D-PDU: ", "D-PDU module: ") + link.bus.describe())
@@ -1069,58 +1147,111 @@ def can_identify(
                 result["adapter_warning"] = _j2534_wrapper_problem(wrapped)
                 reporter.warning(result["adapter_warning"])
         reporter.step(1, 2, tr("Проверка связи с блоком (UDS 10 03)", "Checking the link to the ECU (UDS 10 03)"))
-        try:
-            link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
-        except LINK_ERRORS as exc:
-            if _is_fbl_session_nrc(exc):
-                in_fbl = True
-            else:
+        if target == "fpke":
+            ok_fpke, in_fbl = _probe_fpke_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
+            if not ok_fpke:
                 raise RuntimeError(
                     tr(
-                        f"Блок не отвечает по CAN ({exc}). Проверьте питание +12 В (Pin 1 и Pin 14), массу (Pin 11), "
-                        "CAN-H на Pin 19, CAN-L на Pin 9 и что включён CAN-терминатор (или стоит резистор 120 Ом между ними).",
-                        f"The ECU does not answer on CAN ({exc}). Check +12 V (Pin 1 and Pin 14), ground (Pin 11), "
-                        "CAN-H on Pin 19, CAN-L on Pin 9 and that CAN termination is on (or a 120 Ω resistor between them).",
+                        "Приборная панель Kombi / FPK_E (0x714 → 0x77E) не отвечает по CAN. Проверьте питание +12 В, массу, "
+                        "линии CAN-H / CAN-L и терминатор 120 Ом.",
+                        "Kombi / FPK_E instrument cluster (0x714 → 0x77E) does not answer on CAN. Check +12 V power, ground, "
+                        "CAN-H / CAN-L lines, and the 120 Ω terminator.",
                     )
-                ) from exc
+                )
+            probed_fpke = True
+        else:
+            try:
+                link.request_uds(b"\x10\x03", 0x50, timeout=1.2)
+                with contextlib.suppress(*LINK_ERRORS):
+                    link.request_uds(b"\x3e\x00", 0x7E, timeout=0.5)
+            except LINK_ERRORS as exc:
+                if _is_fbl_session_nrc(exc):
+                    in_fbl = True
+                else:
+                    ok_fpke, fbl_fpke = _probe_fpke_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
+                    if ok_fpke:
+                        probed_fpke = True
+                        in_fbl = fbl_fpke
+                    else:
+                        link.UDS_TX_ID = J533CanLink.UDS_TX_ID
+                        link.UDS_RX_ID = J533CanLink.UDS_RX_ID
+                        raise RuntimeError(
+                            tr(
+                                f"Блок не отвечает на базовые диагностические запросы UDS ({exc}). Проверьте питание +12 В, "
+                                "массу, линии CAN-H / CAN-L (шлюз T20: Pin 19 и Pin 9; приборка T18: Pin 18 и Pin 17) "
+                                "и что включён CAN-терминатор 120 Ом (см. «Справка»).",
+                                f"The ECU does not answer basic UDS diagnostic requests ({exc}). Check +12 V, ground, "
+                                "CAN-H / CAN-L (gateway T20: Pin 19 and Pin 9; cluster T18: Pin 18 and Pin 17) "
+                                "and that 120 Ω CAN termination is on (see “Help”).",
+                            )
+                        ) from exc
         result["responding"] = True
         reporter.step(2, 2, tr("Чтение идентификации блока", "Reading the ECU identification"))
         for did, ru, en in ECU_IDENT_DIDS:
+            if probed_fpke and bus is None and interface in FPKE_NATIVE_INTERFACES:
+                for arb_id, ka_data in FPKE_KEEPALIVE_PATTERN:
+                    with contextlib.suppress(*LINK_ERRORS):
+                        link.send_frame(arb_id, ka_data)
             try:
                 raw = link.request_uds(bytes([0x22, did >> 8, did & 0xFF]), 0x62, timeout=2.0)[3:]
             except LINK_ERRORS:
                 continue  # this ECU variant does not support the identifier
+            if did == 0xF190 and raw in (b"", b"\x00" * len(raw), b"\xff" * len(raw), b"-" * len(raw)):
+                continue
             text = raw.rstrip(b"\x00 ").decode("latin-1")
             value = text.strip() if text and all(32 <= ord(ch) < 127 for ch in text) else raw.hex().upper()
             result["ident"].append({"did": f"{did:04X}", "label_ru": ru, "label_en": en, "value": value})
             reporter.info(f"{did:04X} {tr(ru, en)}: {value}")
 
-        # Cold-boot FBL Default Session answers `10 03 -> 50 03`, omits Application-only DIDs (`F197`, `0600`),
-        # and reports bit 2 (`0x04`, e.g. `0x44`) in `22 F1 DF` when the Application is erased or invalid.
-        answered = {item["did"] for item in result["ident"]}
-        if in_fbl or not ({f"{did:04X}" for did in APP_ONLY_DIDS} & answered):
-            try:
-                raw_df = link.request_uds(b"\x22\xf1\xdf", 0x62, timeout=1.0)
-                if len(raw_df) >= 4:
-                    f1df_val = raw_df[3]
-                    result["f1df"] = f"{f1df_val:02X}"
-                    if f1df_val & 0x04:
-                        in_fbl = True
-                        result["app_valid"] = False
-            except LINK_ERRORS:
-                pass
-        unsupported = unsupported_ecu_reason(result["ident"])
-        if unsupported:
-            result["unsupported"] = unsupported
-            reporter.warning(unsupported)
-        if in_fbl:
-            result["in_fbl"] = True
-            reporter.warning(
-                tr(
-                    "Блок отвечает из загрузчика FBL — основная прошивка сейчас не запущена.",
-                    "The ECU answered from the FBL bootloader — the main application is not running.",
+        if probed_fpke or is_fpke_ident(result["ident"]):
+            result["ecu_kind"] = "fpke"
+            result["uds_tx_id"] = f"0x{FPKE_UDS_TX_ID:03X}"
+            result["uds_rx_id"] = f"0x{FPKE_UDS_RX_ID:03X}"
+            if interface not in FPKE_NATIVE_INTERFACES:
+                fpke_unsupported = tr(
+                    "Работа с приборной панелью Kombi / FPK_E поддерживается только через нативный CAN-адаптер "
+                    "(CANable / SLCAN / candleLight). Чтение и запись через VNCI / D-PDU / J2534 для приборки не поддерживаются.",
+                    "Kombi / FPK_E instrument cluster operations require a native CAN adapter "
+                    "(CANable / SLCAN / candleLight). Reading/writing via VNCI / D-PDU / J2534 is not supported for FPK.",
                 )
-            )
+                result["unsupported"] = fpke_unsupported
+                reporter.warning(fpke_unsupported)
+            else:
+                keep_fpke_alive = bus is None
+            break_fpke = True
+        else:
+            break_fpke = False
+        if not break_fpke:
+            # Cold-boot FBL Default Session answers `10 03 -> 50 03`, omits Application-only DIDs (`F197`, `0600`),
+            # and reports bit 2 (`0x04`, e.g. `0x44`) in `22 F1 DF` when the Application is erased or invalid.
+            answered = {item["did"] for item in result["ident"]}
+            if in_fbl or not ({f"{did:04X}" for did in APP_ONLY_DIDS} & answered):
+                try:
+                    raw_df = link.request_uds(b"\x22\xf1\xdf", 0x62, timeout=1.0)
+                    if len(raw_df) >= 4:
+                        f1df_val = raw_df[3]
+                        result["f1df"] = f"{f1df_val:02X}"
+                        if f1df_val & 0x04:
+                            in_fbl = True
+                            result["app_valid"] = False
+                except LINK_ERRORS:
+                    pass
+            unsupported = unsupported_ecu_reason(result["ident"])
+            if unsupported:
+                result["unsupported"] = unsupported
+                reporter.warning(unsupported)
+            if in_fbl:
+                result["in_fbl"] = True
+                reporter.warning(
+                    tr(
+                        "Блок отвечает из загрузчика FBL — основная прошивка сейчас не запущена.",
+                        "The ECU answered from the FBL bootloader — the main application is not running.",
+                    )
+                )
+    if keep_fpke_alive:
+        with contextlib.suppress(Exception):
+            fpke_link = open_or_reuse_fpke_link(port, interface=interface)
+            fpke_link.start_keepalive()
     return result
 
 
