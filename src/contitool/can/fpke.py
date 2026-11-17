@@ -91,6 +91,23 @@ IDST_ADDR = 0xFFA08010
 RSCAN0_BASE = 0xFFD00000
 WDTA1_BASE = 0xFFED1000
 
+# Immobilizer RAM slot buffers (populated by 0x13FB1C / 0x13FCA0 when a working key is recognized)
+FPKE_83A_RAM_S0_ADDR = 0xFEDF2D44          # 32 B: S0 (16 B) || S1 (16 B) on SW 83A (0x13FB1C)
+FPKE_83A_RAM_SLOTS_FLAG_ADDR = 0xFEDF2D79  # 1 B: bit 0 = Slot A loaded, bit 1 = Slot B loaded (0x03 = both)
+FPKE_83A_RAM_RECOG_STATE_ADDR = 0xFEDF2D2E  # 1 B: 2=reading, 3=learning, 4=recognized, 5=rejected
+FPKE_83A_RAM_LAST_KEY_ID_ADDR = 0xFEDF2CB0  # 4 B: last transponder ID read by LF coil
+FPKE_83A_RAM_EEL67_ADDR = 0xFEDF29E8       # 37 B: RAM mirror of EEL 0x67 (key IDs + allowed/learned) on SW 83A
+FPKE_83A_RAM_EEL68_ADDR = 0xFEDF26DC       # 76 B: RAM mirror of EEL 0x68 (VIN, K_c, flags, mode) on SW 83A
+FPKE_83A_RAM_EEL69_ADDR = 0xFEDF1E2C       # 32 B: RAM mirror of EEL 0x69 (S0 || S1) on SW 83A
+
+FPKE_1703_RAM_S0_ADDR = 0xFEDF5650         # 32 B: S0 (16 B) || S1 (16 B) on SW 1703 (0x13FCA0)
+FPKE_1703_RAM_SLOTS_FLAG_ADDR = 0xFEDF5685
+FPKE_1703_RAM_RECOG_STATE_ADDR = 0xFEDF563A
+FPKE_1703_RAM_LAST_KEY_ID_ADDR = 0xFEDF55BC
+FPKE_1703_RAM_EEL67_ADDR = 0xFEDF5306      # 37 B: RAM mirror of EEL 0x67 on SW 1703
+FPKE_1703_RAM_EEL68_ADDR = 0xFEDF52B8      # 76 B: RAM mirror of EEL 0x68 on SW 1703
+FPKE_1703_RAM_EEL69_ADDR = 0xFEDF4A58      # 32 B: RAM mirror of EEL 0x69 (S0 || S1) on SW 1703
+
 FPKE_STREAM_CHUNK_BYTES = 2048  # 256 x 8-byte CAN frames (~64 ms burst on 0x6F1)
 
 # Keepalive frames (2 ms apart, ~200 ms cycle; 0x3C0 KL_S+KL15=0x03, 0x663 group 5 master for MFL 0x5BF)
@@ -2228,8 +2245,26 @@ def fpke_run_procedure(
 
     if proc_id == "key_poll":
         link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
-        r_start = link.request_uds(b"\x31\x01\x04\x3d\x00", 0x71, timeout=4.0)
-        r_res = link.request_uds(b"\x31\x03\x04\x3d", 0x71, timeout=4.0)
+        coil_id: str | None = None
+        with contextlib.suppress(Exception):
+            r_02e4 = link.request_uds(b"\x22\x02\xe4", 0x62, timeout=3.5)
+            if len(r_02e4) >= 7:
+                raw_id = r_02e4[3:7]
+                if raw_id not in (b"\x00" * 4, b"\xff" * 4):
+                    coil_id = raw_id.hex().upper()
+        if coil_id:
+            msg = tr(
+                f"Штатная катушка: обнаружен транспондер ID {coil_id}.",
+                f"Stock LF coil: transponder ID {coil_id} detected.",
+            )
+            reporter.info(msg)
+            return {"procedure": proc_id, "ok": True, "summary": msg, "coil_key_id": coil_id, "raw": coil_id.lower()}
+
+        r_start = b""
+        r_res = b""
+        with contextlib.suppress(Exception):
+            r_start = link.request_uds(b"\x31\x01\x04\x3d\x00", 0x71, timeout=4.0)
+            r_res = link.request_uds(b"\x31\x03\x04\x3d", 0x71, timeout=4.0)
         tail = r_res[4:] if len(r_res) > 4 else r_start[4:]
         if not tail or all(b == 0 for b in tail):
             msg = tr("Опрос считывателя ключей выполнен (транспондер не поднесён).", "Key reader polled (no transponder detected).")
@@ -2239,7 +2274,7 @@ def fpke_run_procedure(
                 f"Key reader polled (response: {tail.hex(' ').upper()}).",
             )
         reporter.info(msg)
-        return {"procedure": proc_id, "ok": True, "summary": msg, "raw": r_res.hex()}
+        return {"procedure": proc_id, "ok": True, "summary": msg, "coil_key_id": None, "raw": r_res.hex()}
 
     if proc_id == "prog_precond":
         link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
@@ -2271,3 +2306,506 @@ def fpke_run_procedure(
         return {"procedure": proc_id, "ok": True, "summary": msg}
 
     raise ValueError(f"Unknown FPK_E procedure: {proc_id}")
+
+
+# ────────────────────────────── Stock LF Coil Key Learning Procedures ──────────────────────────────
+
+
+def fpke_coil_poll_transponder(
+    link: FpkeCanLink,
+    *,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Read live immobilizer state (`02ED`, `02EF`, `02E0`, `02EE`), coil transponder ID (`02E4`), and learned key IDs (`02E5..02EC`)."""
+    from contitool.core.fpke import decode_fpke_02ed, decode_fpke_02ee
+
+    link.start_keepalive()
+    link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
+    st_02ed = link.request_uds(b"\x22\x02\xed", 0x62, timeout=2.0)[3:]
+    st_02ef = link.request_uds(b"\x22\x02\xef", 0x62, timeout=2.0)[3:]
+    st_02e0 = link.request_uds(b"\x22\x02\xe0", 0x62, timeout=2.0)[3:]
+    st_02ee: bytes | None = None
+    with contextlib.suppress(Exception):
+        st_02ee = link.request_uds(b"\x22\x02\xee", 0x62, timeout=1.5)[3:]
+
+    d_02ed = decode_fpke_02ed(st_02ed)
+    d_02ee = decode_fpke_02ee(st_02ee) if st_02ee else None
+    mode_fam = int(d_02ed["life_state"])
+    learned = int(d_02ed["learned_keys"])
+    rem_keys = int(d_02ed["remaining_keys"])
+    lock_mins = list(st_02ef[:6])
+
+    coil_key_id: str | None = None
+    coil_key_raw_hex: str | None = None
+    with contextlib.suppress(Exception):
+        r_02e4 = link.request_uds(b"\x22\x02\xe4", 0x62, timeout=3.5)
+        if len(r_02e4) >= 7:
+            id_bytes = r_02e4[3:7]
+            if id_bytes not in (b"\x00" * 4, b"\xff" * 4):
+                coil_key_id = id_bytes.hex().upper()
+                coil_key_raw_hex = id_bytes[::-1].hex().upper()
+
+    learned_key_ids: list[str] = []
+    for k in range(min(8, max(0, learned))):
+        did = 0x02E5 + k
+        with contextlib.suppress(Exception):
+            rk = link.request_uds(bytes([0x22, (did >> 8) & 0xFF, did & 0xFF]), 0x62, timeout=1.5)
+            if len(rk) >= 7:
+                learned_key_ids.append(rk[3:7].hex().upper())
+
+    mode_txt = {
+        1: tr("заводской (0)", "virgin (0)"),
+        2: tr("рабочий (1–2)", "normal (1–2)"),
+        3: tr("обучение ключей (3–5)", "key learning (3–5)"),
+    }.get(mode_fam, tr(f"режим {mode_fam}", f"mode {mode_fam}"))
+    coil_txt = (
+        tr(f"чип в катушке: {coil_key_id}", f"chip in coil: {coil_key_id}")
+        if coil_key_id
+        else tr("чип в катушке не обнаружен", "no chip detected in coil")
+    )
+    msg = tr(
+        f"Катушка LF: {coil_txt} • Режим: {mode_txt} • Обучено: {learned} (осталось: {rem_keys})",
+        f"LF Coil: {coil_txt} • Mode: {mode_txt} • Learned: {learned} (remaining: {rem_keys})",
+    )
+    reporter.info(msg)
+    return {
+        "ok": True,
+        "summary": msg,
+        "coil_key_id": coil_key_id,
+        "coil_key_raw_hex": coil_key_raw_hex,
+        "learned_key_ids": learned_key_ids,
+        "learned_keys": learned,
+        "remaining_keys": rem_keys,
+        "mode_family": mode_fam,
+        "power_class": d_02ed["power_class"],
+        "power_class_hex": d_02ed["power_class_hex"],
+        "keyless_coded": d_02ed["keyless_coded"],
+        "lockout_minutes": lock_mins,
+        "challenge_r": st_02e0.hex().upper(),
+        "slaves_02ee": d_02ee,
+    }
+
+
+def fpke_extract_live_s0_s1_from_coil(
+    link: FpkeCanLink,
+    *,
+    expected_crc_a_le: bytes | str | None = None,
+    expected_crc_b_le: bytes | str | None = None,
+    frame_delay: float = FPKE_DEFAULT_FRAME_DELAY,
+    wake_seconds: float = 4.0,
+    poll_timeout: float = 4.0,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Extract live 32-byte `S0 || S1` (`Slot A / Slot B`) from cluster RAM when a working key is recognized by the coil.
+
+    Checks SW 83A RAM (`0xFEDF2D44`, flag `0xFEDF2D79`, EEL 0x69 `0xFEDF1E2C`) and SW 1703 RAM (`0xFEDF5650`,
+    flag `0xFEDF5685`, EEL 0x69 `0xFEDF4A58`), verifying `CRC-32(Slot A)` and `CRC-32(Slot B)` against `EEL 0x68`.
+    """
+    from contitool.core.fpke import fpke_verify_s0_s1
+
+    link.start_keepalive()
+    fpke_ensure_level8(link, frame_delay=frame_delay, wake_seconds=wake_seconds, reporter=reporter)
+
+    # Trigger a quick coil read in 10 03 first so the LF reader is active, then switch back to 10 60 for 0x23
+    coil_key_id: str | None = None
+    with contextlib.suppress(Exception):
+        link.request_uds(b"\x10\x03", 0x50, timeout=1.5)
+        r_02e4 = link.request_uds(b"\x22\x02\xe4", 0x62, timeout=2.5)
+        if len(r_02e4) >= 7 and r_02e4[3:7] not in (b"\x00" * 4, b"\xff" * 4):
+            coil_key_id = r_02e4[3:7].hex().upper()
+    link.request_uds(b"\x10\x60", 0x50, timeout=2.0)
+
+    candidates: tuple[tuple[str, int, int | None, int | None, int | None], ...] = (
+        ("SW 83A Slot RAM (0xFEDF2D44)", FPKE_83A_RAM_S0_ADDR, FPKE_83A_RAM_SLOTS_FLAG_ADDR, FPKE_83A_RAM_RECOG_STATE_ADDR, FPKE_83A_RAM_LAST_KEY_ID_ADDR),
+        ("SW 83A EEL 0x69 RAM (0xFEDF1E2C)", FPKE_83A_RAM_EEL69_ADDR, None, None, None),
+        ("SW 1703 Slot RAM (0xFEDF5650)", FPKE_1703_RAM_S0_ADDR, FPKE_1703_RAM_SLOTS_FLAG_ADDR, FPKE_1703_RAM_RECOG_STATE_ADDR, FPKE_1703_RAM_LAST_KEY_ID_ADDR),
+        ("SW 1703 EEL 0x69 RAM (0xFEDF4A58)", FPKE_1703_RAM_EEL69_ADDR, None, None, None),
+    )
+
+    deadline = time.monotonic() + max(0.3, poll_timeout)
+    last_recog_state: int | None = None
+    last_slots_flag: int | None = None
+
+    while True:
+        reporter.check_cancelled()
+        for src_label, s0_addr, flag_addr, recog_addr, id_addr in candidates:
+            with contextlib.suppress(Exception):
+                raw_32 = fpke_read_memory_0x23(link, s0_addr, 32)
+                if len(raw_32) != 32:
+                    continue
+                s0, s1 = raw_32[:16], raw_32[16:32]
+                fl_val: int | None = None
+                rc_val: int | None = None
+                if flag_addr is not None:
+                    fl_val = fpke_read_memory_0x23(link, flag_addr, 1)[0]
+                    last_slots_flag = fl_val
+                if recog_addr is not None:
+                    rc_val = fpke_read_memory_0x23(link, recog_addr, 1)[0]
+                    last_recog_state = rc_val
+                if id_addr is not None and not coil_key_id:
+                    raw_kid = fpke_read_memory_0x23(link, id_addr, 4)
+                    if raw_kid not in (b"\x00" * 4, b"\xff" * 4):
+                        coil_key_id = raw_kid[::-1].hex().upper()
+
+                ver = fpke_verify_s0_s1(s0, s1, expected_crc_a_le, expected_crc_b_le)
+                if ver["valid"] and (expected_crc_a_le is not None or fl_val == 0x03 or flag_addr is None):
+                    msg = tr(
+                        f"Секрет S0/S1 считан из {src_label} и подтверждён по CRC-32 (A={ver['crc_a_le_hex']}, B={ver['crc_b_le_hex']}).",
+                        f"Secret S0/S1 extracted from {src_label} and verified by CRC-32 (A={ver['crc_a_le_hex']}, B={ver['crc_b_le_hex']}).",
+                    )
+                    reporter.success(msg)
+                    return {
+                        "ok": True,
+                        "summary": msg,
+                        **ver,
+                        "source": src_label,
+                        "source_addr": f"0x{s0_addr:08X}",
+                        "coil_key_id": coil_key_id,
+                        "slots_flag": fl_val,
+                        "recog_state": rc_val,
+                    }
+
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.35)
+
+    # Fallback: if expected CRC-32(A/B) are known, scan .secdata RAM (0xFEDF1D00..0xFEDF5A00) in 256-byte pages
+    if expected_crc_a_le and expected_crc_b_le:
+        for page_addr in range(0xFEDF1D00, 0xFEDF5A00, 0xE0):
+            reporter.check_cancelled()
+            with contextlib.suppress(Exception):
+                chunk = fpke_read_memory_0x23(link, page_addr, 0x100)
+                for off in range(0, len(chunk) - 32, 4):
+                    s0, s1 = chunk[off : off + 16], chunk[off + 16 : off + 32]
+                    ver = fpke_verify_s0_s1(s0, s1, expected_crc_a_le, expected_crc_b_le)
+                    if ver["valid"]:
+                        hit_addr = page_addr + off
+                        src_label = f"RAM scan (0x{hit_addr:08X})"
+                        msg = tr(
+                            f"Секрет S0/S1 найден в {src_label} по совпадению CRC-32 A/B.",
+                            f"Secret S0/S1 found in {src_label} via CRC-32 A/B match.",
+                        )
+                        reporter.success(msg)
+                        return {
+                            "ok": True,
+                            "summary": msg,
+                            **ver,
+                            "source": src_label,
+                            "source_addr": f"0x{hit_addr:08X}",
+                            "coil_key_id": coil_key_id,
+                            "slots_flag": last_slots_flag,
+                            "recog_state": last_recog_state,
+                        }
+
+    raise RuntimeError(
+        tr(
+            f"Слоты A/B ещё не загружены в ОЗУ приборки (флаг слотов={last_slots_flag}, состояние={last_recog_state}). "
+            "Приложите рабочий ключ (Ключ 1) к штатной катушке при включённом зажигании, подождите 1–2 с и повторите.",
+            f"Slots A/B are not loaded in cluster RAM yet (slots_flag={last_slots_flag}, recog_state={last_recog_state}). "
+            "Hold a working key (Key 1) against the stock LF coil with ignition ON, wait 1–2 s, and retry.",
+        )
+    )
+
+
+def fpke_prepare_additive_coil_learning(
+    link: FpkeCanLink,
+    *,
+    s0_hex: str,
+    s1_hex: str,
+    kc_hex: str = "",
+    allowed_keys: int = 3,
+    existing_key_display_ids: list[str] | None = None,
+    expected_crc_a_le: bytes | str | None = None,
+    expected_crc_b_le: bytes | str | None = None,
+    frame_delay: float = FPKE_DEFAULT_FRAME_DELAY,
+    wake_seconds: float = 4.0,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Method A (non-destructive): enter LF coil key-addition mode (`mode = 4`) via `UDS 0x3D` RAM setup without `2E 02F7`.
+
+    Writes `S0 || S1` into the `EEL 0x69` RAM mirror (`0xFEDF1E2C` on SW 83A / `0xFEDF4A58` on SW 1703), sets bit 0
+    of `immo_flags` (`0x52FA.0 = 1`), keeps all existing learned key IDs in `EEL 0x67` (`0xFEDF29E8` / `0xFEDF5306`),
+    raises `allowed_keys` (e.g. `learned + 1`), clears `key_over_can` bit 7 (`0x5303.7 = 0` for local LF coil), and
+    switches `immo_mode = 4` (`0x5301 = 4`) so `2E 02E1 00 00 40 00` appends the new blank key into the next free slot
+    without executing `Action 3` (erasing existing keys).
+    """
+    from contitool.core.fpke import fpke_verify_s0_s1
+
+    s0 = bytes.fromhex("".join(s0_hex.split()))
+    s1 = bytes.fromhex("".join(s1_hex.split()))
+    ver = fpke_verify_s0_s1(s0, s1, expected_crc_a_le, expected_crc_b_le)
+    if not ver["valid"]:
+        raise RuntimeError(
+            tr(
+                f"Проверка S0/S1 не пройдена: CRC-32(A)={ver['crc_a_le_hex']} (ожидался {ver['expected_crc_a_le_hex']}), "
+                f"CRC-32(B)={ver['crc_b_le_hex']} (ожидался {ver['expected_crc_b_le_hex']}). Подготовка режима 4 заблокирована.",
+                f"S0/S1 verification failed: CRC-32(A)={ver['crc_a_le_hex']} (expected {ver['expected_crc_a_le_hex']}), "
+                f"CRC-32(B)={ver['crc_b_le_hex']} (expected {ver['expected_crc_b_le_hex']}). Refusing to enter mode 4.",
+            )
+        )
+
+    link.start_keepalive()
+    fpke_ensure_level8(link, frame_delay=frame_delay, wake_seconds=wake_seconds, reporter=reporter)
+
+    # Read current live state via 02ED/02E5.. first
+    pre_poll = fpke_coil_poll_transponder(link, reporter=reporter)
+    cur_learned = int(pre_poll.get("learned_keys") or 0)
+    live_ids = list(pre_poll.get("learned_key_ids") or [])
+    if not live_ids and existing_key_display_ids:
+        live_ids = [k.strip().upper() for k in existing_key_display_ids if k and k.strip().upper() != "FFFFFFFF"]
+        if cur_learned == 0:
+            cur_learned = len(live_ids)
+
+    target_allowed = max(cur_learned + 1, min(8, int(allowed_keys)))
+    if target_allowed > 8:
+        raise RuntimeError(tr("Все 8 слотов ключей уже заняты.", "All 8 key slots are already full."))
+
+    link.request_uds(b"\x10\x60", 0x50, timeout=2.0)
+
+    # Auto-detect SW 83A vs SW 1703 NvM RAM mirror addresses
+    r67_base = FPKE_83A_RAM_EEL67_ADDR
+    r68_base = FPKE_83A_RAM_EEL68_ADDR
+    r69_base = FPKE_83A_RAM_EEL69_ADDR
+    kc_clean = "".join(kc_hex.split())
+    if len(kc_clean) == 32:
+        kc_bytes = bytes.fromhex(kc_clean)
+        with contextlib.suppress(Exception):
+            kc_83a = fpke_read_memory_0x23(link, FPKE_83A_RAM_EEL68_ADDR + 0x26, 16)
+            if kc_83a != kc_bytes:
+                kc_1703 = fpke_read_memory_0x23(link, FPKE_1703_RAM_EEL68_ADDR + 0x26, 16)
+                if kc_1703 == kc_bytes:
+                    r67_base = FPKE_1703_RAM_EEL67_ADDR
+                    r68_base = FPKE_1703_RAM_EEL68_ADDR
+                    r69_base = FPKE_1703_RAM_EEL69_ADDR
+
+    # Read current EEL 0x67 RAM mirror (37 bytes) and preserve existing learned key IDs
+    r67_raw = bytearray(fpke_read_memory_0x23(link, r67_base, 37))
+    if len(r67_raw) != 37 or r67_raw == bytearray(b"\xaa" * 37):
+        r67_raw = bytearray(b"\xff" * 32 + bytes([target_allowed, cur_learned & 0x0F, 0, 0, 0]))
+        for idx, disp_id in enumerate(live_ids[:cur_learned]):
+            if len(disp_id) == 8:
+                r67_raw[idx * 4 : (idx + 1) * 4] = bytes.fromhex(disp_id)[::-1]
+    else:
+        ram_learned = r67_raw[0x21] & 0x0F
+        if 0 < ram_learned <= 8:
+            cur_learned = ram_learned
+            target_allowed = max(cur_learned + 1, min(8, int(allowed_keys)))
+        # Ensure free slots [cur_learned..7] are 0xFFFFFFFF so 0x13DFA6 treats new blank key as unlearned
+        for slot in range(cur_learned, 8):
+            r67_raw[slot * 4 : (slot + 1) * 4] = b"\xff\xff\xff\xff"
+        r67_raw[0x20] = target_allowed
+        r67_raw[0x21] = (r67_raw[0x21] & 0xF0) | (cur_learned & 0x0F)
+
+    # Read current EEL 0x68 flags/mode/key_over_can bytes at +0x42..+0x4B (10 bytes)
+    r68_tail = bytearray(fpke_read_memory_0x23(link, r68_base + 0x42, 10))
+    if len(r68_tail) != 10 or r68_tail == bytearray(b"\xaa" * 10):
+        r68_tail = bytearray([0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x00])
+    else:
+        if r68_tail[0] == 0xFF:
+            r68_tail[0] = 0x01
+        else:
+            r68_tail[0] |= 0x01  # 0x52FA bit 0 := 1 (S0/S1 present in 0x69)
+        r68_tail[1:7] = b"\x00" * 6  # clear any lockout counters in RAM
+        r68_tail[7] = 0x04           # 0x5301 := 4 (additive key learning mode 4)
+        if r68_tail[9] == 0xFF:
+            r68_tail[9] = 0x00
+        else:
+            r68_tail[9] &= ~0x80     # 0x5303 bit 7 := 0 (local LF coil active)
+
+    # Write S0||S1 to EEL 0x69 RAM, updated EEL 0x67 RAM, and EEL 0x68 tail to RAM via 0x3D
+    fpke_write_memory_0x3d(link, r69_base, s0 + s1)
+    fpke_write_memory_0x3d(link, r67_base, bytes(r67_raw))
+    fpke_write_memory_0x3d(link, r68_base + 0x42, bytes(r68_tail))
+
+    poll = fpke_coil_poll_transponder(link, reporter=reporter)
+    free_slots = max(0, target_allowed - cur_learned)
+    msg = tr(
+        f"Режим дообучения (режим 4, Способ А) активирован в ОЗУ без удаления старых ключей: "
+        f"сохранено {cur_learned} кл., открыто для добавления: {free_slots} (разрешено: {target_allowed}). "
+        "Приложите только новую болванку к катушке и нажмите «2. Обучить ключ в катушке (40 00)».",
+        f"Additive learning mode (mode 4, Method A) activated in RAM without erasing old keys: "
+        f"preserved {cur_learned} key(s), open for addition: {free_slots} (allowed: {target_allowed}). "
+        "Place only the new blank key on the coil and click “2. Learn key in coil (40 00)”.",
+    )
+    reporter.success(msg)
+    return {
+        "ok": True,
+        "method": "additive_ram_mode4",
+        "summary": msg,
+        "preserved_keys": cur_learned,
+        "allowed_keys": target_allowed,
+        "r67_ram_addr": f"0x{r67_base:08X}",
+        "r68_ram_addr": f"0x{r68_base:08X}",
+        "r69_ram_addr": f"0x{r69_base:08X}",
+        "poll": poll,
+    }
+
+
+def fpke_start_coil_key_learning(
+    link: FpkeCanLink,
+    *,
+    vin: str,
+    s0_hex: str,
+    s1_hex: str,
+    kc_hex: str,
+    power_class: int,
+    allowed_keys: int,
+    partner_mask: int = 0x01,
+    key_flags: int = 0x00,
+    status_5302: int = 0x00,
+    expected_crc_a_le: bytes | str | None = None,
+    expected_crc_b_le: bytes | str | None = None,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Step 1 of LF coil key learning: validate `S0/S1` CRC-32 and send `2E 02F7` to enter `mode 2` (`allowed_keys = N, learned = 0`)."""
+    from contitool.core.fpke import build_fpke_02f7_payload, fpke_verify_s0_s1
+
+    s0 = bytes.fromhex("".join(s0_hex.split()))
+    s1 = bytes.fromhex("".join(s1_hex.split()))
+    kc = bytes.fromhex("".join(kc_hex.split()))
+    ver = fpke_verify_s0_s1(s0, s1, expected_crc_a_le, expected_crc_b_le)
+    if not ver["valid"]:
+        raise RuntimeError(
+            tr(
+                f"Проверка S0/S1 не пройдена: CRC-32(A)={ver['crc_a_le_hex']} (ожидался {ver['expected_crc_a_le_hex']}), "
+                f"CRC-32(B)={ver['crc_b_le_hex']} (ожидался {ver['expected_crc_b_le_hex']}). Отправка 02F7 заблокирована.",
+                f"S0/S1 verification failed: CRC-32(A)={ver['crc_a_le_hex']} (expected {ver['expected_crc_a_le_hex']}), "
+                f"CRC-32(B)={ver['crc_b_le_hex']} (expected {ver['expected_crc_b_le_hex']}). Refusing to send 02F7.",
+            )
+        )
+
+    link.start_keepalive()
+    link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
+    st_02ef = link.request_uds(b"\x22\x02\xef", 0x62, timeout=2.0)[3:]
+    if st_02ef and st_02ef[0] > 0:
+        raise RuntimeError(
+            tr(
+                f"Класс 0 (02E3/02F7) заблокирован таймером защиты: осталось {st_02ef[0]} мин.",
+                f"Class 0 (02E3/02F7) lockout timer is active: {st_02ef[0]} min remaining.",
+            )
+        )
+
+    req_02f7, _plain = build_fpke_02f7_payload(
+        vin=vin,
+        s0=s0,
+        s1=s1,
+        current_kc=kc,
+        power_class=power_class,
+        allowed_keys=allowed_keys,
+        partner_mask=partner_mask,
+        key_flags=key_flags,
+        status_5302=status_5302,
+        force_local_coil=True,
+    )
+    reporter.info(
+        tr(
+            f"Отправка пакета адаптации 2E 02F7 (87 Б, разрешено ключей: {allowed_keys}, катушка LF)…",
+            f"Sending adaptation block 2E 02F7 (87 B, allowed keys: {allowed_keys}, LF coil)…",
+        )
+    )
+    link.request_uds(req_02f7, 0x6E, timeout=8.0)
+    poll = fpke_coil_poll_transponder(link, reporter=reporter)
+    msg = tr(
+        f"Режим обучения открыт (2E 02F7 принят): разрешено ключей {allowed_keys}, обучено {poll['learned_keys']}. "
+        "По очереди прикладывайте ключи к катушке и нажимайте «Обучить ключ в катушке».",
+        f"Learning session opened (2E 02F7 accepted): allowed {allowed_keys}, learned {poll['learned_keys']}. "
+        "Place each key on the coil one by one and click “Learn key in coil”.",
+    )
+    reporter.success(msg)
+    return {
+        "ok": True,
+        "summary": msg,
+        "allowed_keys": allowed_keys,
+        "poll": poll,
+    }
+
+
+def fpke_learn_next_key_on_coil(
+    link: FpkeCanLink,
+    *,
+    param: int = 0x00,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Step 2 of LF coil key learning: send `2E 02E1 00 00 40 <param>` to program/register the transponder currently in the LF coil."""
+    from contitool.core.fpke import build_fpke_02e1_request
+
+    link.start_keepalive()
+    link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
+    req = build_fpke_02e1_request(0x40, param & 0xFF)
+    reporter.info(
+        tr(
+            "Запуск обучения ключа на штатной катушке (2E 02E1 00 00 40 00) — держите ключ у катушки (~3–5 с)…",
+            "Starting key learning on stock LF coil (2E 02E1 00 00 40 00) — hold key at the coil (~3–5 s)…",
+        )
+    )
+    link.request_uds(req, 0x6E, timeout=12.0)
+    poll = fpke_coil_poll_transponder(link, reporter=reporter)
+    learned = poll["learned_keys"]
+    rem = poll["remaining_keys"]
+    ids_str = ", ".join(poll["learned_key_ids"]) if poll["learned_key_ids"] else (poll["coil_key_id"] or "—")
+    msg = tr(
+        f"Ключ успешно обучен через катушку! Обучено: {learned} (осталось: {rem}) • ID: {ids_str}",
+        f"Key learned via LF coil! Learned: {learned} (remaining: {rem}) • ID: {ids_str}",
+    )
+    reporter.success(msg)
+    return {
+        "ok": True,
+        "summary": msg,
+        "learned_keys": learned,
+        "remaining_keys": rem,
+        "learned_key_ids": poll["learned_key_ids"],
+        "coil_key_id": poll["coil_key_id"],
+        "poll": poll,
+    }
+
+
+def fpke_finish_coil_key_learning(
+    link: FpkeCanLink,
+    *,
+    sync_channel3: bool = False,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Step 3 of LF coil key learning: send `2E 02E1 00 00 80 00` (or `80 01`) to exit learning mode (`mode -> 1`) and erase `S0/S1`."""
+    from contitool.core.fpke import build_fpke_02e1_request
+
+    link.start_keepalive()
+    link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
+    param = 0x01 if sync_channel3 else 0x00
+    req = build_fpke_02e1_request(0x80, param)
+    used_fallback_80_00 = False
+    try:
+        link.request_uds(req, 0x6E, timeout=20.0 if sync_channel3 else 8.0)
+    except Exception:
+        if not sync_channel3:
+            raise
+        reporter.info(
+            tr(
+                "Узел 0x0E не ответил по каналу 3 (стенд без KESSY/BCM) — завершение обучения командой 80 00…",
+                "Node 0x0E did not answer on channel 3 (bench without KESSY/BCM) — finishing with 80 00…",
+            )
+        )
+        link.request_uds(build_fpke_02e1_request(0x80, 0x00), 0x6E, timeout=8.0)
+        used_fallback_80_00 = True
+
+    key_crc_hex: str | None = None
+    with contextlib.suppress(Exception):
+        r_02fa = link.request_uds(b"\x22\x02\xfa", 0x62, timeout=2.0)
+        if len(r_02fa) >= 8:
+            key_crc_hex = r_02fa[4:8].hex().upper()
+
+    poll = fpke_coil_poll_transponder(link, reporter=reporter)
+    msg = tr(
+        f"Обучение ключей завершено (режим 1, S0/S1 стёрты). Активных ключей: {poll['learned_keys']}.",
+        f"Key learning completed (mode 1, S0/S1 erased). Active keys: {poll['learned_keys']}.",
+    )
+    reporter.success(msg)
+    return {
+        "ok": True,
+        "summary": msg,
+        "learned_keys": poll["learned_keys"],
+        "remaining_keys": poll["remaining_keys"],
+        "learned_key_ids": poll["learned_key_ids"],
+        "key_list_crc32": key_crc_hex,
+        "used_fallback_80_00": used_fallback_80_00,
+        "poll": poll,
+    }

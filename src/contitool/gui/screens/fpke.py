@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -41,7 +42,13 @@ from contitool.can.fpke import (
     can_fpke_full_read,
     can_fpke_read_region,
     close_active_fpke_link,
+    fpke_coil_poll_transponder,
+    fpke_extract_live_s0_s1_from_coil,
+    fpke_finish_coil_key_learning,
+    fpke_learn_next_key_on_coil,
+    fpke_prepare_additive_coil_learning,
     fpke_run_procedure,
+    fpke_start_coil_key_learning,
     get_active_fpke_link,
     open_or_reuse_fpke_link,
 )
@@ -55,6 +62,9 @@ from contitool.core.fpke import (
     format_fpke_immo_comparison,
     format_fpke_report,
     format_fpke_transfer_plan,
+    fpke_s0_s1_from_slots,
+    fpke_slots_from_s0_s1,
+    fpke_verify_s0_s1,
     is_fpke_dflash,
     plan_fpke_a_to_b_transfer,
     transfer_fpke_donor_to_target,
@@ -196,6 +206,8 @@ class FpkeScreen(QWidget):
         self._recipient_dflash: bytes | None = None
         self._recipient_cflash: bytes | None = None
         self._swap_ab: bool = False
+        self._cached_s0_hex: str = ""
+        self._cached_s1_hex: str = ""
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1142,6 +1154,13 @@ class FpkeScreen(QWidget):
             )
             head_row.addWidget(btn_cmp)
             head_row.addWidget(btn_immo_json)
+        elif self._key == "keys" and self.dflash_info:
+            btn_coil_learn = button(
+                tr("Обучение через катушку…", "Learn via LF coil…"),
+                "GhostBtn",
+                slot=self.open_coil_key_learn_dialog,
+            )
+            head_row.addWidget(btn_coil_learn)
         elif self._key == "transfer" and self.dflash_info:
             btn_pick_donor = button(
                 tr("Выбрать донора…", "Select donor…")
@@ -1899,8 +1918,13 @@ class FpkeScreen(QWidget):
             "PrimaryBtn",
             slot=_save_keys_and_odo,
         )
+        btn_coil_wizard = button(
+            tr("Через катушку…", "Via LF coil…"),
+            "GhostBtn",
+            slot=self.open_coil_key_learn_dialog,
+        )
         btn_reset_keys = button(tr("Сбросить поля", "Reset fields"), "GhostBtn", slot=self._render_page)
-        sec_tp.add_footer(btn_apply_keys, btn_reset_keys)
+        sec_tp.add_footer(btn_apply_keys, btn_coil_wizard, btn_reset_keys)
         lay.addWidget(sec_tp)
 
     # ────────────────────────────── Page 4: Donor -> Target Transfer ──────────────────────────────
@@ -2469,6 +2493,52 @@ class FpkeScreen(QWidget):
         panel.state_changed.connect(self._refresh_nav)
         self._active_can_panel = panel
         lay.addWidget(panel)
+
+    def open_coil_key_learn_dialog(self) -> None:
+        if not self.dflash_info:
+            return
+
+        def _on_s0_s1_cached(s0_hex: str, s1_hex: str) -> None:
+            self._cached_s0_hex = s0_hex
+            self._cached_s1_hex = s1_hex
+
+        def _on_learned_keys_synced(learned_ids: list[str], learned_cnt: int, allowed_cnt: int) -> None:
+            df_cur, cf_cur = self._own_dflash_and_cflash()
+            if df_cur is None or not learned_ids:
+                return
+            padded_ids = list(learned_ids[:8]) + [""] * max(0, 8 - len(learned_ids))
+            with contextlib.suppress(Exception):
+                new_df = apply_fpke_dflash_edits(
+                    df_cur,
+                    key_display_ids=padded_ids,
+                    learned_keys=learned_cnt,
+                    allowed_keys=allowed_cnt,
+                    slot_s0_hex="FF" * 16,
+                    slot_s1_hex="FF" * 16,
+                    immo_mode=1,
+                    cflash=cf_cur,
+                )
+                self._commit_dflash_bytes(
+                    new_df,
+                    tr(
+                        f"Список обученных через катушку ключей ({learned_cnt} шт.) синхронизирован с рабочей копией дампа.",
+                        f"Coil-learned key list ({learned_cnt} keys) synchronized with working dump.",
+                    ),
+                )
+
+        dlg = FpkeCoilKeyLearnDialog(
+            self.conn,
+            self.runner,
+            dflash_info=self.dflash_info,
+            part_number=self.part_number,
+            initial_s0_hex=self._cached_s0_hex,
+            initial_s1_hex=self._cached_s1_hex,
+            on_s0_s1_cached=_on_s0_s1_cached,
+            on_learned_keys_synced=_on_learned_keys_synced,
+            parent=self.window(),
+        )
+        dlg.note.connect(self.note.emit)
+        run_dialog(dlg)
 
 
 class _ToggleSwitch(QAbstractButton):
@@ -3288,7 +3358,7 @@ class FpkeCanDialog(Dialog):
         self.panel.state_changed.connect(self._adjust_for_result)
         self.body.addWidget(self.panel)
         self.finish(cancel_text=tr("Закрыть", "Close"))
-        self.resize(self.width(), self.height() + 6)
+        self.resize(self.width(), self.height() + 26)
         self._fit_screen()
 
     def _adjust_for_result(self) -> None:
@@ -3298,3 +3368,485 @@ class FpkeCanDialog(Dialog):
             self.fit_height()
             self.resize(self.width(), self.height() + 6)
             self._fit_screen()
+
+
+class FpkeCoilKeyLearnDialog(Dialog):
+    """Step-by-step wizard for learning blank Megamos AES transponders via the stock 125 kHz LF coil."""
+
+    note = Signal(str)
+
+    def __init__(
+        self,
+        conn: CanConnection,
+        runner: OperationRunner,
+        *,
+        dflash_info: dict[str, Any],
+        part_number: str = "83A920700E",
+        initial_s0_hex: str = "",
+        initial_s1_hex: str = "",
+        on_s0_s1_cached: Callable[[str, str], None] | None = None,
+        on_learned_keys_synced: Callable[[list[str], int, int], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        by_id = {it["key_id"]: it for it in dflash_info.get("items", [])}
+        meta = dflash_info.get("metadata") or {}
+        immo_cfg = dflash_info.get("immo_config") or {}
+        slots = dflash_info.get("slot_secrets") or {}
+        tp = dflash_info.get("transponder_records") or {}
+
+        self._vin = str(meta.get("vin") or "")
+        self._kc_hex = str((by_id.get("kc") or {}).get("hex") or "").upper()
+        self._power_class = int(immo_cfg.get("power_class") or 0)
+        self._partner_mask = int(immo_cfg.get("partners_mask") or 0x01)
+        self._key_flags = int(immo_cfg.get("key_transport_raw") or 0x00)
+        self._status_5302 = int(immo_cfg.get("identity_counter") or 0x00)
+        self._expected_crc_a = str(slots.get("A_crc32_le") or "").upper()
+        self._expected_crc_b = str(slots.get("B_crc32_le") or "").upper()
+        cur_learned = int(tp.get("learned_keys") or 0)
+        self._existing_key_ids = [
+            str(k.get("display_id") or "").upper()
+            for k in (tp.get("key_ids") or [])[:cur_learned]
+            if k.get("present") and k.get("display_id")
+        ]
+
+        subtitle = tr(
+            f"{part_number} • Штатная катушка 125 кГц (Megamos AES) • VIN: {self._vin or '—'} • P_class: 0x{self._power_class:02X}",
+            f"{part_number} • Stock 125 kHz LF coil (Megamos AES) • VIN: {self._vin or '—'} • P_class: 0x{self._power_class:02X}",
+        )
+        super().__init__(
+            parent,
+            tr("Обучение ключей через штатную катушку", "Key learning via stock LF coil"),
+            subtitle,
+            width=760,
+        )
+        self.conn = conn
+        self.runner = runner
+        self._on_s0_s1_cached = on_s0_s1_cached
+        self._on_learned_keys_synced = on_learned_keys_synced
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.body.setContentsMargins(18, 6, 18, 6)
+        self.body.setSpacing(6)
+
+        def _tight_card(sec: Section) -> Section:
+            sec = _FpkeCanControlPanel._compact_section(sec)
+            sec.head.setContentsMargins(14, 7, 14, 3)
+            sec.body.setContentsMargins(14, 2, 14, 8)
+            sec.body.setSpacing(5)
+            return sec
+
+        # ── Live Coil & Immo Status Strip ──
+        self.strip_status = QFrame()
+        self.strip_status.setObjectName("ResultStrip")
+        st_lay = QHBoxLayout(self.strip_status)
+        st_lay.setContentsMargins(12, 5, 12, 5)
+        st_lay.setSpacing(10)
+        self.lbl_live_status = QLabel(
+            tr(
+                f"Дамп: обучено {cur_learned} кл. • CRC A/B: {self._expected_crc_a or '—'} / {self._expected_crc_b or '—'}",
+                f"Dump: {cur_learned} learned key(s) • CRC A/B: {self._expected_crc_a or '—'} / {self._expected_crc_b or '—'}",
+            )
+        )
+        self.lbl_live_status.setWordWrap(True)
+        set_tone(self.lbl_live_status, "info")
+        self.btn_poll_coil = button(
+            tr("Опросить катушку (02E4)", "Poll LF coil (02E4)"),
+            "GhostBtn",
+            slot=self.run_poll_coil,
+        )
+        st_lay.addWidget(self.lbl_live_status, 1)
+        st_lay.addWidget(self.btn_poll_coil, 0)
+        self.body.addWidget(self.strip_status)
+
+        # ── Step 1: Slot Secret S0 / S1 (32 B) ──
+        sec_s01 = _tight_card(Section())
+        sec_s01.set_text(
+            tr("Шаг 1. Секрет слотов S0 / S1 (32 байта)", "Step 1. Slot secret S0 / S1 (32 bytes)"),
+        )
+        self.lbl_crc_state = status_readout(tr("Ожидание S0/S1", "Awaiting S0/S1"), "warn")
+        sec_s01.head.addWidget(self.lbl_crc_state, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        lbl_s01_hint = QLabel(
+            tr(
+                "Приложите рабочий ключ (Ключ 1) к штатной катушке при включённом KL15 и нажмите "
+                "«Считать S0 / S1 с рабочего ключа», либо введите 32 байта вручную.",
+                "Hold a working key (Key 1) at the stock LF coil with ignition ON and click "
+                "“Extract S0 / S1 from working key”, or enter the 32 bytes manually.",
+            )
+        )
+        lbl_s01_hint.setObjectName("Hint")
+        lbl_s01_hint.setWordWrap(True)
+        sec_s01.body.addWidget(lbl_s01_hint)
+
+        raw_s0 = initial_s0_hex or str(slots.get("S0") or "").upper()
+        raw_s1 = initial_s1_hex or str(slots.get("S1") or "").upper()
+        if raw_s0 in ("FF" * 16, "00" * 16):
+            raw_s0 = ""
+        if raw_s1 in ("FF" * 16, "00" * 16):
+            raw_s1 = ""
+
+        s01_row = QHBoxLayout()
+        s01_row.setSpacing(10)
+        self.ed_s0 = QLineEdit(raw_s0)
+        self.ed_s0.setFont(mono_font(11))
+        self.ed_s0.setMinimumWidth(0)
+        self.ed_s0.setPlaceholderText("32 HEX (16 B S0)")
+        c_s0, b_s0 = FpkeScreen._field_box("S0 (RAM 0xFEDF2D44 / EEL 0x69)", self.ed_s0)
+        FpkeScreen._bind_hex_validator(self.ed_s0, b_s0, 16, allow_empty=False)
+
+        self.ed_s1 = QLineEdit(raw_s1)
+        self.ed_s1.setFont(mono_font(11))
+        self.ed_s1.setMinimumWidth(0)
+        self.ed_s1.setPlaceholderText("32 HEX (16 B S1)")
+        c_s1, b_s1 = FpkeScreen._field_box("S1 (RAM 0xFEDF2D54 / EEL 0x69)", self.ed_s1)
+        FpkeScreen._bind_hex_validator(self.ed_s1, b_s1, 16, allow_empty=False)
+
+        s01_row.addWidget(c_s0, 1)
+        s01_row.addWidget(c_s1, 1)
+        sec_s01.body.addLayout(s01_row)
+
+        self.lbl_slots_preview = QLabel("")
+        self.lbl_slots_preview.setFont(mono_font(10))
+        set_tone(self.lbl_slots_preview, "muted")
+        sec_s01.body.addWidget(self.lbl_slots_preview)
+
+        self.btn_extract_s01 = button(
+            tr("Считать S0 / S1 с рабочего ключа в катушке (RAM)", "Extract S0 / S1 from working key in coil (RAM)"),
+            "PrimaryBtn",
+            slot=self.run_extract_s0_s1,
+        )
+        sec_s01.add_footer(self.btn_extract_s01)
+        self.body.addWidget(sec_s01)
+
+        # ── Step 2: Open Learning Session (Method A: Additive RAM Mode 4 / Method B: Full 2E 02F7) ──
+        sec_02f7 = _tight_card(Section())
+        sec_02f7.set_text(
+            tr(
+                "Шаг 2. Вход в режим обучения (Способ А без удаления старых / 2E 02F7)",
+                "Step 2. Enter learning mode (Method A keep old keys / 2E 02F7)",
+            ),
+        )
+        lbl_02f7_warn = QLabel(
+            tr(
+                "Способ А (рекомендуется) через ОЗУ включает режим 4 и сохраняет старые ключи — прикладывать нужно только новую болванку. "
+                "Способ Б (2E 02F7) очищает 0x67 (нужно приложить все ключи).",
+                "Method A (recommended) activates mode 4 in RAM and keeps existing keys — only place the new blank key. "
+                "Method B (2E 02F7) clears 0x67 (all keys must be presented).",
+            )
+        )
+        lbl_02f7_warn.setObjectName("Hint")
+        lbl_02f7_warn.setWordWrap(True)
+        sec_02f7.body.addWidget(lbl_02f7_warn)
+
+        cfg_row = QHBoxLayout()
+        cfg_row.setSpacing(12)
+        lbl_cnt = group_label(tr("ИТОГОВОЕ ЧИСЛО КЛЮЧЕЙ (1–8):", "TARGET TOTAL KEYS (1–8):"))
+        self.spn_target_keys = QSpinBox()
+        self.spn_target_keys.setRange(1, 8)
+        self.spn_target_keys.setValue(min(8, max(1, cur_learned + 1)))
+        self.spn_target_keys.setFont(mono_font(12, bold=True))
+        self.spn_target_keys.setFixedWidth(68)
+        lbl_kc_info = QLabel(f"CS/K_c: {self._kc_hex[:12]}… • P_class: 0x{self._power_class:02X}")
+        lbl_kc_info.setFont(mono_font(10))
+        set_tone(lbl_kc_info, "muted")
+        cfg_row.addWidget(lbl_cnt)
+        cfg_row.addWidget(self.spn_target_keys)
+        cfg_row.addSpacing(8)
+        cfg_row.addWidget(lbl_kc_info, 1)
+        sec_02f7.body.addLayout(cfg_row)
+
+        self.btn_prepare_additive = button(
+            tr("1А. Дописать новый (сохранить старые — Режим 4)", "1A. Add new key (keep existing — Mode 4)"),
+            "PrimaryBtn",
+            slot=self.run_prepare_additive_mode4,
+        )
+        self.btn_start_02f7 = button(
+            tr("1Б. Перезаписать все (2E 02F7)", "1B. Overwrite all (2E 02F7)"),
+            "GhostBtn",
+            slot=self.run_start_learning_02f7,
+        )
+        sec_02f7.add_footer(self.btn_prepare_additive, self.btn_start_02f7)
+        self.body.addWidget(sec_02f7)
+
+        # ── Step 3: Learn Keys on Coil & Finish (2E 02E1 40 00 -> 80 00) ──
+        sec_learn = _tight_card(Section())
+        sec_learn.set_text(
+            tr("Шаг 3. Привязка ключей на катушке и завершение (2E 02E1)", "Step 3. Bind keys on LF coil & finish (2E 02E1)"),
+        )
+        lbl_lrn_hint = QLabel(
+            tr(
+                "По очереди прикладывайте каждый ключ к катушке и нажимайте «2. Обучить ключ в катушке (40 00)». "
+                "В чистую болванку Megamos AES (бит 1 в 0x01F = 1) приборка запишет K_c, слоты A/B и метку 0x9911 (~3–5 с).",
+                "Place each key on the coil one by one and click “2. Learn key in coil (40 00)”. "
+                "For a blank Megamos AES chip (bit 1 of 0x01F = 1), the cluster writes K_c, slots A/B, and marker 0x9911 (~3–5 s).",
+            )
+        )
+        lbl_lrn_hint.setObjectName("Hint")
+        lbl_lrn_hint.setWordWrap(True)
+        sec_learn.body.addWidget(lbl_lrn_hint)
+
+        self.chk_sync_ch3 = QCheckBox(
+            tr(
+                "При завершении передать очередь 0x6A внешнему блоку 0x0E по каналу 3 (80 01 — в автомобиле)",
+                "Send queue 0x6A to external node 0x0E on channel 3 upon finish (80 01 — in vehicle)",
+            )
+        )
+        self.chk_sync_ch3.setChecked(False)
+        sec_learn.body.addWidget(self.chk_sync_ch3)
+
+        self.btn_learn_key = button(
+            tr("2. Обучить ключ в катушке (40 00)", "2. Learn key in coil (40 00)"),
+            "PrimaryBtn",
+            slot=self.run_learn_next_key,
+        )
+        self.btn_finish_learn = button(
+            tr("3. Завершить обучение (80 00)", "3. Finish learning (80 00)"),
+            "GhostBtn",
+            slot=self.run_finish_learning,
+        )
+        sec_learn.add_footer(self.btn_learn_key, self.btn_finish_learn)
+        self.body.addWidget(sec_learn)
+
+        self.ed_s0.textChanged.connect(lambda _t: self._update_s01_validation())
+        self.ed_s1.textChanged.connect(lambda _t: self._update_s01_validation())
+        self._update_s01_validation()
+
+        self.finish(cancel_text=tr("Закрыть", "Close"))
+        self.resize(self.width(), self.height() + 26)
+        self._fit_screen()
+
+    def _clean_hex(self, txt: str) -> str:
+        return "".join(txt.split()).replace("0x", "").replace("0X", "").upper()
+
+    def _update_s01_validation(self) -> None:
+        s0_h = self._clean_hex(self.ed_s0.text())
+        s1_h = self._clean_hex(self.ed_s1.text())
+        if len(s0_h) != 32 or len(s1_h) != 32 or not all(c in "0123456789ABCDEF" for c in s0_h + s1_h):
+            self.lbl_crc_state.setText(tr("Не заданы S0/S1", "S0/S1 missing"))
+            set_tone(self.lbl_crc_state, "warn")
+            self.lbl_slots_preview.setText(
+                tr(
+                    f"Ожидаемые CRC-32 (0x68): A={self._expected_crc_a or '—'} • B={self._expected_crc_b or '—'}",
+                    f"Expected CRC-32 (0x68): A={self._expected_crc_a or '—'} • B={self._expected_crc_b or '—'}",
+                )
+            )
+            self.btn_prepare_additive.setEnabled(False)
+            self.btn_start_02f7.setEnabled(False)
+            return
+
+        ver = fpke_verify_s0_s1(
+            bytes.fromhex(s0_h),
+            bytes.fromhex(s1_h),
+            self._expected_crc_a or None,
+            self._expected_crc_b or None,
+        )
+        self.lbl_slots_preview.setText(
+            f"Slot A: {ver['slot_a_hex']} (CRC: {ver['crc_a_le_hex']})  •  "
+            f"Slot B: {ver['slot_b_hex']} (CRC: {ver['crc_b_le_hex']})"
+        )
+        if ver["valid"]:
+            self.lbl_crc_state.setText(tr("CRC A/B совпали с 0x68", "CRC A/B match 0x68"))
+            set_tone(self.lbl_crc_state, "ok")
+            self.btn_prepare_additive.setEnabled(True)
+            self.btn_start_02f7.setEnabled(True)
+            if self._on_s0_s1_cached is not None:
+                self._on_s0_s1_cached(s0_h, s1_h)
+        else:
+            self.lbl_crc_state.setText(tr("CRC A/B НЕ совпадают!", "CRC A/B mismatch!"))
+            set_tone(self.lbl_crc_state, "err")
+            self.btn_prepare_additive.setEnabled(False)
+            self.btn_start_02f7.setEnabled(False)
+
+    def _ensure_link(self) -> Any | None:
+        if not ensure_ready(self.conn, self):
+            return None
+        try:
+            return open_or_reuse_fpke_link(self.conn.port, interface=self.conn.interface)
+        except Exception as exc:
+            self._set_status(str(exc), "err")
+            return None
+
+    def _set_status(self, msg: str, tone: str = "info") -> None:
+        if not _qt_valid(self) or not _qt_valid(self.lbl_live_status):
+            return
+        self.lbl_live_status.setText(msg)
+        set_tone(self.lbl_live_status, tone)
+        self.note.emit(msg)
+
+    def run_poll_coil(self) -> None:
+        if self.runner.is_busy:
+            return
+        link = self._ensure_link()
+        if link is None:
+            return
+
+        def task(rep: Any) -> dict[str, Any]:
+            return fpke_coil_poll_transponder(link, reporter=rep)
+
+        def done(res: dict[str, Any]) -> None:
+            if not _qt_valid(self):
+                return
+            ids = ", ".join(res.get("learned_key_ids") or [])
+            summary = str(res.get("summary") or "")
+            if ids:
+                summary += f" • ID: {ids}"
+            self._set_status(summary, "ok" if res.get("coil_key_id") else "info")
+
+        self.runner.run_task(
+            tr("Опрос штатной катушки LF (02E4 / 02ED)", "Polling stock LF coil (02E4 / 02ED)"),
+            task,
+            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+        )
+
+    def run_extract_s0_s1(self) -> None:
+        if self.runner.is_busy:
+            return
+        link = self._ensure_link()
+        if link is None:
+            return
+        exp_a = self._expected_crc_a or None
+        exp_b = self._expected_crc_b or None
+
+        def task(rep: Any) -> dict[str, Any]:
+            return fpke_extract_live_s0_s1_from_coil(
+                link,
+                expected_crc_a_le=exp_a,
+                expected_crc_b_le=exp_b,
+                reporter=rep,
+            )
+
+        def done(res: dict[str, Any]) -> None:
+            if not _qt_valid(self):
+                return
+            self.ed_s0.setText(str(res.get("s0_hex") or ""))
+            self.ed_s1.setText(str(res.get("s1_hex") or ""))
+            self._update_s01_validation()
+            self._set_status(str(res.get("summary") or ""), "ok")
+
+        self.runner.run_task(
+            tr("Чтение S0 / S1 из ОЗУ приборки", "Extracting S0 / S1 from cluster RAM"),
+            task,
+            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+        )
+
+    def run_prepare_additive_mode4(self) -> None:
+        if self.runner.is_busy:
+            return
+        link = self._ensure_link()
+        if link is None:
+            return
+        s0_h = self._clean_hex(self.ed_s0.text())
+        s1_h = self._clean_hex(self.ed_s1.text())
+        target_n = self.spn_target_keys.value()
+        existing_ids = list(self._existing_key_ids)
+
+        def task(rep: Any) -> dict[str, Any]:
+            return fpke_prepare_additive_coil_learning(
+                link,
+                s0_hex=s0_h,
+                s1_hex=s1_h,
+                kc_hex=self._kc_hex,
+                allowed_keys=target_n,
+                existing_key_display_ids=existing_ids,
+                expected_crc_a_le=self._expected_crc_a or None,
+                expected_crc_b_le=self._expected_crc_b or None,
+                reporter=rep,
+            )
+
+        def done(res: dict[str, Any]) -> None:
+            if not _qt_valid(self):
+                return
+            self._set_status(str(res.get("summary") or ""), "ok")
+
+        self.runner.run_task(
+            tr(
+                "Активация режима дообучения 4 в ОЗУ (без удаления старых ключей)",
+                "Activating additive learning mode 4 in RAM (keeping existing keys)",
+            ),
+            task,
+            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+        )
+
+    def run_start_learning_02f7(self) -> None:
+        if self.runner.is_busy:
+            return
+        link = self._ensure_link()
+        if link is None:
+            return
+        s0_h = self._clean_hex(self.ed_s0.text())
+        s1_h = self._clean_hex(self.ed_s1.text())
+        target_n = self.spn_target_keys.value()
+
+        def task(rep: Any) -> dict[str, Any]:
+            return fpke_start_coil_key_learning(
+                link,
+                vin=self._vin,
+                s0_hex=s0_h,
+                s1_hex=s1_h,
+                kc_hex=self._kc_hex,
+                power_class=self._power_class,
+                allowed_keys=target_n,
+                partner_mask=self._partner_mask,
+                key_flags=self._key_flags,
+                status_5302=self._status_5302,
+                expected_crc_a_le=self._expected_crc_a or None,
+                expected_crc_b_le=self._expected_crc_b or None,
+                reporter=rep,
+            )
+
+        def done(res: dict[str, Any]) -> None:
+            if not _qt_valid(self):
+                return
+            self._set_status(str(res.get("summary") or ""), "ok")
+
+        self.runner.run_task(
+            tr("Открытие режима обучения ключей (2E 02F7)", "Opening key learning session (2E 02F7)"),
+            task,
+            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+        )
+
+    def run_learn_next_key(self) -> None:
+        if self.runner.is_busy:
+            return
+        link = self._ensure_link()
+        if link is None:
+            return
+
+        def task(rep: Any) -> dict[str, Any]:
+            return fpke_learn_next_key_on_coil(link, param=0x00, reporter=rep)
+
+        def done(res: dict[str, Any]) -> None:
+            if not _qt_valid(self):
+                return
+            self._set_status(str(res.get("summary") or ""), "ok")
+
+        self.runner.run_task(
+            tr("Обучение ключа в штатной катушке (2E 02E1 40 00)", "Learning key in stock LF coil (2E 02E1 40 00)"),
+            task,
+            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+        )
+
+    def run_finish_learning(self) -> None:
+        if self.runner.is_busy:
+            return
+        link = self._ensure_link()
+        if link is None:
+            return
+        sync_ch3 = self.chk_sync_ch3.isChecked()
+
+        def task(rep: Any) -> dict[str, Any]:
+            return fpke_finish_coil_key_learning(link, sync_channel3=sync_ch3, reporter=rep)
+
+        def done(res: dict[str, Any]) -> None:
+            if not _qt_valid(self):
+                return
+            self._set_status(str(res.get("summary") or ""), "ok")
+            learned_ids = list(res.get("learned_key_ids") or [])
+            learned_cnt = int(res.get("learned_keys") or len(learned_ids))
+            if learned_ids and self._on_learned_keys_synced is not None:
+                self._on_learned_keys_synced(learned_ids, learned_cnt, learned_cnt)
+
+        self.runner.run_task(
+            tr("Завершение обучения ключей (2E 02E1 80 00)", "Finishing key learning (2E 02E1 80 00)"),
+            task,
+            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+        )

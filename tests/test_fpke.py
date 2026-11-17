@@ -1279,3 +1279,250 @@ def test_fpke_extra_area_retries_on_transient_eel_dflash_aliasing(tmp_path: Path
     assert rep["idauth"]["accepted"] is True
     assert rep["idauth"]["idst_after_relock"] == "01000000"
     assert (tmp_path / "eel_retry" / "ExtraArea.bin").read_bytes() == bus.extra
+
+
+def test_fpke_coil_key_learning_end_to_end_and_dialog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import zlib
+    from PySide6.QtWidgets import QApplication
+    from contitool.can.fpke import (
+        FPKE_83A_RAM_EEL67_ADDR,
+        FPKE_83A_RAM_EEL68_ADDR,
+        FPKE_83A_RAM_EEL69_ADDR,
+        FPKE_83A_RAM_LAST_KEY_ID_ADDR,
+        FPKE_83A_RAM_RECOG_STATE_ADDR,
+        FPKE_83A_RAM_S0_ADDR,
+        FPKE_83A_RAM_SLOTS_FLAG_ADDR,
+        FpkeCanLink,
+        close_active_fpke_link,
+        fpke_coil_poll_transponder,
+        fpke_extract_live_s0_s1_from_coil,
+        fpke_finish_coil_key_learning,
+        fpke_learn_next_key_on_coil,
+        fpke_prepare_additive_coil_learning,
+        fpke_start_coil_key_learning,
+        set_active_fpke_link,
+    )
+    from contitool.core.fpke import (
+        apply_fpke_dflash_edits,
+        build_fpke_02e1_request,
+        build_fpke_02f7_payload,
+        encode_fpke_02f7_config,
+        fpke_compute_02e1_mac,
+        fpke_crc16_ccitt,
+        fpke_s0_s1_from_slots,
+        fpke_slots_from_s0_s1,
+        fpke_verify_s0_s1,
+    )
+    from contitool.gui.main_window import MainWindow
+    from contitool.gui.screens.fpke import FpkeCoilKeyLearnDialog
+    from contitool.gui.theme import apply_theme
+
+    # 1. Verify firmware CRC-16/CCITT and 02E1 MAC against ac-immo-diag.md §12 vector
+    assert fpke_crc16_ccitt(b"123456789") == 0x29B1
+    assert fpke_compute_02e1_mac(b"LAB IMMO KC KEY!", bytes.fromhex("2ae91569"), 0x10, 0x01).hex() == "14db"
+    assert build_fpke_02e1_request(0x40, 0x00) == bytes.fromhex("2e02e100004000")
+    assert build_fpke_02e1_request(0x80, 0x00) == bytes.fromhex("2e02e100008000")
+
+    # 2. Verify Slot A/B <-> S0/S1 permutation and 02F7 config byte encoding (0x13A99C inverse)
+    slot_a = b"LAB IMMO SLOT A!"
+    slot_b = b"LAB IMMO SLOT B!"
+    s0, s1 = fpke_s0_s1_from_slots(slot_a, slot_b)
+    assert fpke_slots_from_s0_s1(s0, s1) == (slot_a, slot_b)
+    crc_a_le = struct.pack("<I", zlib.crc32(slot_a))
+    crc_b_le = struct.pack("<I", zlib.crc32(slot_b))
+    ver = fpke_verify_s0_s1(s0, s1, crc_a_le, crc_b_le)
+    assert ver["valid"] is True
+    assert ver["crc_a_le_hex"] == "E80B6C4F"
+    assert ver["crc_b_le_hex"] == "2B584164"
+
+    b42, b43 = encode_fpke_02f7_config(3, partner_mask=0x05, key_flags=0x80, force_local_coil=True)
+    assert (b42 & 0x0F) == 3
+    assert (b43 & 0x01) == 0x00  # local LF coil forced (bit 0 = 0)
+    assert (b43 & 0x30) == 0x30  # partner 0 (ECU, 0x10) + partner 2 (TCU, 0x20)
+
+    # 3. Simulated cluster bus with working Key 1 in coil -> extract S0/S1 -> 2E 02F7 -> 3x 2E 02E1 40 00 -> 2E 02E1 80 00
+    class CoilLearnBus(FakeFpkeBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ram[FPKE_83A_RAM_S0_ADDR] = s0 + s1
+            self.ram[FPKE_83A_RAM_SLOTS_FLAG_ADDR] = b"\x03"
+            self.ram[FPKE_83A_RAM_RECOG_STATE_ADDR] = b"\x04"
+            self.ram[FPKE_83A_RAM_LAST_KEY_ID_ADDR] = bytes.fromhex("a1b2c3d4")
+            self.coil_queue = ["D4C3B2A1", "1807F6E5", "5A4B3C2D"]
+            self.learned_ids: list[str] = ["D4C3B2A1", "1807F6E5"]
+            self.allowed_cnt = 2
+            self.mode_fam = 2
+            self.last_02f7: bytes = b""
+            self._sync_ident_map()
+
+        def _sync_ident_map(self) -> None:
+            cur_coil = self.coil_queue[0] if self.coil_queue else "5A4B3C2D"
+            self.ident_map[0x02E4] = bytes.fromhex(cur_coil)
+            rem = max(0, self.allowed_cnt - len(self.learned_ids))
+            self.ident_map[0x02ED] = bytes([self.mode_fam, 0x01, 0x03, 0x4C, len(self.learned_ids), 0x00, rem, 0x00, 0x00, 0x00])
+            for idx in range(8):
+                did = 0x02E5 + idx
+                if idx < len(self.learned_ids):
+                    self.ident_map[did] = bytes.fromhex(self.learned_ids[idx])
+                else:
+                    self.ident_map.pop(did, None)
+            self.ident_map[0x02FA] = b"\x01\x33\xea\x91\xd3"
+
+        def _handle_uds(self, req: bytes) -> None:
+            if req[:3] == b"\x2e\x02\xf7":
+                assert len(req) == 87
+                self.last_02f7 = req
+                self.mode_fam = 3
+                self.learned_ids = []
+                self.allowed_cnt = 3
+                self._sync_ident_map()
+                self._push_uds_reply(b"\x6e\x02\xf7")
+                return
+            if req[:3] == b"\x2e\x02\xe1":
+                cmd, param = req[5], req[6]
+                if cmd == 0x40:
+                    nxt = self.coil_queue.pop(0) if self.coil_queue else "5A4B3C2D"
+                    self.learned_ids.append(nxt)
+                    self.mode_fam = 3
+                    self._sync_ident_map()
+                    self._push_uds_reply(b"\x6e\x02\xe1")
+                    return
+                if cmd == 0x80 and param in (0x00, 0x01):
+                    self.mode_fam = 2
+                    self.allowed_cnt = len(self.learned_ids)
+                    self._sync_ident_map()
+                    self._push_uds_reply(b"\x6e\x02\xe1")
+                    return
+            super()._handle_uds(req)
+
+    close_active_fpke_link()
+    bus = CoilLearnBus()
+    link = FpkeCanLink("fake-port", interface="slcan", bus=bus)
+    link.level8_active = True
+    set_active_fpke_link(link)
+    try:
+        ext = fpke_extract_live_s0_s1_from_coil(
+            link,
+            expected_crc_a_le=crc_a_le,
+            expected_crc_b_le=crc_b_le,
+            wake_seconds=0.0,
+        )
+        assert ext["ok"] is True
+        assert ext["s0_hex"] == s0.hex().upper()
+        assert ext["s1_hex"] == s1.hex().upper()
+        assert ext["coil_key_id"] == "D4C3B2A1"
+
+        # Wrong expected CRC must block 2E 02F7
+        with pytest.raises(RuntimeError, match="CRC-32"):
+            fpke_start_coil_key_learning(
+                link,
+                vin="TESTVIN0123456789",
+                s0_hex=ext["s0_hex"],
+                s1_hex=ext["s1_hex"],
+                kc_hex="505152535455565758595A5B5C5D5E5F",
+                power_class=0x4C,
+                allowed_keys=3,
+                expected_crc_a_le="DEADBEEF",
+                expected_crc_b_le=crc_b_le,
+            )
+
+        st_open = fpke_start_coil_key_learning(
+            link,
+            vin="TESTVIN0123456789",
+            s0_hex=ext["s0_hex"],
+            s1_hex=ext["s1_hex"],
+            kc_hex="505152535455565758595A5B5C5D5E5F",
+            power_class=0x4C,
+            allowed_keys=3,
+            expected_crc_a_le=crc_a_le,
+            expected_crc_b_le=crc_b_le,
+        )
+        assert st_open["ok"] is True and st_open["poll"]["learned_keys"] == 0 and st_open["poll"]["remaining_keys"] == 3
+
+        k1 = fpke_learn_next_key_on_coil(link)
+        k2 = fpke_learn_next_key_on_coil(link)
+        k3 = fpke_learn_next_key_on_coil(link)
+        assert k1["learned_keys"] == 1 and k2["learned_keys"] == 2 and k3["learned_keys"] == 3
+        assert k3["learned_key_ids"] == ["D4C3B2A1", "1807F6E5", "5A4B3C2D"]
+
+        fin = fpke_finish_coil_key_learning(link, sync_channel3=False)
+        assert fin["ok"] is True
+        assert fin["learned_keys"] == 3 and fin["remaining_keys"] == 0
+        assert fin["learned_key_ids"] == ["D4C3B2A1", "1807F6E5", "5A4B3C2D"]
+
+        # 3b. Method A (additive RAM mode 4 without 2E 02F7): preserves existing 2 keys and adds only Key 3
+        bus.learned_ids = ["D4C3B2A1", "1807F6E5"]
+        bus.allowed_cnt = 2
+        bus.mode_fam = 2
+        bus.coil_queue = ["5A4B3C2D"]
+        bus._sync_ident_map()
+
+        prep_a = fpke_prepare_additive_coil_learning(
+            link,
+            s0_hex=ext["s0_hex"],
+            s1_hex=ext["s1_hex"],
+            kc_hex="505152535455565758595A5B5C5D5E5F",
+            allowed_keys=3,
+            expected_crc_a_le=crc_a_le,
+            expected_crc_b_le=crc_b_le,
+            wake_seconds=0.0,
+        )
+        assert prep_a["ok"] is True
+        assert prep_a["preserved_keys"] == 2
+        assert prep_a["allowed_keys"] == 3
+        assert bus.ram[FPKE_83A_RAM_EEL69_ADDR] == s0 + s1
+        assert bus.ram[FPKE_83A_RAM_EEL67_ADDR][:8] == bytes.fromhex("a1b2c3d4e5f60718")
+        assert bus.ram[FPKE_83A_RAM_EEL67_ADDR][0x20] == 3
+        assert (bus.ram[FPKE_83A_RAM_EEL67_ADDR][0x21] & 0x0F) == 2
+        assert (bus.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42][0] & 0x01) == 0x01
+        assert bus.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42][7] == 0x04  # mode 4
+
+        k3_only = fpke_learn_next_key_on_coil(link)
+        assert k3_only["learned_keys"] == 3
+        assert k3_only["learned_key_ids"] == ["D4C3B2A1", "1807F6E5", "5A4B3C2D"]
+        fin_a = fpke_finish_coil_key_learning(link, sync_channel3=False)
+        assert fin_a["learned_keys"] == 3 and fin_a["remaining_keys"] == 0
+
+        # 4. Exercise FpkeCoilKeyLearnDialog UI & synchronization back into FpkeScreen working dump
+        app = QApplication.instance() or QApplication([])
+        apply_theme(app)  # type: ignore[arg-type]
+
+        df_unit = apply_fpke_dflash_edits(
+            build_synthetic_fpke_dflash(),
+            slot_s0_hex=s0.hex(),
+            slot_s1_hex=s1.hex(),
+            crc_a_hex=crc_a_le.hex(),
+            crc_b_hex=crc_b_le.hex(),
+        )
+        # Clear S0/S1 in EEL 0x69 while keeping the valid CRC-32(A/B) in EEL 0x68
+        df_mode1 = apply_fpke_dflash_edits(df_unit, slot_s0_hex="FF" * 16, slot_s1_hex="FF" * 16)
+        unit_dir = tmp_path / "coil_gui_unit"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        (unit_dir / "Dflash.bin").write_bytes(df_mode1)
+        (unit_dir / "ExtraArea.bin").write_bytes(build_synthetic_extra_area())
+
+        win = MainWindow()
+        win.open_folder(str(unit_dir))
+        win.fpke_screen.select("keys")
+        app.processEvents()
+
+        synced_calls: list[tuple[list[str], int, int]] = []
+        dlg = FpkeCoilKeyLearnDialog(
+            win.conn,
+            win.runner,
+            dflash_info=win.fpke_screen.dflash_info,
+            part_number="83A920700E",
+            on_learned_keys_synced=lambda ids, lrn, alw: synced_calls.append((ids, lrn, alw)),
+            parent=win,
+        )
+        assert dlg.btn_prepare_additive.isEnabled() is False
+        assert dlg.btn_start_02f7.isEnabled() is False
+        dlg.ed_s0.setText(s0.hex().upper())
+        dlg.ed_s1.setText(s1.hex().upper())
+        app.processEvents()
+        assert dlg.btn_prepare_additive.isEnabled() is True
+        assert dlg.btn_start_02f7.isEnabled() is True
+        dlg.close()
+        win.close()
+    finally:
+        close_active_fpke_link()

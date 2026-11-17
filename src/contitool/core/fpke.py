@@ -177,6 +177,217 @@ def aes128_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
     return bytes(out)
 
 
+def aes128_ecb_encrypt(key: bytes, plaintext: bytes) -> bytes:
+    """Encrypt `plaintext` (multiple of 16 bytes) with AES-128-ECB (no padding)."""
+    if len(plaintext) % 16 != 0:
+        raise ValueError(f"AES-128-ECB plaintext must be a multiple of 16 bytes, got {len(plaintext)}")
+    rks = _aes128_expand_key(key)
+    out = bytearray()
+    for off in range(0, len(plaintext), 16):
+        out.extend(_aes128_encrypt_block(plaintext[off : off + 16], rks))
+    return bytes(out)
+
+
+# 10-byte ROM constant for `2E 02E1` MAC block (SW 1703 `0x19D1D8`, SW 83A `0x196E68`)
+FPKE_02E1_C10 = bytes.fromhex("01020304050607080910")
+
+
+def fpke_crc16_ccitt(data: bytes) -> int:
+    """Compute firmware CRC-16/CCITT (`0x13F4A2`: polynomial `0x1021`, init `0xFFFF`)."""
+    c = 0xFFFF
+    for b in data:
+        c ^= b << 8
+        for _ in range(8):
+            c = ((c << 1) ^ 0x1021) & 0xFFFF if (c & 0x8000) else (c << 1) & 0xFFFF
+    return c
+
+
+def fpke_compute_02e1_mac(kc: bytes, challenge_r: bytes, cmd: int, param: int) -> bytes:
+    """Compute 2-byte big-endian MAC for `2E 02E1 <M0> <M1> <C> <P>` (`ac-immo-diag.md` §4.2).
+
+    Commands `0x40` and `0x80` (`P in {0, 1, 2}`) do not use MAC (`00 00`).
+    Commands `0x01`, `0x02`, `0x04`, `0x10` use `CRC16_CCITT(AES128_ECB_Kc(C || P || R[0..3] || C10))`.
+    """
+    c_byte = cmd & 0xFF
+    p_byte = param & 0xFF
+    if c_byte in (0x40, 0x80):
+        return b"\x00\x00"
+    if len(kc) != 16:
+        raise ValueError(f"K_c must be 16 bytes, got {len(kc)}")
+    if len(challenge_r) != 4:
+        raise ValueError(f"Challenge R (DID 0x02E0) must be 4 bytes, got {len(challenge_r)}")
+    blk = bytes([c_byte, p_byte]) + challenge_r + FPKE_02E1_C10
+    crc = fpke_crc16_ccitt(aes128_ecb_encrypt(kc, blk))
+    return bytes([(crc >> 8) & 0xFF, crc & 0xFF])
+
+
+def build_fpke_02e1_request(
+    cmd: int,
+    param: int,
+    *,
+    kc: bytes | None = None,
+    challenge_r: bytes | None = None,
+) -> bytes:
+    """Build 7-byte UDS request `2E 02 E1 <M0> <M1> <C> <P>`."""
+    c_byte = cmd & 0xFF
+    p_byte = param & 0xFF
+    if c_byte in (0x40, 0x80):
+        mac = b"\x00\x00"
+    else:
+        if kc is None or challenge_r is None:
+            raise ValueError(f"Command 0x{c_byte:02X} requires 16-byte K_c and 4-byte challenge R (0x02E0)")
+        mac = fpke_compute_02e1_mac(kc, challenge_r, c_byte, p_byte)
+    return bytes([0x2E, 0x02, 0xE1, mac[0], mac[1], c_byte, p_byte])
+
+
+def fpke_slots_from_s0_s1(s0: bytes, s1: bytes) -> tuple[bytes, bytes]:
+    """Reconstruct 16-byte `(slot_a, slot_b)` from `EEL 0x69` `(s0, s1)` (`0x13FC24`, `ac-immo-she.md` §3.3)."""
+    if len(s0) != 16 or len(s1) != 16:
+        raise ValueError("S0 and S1 must each be 16 bytes")
+    slot_a = bytes(s0[0:4]) + bytes(s1[4:12]) + bytes(s0[12:16])
+    slot_b = bytes(s1[0:4]) + bytes(s0[4:12]) + bytes(s1[12:16])
+    return slot_a, slot_b
+
+
+def fpke_s0_s1_from_slots(slot_a: bytes, slot_b: bytes) -> tuple[bytes, bytes]:
+    """Pack 16-byte `(slot_a, slot_b)` into `EEL 0x69` / `02F7` `(s0, s1)` layout (involutory permutation)."""
+    if len(slot_a) != 16 or len(slot_b) != 16:
+        raise ValueError("Slot A and Slot B must each be 16 bytes")
+    return fpke_slots_from_s0_s1(slot_a, slot_b)
+
+
+def fpke_verify_s0_s1(
+    s0: bytes,
+    s1: bytes,
+    expected_crc_a_le: bytes | str | None = None,
+    expected_crc_b_le: bytes | str | None = None,
+) -> dict[str, Any]:
+    """Verify `S0 / S1` (`EEL 0x69` / RAM `0xFEDF2D44`) against `EEL 0x68` `CRC-32(A)` and `CRC-32(B)` (`VDO CS+`)."""
+    if len(s0) != 16 or len(s1) != 16:
+        raise ValueError("S0 and S1 must each be 16 bytes")
+    slot_a, slot_b = fpke_slots_from_s0_s1(s0, s1)
+    crc_a_le = struct.pack("<I", zlib.crc32(slot_a))
+    crc_b_le = struct.pack("<I", zlib.crc32(slot_b))
+
+    def _norm_crc(val: bytes | str | None) -> bytes | None:
+        if val is None:
+            return None
+        if isinstance(val, str):
+            cleaned = "".join(val.split()).replace("0x", "").replace("0X", "")
+            return bytes.fromhex(cleaned) if len(cleaned) == 8 else None
+        return bytes(val) if len(val) == 4 else None
+
+    exp_a = _norm_crc(expected_crc_a_le)
+    exp_b = _norm_crc(expected_crc_b_le)
+    not_blank = (
+        s0 not in (b"\xff" * 16, b"\x00" * 16, b"\xaa" * 16)
+        and s1 not in (b"\xff" * 16, b"\x00" * 16, b"\xaa" * 16)
+    )
+    crc_a_ok = True if exp_a is None else (crc_a_le == exp_a)
+    crc_b_ok = True if exp_b is None else (crc_b_le == exp_b)
+    return {
+        "valid": bool(not_blank and crc_a_ok and crc_b_ok),
+        "not_blank": not_blank,
+        "crc_a_ok": crc_a_ok,
+        "crc_b_ok": crc_b_ok,
+        "s0_hex": s0.hex().upper(),
+        "s1_hex": s1.hex().upper(),
+        "slot_a_hex": slot_a.hex().upper(),
+        "slot_b_hex": slot_b.hex().upper(),
+        "crc_a_le_hex": crc_a_le.hex().upper(),
+        "crc_b_le_hex": crc_b_le.hex().upper(),
+        "expected_crc_a_le_hex": exp_a.hex().upper() if exp_a else None,
+        "expected_crc_b_le_hex": exp_b.hex().upper() if exp_b else None,
+    }
+
+
+def encode_fpke_02f7_config(
+    allowed_keys: int,
+    partner_mask: int = 0x01,
+    key_flags: int = 0x00,
+    *,
+    force_local_coil: bool = True,
+) -> tuple[int, int]:
+    """Encode `P[0x42]` and `P[0x43]` of `2E 02F7` as exact inverse of `0x13A99C` (`ac-immo-data.md` §2.4)."""
+    if not (1 <= allowed_keys <= 8):
+        raise ValueError(f"allowed_keys must be in 1..8, got {allowed_keys}")
+    eff_flags = (key_flags & ~0x80) if force_local_coil else (key_flags & 0xFF)
+    b42 = allowed_keys & 0x0F
+    if partner_mask & 0x80:  # partner 7 -> b42 bit 6
+        b42 |= 0x40
+    if partner_mask & 0x40:  # partner 6 -> b42 bit 7
+        b42 |= 0x80
+
+    b43 = 0
+    if eff_flags & 0x80:     # 0x5303 bit 7 (key over CAN) -> b43 bit 0
+        b43 |= 0x01
+    if eff_flags & 0x40:     # 0x5303 bit 6 (restart window off) -> b43 bit 1
+        b43 |= 0x02
+    if partner_mask & 0x20:  # partner 5 -> b43 bit 2
+        b43 |= 0x04
+    if partner_mask & 0x02:  # partner 1 -> b43 bit 3
+        b43 |= 0x08
+    if partner_mask & 0x01:  # partner 0 (ECU) -> b43 bit 4
+        b43 |= 0x10
+    if partner_mask & 0x04:  # partner 2 (TCU) -> b43 bit 5
+        b43 |= 0x20
+    if partner_mask & 0x08:  # partner 3 (ELV) -> b43 bit 6
+        b43 |= 0x40
+    if partner_mask & 0x10:  # partner 4 -> b43 bit 7
+        b43 |= 0x80
+    return b42, b43
+
+
+def build_fpke_02f7_payload(
+    *,
+    vin: str,
+    s0: bytes,
+    s1: bytes,
+    current_kc: bytes,
+    new_kc: bytes | None = None,
+    power_class: int,
+    allowed_keys: int,
+    partner_mask: int = 0x01,
+    key_flags: int = 0x00,
+    status_5302: int = 0x00,
+    force_local_coil: bool = True,
+) -> tuple[bytes, bytes]:
+    """Build 87-byte `2E 02F7` UDS request (`2E 02 F7 || AES128_ECB_Kc(P[80]) || CRC32_BE(P)`) and 80-byte plaintext."""
+    vin_clean = vin.strip().upper()
+    if len(vin_clean) != 17 or not all(0x20 <= ord(c) < 0x7F for c in vin_clean):
+        raise ValueError(f"VIN must be 17 ASCII characters, got {vin!r}")
+    if len(s0) != 16 or len(s1) != 16:
+        raise ValueError("S0 and S1 must each be 16 bytes")
+    if s0 in (b"\xff" * 16, b"\x00" * 16) or s1 in (b"\xff" * 16, b"\x00" * 16):
+        raise ValueError("Refusing to build 02F7 with blank/erased S0/S1")
+    if len(current_kc) != 16:
+        raise ValueError("current_kc must be 16 bytes")
+    eff_new_kc = current_kc if new_kc is None else new_kc
+    if len(eff_new_kc) != 16:
+        raise ValueError("new_kc must be 16 bytes")
+
+    p = bytearray(80)
+    p[0x00:0x11] = vin_clean.encode("ascii")
+    p[0x11:0x21] = s0
+    p[0x21:0x31] = s1
+    p[0x31:0x41] = eff_new_kc
+    p[0x41] = power_class & 0xFF
+    b42, b43 = encode_fpke_02f7_config(
+        allowed_keys,
+        partner_mask,
+        key_flags,
+        force_local_coil=force_local_coil,
+    )
+    p[0x42] = b42
+    p[0x43] = b43
+    p[0x44] = status_5302 & 0xFF
+
+    plain = bytes(p)
+    encrypted = aes128_ecb_encrypt(current_kc, plain)
+    crc_be = zlib.crc32(plain).to_bytes(4, "big")
+    return b"\x2e\x02\xf7" + encrypted + crc_be, plain
+
+
 def build_fd11_proof(
     challenge_resp: bytes,
     key: bytes,
@@ -1525,6 +1736,8 @@ def apply_fpke_dflash_edits(
     cs_hex: str | None = None,
     crc_a_hex: str | None = None,
     crc_b_hex: str | None = None,
+    slot_s0_hex: str | None = None,
+    slot_s1_hex: str | None = None,
     power_class: int | str | None = None,
     immo_mode: int | None = None,
     key_over_can: bool | None = None,
@@ -1666,6 +1879,15 @@ def apply_fpke_dflash_edits(
         if r67[0x24] == 0xFF:
             r67[0x24] = cur_learned
         updates[0x67] = bytes(r67)
+
+    # 3b. EEL 0x69 (Temporary slot secret S0 / S1)
+    if slot_s0_hex is not None or slot_s1_hex is not None:
+        r69 = _base_record(0x69)
+        if slot_s0_hex is not None:
+            r69[0x02:0x12] = _parse_exact_hex(slot_s0_hex, 16, "Slot S0 (0x69)")
+        if slot_s1_hex is not None:
+            r69[0x12:0x22] = _parse_exact_hex(slot_s1_hex, 16, "Slot S1 (0x69)")
+        updates[0x69] = bytes(r69)
 
     # 4. EEL 0x6B & 0x6D (Component Protection keys & adaptation status)
     if ika_key_hex is not None or gfa_key_hex is not None:
