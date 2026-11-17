@@ -544,6 +544,7 @@ class MainWindow(QMainWindow):
         dlg = RestoreDialog(self, str(self.ws.folder or self.conn.out_dir))
         if not run_dialog(dlg) or not dlg.kinds or not ensure_ready(self.conn, self):
             return
+        close_active_fpke_link()
         files, kinds = dict(dlg.files), dlg.kinds
         port, iface = self.conn.port, self.conn.interface
         cf = files.get("cflash")
@@ -718,8 +719,22 @@ class MainWindow(QMainWindow):
         """Non-blocking: the log and the screen stay usable while the offer is open; a newer failure replaces it."""
         if self._report_dlg is not None:
             self._report_dlg.close()
-        dumps = {f"loaded/{p.name}": p for p in self.ws.original.values()}
-        dumps.update({f"edited/{p.name}": p for k, p in self.ws.current.items() if self.ws.modified(k)})
+        if self.fpke_screen.is_open:
+            dumps: dict[str, Path] = {}
+            orig_df = self.fpke_screen._orig_dflash_path
+            if orig_df is not None and orig_df.is_file():
+                dumps[f"loaded/{orig_df.name}"] = orig_df
+            for kind, p in self.fpke_screen.files.items():
+                if kind == "dflash" and orig_df is not None:
+                    continue
+                if p is not None and p.is_file():
+                    dumps[f"loaded/{p.name}"] = p
+            work_df = self.fpke_screen._working_dflash_path
+            if self.fpke_screen.is_dflash_modified and work_df is not None and work_df.is_file():
+                dumps[f"edited/{work_df.name}"] = work_df
+        else:
+            dumps = {f"loaded/{p.name}": p for p in self.ws.original.values()}
+            dumps.update({f"edited/{p.name}": p for k, p in self.ws.current.items() if self.ws.modified(k)})
         dlg = ProblemReportDialog(self, failure, self.conn, self.console.txt_full.toPlainText(), dumps)
         dlg.setModal(False)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)

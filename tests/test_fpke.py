@@ -1475,7 +1475,7 @@ def test_fpke_coil_key_learning_end_to_end_and_dialog(tmp_path: Path, monkeypatc
         assert bus.ram[FPKE_83A_RAM_EEL67_ADDR][0x20] == 3
         assert (bus.ram[FPKE_83A_RAM_EEL67_ADDR][0x21] & 0x0F) == 2
         assert (bus.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42][0] & 0x01) == 0x01
-        assert bus.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42][7] == 0x04  # mode 4
+        assert bus.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42][7] == 0x05  # mode 5 (stays in 5 when learned < allowed)
 
         k3_only = fpke_learn_next_key_on_coil(link)
         assert k3_only["learned_keys"] == 3
@@ -1526,3 +1526,248 @@ def test_fpke_coil_key_learning_end_to_end_and_dialog(tmp_path: Path, monkeypatc
         win.close()
     finally:
         close_active_fpke_link()
+
+
+def test_fpke_eel_append_block_rollover_rwp_separator_and_ring_wrap() -> None:
+    from contitool.core.fpke import (
+        EEL_MARK,
+        eel_append_records,
+        eel_cs24,
+        eel_parse_pool,
+        eel_read_record_any,
+        fpke_eel_layout,
+    )
+
+    df = build_synthetic_fpke_dflash()
+    lay = fpke_eel_layout(None, df)
+    init_blocks, _ = eel_parse_pool(lay, df)
+    init_head = max((b for b in init_blocks if b["state"] == "active"), key=lambda b: (b["ec"] or 0, b["vb"]))["vb"]
+    next_vb = (init_head + 1) % lay["n_vb"]
+
+    # Append enough large ID=1 (252 B) records to overflow init_head into next_vb
+    cur = df
+    for seq in range(10):
+        payload = struct.pack("<H", 252) + bytes([seq]) * 250
+        cur = eel_append_records(cur, {1: payload})
+
+    blocks, _ = eel_parse_pool(lay, cur)
+    assert blocks[init_head]["state"] == "active"
+    assert blocks[next_vb]["state"] == "active"
+    assert blocks[next_vb]["ec"] == blocks[init_head]["ec"]  # EC does NOT increment at next_vb != 0
+
+    # init_head must retain a clean 4-byte separator word (0xFFFFFFFF) at its separator offset,
+    # and next_vb's RWP (+0x14) must store the full DataFlash pool byte offset of init_head's separator.
+    head_sep = init_head * lay["vb"] + blocks[init_head]["separator"]
+    assert cur[head_sep : head_sep + 4] == b"\xff\xff\xff\xff"
+    assert blocks[next_vb]["rwp_ok"] is True
+    assert blocks[next_vb]["rwp"] == head_sep
+
+    # Test ring wrap-around VB 27 -> VB 0 (EC increments by +1 at VB 0)
+    ring_df = bytearray(b"\xff" * 0x10000)
+    for n in range(28):
+        b = n * 0x800
+        ec_val = 11 if n < 3 else 10
+        struct.pack_into("<I", ring_df, b + 0x04, EEL_MARK)  # P
+        struct.pack_into("<I", ring_df, b + 0x10, eel_cs24(ec_val))
+    # Activate VB 27 at EC=10
+    b27 = 27 * 0x800
+    struct.pack_into("<I", ring_df, b27 + 0x08, EEL_MARK)
+    struct.pack_into("<I", ring_df, b27 + 0x14, eel_cs24(26 * 0x800 + 0x18))
+    struct.pack_into("<I", ring_df, b27 + 0x0C, EEL_MARK)
+
+    wrapped = bytes(ring_df)
+    for seq in range(9):
+        wrapped = eel_append_records(wrapped, {1: struct.pack("<H", 252) + bytes([0xA0 + seq]) * 250})
+
+    w_blocks, _ = eel_parse_pool(lay, wrapped)
+    assert w_blocks[27]["state"] == "active" and w_blocks[27]["ec"] == 10
+    assert w_blocks[0]["state"] == "active" and w_blocks[0]["ec"] == 11  # incremented at VB 0
+    vb27_sep = 27 * 0x800 + w_blocks[27]["separator"]
+    assert wrapped[vb27_sep : vb27_sep + 4] == b"\xff\xff\xff\xff"
+    assert w_blocks[0]["rwp_ok"] is True
+    assert w_blocks[0]["rwp"] == vb27_sep
+    rec_back, src_back = eel_read_record_any(lay, wrapped, 1)
+    assert src_back["vb"] == 0 and rec_back[2] == 0xA8
+
+    # Pool exhaustion guard: if activating next_vb would leave 0 prepared/invalid blocks, refuse cleanly
+    exhausted = bytearray(ring_df)
+    for n in range(26):
+        b = n * 0x800
+        struct.pack_into("<I", exhausted, b + 0x08, EEL_MARK)
+        struct.pack_into("<I", exhausted, b + 0x14, eel_cs24(((n - 1) % 28) * 0x800 + 0x18))
+        struct.pack_into("<I", exhausted, b + 0x0C, EEL_MARK)
+    # Now only VB 26 is prepared (VB 0..25 and VB 27 active -> head is VB 25 at EC=11)
+    almost_full = bytes(exhausted)
+    with pytest.raises(RuntimeError, match="EEL pool"):
+        for seq in range(10):
+            almost_full = eel_append_records(almost_full, {1: struct.pack("<H", 252) + bytes([seq]) * 250})
+
+
+def test_fpke_coil_kessy_preservation_and_mode2_exit() -> None:
+    import zlib
+    from contitool.can.fpke import (
+        FPKE_83A_RAM_EEL67_ADDR,
+        FPKE_83A_RAM_EEL68_ADDR,
+        FpkeCanLink,
+        fpke_finish_coil_key_learning,
+        fpke_prepare_additive_coil_learning,
+    )
+    from contitool.core.fpke import fpke_s0_s1_from_slots
+
+    slot_a = b"LAB IMMO SLOT A!"
+    slot_b = b"LAB IMMO SLOT B!"
+    s0, s1 = fpke_s0_s1_from_slots(slot_a, slot_b)
+    crc_a_le = struct.pack("<I", zlib.crc32(slot_a))
+    crc_b_le = struct.pack("<I", zlib.crc32(slot_b))
+
+    class KessyAndMode2Bus(FakeFpkeBus):
+        def __init__(self) -> None:
+            super().__init__()
+            # Populate SW 83A RAM mirror with 1 learned key and KESSY key_over_can = 0x80
+            self.ram[FPKE_83A_RAM_EEL67_ADDR] = bytes.fromhex("a1b2c3d4") + b"\xff" * 28 + bytes([1, 0x01, 0, 0, 0])
+            self.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42] = bytes([0x00, 0, 0, 0, 0, 0, 0, 0x01, 0x01, 0x80])
+            self.ident_map[0x02ED] = bytes([2, 0x01, 0x03, 0x4C, 1, 0x00, 0, 0x00, 0x01, 0x00])
+            self.ident_map[0x02E5] = bytes.fromhex("d4c3b2a1")
+            self.ident_map[0x02FA] = b"\x01\x11\x22\x33\x44"
+            self.flag_at_80_00: int | None = None
+
+        def _read_region_slice(self, addr: int, size: int) -> bytes:
+            for base, buf in sorted(self.ram.items()):
+                if base <= addr and addr + size <= base + len(buf):
+                    off = addr - base
+                    return bytes(buf[off : off + size])
+            return super()._read_region_slice(addr, size)
+
+        def _handle_uds(self, req: bytes) -> None:
+            if req[:2] == b"\x3d\x44":
+                addr = int.from_bytes(req[2:6], "big")
+                size = int.from_bytes(req[6:10], "big")
+                data = req[10 : 10 + size]
+                updated = False
+                for base, buf in list(self.ram.items()):
+                    if base <= addr and addr + size <= base + len(buf):
+                        arr = bytearray(buf)
+                        off = addr - base
+                        arr[off : off + size] = data
+                        self.ram[base] = bytes(arr)
+                        updated = True
+                        break
+                if not updated:
+                    self.ram[addr] = data
+                self._push_uds_reply(b"\x7d\x44" + req[2:10])
+                return
+            if req[:3] == b"\x2e\x02\xe1" and req[5] == 0x80:
+                tail = self.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42]
+                cur_mode = tail[7]
+                if cur_mode not in (4, 5):
+                    # Firmware rejects 0x80 with NRC 0x7F in mode 2
+                    self._push_uds_reply(b"\x7f\x2e\x7f")
+                    return
+                self.flag_at_80_00 = tail[9]
+                arr = bytearray(tail)
+                arr[7] = 0x01
+                self.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42] = bytes(arr)
+                self._push_uds_reply(b"\x6e\x02\xe1")
+                return
+            super()._handle_uds(req)
+
+    bus = KessyAndMode2Bus()
+    with FpkeCanLink("fake-port", interface="slcan", bus=bus) as link:
+        link.level8_active = True
+        prep = fpke_prepare_additive_coil_learning(
+            link,
+            s0_hex=s0.hex(),
+            s1_hex=s1.hex(),
+            allowed_keys=4,
+            expected_crc_a_le=crc_a_le,
+            expected_crc_b_le=crc_b_le,
+            wake_seconds=0.0,
+        )
+        assert prep["kessy_preserved"] is True
+        assert prep["immo_mode"] == 5
+        # During coil learning, bit 7 of 0x5303 is temporarily 0 so the local LF coil is active
+        assert (bus.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42][9] & 0x80) == 0x00
+
+        # Simulate cluster dropping to mode 2 before finish: finish promotes 2 -> 5 AND restores KESSY 0x80 before 80 00!
+        arr = bytearray(bus.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42])
+        arr[7] = 0x02
+        bus.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42] = bytes(arr)
+
+        fin = fpke_finish_coil_key_learning(link, sync_channel3=False)
+        assert fin["ok"] is True
+        assert fin["promoted_mode2"] is True
+        assert fin["kessy_restored"] is True
+        assert bus.flag_at_80_00 == 0x80
+        assert (bus.ram[FPKE_83A_RAM_EEL68_ADDR + 0x42][9] & 0x80) == 0x80
+
+
+def test_fpke_link_release_problem_report_dumps_and_public_exports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ast
+    from PySide6.QtWidgets import QApplication
+    import can as pycan
+    from contitool.can.fpke import FpkeCanLink, close_active_fpke_link, get_active_fpke_link, set_active_fpke_link
+    from contitool.can.transport import J533CanLink
+    from contitool.core.fpke import apply_fpke_dflash_edits
+    from contitool.gui.main_window import MainWindow
+    from contitool.gui.theme import apply_theme
+    from contitool.report import Failure
+
+    # 1. Opening J533CanLink with bus=None closes any background FpkeCanLink first
+    fake_fpke_bus = FakeFpkeBus()
+    fpke_link = FpkeCanLink("shared-port", interface="slcan", bus=fake_fpke_bus)
+    set_active_fpke_link(fpke_link)
+    assert get_active_fpke_link() is fpke_link
+
+    class DummyRawBus:
+        def shutdown(self) -> None:
+            pass
+
+    monkeypatch.setattr(pycan.interface, "Bus", lambda **_kw: DummyRawBus())
+    with J533CanLink("shared-port", interface="socketcan", bus=None):
+        assert fpke_link.is_closed is True
+        assert get_active_fpke_link() is None
+    close_active_fpke_link()
+
+    # 2. MainWindow.offer_problem_report includes loaded & edited FPK_E dumps when fpke_screen is open
+    app = QApplication.instance() or QApplication([])
+    apply_theme(app)  # type: ignore[arg-type]
+    unit_dir = tmp_path / "report_fpke_unit"
+    unit_dir.mkdir()
+    orig_df = build_synthetic_fpke_dflash()
+    (unit_dir / "Dflash.bin").write_bytes(orig_df)
+    (unit_dir / "ExtraArea.bin").write_bytes(build_synthetic_extra_area())
+
+    win = MainWindow()
+    win.open_folder(str(unit_dir))
+    edited_df = apply_fpke_dflash_edits(orig_df, vin="REPORTVIN00000001")
+    win.fpke_screen._commit_dflash_bytes(edited_df, "edited")
+    app.processEvents()
+
+    win.offer_problem_report(Failure("Test failure", "trace", started=0.0))
+    assert win._report_dlg is not None
+    dump_keys = set(win._report_dlg.dumps.keys())
+    assert "loaded/Dflash.bin" in dump_keys
+    assert "loaded/ExtraArea.bin" in dump_keys
+    assert "edited/Dflash.bin" in dump_keys
+    assert win._report_dlg.dumps["loaded/Dflash.bin"].read_bytes() == orig_df
+    assert win._report_dlg.dumps["edited/Dflash.bin"].read_bytes() == edited_df
+    win._report_dlg.close()
+    win.close()
+
+    # 3. Verify __all__ covers 100% of top-level imports in contitool/fpke.py, core/__init__.py, and can/__init__.py
+    repo_root = Path(__file__).resolve().parents[1]
+    for rel in ("src/contitool/fpke.py", "src/contitool/core/__init__.py", "src/contitool/can/__init__.py"):
+        tree = ast.parse((repo_root / rel).read_text(encoding="utf-8"))
+        all_set: set[str] = set()
+        imported_set: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name) and tgt.id == "__all__" and isinstance(node.value, (ast.List, ast.Tuple)):
+                        all_set = {elt.value for elt in node.value.elts if isinstance(elt, ast.Constant)}
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    name = alias.asname or alias.name
+                    if not name.startswith("_"):
+                        imported_set.add(name)
+        assert imported_set == all_set, f"{rel} mismatch: missing={imported_set - all_set}, extra={all_set - imported_set}"

@@ -193,34 +193,38 @@ class J533CanLink:
         if bus is not None:
             self.bus = bus
             self._owns_bus = False
-        elif interface == "dpdu":
-            from contitool.can import dpdu
-
-            # Kept open between operations: reopening re-rolls which D-PDU module the driver hands out.
-            self._borrowed = dpdu.open_session(port or "", bitrate)
-            self.bus = self._borrowed
-            self._owns_bus = False
-        elif interface == "j2534":
-            from contitool.can.j2534 import J2534Bus
-
-            self.bus = J2534Bus(port, bitrate)
-            self._owns_bus = True
         else:
-            import can
+            from contitool.can.fpke import close_active_fpke_link
 
-            kwargs: dict[str, Any] = {
-                "interface": interface,
-                "channel": port,
-                "bitrate": bitrate,
-                "timeout": 0.1,
-            }
-            if interface == "slcan":
-                kwargs["tty_baudrate"] = tty_baudrate
-                kwargs["listen_only"] = listen_only
-            self.bus = can.interface.Bus(**kwargs)
-            if interface == "slcan":
-                _tune_slcan_bus(self.bus)
-            self._owns_bus = True
+            close_active_fpke_link()
+            if interface == "dpdu":
+                from contitool.can import dpdu
+
+                # Kept open between operations: reopening re-rolls which D-PDU module the driver hands out.
+                self._borrowed = dpdu.open_session(port or "", bitrate)
+                self.bus = self._borrowed
+                self._owns_bus = False
+            elif interface == "j2534":
+                from contitool.can.j2534 import J2534Bus
+
+                self.bus = J2534Bus(port, bitrate)
+                self._owns_bus = True
+            else:
+                import can
+
+                kwargs: dict[str, Any] = {
+                    "interface": interface,
+                    "channel": port,
+                    "bitrate": bitrate,
+                    "timeout": 0.1,
+                }
+                if interface == "slcan":
+                    kwargs["tty_baudrate"] = tty_baudrate
+                    kwargs["listen_only"] = listen_only
+                self.bus = can.interface.Bus(**kwargs)
+                if interface == "slcan":
+                    _tune_slcan_bus(self.bus)
+                self._owns_bus = True
         self._timer_held = _acquire_win_timer()
 
     def close(self) -> None:

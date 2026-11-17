@@ -485,6 +485,7 @@ class FpkeCanLink:
         self.sim_rpm: float = 800.0
         self.sim_temp_c: float = 90.0
         self.sim_auto_sweep: bool = True
+        self._saved_coil_key_flags: tuple[int | None, int] | None = None
 
         self.attach_log(log_path)
 
@@ -518,6 +519,7 @@ class FpkeCanLink:
     def close(self) -> None:
         self.is_closed = True
         self.level8_active = False
+        self._saved_coil_key_flags = None
         self.stop_drive_simulation()
         self.stop_keepalive()
         if getattr(self, "_timer_held", False):
@@ -2425,49 +2427,67 @@ def fpke_extract_live_s0_s1_from_coil(
     deadline = time.monotonic() + max(0.3, poll_timeout)
     last_recog_state: int | None = None
     last_slots_flag: int | None = None
+    restored_kessy: tuple[int, int] | None = None
+    attempt_idx = 0
 
-    while True:
-        reporter.check_cancelled()
-        for src_label, s0_addr, flag_addr, recog_addr, id_addr in candidates:
+    try:
+        while True:
+            reporter.check_cancelled()
+            for src_label, s0_addr, flag_addr, recog_addr, id_addr in candidates:
+                with contextlib.suppress(Exception):
+                    raw_32 = fpke_read_memory_0x23(link, s0_addr, 32)
+                    if len(raw_32) != 32:
+                        continue
+                    s0, s1 = raw_32[:16], raw_32[16:32]
+                    fl_val: int | None = None
+                    rc_val: int | None = None
+                    if flag_addr is not None:
+                        fl_val = fpke_read_memory_0x23(link, flag_addr, 1)[0]
+                        last_slots_flag = fl_val
+                    if recog_addr is not None:
+                        rc_val = fpke_read_memory_0x23(link, recog_addr, 1)[0]
+                        last_recog_state = rc_val
+                    if id_addr is not None and not coil_key_id:
+                        raw_kid = fpke_read_memory_0x23(link, id_addr, 4)
+                        if raw_kid not in (b"\x00" * 4, b"\xff" * 4):
+                            coil_key_id = raw_kid[::-1].hex().upper()
+
+                    ver = fpke_verify_s0_s1(s0, s1, expected_crc_a_le, expected_crc_b_le)
+                    if ver["valid"] and (expected_crc_a_le is not None or fl_val == 0x03 or flag_addr is None):
+                        msg = tr(
+                            f"Секрет S0/S1 считан из {src_label} и подтверждён по CRC-32 (A={ver['crc_a_le_hex']}, B={ver['crc_b_le_hex']}).",
+                            f"Secret S0/S1 extracted from {src_label} and verified by CRC-32 (A={ver['crc_a_le_hex']}, B={ver['crc_b_le_hex']}).",
+                        )
+                        reporter.success(msg)
+                        return {
+                            "ok": True,
+                            "summary": msg,
+                            **ver,
+                            "source": src_label,
+                            "source_addr": f"0x{s0_addr:08X}",
+                            "coil_key_id": coil_key_id,
+                            "slots_flag": fl_val,
+                            "recog_state": rc_val,
+                        }
+
+            # On a KESSY unit (0x5303 bit 7 = 0x80), temporarily enable the local LF coil in RAM while polling
+            if attempt_idx == 0 and restored_kessy is None and poll_timeout >= 0.5 and time.monotonic() < deadline:
+                _, r68_base, _ = _detect_fpke_nvm_ram_bases(link)
+                with contextlib.suppress(Exception):
+                    orig_5303 = fpke_read_memory_0x23(link, r68_base + 0x4B, 1)[0]
+                    if orig_5303 not in (0xAA, 0xFF) and (orig_5303 & 0x80):
+                        fpke_write_memory_0x3d(link, r68_base + 0x4B, bytes([orig_5303 & ~0x80]))
+                        restored_kessy = (r68_base + 0x4B, orig_5303)
+
+            attempt_idx += 1
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.35)
+    finally:
+        if restored_kessy is not None:
             with contextlib.suppress(Exception):
-                raw_32 = fpke_read_memory_0x23(link, s0_addr, 32)
-                if len(raw_32) != 32:
-                    continue
-                s0, s1 = raw_32[:16], raw_32[16:32]
-                fl_val: int | None = None
-                rc_val: int | None = None
-                if flag_addr is not None:
-                    fl_val = fpke_read_memory_0x23(link, flag_addr, 1)[0]
-                    last_slots_flag = fl_val
-                if recog_addr is not None:
-                    rc_val = fpke_read_memory_0x23(link, recog_addr, 1)[0]
-                    last_recog_state = rc_val
-                if id_addr is not None and not coil_key_id:
-                    raw_kid = fpke_read_memory_0x23(link, id_addr, 4)
-                    if raw_kid not in (b"\x00" * 4, b"\xff" * 4):
-                        coil_key_id = raw_kid[::-1].hex().upper()
-
-                ver = fpke_verify_s0_s1(s0, s1, expected_crc_a_le, expected_crc_b_le)
-                if ver["valid"] and (expected_crc_a_le is not None or fl_val == 0x03 or flag_addr is None):
-                    msg = tr(
-                        f"Секрет S0/S1 считан из {src_label} и подтверждён по CRC-32 (A={ver['crc_a_le_hex']}, B={ver['crc_b_le_hex']}).",
-                        f"Secret S0/S1 extracted from {src_label} and verified by CRC-32 (A={ver['crc_a_le_hex']}, B={ver['crc_b_le_hex']}).",
-                    )
-                    reporter.success(msg)
-                    return {
-                        "ok": True,
-                        "summary": msg,
-                        **ver,
-                        "source": src_label,
-                        "source_addr": f"0x{s0_addr:08X}",
-                        "coil_key_id": coil_key_id,
-                        "slots_flag": fl_val,
-                        "recog_state": rc_val,
-                    }
-
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(0.35)
+                link.request_uds(b"\x10\x60", 0x50, timeout=1.5)
+                fpke_write_memory_0x3d(link, restored_kessy[0], bytes([restored_kessy[1]]))
 
     # Fallback: if expected CRC-32(A/B) are known, scan .secdata RAM (0xFEDF1D00..0xFEDF5A00) in 256-byte pages
     if expected_crc_a_le and expected_crc_b_le:
@@ -2507,6 +2527,30 @@ def fpke_extract_live_s0_s1_from_coil(
     )
 
 
+def _detect_fpke_nvm_ram_bases(link: FpkeCanLink, kc_hex: str = "") -> tuple[int, int, int]:
+    """Return `(r67_base, r68_base, r69_base)` in `.secdata` RAM for SW 83A vs SW 1703."""
+    kc_clean = "".join(kc_hex.split())
+    if len(kc_clean) == 32:
+        kc_bytes = bytes.fromhex(kc_clean)
+        with contextlib.suppress(Exception):
+            kc_83a = fpke_read_memory_0x23(link, FPKE_83A_RAM_EEL68_ADDR + 0x26, 16)
+            if kc_83a == kc_bytes:
+                return FPKE_83A_RAM_EEL67_ADDR, FPKE_83A_RAM_EEL68_ADDR, FPKE_83A_RAM_EEL69_ADDR
+        with contextlib.suppress(Exception):
+            kc_1703 = fpke_read_memory_0x23(link, FPKE_1703_RAM_EEL68_ADDR + 0x26, 16)
+            if kc_1703 == kc_bytes:
+                return FPKE_1703_RAM_EEL67_ADDR, FPKE_1703_RAM_EEL68_ADDR, FPKE_1703_RAM_EEL69_ADDR
+    with contextlib.suppress(Exception):
+        mode_83a = fpke_read_memory_0x23(link, FPKE_83A_RAM_EEL68_ADDR + 0x49, 1)[0]
+        if mode_83a <= 5:
+            return FPKE_83A_RAM_EEL67_ADDR, FPKE_83A_RAM_EEL68_ADDR, FPKE_83A_RAM_EEL69_ADDR
+    with contextlib.suppress(Exception):
+        mode_1703 = fpke_read_memory_0x23(link, FPKE_1703_RAM_EEL68_ADDR + 0x49, 1)[0]
+        if mode_1703 <= 5:
+            return FPKE_1703_RAM_EEL67_ADDR, FPKE_1703_RAM_EEL68_ADDR, FPKE_1703_RAM_EEL69_ADDR
+    return FPKE_83A_RAM_EEL67_ADDR, FPKE_83A_RAM_EEL68_ADDR, FPKE_83A_RAM_EEL69_ADDR
+
+
 def fpke_prepare_additive_coil_learning(
     link: FpkeCanLink,
     *,
@@ -2521,13 +2565,13 @@ def fpke_prepare_additive_coil_learning(
     wake_seconds: float = 4.0,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
-    """Method A (non-destructive): enter LF coil key-addition mode (`mode = 4`) via `UDS 0x3D` RAM setup without `2E 02F7`.
+    """Method A (non-destructive): enter LF coil key-addition mode (`mode = 5`) via `UDS 0x3D` RAM setup without `2E 02F7`.
 
     Writes `S0 || S1` into the `EEL 0x69` RAM mirror (`0xFEDF1E2C` on SW 83A / `0xFEDF4A58` on SW 1703), sets bit 0
     of `immo_flags` (`0x52FA.0 = 1`), keeps all existing learned key IDs in `EEL 0x67` (`0xFEDF29E8` / `0xFEDF5306`),
-    raises `allowed_keys` (e.g. `learned + 1`), clears `key_over_can` bit 7 (`0x5303.7 = 0` for local LF coil), and
-    switches `immo_mode = 4` (`0x5301 = 4`) so `2E 02E1 00 00 40 00` appends the new blank key into the next free slot
-    without executing `Action 3` (erasing existing keys).
+    raises `allowed_keys` (e.g. `learned + 1`), clears `key_over_can` bit 7 (`0x5303.7 = 0` for local LF coil while
+    remembering any KESSY flag for `80 00` restoration), and switches `immo_mode = 5` (`0x5301 = 5`) so internal
+    transition `k = 7` stays in `mode = 5` even if `learned < allowed`.
     """
     from contitool.core.fpke import fpke_verify_s0_s1
 
@@ -2538,9 +2582,9 @@ def fpke_prepare_additive_coil_learning(
         raise RuntimeError(
             tr(
                 f"Проверка S0/S1 не пройдена: CRC-32(A)={ver['crc_a_le_hex']} (ожидался {ver['expected_crc_a_le_hex']}), "
-                f"CRC-32(B)={ver['crc_b_le_hex']} (ожидался {ver['expected_crc_b_le_hex']}). Подготовка режима 4 заблокирована.",
+                f"CRC-32(B)={ver['crc_b_le_hex']} (ожидался {ver['expected_crc_b_le_hex']}). Подготовка режима дообучения заблокирована.",
                 f"S0/S1 verification failed: CRC-32(A)={ver['crc_a_le_hex']} (expected {ver['expected_crc_a_le_hex']}), "
-                f"CRC-32(B)={ver['crc_b_le_hex']} (expected {ver['expected_crc_b_le_hex']}). Refusing to enter mode 4.",
+                f"CRC-32(B)={ver['crc_b_le_hex']} (expected {ver['expected_crc_b_le_hex']}). Refusing to enter additive mode.",
             )
         )
 
@@ -2562,21 +2606,7 @@ def fpke_prepare_additive_coil_learning(
 
     link.request_uds(b"\x10\x60", 0x50, timeout=2.0)
 
-    # Auto-detect SW 83A vs SW 1703 NvM RAM mirror addresses
-    r67_base = FPKE_83A_RAM_EEL67_ADDR
-    r68_base = FPKE_83A_RAM_EEL68_ADDR
-    r69_base = FPKE_83A_RAM_EEL69_ADDR
-    kc_clean = "".join(kc_hex.split())
-    if len(kc_clean) == 32:
-        kc_bytes = bytes.fromhex(kc_clean)
-        with contextlib.suppress(Exception):
-            kc_83a = fpke_read_memory_0x23(link, FPKE_83A_RAM_EEL68_ADDR + 0x26, 16)
-            if kc_83a != kc_bytes:
-                kc_1703 = fpke_read_memory_0x23(link, FPKE_1703_RAM_EEL68_ADDR + 0x26, 16)
-                if kc_1703 == kc_bytes:
-                    r67_base = FPKE_1703_RAM_EEL67_ADDR
-                    r68_base = FPKE_1703_RAM_EEL68_ADDR
-                    r69_base = FPKE_1703_RAM_EEL69_ADDR
+    r67_base, r68_base, r69_base = _detect_fpke_nvm_ram_bases(link, kc_hex)
 
     # Read current EEL 0x67 RAM mirror (37 bytes) and preserve existing learned key IDs
     r67_raw = bytearray(fpke_read_memory_0x23(link, r67_base, 37))
@@ -2598,19 +2628,28 @@ def fpke_prepare_additive_coil_learning(
 
     # Read current EEL 0x68 flags/mode/key_over_can bytes at +0x42..+0x4B (10 bytes)
     r68_tail = bytearray(fpke_read_memory_0x23(link, r68_base + 0x42, 10))
+    kessy_saved = False
     if len(r68_tail) != 10 or r68_tail == bytearray(b"\xaa" * 10):
-        r68_tail = bytearray([0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x00])
+        r68_tail = bytearray([0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00])
+        link._saved_coil_key_flags = None
     else:
         if r68_tail[0] == 0xFF:
             r68_tail[0] = 0x01
         else:
             r68_tail[0] |= 0x01  # 0x52FA bit 0 := 1 (S0/S1 present in 0x69)
         r68_tail[1:7] = b"\x00" * 6  # clear any lockout counters in RAM
-        r68_tail[7] = 0x04           # 0x5301 := 4 (additive key learning mode 4)
-        if r68_tail[9] == 0xFF:
+        r68_tail[7] = 0x05           # 0x5301 := 5 (additive key learning mode 5; stays in 5 when learned < allowed)
+        orig_5303 = r68_tail[9]
+        if orig_5303 == 0xFF:
             r68_tail[9] = 0x00
+            link._saved_coil_key_flags = None
         else:
-            r68_tail[9] &= ~0x80     # 0x5303 bit 7 := 0 (local LF coil active)
+            if orig_5303 & 0x80:
+                link._saved_coil_key_flags = (r68_base + 0x4B, orig_5303)
+                kessy_saved = True
+            else:
+                link._saved_coil_key_flags = None
+            r68_tail[9] = orig_5303 & ~0x80  # 0x5303 bit 7 := 0 (local LF coil active during learning)
 
     # Write S0||S1 to EEL 0x69 RAM, updated EEL 0x67 RAM, and EEL 0x68 tail to RAM via 0x3D
     fpke_write_memory_0x3d(link, r69_base, s0 + s1)
@@ -2620,17 +2659,19 @@ def fpke_prepare_additive_coil_learning(
     poll = fpke_coil_poll_transponder(link, reporter=reporter)
     free_slots = max(0, target_allowed - cur_learned)
     msg = tr(
-        f"Режим дообучения (режим 4, Способ А) активирован в ОЗУ без удаления старых ключей: "
+        f"Режим дообучения (режим 5, Способ А) активирован в ОЗУ без удаления старых ключей: "
         f"сохранено {cur_learned} кл., открыто для добавления: {free_slots} (разрешено: {target_allowed}). "
         "Приложите только новую болванку к катушке и нажмите «2. Обучить ключ в катушке (40 00)».",
-        f"Additive learning mode (mode 4, Method A) activated in RAM without erasing old keys: "
+        f"Additive learning mode (mode 5, Method A) activated in RAM without erasing old keys: "
         f"preserved {cur_learned} key(s), open for addition: {free_slots} (allowed: {target_allowed}). "
         "Place only the new blank key on the coil and click “2. Learn key in coil (40 00)”.",
     )
     reporter.success(msg)
     return {
         "ok": True,
-        "method": "additive_ram_mode4",
+        "method": "additive_ram_mode5",
+        "immo_mode": 5,
+        "kessy_preserved": kessy_saved,
         "summary": msg,
         "preserved_keys": cur_learned,
         "allowed_keys": target_allowed,
@@ -2685,6 +2726,10 @@ def fpke_start_coil_key_learning(
             )
         )
 
+    if key_flags & 0x80:
+        link._saved_coil_key_flags = (None, key_flags & 0xFF)
+    else:
+        link._saved_coil_key_flags = None
     req_02f7, _plain = build_fpke_02f7_payload(
         vin=vin,
         s0=s0,
@@ -2763,29 +2808,79 @@ def fpke_finish_coil_key_learning(
     link: FpkeCanLink,
     *,
     sync_channel3: bool = False,
+    restore_key_flags: int | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
     """Step 3 of LF coil key learning: send `2E 02E1 00 00 80 00` (or `80 01`) to exit learning mode (`mode -> 1`) and erase `S0/S1`."""
     from contitool.core.fpke import build_fpke_02e1_request
 
     link.start_keepalive()
+
+    # Restore KESSY key_over_can flag (0x5303 bit 7) in RAM before 80 00 flushes EEL 0x68 to DataFlash
+    saved_pair = link._saved_coil_key_flags
+    eff_restore_flags = restore_key_flags if restore_key_flags is not None else (saved_pair[1] if saved_pair else None)
+    kessy_restored = False
+    if eff_restore_flags is not None and (eff_restore_flags & 0x80):
+        if link.level8_active or fpke_check_level8(link) is not None:
+            with contextlib.suppress(Exception):
+                link.request_uds(b"\x10\x60", 0x50, timeout=2.0)
+                flag_addr = (
+                    saved_pair[0]
+                    if (saved_pair is not None and saved_pair[0] is not None)
+                    else (_detect_fpke_nvm_ram_bases(link)[1] + 0x4B)
+                )
+                cur_b = fpke_read_memory_0x23(link, flag_addr, 1)[0]
+                base_b = 0x00 if cur_b in (0xAA, 0xFF) else (cur_b & 0x3F)
+                fpke_write_memory_0x3d(link, flag_addr, bytes([base_b | (eff_restore_flags & 0xC0)]))
+                kessy_restored = True
+    link._saved_coil_key_flags = None
+
     link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
     param = 0x01 if sync_channel3 else 0x00
     req = build_fpke_02e1_request(0x80, param)
     used_fallback_80_00 = False
+    promoted_mode2 = False
+
+    def _promote_mode2_if_needed(exc: Exception) -> bool:
+        nonlocal promoted_mode2
+        if promoted_mode2 or not isinstance(exc, UdsNegativeResponse) or exc.nrc not in (0x7F, 0x22):
+            return False
+        if not (link.level8_active or fpke_check_level8(link) is not None):
+            return False
+        with contextlib.suppress(Exception):
+            link.request_uds(b"\x10\x60", 0x50, timeout=2.0)
+            _, r68_base, _ = _detect_fpke_nvm_ram_bases(link)
+            cur_mode = fpke_read_memory_0x23(link, r68_base + 0x49, 1)[0]
+            if cur_mode in (2, 3):
+                fpke_write_memory_0x3d(link, r68_base + 0x49, b"\x05")
+                link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
+                promoted_mode2 = True
+                return True
+            link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
+        return False
+
     try:
         link.request_uds(req, 0x6E, timeout=20.0 if sync_channel3 else 8.0)
-    except Exception:
-        if not sync_channel3:
-            raise
-        reporter.info(
-            tr(
-                "Узел 0x0E не ответил по каналу 3 (стенд без KESSY/BCM) — завершение обучения командой 80 00…",
-                "Node 0x0E did not answer on channel 3 (bench without KESSY/BCM) — finishing with 80 00…",
+    except Exception as exc:
+        if _promote_mode2_if_needed(exc):
+            try:
+                link.request_uds(req, 0x6E, timeout=20.0 if sync_channel3 else 8.0)
+            except Exception:
+                if not sync_channel3:
+                    raise
+                link.request_uds(build_fpke_02e1_request(0x80, 0x00), 0x6E, timeout=8.0)
+                used_fallback_80_00 = True
+        else:
+            if not sync_channel3:
+                raise
+            reporter.info(
+                tr(
+                    "Узел 0x0E не ответил по каналу 3 (стенд без KESSY/BCM) — завершение обучения командой 80 00…",
+                    "Node 0x0E did not answer on channel 3 (bench without KESSY/BCM) — finishing with 80 00…",
+                )
             )
-        )
-        link.request_uds(build_fpke_02e1_request(0x80, 0x00), 0x6E, timeout=8.0)
-        used_fallback_80_00 = True
+            link.request_uds(build_fpke_02e1_request(0x80, 0x00), 0x6E, timeout=8.0)
+            used_fallback_80_00 = True
 
     key_crc_hex: str | None = None
     with contextlib.suppress(Exception):
@@ -2807,5 +2902,7 @@ def fpke_finish_coil_key_learning(
         "learned_key_ids": poll["learned_key_ids"],
         "key_list_crc32": key_crc_hex,
         "used_fallback_80_00": used_fallback_80_00,
+        "promoted_mode2": promoted_mode2,
+        "kessy_restored": kessy_restored,
         "poll": poll,
     }

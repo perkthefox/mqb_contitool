@@ -3527,9 +3527,9 @@ class FpkeCoilKeyLearnDialog(Dialog):
         )
         lbl_02f7_warn = QLabel(
             tr(
-                "Способ А (рекомендуется) через ОЗУ включает режим 4 и сохраняет старые ключи — прикладывать нужно только новую болванку. "
+                "Способ А (рекомендуется) через ОЗУ включает режим 5 и сохраняет старые ключи — прикладывать нужно только новую болванку. "
                 "Способ Б (2E 02F7) очищает 0x67 (нужно приложить все ключи).",
-                "Method A (recommended) activates mode 4 in RAM and keeps existing keys — only place the new blank key. "
+                "Method A (recommended) activates mode 5 in RAM and keeps existing keys — only place the new blank key. "
                 "Method B (2E 02F7) clears 0x67 (all keys must be presented).",
             )
         )
@@ -3555,7 +3555,7 @@ class FpkeCoilKeyLearnDialog(Dialog):
         sec_02f7.body.addLayout(cfg_row)
 
         self.btn_prepare_additive = button(
-            tr("1А. Дописать новый (сохранить старые — Режим 4)", "1A. Add new key (keep existing — Mode 4)"),
+            tr("1А. Дописать новый (сохранить старые — Режим 5)", "1A. Add new key (keep existing — Mode 5)"),
             "PrimaryBtn",
             slot=self.run_prepare_additive_mode4,
         )
@@ -3759,8 +3759,8 @@ class FpkeCoilKeyLearnDialog(Dialog):
 
         self.runner.run_task(
             tr(
-                "Активация режима дообучения 4 в ОЗУ (без удаления старых ключей)",
-                "Activating additive learning mode 4 in RAM (keeping existing keys)",
+                "Активация режима дообучения 5 в ОЗУ (без удаления старых ключей)",
+                "Activating additive learning mode 5 in RAM (keeping existing keys)",
             ),
             task,
             on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),

@@ -690,7 +690,9 @@ def eel_parse_pool(
         }
         if state == "active":
             rwp = word(b + 0x14)
-            rec["rwp_ok"] = written(b + 0x14) and eel_cs24(rwp) == rwp
+            rwp_ok = written(b + 0x14) and eel_cs24(rwp) == rwp
+            rec["rwp_ok"] = rwp_ok
+            rec["rwp"] = (rwp & 0xFFFFFF) if rwp_ok else None
             a = b + 0x18
             min_bottom = b + lay["vb"] - 4
             refs_in_block: list[tuple[int, int, int]] = []
@@ -1679,24 +1681,34 @@ def eel_append_records(
         ref_addr = b_addr + int(head.get("separator", 0x18))
         next_top = int(head.get("next_top", b_addr + lay["vb"] - 8))
 
+        # Leave at least one clean 4-byte separator word (`ref_addr + 0x10 .. ref_addr + 0x13`) between refs and data
         fits = (
-            ref_addr + 0x10 <= next_top - padded + 4
-            and df[ref_addr : ref_addr + 0x10] == b"\xff" * 0x10
+            ref_addr + 0x14 <= next_top - padded + 4
+            and df[ref_addr : ref_addr + 0x14] == b"\xff" * 0x14
             and df[next_top - padded + 4 : next_top + 4] == b"\xff" * padded
         )
         if not fits:
             next_vb = (head["vb"] + 1) % lay["n_vb"]
+            if blocks[next_vb]["state"] == "active":
+                raise RuntimeError(f"EEL pool full: next virtual block VB {next_vb} is already active")
+            remaining_free = sum(
+                1 for blk in blocks if blk["vb"] != next_vb and blk["state"] in ("prepared", "invalid")
+            )
+            if remaining_free < 1:
+                raise RuntimeError(
+                    "EEL pool exhausted: at least one prepared/invalidated virtual block must remain free for R_EEL_Startup"
+                )
             nb = lay["base"] + next_vb * lay["vb"]
-            max_ec = max((blk["ec"] or 0) for blk in blocks)
-            prev_ref_off = (ref_addr - 0x10 - b_addr) if head.get("refs", 0) > 0 else 0x18
+            old_sep = ref_addr  # full DataFlash pool byte offset of previous head's separator (`0x14D10A`)
+            expected_ec = (head["ec"] or 1) + (1 if next_vb == 0 else 0)
             if (
                 blocks[next_vb]["state"] == "prepared"
-                and (blocks[next_vb]["ec"] or 0) >= (head["ec"] or 0)
+                and (blocks[next_vb]["ec"] or 0) == expected_ec
                 and df[nb + 0x18 : nb + lay["vb"] - 4] == b"\xff" * (lay["vb"] - 0x1C)
             ):
                 struct.pack_into("<I", df, nb + 0x08, EEL_MARK)
+                struct.pack_into("<I", df, nb + 0x14, eel_cs24(old_sep))
                 struct.pack_into("<I", df, nb + 0x0C, EEL_MARK)
-                struct.pack_into("<I", df, nb + 0x14, eel_cs24(prev_ref_off))
             else:
                 df[nb : nb + lay["vb"]] = b"\xff" * lay["vb"]
                 struct.pack_into(
@@ -1707,9 +1719,9 @@ def eel_append_records(
                     EEL_MARK,
                     EEL_MARK,
                     EEL_MARK,
-                    eel_cs24(max_ec + 1),
+                    eel_cs24(expected_ec),
                 )
-                struct.pack_into("<I", df, nb + 0x14, eel_cs24(prev_ref_off))
+                struct.pack_into("<I", df, nb + 0x14, eel_cs24(old_sep))
             b_addr = nb
             ref_addr = nb + 0x18
             next_top = nb + lay["vb"] - 8
