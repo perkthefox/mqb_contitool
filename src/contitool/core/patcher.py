@@ -13,6 +13,7 @@ from contitool.core.analyzer import (
     analyze_dflash,
     analyze_dflash_datasets,
     analyze_dflash_swap,
+    analyze_uflash,
     build_hybrid_cave,
     check_fec_dataset_support,
     decode_jr_disp22,
@@ -58,6 +59,7 @@ from contitool.core.constants import (
     STOCK_MOVEA_0X40,
     STOCK_UFLASH_RSA_CMOV,
     SlotSpec,
+    UFLASH_ADDR_START,
     UFLASH_RSA_CMP_OFFSET,
     UNSUPPORTED_DATASET_RU,
     UNSUPPORTED_DATASET_WARNING,
@@ -165,23 +167,33 @@ def apply_uflash_rsa_patch(
     restore_stock: bool = False,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> tuple[bytes, str]:
-    """Patch (or restore) Uflash.bin (+0x342A) so FBL CheckMemory (31 01 02 02) accepts unsigned .odx."""
-    reporter.step(1, 2, tr("Проверка сигнатуры бутлодера Uflash @ +0x342A", "Validating Uflash FBL signature @ +0x342A"))
+    """Patch (or restore) Uflash.bin (+0x342A / +0x3444) so FBL CheckMemory (31 01 02 02) accepts unsigned .odx."""
+    reporter.step(1, 2, tr("Проверка сигнатуры бутлодера Uflash", "Validating Uflash FBL signature"))
     validate_uflash_bytes(uf_raw)
+    uinfo = analyze_uflash(uf_raw)
+    cmp_off = uinfo.rsa_cmp_offset if uinfo.rsa_cmp_offset is not None else UFLASH_RSA_CMP_OFFSET
+    cmp_vaddr = UFLASH_ADDR_START + cmp_off
     reporter.progress(50, 100)
-    reporter.step(2, 2, tr("Модификация инструкции проверки RSA @ 0x0100342A", "Updating RSA verification instruction @ 0x0100342A"))
+    reporter.step(
+        2,
+        2,
+        tr(
+            f"Модификация инструкции проверки RSA @ 0x{cmp_vaddr:08X}",
+            f"Updating RSA verification instruction @ 0x{cmp_vaddr:08X}",
+        ),
+    )
     uf = bytearray(uf_raw)
     if restore_stock:
-        uf[UFLASH_RSA_CMP_OFFSET : UFLASH_RSA_CMP_OFFSET + 4] = STOCK_UFLASH_RSA_CMOV
+        uf[cmp_off : cmp_off + 4] = STOCK_UFLASH_RSA_CMOV
         desc = tr(
-            "возврат штатной проверки RSA-1024 в Uflash.bin @ 0x0100342A (e2 57 14 eb)",
-            "restored stock RSA-1024 verification in Uflash.bin @ 0x0100342A (e2 57 14 eb)",
+            f"возврат штатной проверки RSA-1024 в Uflash.bin @ 0x{cmp_vaddr:08X} (e2 57 14 eb)",
+            f"restored stock RSA-1024 verification in Uflash.bin @ 0x{cmp_vaddr:08X} (e2 57 14 eb)",
         )
     else:
-        uf[UFLASH_RSA_CMP_OFFSET : UFLASH_RSA_CMP_OFFSET + 4] = PATCH_UFLASH_RSA_OK
+        uf[cmp_off : cmp_off + 4] = PATCH_UFLASH_RSA_OK
         desc = tr(
-            "инженерный RSA-Free загрузчик в Uflash.bin @ 0x0100342A (00 ea 00 00: приём любых .odx по UDS без RSA)",
-            "Engineering RSA-Free FBL in Uflash.bin @ 0x0100342A (00 ea 00 00: accepts any .odx over UDS without RSA)",
+            f"инженерный RSA-Free загрузчик в Uflash.bin @ 0x{cmp_vaddr:08X} (00 ea 00 00: приём любых .odx по UDS без RSA)",
+            f"Engineering RSA-Free FBL in Uflash.bin @ 0x{cmp_vaddr:08X} (00 ea 00 00: accepts any .odx over UDS without RSA)",
         )
     reporter.progress(100, 100)
     reporter.success(desc)

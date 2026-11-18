@@ -44,7 +44,9 @@ from contitool.core.constants import (
     STOCK_UFLASH_RSA_CMOV,
     SWAP_KEY_HDR,
     SlotSpec,
+    UFLASH_ADDR_START,
     UFLASH_RSA_CMP_OFFSET,
+    UFLASH_RSA_FN_HEAD_DELTA,
     UFLASH_SIZE,
     ZDC_DATASET_SPECS,
     ZDC_MAINGW_FPA_INST1_MAP_OFF,
@@ -213,6 +215,33 @@ def split_cflash_or_app(raw: bytes) -> tuple[bytes, bytearray]:
     )
 
 
+class UnrecognisedUflashError(ValueError):
+    """Raised when a 32 KB image is a genuine J533 FBL (`SH850T01`), but its RSA check site is unknown."""
+
+
+def find_uflash_rsa_sites(uf: bytes, *, base_offset: int = 0) -> list[int]:
+    """Locate the 4-byte RSA result instruction (`cmov ne, 2, r10, r29` or patched `mov 0, r29; nop`) in FBL Uflash.
+
+    Matches both HW 521+ builds (`+0x342A`, function @ `0x010033FC`) and HW 517/518 builds (`+0x3444`, function
+    @ `0x01003416`) by checking the position-independent `jarl disp22, lp; cmp r0, r10; <insn4>; add r10, r29;
+    andi 0x00FF, r0, r0`-style sequence.
+    """
+    pattern = re.compile(
+        rb"..\x80\x51(\xe2\x57\x14\xeb|\x00\xea\x00\x00)\x1d\x50\x40\x06\xff\x00",
+        re.DOTALL,
+    )
+    hits: list[int] = []
+    for m in pattern.finditer(uf):
+        off = m.start(1)
+        abs_off = base_offset + off
+        if off < 6 or abs_off < UFLASH_RSA_FN_HEAD_DELTA or (abs_off & 1) != 0:
+            continue
+        hw0, hw1 = struct.unpack_from("<HH", uf, off - 6)
+        if (hw0 & 0xFFC0) == 0xFF80 and (hw1 & 1) == 0:
+            hits.append(abs_off)
+    return hits
+
+
 def validate_uflash_bytes(uf: bytes) -> None:
     if len(uf) != UFLASH_SIZE:
         raise ValueError(
@@ -221,14 +250,15 @@ def validate_uflash_bytes(uf: bytes) -> None:
                 f"Expected Uflash.bin of 32,768 bytes (32 KB), got {len(uf):,} B",
             )
         )
-    anchor_pre = uf[UFLASH_RSA_CMP_OFFSET - 6 : UFLASH_RSA_CMP_OFFSET]
-    anchor_post = uf[UFLASH_RSA_CMP_OFFSET + 4 : UFLASH_RSA_CMP_OFFSET + 10]
-    mid = uf[UFLASH_RSA_CMP_OFFSET : UFLASH_RSA_CMP_OFFSET + 4]
-    if (
-        anchor_pre != bytes.fromhex("80ff38158051")
-        or anchor_post != bytes.fromhex("1d504006ff00")
-        or mid not in (STOCK_UFLASH_RSA_CMOV, PATCH_UFLASH_RSA_OK)
-    ):
+    hits = find_uflash_rsa_sites(uf)
+    if len(hits) != 1:
+        if FBL_LIBRARY_ID in uf:
+            raise UnrecognisedUflashError(
+                tr(
+                    "Сборка загрузчика J533 FBL в Uflash не распознана (сигнатура проверки RSA не найдена по известным смещениям +0x342A/+0x3444)!",
+                    "Unrecognised J533 FBL Uflash build (RSA check signature not found at known offsets +0x342A/+0x3444)!",
+                )
+            )
         raise ValueError(
             tr(
                 "Не найдена сигнатура проверки RSA @ Uflash+0x342A — этот файл не является Uflash загрузчика J533 "
@@ -241,9 +271,11 @@ def validate_uflash_bytes(uf: bytes) -> None:
 
 def validate_dflash_bytes(df: bytes) -> None:
     if len(df) == UFLASH_SIZE:
-        # Distinguish genuine Uflash from truncated 32 KB Dflash for maximum clarity
+        # Distinguish genuine Uflash (including unrecognised FBL builds with SH850T01) from truncated 32 KB Dflash
         try:
             validate_uflash_bytes(df)
+            is_uflash = True
+        except UnrecognisedUflashError:
             is_uflash = True
         except ValueError:
             is_uflash = False
@@ -431,6 +463,8 @@ class UflashSummary:
     signature_found: bool
     rsa_bypassed: bool = False
     raw_insn_hex: str = ""
+    rsa_cmp_offset: int | None = None
+    rsa_probe_vaddr: int | None = None
 
 
 def fbl_app_valid(cflash: bytes) -> bool:
@@ -865,18 +899,29 @@ def analyze_uflash(uf: bytes) -> UflashSummary:
             )
         )
     sha = hashlib.sha256(uf).hexdigest()
+    hits = find_uflash_rsa_sites(uf)
+    if len(hits) == 1:
+        cmp_off = hits[0]
+        mid = uf[cmp_off : cmp_off + 4]
+        probe_vaddr = UFLASH_ADDR_START + cmp_off - UFLASH_RSA_FN_HEAD_DELTA
+        return UflashSummary(
+            size=len(uf),
+            sha256=sha,
+            signature_found=True,
+            rsa_bypassed=(mid == PATCH_UFLASH_RSA_OK),
+            raw_insn_hex=mid.hex(),
+            rsa_cmp_offset=cmp_off,
+            rsa_probe_vaddr=probe_vaddr,
+        )
     mid = uf[UFLASH_RSA_CMP_OFFSET : UFLASH_RSA_CMP_OFFSET + 4]
-    anchor_ok = (
-        uf[UFLASH_RSA_CMP_OFFSET - 6 : UFLASH_RSA_CMP_OFFSET] == bytes.fromhex("80ff38158051")
-        and uf[UFLASH_RSA_CMP_OFFSET + 4 : UFLASH_RSA_CMP_OFFSET + 10] == bytes.fromhex("1d504006ff00")
-        and mid in (STOCK_UFLASH_RSA_CMOV, PATCH_UFLASH_RSA_OK)
-    )
     return UflashSummary(
         size=len(uf),
         sha256=sha,
-        signature_found=anchor_ok,
-        rsa_bypassed=(anchor_ok and mid == PATCH_UFLASH_RSA_OK),
+        signature_found=False,
+        rsa_bypassed=False,
         raw_insn_hex=mid.hex(),
+        rsa_cmp_offset=None,
+        rsa_probe_vaddr=None,
     )
 
 

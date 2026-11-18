@@ -41,6 +41,7 @@ from contitool.can.payloads import (
     build_dflash_reader_payload,
     build_fed_reader_payload,
     build_reader_payload,
+    build_rsa_probe_payload,
     build_service_loader_uds_steps,
     build_uflash_faci_payloads,
     cflash_block_ranges,
@@ -49,10 +50,13 @@ from contitool.can.payloads import (
 )
 from contitool.can.transport import TRANSPORT_ERRORS, J533CanLink, UdsNegativeResponse
 from contitool.core.analyzer import (
+    FBL_LIBRARY_ID,
+    UnrecognisedUflashError,
     analyze_cflash,
     analyze_dflash_swap,
     fbl_app_valid,
     analyze_uflash,
+    find_uflash_rsa_sites,
     split_cflash_or_app,
     validate_dflash_bytes,
     validate_uflash_bytes,
@@ -66,17 +70,23 @@ from contitool.core.constants import (
     CFLASH_SIZE,
     CHIP_ID_ADDR,
     CHIP_ID_SIZE,
+    DEFAULT_UFLASH_RSA_FN_VADDR,
     DFLASH_ADDR_START,
     DFLASH_SIZE,
     DFLASH_SWAP_NVM_OFF,
     EEPROM_SIZE,
     EXTRA_AREA_IDCODE_OFFSET,
+    EXTRA_AREA_OTP_CFL0_OFFSET,
+    EXTRA_AREA_OTP_CFL1_OFFSET,
+    EXTRA_AREA_OTP_EUA_OFFSET,
+    EXTRA_AREA_SECURITY_OFFSET,
     EXTRA_AREA_SIZE,
     FBL_PRESENCE_MAGIC,
     IDCODE_SIZE,
     OPBT_SIZE,
     UFLASH_ADDR_START,
     UFLASH_RSA_CMP_OFFSET,
+    UFLASH_RSA_FN_HEAD_DELTA,
     UFLASH_SIZE,
     ZDC_DATASET_SPECS,
     ZDC_UDS_UPLOAD_MAP,
@@ -815,21 +825,40 @@ def read_memory_area(
     return result
 
 
-def run_rsa_probe(link: J533CanLink, *, reporter: OperationReporter = NULL_REPORTER) -> dict[str, Any]:
+def run_rsa_probe(
+    link: J533CanLink,
+    *,
+    uflash_bytes: bytes | None = None,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
     """Execute live 92-byte RSA probe in RAM-loader (`0` = Engineering RSA-Free FBL, `2` = Stock RSA)."""
+    rsa_fn_vaddr = DEFAULT_UFLASH_RSA_FN_VADDR
+    if uflash_bytes is not None:
+        uinfo = analyze_uflash(uflash_bytes)
+        if uinfo.rsa_probe_vaddr is not None:
+            rsa_fn_vaddr = uinfo.rsa_probe_vaddr
+    else:
+        with contextlib.suppress(*LINK_ERRORS, ValueError):
+            win = read_memory_bytes(link, UFLASH_ADDR_START + 0x3000, 0x0800)
+            hits = find_uflash_rsa_sites(win, base_offset=0x3000)
+            if len(hits) == 1:
+                rsa_fn_vaddr = UFLASH_ADDR_START + hits[0] - UFLASH_RSA_FN_HEAD_DELTA
+
+    probe_payload = build_rsa_probe_payload(rsa_fn_vaddr)
     reporter.can_log(
         tr(
-            "Запуск RSA-пробника (вызов 0x010033FC на 128 байтах 0xFF)…",
-            "Running live RSA probe (calling 0x010033FC on 128 bytes of 0xFF)…",
+            f"Запуск RSA-пробника (вызов 0x{rsa_fn_vaddr:08X} на 128 байтах 0xFF)…",
+            f"Running live RSA probe (calling 0x{rsa_fn_vaddr:08X} on 128 bytes of 0xFF)…",
         )
     )
-    link.send_loader_payload(RSA_PROBE_PAYLOAD, reporter=reporter)
+    link.send_loader_payload(probe_payload, reporter=reporter)
     _consume_loader_end_frame(link, timeout=5.0, label="RSA probe")
     status_bytes = read_memory_bytes(link, 0xFEDE9000, 4)
     rsa_status = int.from_bytes(status_bytes, "little")
     return {
         "complete": True,
-        "payload_sha256": EXPECTED_RSA_PROBE_SHA256,
+        "payload_sha256": _digest(probe_payload),
+        "rsa_fn_vaddr": f"0x{rsa_fn_vaddr:08X}",
         "rsa_status": rsa_status,
         "engineering_active": rsa_status == 0,
         "flash_commands_sent": False,
@@ -1288,24 +1317,42 @@ def can_verify(
             report["uflash_signature_found"] = uf_info.signature_found
             report["uflash_rsa_bypassed"] = uf_info.rsa_bypassed
 
-            reporter.step(3, total_steps, tr("Запуск живого RSA-пробника в RAM (0x010033FC)", "Running live RSA verification probe in RAM (0x010033FC)"))
-            rsa_res = run_rsa_probe(link, reporter=reporter)
-            report["rsa_probe"] = rsa_res
-            report["rsa_status"] = rsa_res["rsa_status"]
-            if rsa_res["rsa_status"] == 0:
-                reporter.success(
-                    tr(
-                        "Статус загрузчика: ИНЖЕНЕРНЫЙ RSA-FREE FBL АКТИВЕН (rsa_status = 0)",
-                        "Bootloader status: ENGINEERING RSA-FREE FBL ACTIVE (rsa_status = 0)",
+            probe_addr = uf_info.rsa_probe_vaddr or DEFAULT_UFLASH_RSA_FN_VADDR
+            reporter.step(
+                3,
+                total_steps,
+                tr(
+                    f"Запуск живого RSA-пробника в RAM (0x{probe_addr:08X})",
+                    f"Running live RSA verification probe in RAM (0x{probe_addr:08X})",
+                ),
+            )
+            if uf_info.signature_found:
+                rsa_res = run_rsa_probe(link, uflash_bytes=uf_bytes, reporter=reporter)
+                report["rsa_probe"] = rsa_res
+                report["rsa_status"] = rsa_res["rsa_status"]
+                if rsa_res["rsa_status"] == 0:
+                    reporter.success(
+                        tr(
+                            "Статус загрузчика: ИНЖЕНЕРНЫЙ RSA-FREE FBL АКТИВЕН (rsa_status = 0)",
+                            "Bootloader status: ENGINEERING RSA-FREE FBL ACTIVE (rsa_status = 0)",
+                        )
                     )
-                )
+                else:
+                    reporter.info(
+                        tr(
+                            f"Статус загрузчика: Заводская проверка RSA-1024 АКТИВНА (rsa_status = {rsa_res['rsa_status']})",
+                            f"Bootloader status: Stock RSA-1024 check is ACTIVE (rsa_status = {rsa_res['rsa_status']})",
+                        )
+                    )
             else:
-                reporter.info(
+                reporter.warning(
                     tr(
-                        f"Статус загрузчика: Заводская проверка RSA-1024 АКТИВНА (rsa_status = {rsa_res['rsa_status']})",
-                        f"Bootloader status: Stock RSA-1024 check is ACTIVE (rsa_status = {rsa_res['rsa_status']})",
+                        "Неизвестная сборка загрузчика FBL — пропуск живого RSA-пробника.",
+                        "Unrecognised FBL build — skipping live RSA probe.",
                     )
                 )
+                report["rsa_probe"] = {"skipped": True, "reason": "unrecognised_fbl"}
+                report["rsa_status"] = None
 
             if return_to_app:
                 reporter.step(4, total_steps, tr("Возврат шлюза в штатный рабочий режим (10 03)", "Returning gateway to normal Application mode (10 03)"))
@@ -1328,6 +1375,80 @@ def can_verify(
             raise
         finally:
             _write_json(out_dir / "verification.json", report)
+
+
+class UflashProtectedError(RuntimeError):
+    """Raised when the ECU's Extended User Area (`Uflash` @ `0x01000000`) is hardware OTP/write-protected."""
+
+
+def _uflash_protected_message(detail: str = "") -> str:
+    suffix = f" [{detail}]" if detail else ""
+    return tr(
+        "Загрузчик Uflash (0x01000000) в этом блоке аппаратно защищён от перезаписи на заводе (OTP) — "
+        f"загрузчик не изменён.{suffix} Для адаптации IKA/CP, Engineering Mode, ключей SWaP или заливки бэкапа "
+        "отдельная активация инженерного загрузчика не требуется: нажмите «Записать в блок», и ContiTool запишет "
+        "изменённые блоки CodeFlash напрямую через FACI.",
+        "The Uflash bootloader (0x01000000) on this ECU is permanently write-protected by factory hardware OTP — "
+        f"the bootloader is untouched.{suffix} Separate engineering bootloader activation is not needed for IKA/CP "
+        "adaptation, Engineering Mode, SWaP keys, or backup restore: click “Write to ECU” and ContiTool will program "
+        "the modified CodeFlash blocks directly via FACI.",
+    )
+
+
+def probe_extra_area_protection(
+    link: J533CanLink,
+    *,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any] | None:
+    """Read 256-byte Extra Area (`0xFF300000..0xFF3000FF`) via `OPBT_READER_STUB` to inspect OTP, Security & IDCODE."""
+    if link is None or not hasattr(link, "send_loader_payload"):
+        return None
+    try:
+        link.send_loader_payload(OPBT_READER_STUB, reporter=reporter)
+        _consume_loader_end_frame(link, timeout=5.0, label="Extra Area probe")
+        hdr = read_memory_bytes(link, 0xFEDE9000, 512)
+    except (*LINK_ERRORS, ValueError):
+        return None
+    status = int.from_bytes(hdr[0:4], "little")
+    bfaselr_final = int.from_bytes(hdr[8:12], "little")
+    if status != 1 or bfaselr_final != 0:
+        return None
+    extra_area = hdr[0x100 : 0x100 + EXTRA_AREA_SIZE]
+    opbt_bytes = extra_area[OPBT_EXTRA_AREA_OFFSET : OPBT_EXTRA_AREA_OFFSET + OPBT_SIZE]
+    if not is_plausible_opbt_bytes(opbt_bytes):
+        return None
+    otp_cfl0 = int.from_bytes(extra_area[EXTRA_AREA_OTP_CFL0_OFFSET : EXTRA_AREA_OTP_CFL0_OFFSET + 4], "little")
+    otp_cfl1 = int.from_bytes(extra_area[EXTRA_AREA_OTP_CFL1_OFFSET : EXTRA_AREA_OTP_CFL1_OFFSET + 4], "little")
+    otp_eua = int.from_bytes(extra_area[EXTRA_AREA_OTP_EUA_OFFSET : EXTRA_AREA_OTP_EUA_OFFSET + 4], "little")
+    sec_flags = int.from_bytes(extra_area[EXTRA_AREA_SECURITY_OFFSET : EXTRA_AREA_SECURITY_OFFSET + 4], "little")
+    raw_idcode = bytes(extra_area[EXTRA_AREA_IDCODE_OFFSET : EXTRA_AREA_IDCODE_OFFSET + IDCODE_SIZE])
+    return {
+        "otp_cfl0": f"0x{otp_cfl0:08X}",
+        "otp_cfl1": f"0x{otp_cfl1:08X}",
+        "otp_eua": f"0x{otp_eua:08X}",
+        "security_flags": f"0x{sec_flags:08X}",
+        "uflash_otp_locked": (otp_eua & 1) == 0,
+        "block_erase_disabled": ((sec_flags >> 30) & 1) == 0,
+        "write_disabled": ((sec_flags >> 29) & 1) == 0,
+        "idcode_hex": raw_idcode.hex().upper(),
+        "idcode_bytes": raw_idcode,
+    }
+
+
+def _resolve_live_selfid(
+    link: J533CanLink,
+    cflash_ab00: bytes,
+    *,
+    extra_prot: dict[str, Any] | None = None,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> bytes:
+    """Return the MCU's authoritative 16-byte `SELFID` from `Extra Area + 0x50` when available, else `Cflash+0xAB00`."""
+    prot = extra_prot if extra_prot is not None else probe_extra_area_protection(link, reporter=reporter)
+    if prot is not None:
+        raw_id = prot.get("idcode_bytes")
+        if isinstance(raw_id, bytes) and len(raw_id) == SELFID_SIZE and raw_id != b"\x00" * SELFID_SIZE:
+            return raw_id
+    return cflash_ab00
 
 
 def read_opbt_in_loader(
@@ -1366,6 +1487,10 @@ def read_opbt_in_loader(
     extra_area = hdr[0x100 : 0x100 + EXTRA_AREA_SIZE]
     opbt_bytes = extra_area[OPBT_EXTRA_AREA_OFFSET : OPBT_EXTRA_AREA_OFFSET + OPBT_SIZE]
     extra_idcode = extra_area[EXTRA_AREA_IDCODE_OFFSET : EXTRA_AREA_IDCODE_OFFSET + IDCODE_SIZE]
+    otp_cfl0 = int.from_bytes(extra_area[EXTRA_AREA_OTP_CFL0_OFFSET : EXTRA_AREA_OTP_CFL0_OFFSET + 4], "little")
+    otp_cfl1 = int.from_bytes(extra_area[EXTRA_AREA_OTP_CFL1_OFFSET : EXTRA_AREA_OTP_CFL1_OFFSET + 4], "little")
+    otp_eua = int.from_bytes(extra_area[EXTRA_AREA_OTP_EUA_OFFSET : EXTRA_AREA_OTP_EUA_OFFSET + 4], "little")
+    sec_flags = int.from_bytes(extra_area[EXTRA_AREA_SECURITY_OFFSET : EXTRA_AREA_SECURITY_OFFSET + 4], "little")
     if not is_plausible_opbt_bytes(opbt_bytes):
         raise RuntimeError(
             tr(
@@ -1381,7 +1506,15 @@ def read_opbt_in_loader(
         with contextlib.suppress(*LINK_ERRORS):
             link.drain_rx(quick=True)
 
-    oinfo = analyze_opbt(opbt_bytes, extra_idcode=extra_idcode, chip_id=chip_id)
+    oinfo = analyze_opbt(
+        opbt_bytes,
+        extra_idcode=extra_idcode,
+        chip_id=chip_id,
+        otp_cfl0=otp_cfl0,
+        otp_cfl1=otp_cfl1,
+        otp_eua=otp_eua,
+        security_flags=sec_flags,
+    )
     output_path.write_bytes(opbt_bytes)
     sha = _digest(opbt_bytes)
     reporter.progress(OPBT_SIZE, OPBT_SIZE, unit="B", detail="Opbt.bin")
@@ -1405,6 +1538,11 @@ def read_opbt_in_loader(
         "chip_id": oinfo.chip_id.hex().upper() if oinfo.chip_id else None,
         "jtag_enabled": oinfo.jtag_enabled,
         "icus_activated": oinfo.icus_activated,
+        "otp_cfl0": f"0x{otp_cfl0:08X}",
+        "otp_cfl1": f"0x{otp_cfl1:08X}",
+        "otp_eua": f"0x{otp_eua:08X}",
+        "security_flags": f"0x{sec_flags:08X}",
+        "uflash_otp_locked": oinfo.uflash_otp_locked,
         "bfaselr_initial": bfaselr_initial,
         "bfaselr_final": bfaselr_final,
         "flash_commands_sent": False,
@@ -1908,18 +2046,24 @@ def _execute_faci_payloads(
                 fpmon = diag_raw[0]
                 flmdps = diag_raw[1]
                 fastat = diag_raw[2]
+                idst = diag_raw[3]
                 fentryr = int.from_bytes(diag_raw[4:6], "little")
                 fpckar = int.from_bytes(diag_raw[6:8], "little")
-                entry["faci_diag"] = {
+                diag_dict: dict[str, Any] = {
                     "fpmon": fpmon,
                     "flmdps": flmdps,
                     "fastat": fastat,
                     "fentryr": fentryr,
                     "fpckar": fpckar,
                 }
+                idst_part = ""
+                if idst != 0:
+                    diag_dict["idst"] = idst
+                    idst_part = f", IDST=0x{idst:02X}"
+                entry["faci_diag"] = diag_dict
                 diag_suffix = (
                     f" (FPMON=0x{fpmon:02X}, FENTRYR=0x{fentryr:04X}, "
-                    f"FASTAT=0x{fastat:02X}, FPCKAR=0x{fpckar:04X}, FLMDPS=0x{flmdps:02X})"
+                    f"FASTAT=0x{fastat:02X}, FPCKAR=0x{fpckar:04X}, FLMDPS=0x{flmdps:02X}{idst_part})"
                 )
             raise RuntimeError(
                 tr(
@@ -1972,7 +2116,6 @@ def can_write_uflash(
                 reporter=reporter,
             )
             current_uf = cur_uf_path.read_bytes()
-            validate_uflash_bytes(current_uf)
             result["before_uflash_sha256"] = _digest(current_uf)
 
             if input_uflash is None:
@@ -1982,21 +2125,36 @@ def can_write_uflash(
             else:
                 source_uf = bytes(input_uflash)
 
-            if raw_image:
-                validate_uflash_bytes(source_uf)
+            same_unrecognised_fbl = (
+                raw_image
+                and len(current_uf) == UFLASH_SIZE
+                and current_uf == source_uf
+                and not find_uflash_rsa_sites(current_uf)
+                and FBL_LIBRARY_ID in current_uf
+            )
+            if same_unrecognised_fbl:
                 candidate = source_uf
-                mod_desc = "raw validated Uflash image"
+                mod_desc = "raw matching unrecognised FBL Uflash image"
+                cur_uinfo = analyze_uflash(current_uf)
             else:
-                candidate, mod_desc = apply_uflash_rsa_patch(source_uf, restore_stock=restore_stock)
+                validate_uflash_bytes(current_uf)
+                cur_uinfo = analyze_uflash(current_uf)
+                if raw_image:
+                    validate_uflash_bytes(source_uf)
+                    candidate = source_uf
+                    mod_desc = "raw validated Uflash image"
+                else:
+                    candidate, mod_desc = apply_uflash_rsa_patch(source_uf, restore_stock=restore_stock)
 
+            cmp_off = cur_uinfo.rsa_cmp_offset if cur_uinfo.rsa_cmp_offset is not None else UFLASH_RSA_CMP_OFFSET
             # Safety guard: unless raw_image is explicitly requested, candidate and physical Uflash
-            # may ONLY differ in the 4-byte RSA comparison instruction at +0x342A..+0x342D!
+            # may ONLY differ in the 4-byte RSA comparison instruction at cmp_off..cmp_off+3!
             diffs = [i for i in range(UFLASH_SIZE) if current_uf[i] != candidate[i]]
-            if not raw_image and any(not (UFLASH_RSA_CMP_OFFSET <= i < UFLASH_RSA_CMP_OFFSET + 4) for i in diffs):
+            if not raw_image and any(not (cmp_off <= i < cmp_off + 4) for i in diffs):
                 raise RuntimeError(
                     tr(
-                        "Входной файл Uflash не принадлежит этому шлюзу (отличается за пределами +0x342A)! Запись заблокирована.",
-                        "Input Uflash does not match physical Uflash outside +0x342A! Write refused for safety.",
+                        f"Входной файл Uflash не принадлежит этому шлюзу (отличается за пределами +0x{cmp_off:04X})! Запись заблокирована.",
+                        f"Input Uflash does not match physical Uflash outside +0x{cmp_off:04X}! Write refused for safety.",
                     )
                 )
 
@@ -2016,6 +2174,25 @@ def can_write_uflash(
                 result["already_matching"] = True
                 result["step3_skipped_backup"] = True
             else:
+                prot = probe_extra_area_protection(link, reporter=reporter)
+                custom_flid: bytes | None = None
+                if prot is not None:
+                    result["extra_area_protection"] = {k: v for k, v in prot.items() if k != "idcode_bytes"}
+                    if prot.get("uflash_otp_locked") or prot.get("block_erase_disabled") or prot.get("write_disabled"):
+                        otp_detail = f"OTPEUA={prot['otp_eua']}, SECF={prot['security_flags']}"
+                        raise UflashProtectedError(_uflash_protected_message(otp_detail))
+                    id_bytes = prot.get("idcode_bytes")
+                    if (
+                        isinstance(id_bytes, bytes)
+                        and len(id_bytes) == SELFID_SIZE
+                        and not all(x == 0xFF for x in id_bytes)
+                        and not all(x == 0x00 for x in id_bytes)
+                    ):
+                        with contextlib.suppress(*LINK_ERRORS, ValueError):
+                            ab00_id = read_memory_bytes(link, SELFID_OFFSET, SELFID_SIZE)
+                            if ab00_id != id_bytes:
+                                custom_flid = id_bytes
+
                 if not skip_full_backup:
                     reporter.step(3, total_steps, tr("Обязательный полный бэкап Cflash + Dflash перед стиранием Uflash", "Mandatory full Cflash + Dflash backup before erasing Uflash"))
                     read_memory_area(
@@ -2037,7 +2214,7 @@ def can_write_uflash(
                 else:
                     reporter.step(3, total_steps, tr("Полное чтение блока уже есть — остальные области не читаются", "A complete read of this ECU is on file — the other areas are not read again"))
 
-                payloads, pages = build_uflash_faci_payloads(candidate)
+                payloads, pages = build_uflash_faci_payloads(candidate, flid_16b=custom_flid)
                 result["payload_sha256"] = _digest(payloads[0])
                 result["pages_written"] = pages
                 result["packet_count"] = len(payloads)
@@ -2052,20 +2229,45 @@ def can_write_uflash(
                 )
                 result["flash_commands_sent"] = True
                 result["packets"] = []
-                with reporter.uninterruptible():  # a cancel held back by the write must not skip its record
-                    pkt_logs = _execute_faci_payloads(
-                        link,
-                        payloads,
-                        label="FACI Uflash Packet",
-                        status_words=3,
-                        has_faci_diag=True,
-                        packets_out=result["packets"],
-                        reporter=reporter,
-                    )
-                    result["loader_response"] = pkt_logs[-1]["loader_response"]
-                    result["marker"] = pkt_logs[-1]["marker"]
-                    result["fstatr"] = pkt_logs[-1]["fstatr"]
-                    result["write_performed"] = True
+                try:
+                    with reporter.uninterruptible():  # a cancel held back by the write must not skip its record
+                        pkt_logs = _execute_faci_payloads(
+                            link,
+                            payloads,
+                            label="FACI Uflash Packet",
+                            status_words=3,
+                            has_faci_diag=True,
+                            packets_out=result["packets"],
+                            reporter=reporter,
+                        )
+                        result["loader_response"] = pkt_logs[-1]["loader_response"]
+                        result["marker"] = pkt_logs[-1]["marker"]
+                        result["fstatr"] = pkt_logs[-1]["fstatr"]
+                        result["write_performed"] = True
+                except RuntimeError as faci_err:
+                    last_pkt = result["packets"][-1] if result.get("packets") else {}
+                    if (
+                        last_pkt.get("marker") == 3
+                        and (int(last_pkt.get("fstatr", 0)) & 0x7000) == 0x4000
+                        and last_pkt.get("last_offset") == UFLASH_ADDR_START
+                    ):
+                        intact = False
+                        with contextlib.suppress(*LINK_ERRORS, ValueError):
+                            chk_path = out_dir / "Uflash_after_error.bin"
+                            chk = read_memory_area(
+                                link,
+                                UFLASH_ADDR_START,
+                                UFLASH_ADDR_START + UFLASH_SIZE,
+                                chk_path,
+                                label="Uflash Integrity Check",
+                                reference=current_uf,
+                                reporter=reporter,
+                            )
+                            intact = bool(chk.get("reference_match"))
+                            result["uflash_intact_after_error"] = intact
+                        if intact:
+                            raise UflashProtectedError(_uflash_protected_message(str(faci_err))) from faci_err
+                    raise
                 reporter.success(
                     tr(
                         f"Запись FACI завершена штатно (marker=1, FSTATR=0x{result['fstatr']:04X})",
@@ -2088,13 +2290,16 @@ def can_write_uflash(
             if not rb.get("reference_match"):
                 raise RuntimeError(f"Uflash readback mismatch at {rb.get('first_mismatch_address')!r}")
 
-            rsa_res = run_rsa_probe(link, reporter=reporter)
-            result["rsa_probe"] = rsa_res
-            cand_bypassed = analyze_uflash(candidate).rsa_bypassed
-            if cand_bypassed and rsa_res["rsa_status"] != 0:
-                raise RuntimeError(f"Engineering RSA bypass did not activate: {rsa_res}")
-            if not cand_bypassed and rsa_res["rsa_status"] == 0:
-                raise RuntimeError("Stock RSA verification was requested, but rsa_status is still 0")
+            cand_uinfo = analyze_uflash(candidate)
+            if cand_uinfo.signature_found:
+                rsa_res = run_rsa_probe(link, uflash_bytes=candidate, reporter=reporter)
+                result["rsa_probe"] = rsa_res
+                if cand_uinfo.rsa_bypassed and rsa_res["rsa_status"] != 0:
+                    raise RuntimeError(f"Engineering RSA bypass did not activate: {rsa_res}")
+                if not cand_uinfo.rsa_bypassed and rsa_res["rsa_status"] == 0:
+                    raise RuntimeError("Stock RSA verification was requested, but rsa_status is still 0")
+            else:
+                result["rsa_probe"] = {"skipped": True, "reason": "unrecognised_fbl"}
 
             if return_to_app:
                 reporter.step(6, total_steps, tr("Перезапуск шлюза и проверка штатного режима (10 03 / 3E 00)", "Resetting gateway & verifying normal Application communication"))
@@ -2117,6 +2322,13 @@ def can_write_uflash(
             raise
         except Exception as exc:
             result["error"] = str(exc)
+            if not result.get("flash_commands_sent") or result.get("uflash_intact_after_error"):
+                _hand_back_after_read_error(
+                    link,
+                    reporter,
+                    active_loader=bool(result.get("loader_session") or result.get("beacon")),
+                    return_to_app=return_to_app,
+                )
             raise
         finally:
             _write_json(out_dir / "uflash_write_result.json", result)
@@ -2317,7 +2529,11 @@ def can_write_dflash(
                 else:
                     reporter.step(3, total_steps, tr("Полное чтение блока уже есть — остальные области не читаются", "A complete read of this ECU is on file — the other areas are not read again"))
 
-                selfid_16b = read_memory_bytes(link, SELFID_OFFSET, SELFID_SIZE)
+                selfid_16b = _resolve_live_selfid(
+                    link,
+                    read_memory_bytes(link, SELFID_OFFSET, SELFID_SIZE),
+                    reporter=reporter,
+                )
                 payloads = build_dflash_faci_payloads(
                     blocks_to_write,
                     flid_16b=selfid_16b,
@@ -2818,7 +3034,10 @@ def can_write_cflash(
         try:
             reporter.step(1, total_steps, tr("Вход в RAM-Loader и проверка загрузчика (RSA Probe)", "Entering RAM-Loader & probing bootloader state"))
             enter_ram_loader(link, reporter=reporter)
-            rsa_res = run_rsa_probe(link, reporter=reporter)
+            if raw_faci:
+                rsa_res = {"skipped": True, "reason": "raw_faci"}
+            else:
+                rsa_res = run_rsa_probe(link, reporter=reporter)
             result["rsa_precheck"] = rsa_res
 
             backup_dir = out_dir / "backup"
@@ -2869,6 +3088,7 @@ def can_write_cflash(
                 physical_before = expected_before_cflash
 
             live_selfid = physical_before[SELFID_OFFSET : SELFID_OFFSET + SELFID_SIZE]
+            faci_selfid = _resolve_live_selfid(link, live_selfid, reporter=reporter)
             expected_full = bytearray(prefix + bytes(app))
             expected_full[0xC000:0xC004] = FBL_PRESENCE_MAGIC.to_bytes(4, "little")
             expected_full[0xC100:0xC104] = b"\xff\xff\xff\xff"
@@ -2919,7 +3139,7 @@ def can_write_cflash(
                         link,
                         bytes(expected_full),
                         changed_blocks,
-                        flid_16b=live_selfid,
+                        flid_16b=faci_selfid,
                         reporter=reporter,
                     )
                 reporter.step(4, total_steps, tr("Прямая запись FACI завершена — переход к верификации", "Direct FACI write complete — proceeding to readback"))
@@ -2973,7 +3193,7 @@ def can_write_cflash(
                             link,
                             bytes(expected_full),
                             boot_now,
-                            flid_16b=live_selfid,
+                            flid_16b=faci_selfid,
                             reporter=reporter,
                         )
                     else:
@@ -3002,7 +3222,7 @@ def can_write_cflash(
                             reporter.can_log(tr("Запись загрузчика о программировании (блок 4) — из образа, после UDS",
                                                 "The FBL's programming record (block 4) — from the image, after UDS"))
                             result["fbl_record_faci"] = _program_cflash_blocks_in_loader(
-                                link, bytes(expected_full), [FBL_RECORD_BLOCK], flid_16b=live_selfid, reporter=reporter
+                                link, bytes(expected_full), [FBL_RECORD_BLOCK], flid_16b=faci_selfid, reporter=reporter
                             )
                     else:
                         reporter.step(4, total_steps, tr("Прикладная область 0x00C200..0x17FFFF без изменений — UDS перезапись не требуется", "Application area 0x00C200..0x17FFFF unchanged — skipping UDS reflash"))
@@ -3218,23 +3438,45 @@ def can_restore_backup(
                     reporter.warning(str(exc))
                     refused = True
             if refused:
-                result["uflash_engineering"] = can_write_uflash(
-                    port, restore_stock=False, interface=interface, session_dir=out_dir / "uflash_eng",
-                    skip_full_backup=True, return_to_app=False, reporter=reporter,
-                )
+                use_raw_faci = False
+                try:
+                    result["uflash_engineering"] = can_write_uflash(
+                        port, restore_stock=False, interface=interface, session_dir=out_dir / "uflash_eng",
+                        skip_full_backup=True, return_to_app=False, reporter=reporter,
+                    )
+                except (UflashProtectedError, UnrecognisedUflashError) as uf_exc:
+                    use_raw_faci = True
+                    result["uflash_engineering_skipped"] = str(uf_exc)
+                    reporter.warning(
+                        tr(
+                            f"Загрузчик Uflash не может быть изменён ({uf_exc}) — восстанавливаем CodeFlash напрямую через FACI.",
+                            f"The Uflash bootloader cannot be modified ({uf_exc}) — restoring CodeFlash directly via FACI.",
+                        )
+                    )
                 result["cflash"] = can_write_cflash(
-                    port, files["cflash"], interface=interface, session_dir=out_dir / "cflash_retry",
+                    port, files["cflash"], raw_faci=use_raw_faci, interface=interface, session_dir=out_dir / "cflash_retry",
                     skip_backup=True, return_to_app=False, reporter=reporter,
                 )
             did_backup = True
         elif "cflash" in writes:
             # the CodeFlash write right after reads CodeFlash, DataFlash and the bootloader itself: no copy here
-            result["uflash_engineering"] = can_write_uflash(
-                port, restore_stock=False, interface=interface, session_dir=out_dir / "uflash_eng",
-                skip_full_backup=True, return_to_app=False, reporter=reporter,
-            )
+            use_raw_faci = False
+            try:
+                result["uflash_engineering"] = can_write_uflash(
+                    port, restore_stock=False, interface=interface, session_dir=out_dir / "uflash_eng",
+                    skip_full_backup=True, return_to_app=False, reporter=reporter,
+                )
+            except (UflashProtectedError, UnrecognisedUflashError) as uf_exc:
+                use_raw_faci = True
+                result["uflash_engineering_skipped"] = str(uf_exc)
+                reporter.warning(
+                    tr(
+                        f"Загрузчик Uflash не может быть изменён ({uf_exc}) — восстанавливаем CodeFlash напрямую через FACI.",
+                        f"The Uflash bootloader cannot be modified ({uf_exc}) — restoring CodeFlash directly via FACI.",
+                    )
+                )
             result["cflash"] = can_write_cflash(
-                port, files["cflash"], interface=interface, session_dir=out_dir / "cflash",
+                port, files["cflash"], raw_faci=use_raw_faci, interface=interface, session_dir=out_dir / "cflash",
                 return_to_app=False, reporter=reporter,
             )
             did_backup = True
@@ -3543,6 +3785,7 @@ def can_turnkey_read_patch_flash(
     orig_df = (backup_dir / "Dflash.bin").read_bytes()
 
     need_cflash = bool(patch_cp_hybrid or patch_engineering_cflash or cp_updates)
+    use_raw_faci = False
     if unlock_engineering_uflash or need_cflash:
         reporter.info(
             tr(
@@ -3550,17 +3793,29 @@ def can_turnkey_read_patch_flash(
                 "═══ PHASE B: UNLOCKING ENGINEERING RSA-FREE UFLASH ═══",
             )
         )
-        uf_res = can_write_uflash(
-            port,
-            input_uflash=orig_uf,
-            restore_stock=False,
-            interface=interface,
-            session_dir=out_dir / "02_uflash_unlock",
-            skip_full_backup=True,
-            return_to_app=not bool(cp_updates),
-            reporter=reporter,
-        )
-        summary["uflash_unlock"] = uf_res
+        try:
+            uf_res = can_write_uflash(
+                port,
+                input_uflash=orig_uf,
+                restore_stock=False,
+                interface=interface,
+                session_dir=out_dir / "02_uflash_unlock",
+                skip_full_backup=True,
+                return_to_app=not bool(cp_updates),
+                reporter=reporter,
+            )
+            summary["uflash_unlock"] = uf_res
+        except (UflashProtectedError, UnrecognisedUflashError) as uf_exc:
+            if not need_cflash:
+                raise
+            use_raw_faci = True
+            summary["uflash_unlock_skipped"] = str(uf_exc)
+            reporter.warning(
+                tr(
+                    f"Загрузчик Uflash не может быть изменён ({uf_exc}) — записываем CodeFlash напрямую через FACI.",
+                    f"The Uflash bootloader cannot be modified ({uf_exc}) — programming CodeFlash directly via FACI.",
+                )
+            )
 
     if cp_updates:
         reporter.info(
@@ -3615,6 +3870,7 @@ def can_turnkey_read_patch_flash(
             port,
             mod_cf,
             expected_before_cflash=orig_cf,
+            raw_faci=use_raw_faci,
             interface=interface,
             session_dir=out_dir / "03_cflash_flash",
             skip_backup=True,

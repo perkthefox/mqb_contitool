@@ -1,5 +1,19 @@
 # Changelog / История изменений
 
+## 2.1.3 — 2026-11-18
+
+### 🇷🇺 Исправлено
+- **Поддержка загрузчиков `HW 517` и `HW 518` (`3Q0907530B` / `3Q0907530C`, #36, #37):** анализатор `Uflash.bin`, патчер инженерного загрузчика и живой CAN-пробник `RSA_PROBE_PAYLOAD` теперь автоматически определяют фактический адрес процедуры проверки RSA-1024 в сборке FBL — как стандартный `+0x342A` (`0x010033FC`, `HW 521+`), так и смещённый `+0x3444` (`0x01003416`, `HW 517` / `HW 518`). Устранены ошибки распознавания загрузчика и сбои при полном восстановлении бэкапа (`CodeFlash + DataFlash + Uflash`).
+- **Аутентификация `SELFID` (`IDCODE`) из `Extra Area` и автоматический переход на прямую запись `CodeFlash` при OTP-защите `Uflash` (#31, #34):**
+  - Перед записью через `FACI` считывается окно `Extra Area` (`0xFF300000..0xFF3000FF`): проверяются аппаратные регистры защиты `OTPEUA` (`0xFF300048`), `OTPCFL0`/`OTPCFL1` и флаги безопасности (`0xFF300060`), а для регистра `SELFID` (`0xFFA08000`) используется актуальный 128-битный `IDCODE` из `0xFF300050` с контролем статуса `IDST` (`0xFFA08010`) и автоматическим перебором `0xFFFFFFFF * 4` на чистых процессорах.
+  - Если область `Extended User Area` (`Uflash`) закрыта заводским OTP-замком (`OTPEUA` бит 0 == `0` или `FACI` возвращает `marker=3, FSTATR=0x0000C000` на `0x01000000`), операции **«Запись в блок»**, адаптация ключей под ключ (`turnkey`) и восстановление бэкапа автоматически переключаются на прямую поблочную запись `CodeFlash` через `FACI` в `RAM-Loader` (`raw_faci=True`) без модификации заводского `Uflash`, а при одиночной записи `Uflash` шлюз штатно выводится обратно в режим приложения.
+
+### 🇬🇧 Fixed
+- **`HW 517` and `HW 518` bootloader support (`3Q0907530B` / `3Q0907530C`, #36, #37):** `Uflash.bin` analysis, engineering bootloader patching, and the live CAN `RSA_PROBE_PAYLOAD` now dynamically locate the FBL RSA-1024 verification routine across both `+0x342A` (`0x010033FC`, `HW 521+`) and `+0x3444` (`0x01003416`, `HW 517` / `HW 518`), resolving unrecognised bootloader errors and full backup restore failures (`CodeFlash + DataFlash + Uflash`).
+- **`Extra Area` `SELFID` (`IDCODE`) authentication and automatic direct `CodeFlash` `FACI` fallback on OTP-locked `Uflash` (#31, #34):**
+  - Before `FACI` programming, ContiTool now inspects `Extra Area` (`0xFF300000..0xFF3000FF`) for `OTPEUA` (`0xFF300048`), `OTPCFL0`/`OTPCFL1`, and security flags (`0xFF300060`), authenticates `SELFID` (`0xFFA08000`) using the authoritative 128-bit `IDCODE` at `0xFF300050`, verifies `IDST` (`0xFFA08010`), and automatically retries `0xFFFFFFFF * 4` when `Extra Area` `IDCODE` is blank.
+  - When `Extended User Area` (`Uflash`) is permanently factory OTP-locked (`OTPEUA` bit 0 == `0` or `FACI` returns `marker=3, FSTATR=0x0000C000` at `0x01000000`), **“Write to ECU”**, turnkey key adaptation, and backup restore automatically fall back to direct in-RAM `FACI` `CodeFlash` block programming (`raw_faci=True`) while leaving stock `Uflash` untouched, and standalone `Uflash` writes cleanly return the gateway to Application mode.
+
 ## 2.1.2 — 2026-11-15
 
 ### 🇷🇺 Исправлено

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from contitool.can import (
+    UflashProtectedError,
     can_activate_swap,
     can_health_check,
     can_learn_mfl_button,
@@ -49,6 +50,7 @@ from contitool.core import (
     STOCK_SWAP_MODULUS,
     UNSUPPORTED_DATASET_RU,
     UNSUPPORTED_DATASET_WARNING,
+    UnrecognisedUflashError,
     ZDC_UDS_UPLOAD_MAP,
     ZdcAutoParamConfig,
     analyze_eeprom,
@@ -1323,17 +1325,20 @@ class EcuScreen(QWidget):
 
     def _page_boot(self, lay: QVBoxLayout) -> None:
         st = self._head(lay, "boot")
+        uf_inf = self.ws.info("uflash")
+        uf_off = uf_inf.uflash_info.rsa_cmp_offset if (uf_inf and uf_inf.uflash_info) else None
+        addr_lbl = f"0x{0x01000000 + uf_off:08X}" if uf_off is not None else "0x0100342A / 0x01003444"
         self._text(
             lay,
             tr(
                 "Загрузчик (Uflash) записывает прошивку в блок. Заводской загрузчик принимает только CodeFlash с "
                 "подписью VAG, а любое изменение CodeFlash эту подпись нарушает. Инженерный загрузчик подпись не "
                 "проверяет — с ним изменённый CodeFlash записывается по CAN. От заводского он отличается одной "
-                "инструкцией: 4 байта по адресу 0x0100342A.",
+                f"инструкцией: 4 байта по адресу {addr_lbl}.",
                 "The bootloader (Uflash) writes firmware into the ECU. The factory bootloader accepts only CodeFlash "
                 "signed by VAG, and any change to CodeFlash breaks that signature. The engineering bootloader does not "
                 "check the signature, so a modified CodeFlash can be written over CAN. It differs from the factory one "
-                "by a single instruction: 4 bytes at 0x0100342A.",
+                f"by a single instruction: 4 bytes at {addr_lbl}.",
             ),
         )
         btns = []
@@ -2578,18 +2583,32 @@ class EcuScreen(QWidget):
                 cf_orig is None
                 or split_cflash_or_app(cf_path.read_bytes())[1] != split_cflash_or_app(cf_orig.read_bytes())[1]
             )
+            use_raw_faci = False
             if app_changed:
-                # UDS programming of the application needs the engineering bootloader; boot blocks go via FACI
-                out["uflash"] = can_write_uflash(
-                    port,
-                    restore_stock=False,
-                    interface=iface,
-                    session_dir=sdir / "uflash",
-                    skip_full_backup=did_backup,
-                    return_to_app=(df_path is None),
-                    reporter=rep,
-                )
-                did_backup = did_backup or not bool(out["uflash"].get("step3_skipped_backup"))
+                # UDS programming of the application needs the engineering bootloader; if Uflash is OTP-protected or
+                # an unrecognised build, fall back automatically to direct FACI programming of changed CodeFlash blocks.
+                try:
+                    out["uflash"] = can_write_uflash(
+                        port,
+                        restore_stock=False,
+                        interface=iface,
+                        session_dir=sdir / "uflash",
+                        skip_full_backup=did_backup,
+                        return_to_app=(df_path is None),
+                        reporter=rep,
+                    )
+                    did_backup = did_backup or not bool(out["uflash"].get("step3_skipped_backup"))
+                except (UflashProtectedError, UnrecognisedUflashError) as uf_exc:
+                    use_raw_faci = True
+                    out["uflash_skipped"] = str(uf_exc)
+                    rep.warning(
+                        tr(
+                            f"Загрузчик Uflash не может быть перезаписан ({uf_exc}) — изменённые блоки CodeFlash "
+                            "будут записаны напрямую через FACI в ОЗУ без модификации загрузчика.",
+                            f"The Uflash bootloader cannot be rewritten ({uf_exc}) — modified CodeFlash blocks "
+                            "will be programmed directly via FACI in RAM without modifying the bootloader.",
+                        )
+                    )
 
             if df_path is not None:
                 out["dflash"] = can_write_dflash(
@@ -2605,6 +2624,7 @@ class EcuScreen(QWidget):
                 did_backup = True
 
             if cf_path is not None:
+                cflash_extra_kw = {"raw_faci": True} if use_raw_faci else {}
                 out["cflash"] = can_write_cflash(
                     port,
                     cf_path,
@@ -2612,6 +2632,7 @@ class EcuScreen(QWidget):
                     session_dir=sdir / "cflash",
                     skip_backup=did_backup,  # a full read is on file, or the bootloader / DataFlash step took one
                     reporter=rep,
+                    **cflash_extra_kw,
                 )
                 zdc_blocks = out.get("dflash", {}).get("zdc_blocks_written")
                 if zdc_blocks:  # DataFlash went first without the application; its coding is due now

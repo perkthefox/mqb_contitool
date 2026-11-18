@@ -326,8 +326,9 @@ def format_cflash_report(summary: CflashSummary, style: Style | None = None, pat
 
 def format_uflash_report(summary: UflashSummary, style: Style | None = None, path_label: str = "") -> str:
     st = style or Style(False)
+    off_tag = f"+0x{summary.rsa_cmp_offset:04X}" if summary.rsa_cmp_offset is not None else "+0x342A"
     rsa_str = (
-        st.badge_ok(tr("ИНЖЕНЕРНЫЙ RSA-FREE FBL (+0x342A пропатчен)", "ENGINEERING RSA-FREE FBL (+0x342A patched)"))
+        st.badge_ok(tr(f"ИНЖЕНЕРНЫЙ RSA-FREE FBL ({off_tag} пропатчен)", f"ENGINEERING RSA-FREE FBL ({off_tag} patched)"))
         if summary.rsa_bypassed
         else st.dim(tr("ЗАВОДСКАЯ ПРОВЕРКА RSA-1024 АКТИВНА", "STOCK RSA-1024 CHECK ACTIVE"))
     )

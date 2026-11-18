@@ -14,6 +14,10 @@ from contitool.core.constants import (
     CHIP_ID_SIZE,
     EEPROM_SIZE,
     EXTRA_AREA_IDCODE_OFFSET,
+    EXTRA_AREA_OTP_CFL0_OFFSET,
+    EXTRA_AREA_OTP_CFL1_OFFSET,
+    EXTRA_AREA_OTP_EUA_OFFSET,
+    EXTRA_AREA_SECURITY_OFFSET,
     EXTRA_AREA_SIZE,
     IDCODE_SIZE,
     OPBT_LEGACY_SIZE,
@@ -228,10 +232,22 @@ class OpbtSummary:
     fields: tuple[OpbtField, ...]
     idcode: bytes = b""
     chip_id: bytes = b""
+    otp_cfl0: int | None = None
+    otp_cfl1: int | None = None
+    otp_eua: int | None = None
+    security_flags: int | None = None
 
     @property
     def chip_id_lot(self) -> str:
         return chip_id_lot_ascii(self.chip_id)
+
+    @property
+    def uflash_otp_locked(self) -> bool | None:
+        return None if self.otp_eua is None else ((self.otp_eua & 1) == 0)
+
+    @property
+    def block_erase_disabled(self) -> bool | None:
+        return None if self.security_flags is None else (((self.security_flags >> 30) & 1) == 0)
 
 
 def is_plausible_opbt_bytes(raw: bytes) -> bool:
@@ -256,6 +272,10 @@ def analyze_opbt(
     *,
     extra_idcode: bytes | str | None = None,
     chip_id: bytes | str | None = None,
+    otp_cfl0: int | None = None,
+    otp_cfl1: int | None = None,
+    otp_eua: int | None = None,
+    security_flags: int | None = None,
 ) -> OpbtSummary:
     """Decode 32-byte (OPBT0..7), 36-byte (OPBT0..8), or 256-byte Extra Area dumps per RH850/F1L Table 35.34."""
     from_extra = False
@@ -264,6 +284,14 @@ def analyze_opbt(
         opbt_bytes = raw[OPBT_EXTRA_AREA_OFFSET : OPBT_EXTRA_AREA_OFFSET + OPBT_SIZE]
         if not extra_idcode:
             extra_idcode = raw[EXTRA_AREA_IDCODE_OFFSET : EXTRA_AREA_IDCODE_OFFSET + IDCODE_SIZE]
+        if otp_cfl0 is None:
+            otp_cfl0, = struct.unpack_from("<I", raw, EXTRA_AREA_OTP_CFL0_OFFSET)
+        if otp_cfl1 is None:
+            otp_cfl1, = struct.unpack_from("<I", raw, EXTRA_AREA_OTP_CFL1_OFFSET)
+        if otp_eua is None:
+            otp_eua, = struct.unpack_from("<I", raw, EXTRA_AREA_OTP_EUA_OFFSET)
+        if security_flags is None:
+            security_flags, = struct.unpack_from("<I", raw, EXTRA_AREA_SECURITY_OFFSET)
     elif len(raw) in (OPBT_LEGACY_SIZE, OPBT_SIZE):
         opbt_bytes = raw
     else:
@@ -409,6 +437,10 @@ def analyze_opbt(
         fields=tuple(fields),
         idcode=normalize_idcode_bytes(extra_idcode),
         chip_id=normalize_chip_id_bytes(chip_id),
+        otp_cfl0=otp_cfl0,
+        otp_cfl1=otp_cfl1,
+        otp_eua=otp_eua,
+        security_flags=security_flags,
     )
 
 

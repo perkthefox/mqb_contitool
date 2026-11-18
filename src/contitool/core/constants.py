@@ -27,7 +27,11 @@ OPBT_LEGACY_SIZE = 32               # 32 bytes (OPBT0..OPBT7 @ 0xFF300070..0xFF3
 OPBT_SIZE = 36                      # 36 bytes (OPBT0..OPBT8 @ 0xFF300070..0xFF300093)
 EXTRA_AREA_SIZE = 256               # 256 bytes (Extra Area @ 0xFF300000..0xFF3000FF)
 CFLASH_IDCODE_OFFSET = 0x0000AB00   # 16-byte RH850 SELFID / IDCODE in CodeFlash boot block 5
+EXTRA_AREA_OTP_CFL0_OFFSET = 0x40   # 32-bit OTP flags for CodeFlash blocks 0..31 (0xFF300040, bit=0 -> locked)
+EXTRA_AREA_OTP_CFL1_OFFSET = 0x44   # 32-bit OTP flags for CodeFlash blocks 32..53 (0xFF300044, bit=0 -> locked)
+EXTRA_AREA_OTP_EUA_OFFSET = 0x48    # 32-bit OTP flag for Extended User Area / Uflash (0xFF300048, bit 0=0 -> locked)
 EXTRA_AREA_IDCODE_OFFSET = 0x50     # 16-byte RH850 IDCODE in Extra Area (0xFF300050..0xFF30005F)
+EXTRA_AREA_SECURITY_OFFSET = 0x60   # 32-bit Security Setting flags in Extra Area (0xFF300060)
 IDCODE_SIZE = 16                    # 128-bit (4 x 32-bit words)
 CHIP_ID_ADDR = 0xFFCD00E0           # 32-byte RH850 SCDS Chip ID register block (0xFFCD00E0..0xFFCD00FF)
 CHIP_ID_SIZE = 32
@@ -52,7 +56,9 @@ STOCK_CCP_BLACKLIST_CMOV = b"\xe0\xe7\x06\xe3"   # cmov nh, 0, r28, r28
 PATCH_CCP_BLACKLIST_NOP = b"\x00\x00\x00\x00"    # nop; nop
 STOCK_A167_BE = b"\xd2\x0d"                      # be +26
 PATCH_A167_NOP = b"\x00\x00"                     # nop
-UFLASH_RSA_CMP_OFFSET = 0x342A                   # 0x0100342A in Uflash.bin
+UFLASH_RSA_CMP_OFFSET = 0x342A                   # Default RSA check offset (0x0100342A on HW 521+; 0x01003444 on HW 517/518)
+UFLASH_RSA_FN_HEAD_DELTA = 0x2E                  # Offset from RSA verify function entry (0x33FC / 0x3416) to cmov instruction
+DEFAULT_UFLASH_RSA_FN_VADDR = 0x010033FC         # Default RSA verify function address in Uflash (HW 521+)
 STOCK_UFLASH_RSA_CMOV = b"\xe2\x57\x14\xeb"      # cmov ne, 2, r10, r29
 PATCH_UFLASH_RSA_OK = b"\x00\xea\x00\x00"        # mov 0, r29; nop
 
