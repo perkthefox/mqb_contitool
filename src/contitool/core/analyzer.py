@@ -379,6 +379,8 @@ class FscSlotInfo:
     timestamp: int
     crc_ok: bool
     factory_eol: bool
+    vcrn_matches: bool = True
+    nvm_status: int | None = None
 
 
 @dataclasses.dataclass
@@ -394,6 +396,7 @@ class DflashSwapSummary:
     swap_rsa_exp_ok: bool = False
     vin: str = ""
     active_fscs: list[FscSlotInfo] = dataclasses.field(default_factory=list)
+    foreign_fscs: list[FscSlotInfo] = dataclasses.field(default_factory=list)
     inactive_fecs: list[int] = dataclasses.field(default_factory=list)
     free_slots: int = 0
     slot_timestamps: dict[int, int] = dataclasses.field(default_factory=dict)
@@ -590,18 +593,23 @@ def analyze_dflash_swap(df: bytes) -> DflashSwapSummary:
     inactive_fecs: list[int] = []
     free_slots = 0
     slot_timestamps: dict[int, int] = {}
+    slot_statuses: dict[int, int] = {}
     for slot in range(15):
         ent = payload[0x10E + slot * 14 : 0x10E + (slot + 1) * 14]
         fec_meta, ts_meta = struct.unpack_from(">II", ent, 4)
         st_byte = ent[12]
         if fec_meta != 0:
+            slot_statuses[slot] = st_byte
             slot_timestamps[fec_meta] = max(slot_timestamps.get(fec_meta, 0), ts_meta)
             if st_byte == 0xB0:
                 inactive_fecs.append(fec_meta)
         elif ent == b"\x00" * 14:
             free_slots += 1
 
+    ecu_vcrn_valid = vcrn not in (b"", b"\x00" * 5, b"\xff" * 5)
+    ecu_vcrn_hex = vcrn.hex()
     fscs: list[FscSlotInfo] = []
+    foreign_fscs: list[FscSlotInfo] = []
     detected_vin = ""
     for slot in range(15):
         off = DFLASH_FSC_BASE_OFF + slot * DFLASH_FSC_STRIDE
@@ -611,27 +619,35 @@ def analyze_dflash_swap(df: bytes) -> DflashSwapSummary:
         spay = df[off + 4 : off + 4 + DFLASH_FSC_PAY_SIZE]
         scrc_calc = zlib.crc32(spay) & 0xFFFFFFFF
         scrc_st, = struct.unpack_from("<I", df, off + 0xB0)
+        scrc_ok = scrc_calc == scrc_st
         if spay[0:2] == b"\x11\x02" and spay[6] == 0x03:
             fec_u32, = struct.unpack_from(">I", spay, 2)
             svcrn = spay[7:12].hex()
             raw_vin = spay[12:29].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
-            if raw_vin and not detected_vin:
-                detected_vin = raw_vin
             ts_u32, = struct.unpack_from(">I", spay, 30)
             slot_timestamps[fec_u32] = max(slot_timestamps.get(fec_u32, 0), ts_u32)
             factory_eol = not any(spay[FSC_SIGNED_BODY_SIZE:])
-            fscs.append(
-                FscSlotInfo(
-                    slot_idx=slot,
-                    dflash_off=off,
-                    fec_code=fec_u32,
-                    vcrn_hex=svcrn,
-                    vin=raw_vin,
-                    timestamp=ts_u32,
-                    crc_ok=(scrc_calc == scrc_st),
-                    factory_eol=factory_eol,
-                )
+            vcrn_matches = ecu_vcrn_valid and (svcrn == ecu_vcrn_hex)
+            slot_info = FscSlotInfo(
+                slot_idx=slot,
+                dflash_off=off,
+                fec_code=fec_u32,
+                vcrn_hex=svcrn,
+                vin=raw_vin,
+                timestamp=ts_u32,
+                crc_ok=scrc_ok,
+                factory_eol=factory_eol,
+                vcrn_matches=vcrn_matches,
+                nvm_status=slot_statuses.get(slot),
             )
+            if vcrn_matches:
+                # Only treat a certificate's VIN as belonging to this vehicle when its VCRN matches this gateway:
+                # a used gateway re-adapted online keeps the donor car's rejected FSC slots (old VCRN & donor VIN).
+                if scrc_ok and raw_vin and not detected_vin:
+                    detected_vin = raw_vin
+                fscs.append(slot_info)
+            else:
+                foreign_fscs.append(slot_info)
 
     return DflashSwapSummary(
         initialized=(init_flag != 0),
@@ -645,6 +661,7 @@ def analyze_dflash_swap(df: bytes) -> DflashSwapSummary:
         swap_rsa_exp_ok=exp_ok,
         vin=detected_vin,
         active_fscs=fscs,
+        foreign_fscs=foreign_fscs,
         inactive_fecs=inactive_fecs,
         free_slots=free_slots,
         slot_timestamps=slot_timestamps,

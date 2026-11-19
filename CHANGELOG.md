@@ -1,5 +1,21 @@
 # Changelog / История изменений
 
+## 2.1.4 — 2026-11-20
+
+### 🇷🇺 Исправлено
+- **Корректная обработка старых SWaP-сертификатов с чужим `VCRN` на б/у шлюзах после онлайн-перепривязки CP:**
+  - Анализатор `analyze_dflash_swap()` теперь сверяет 5-байтовый `VCRN` внутри каждого слота `FSC` (`0xDD00..0xE780`) с актуальным `VCRN` шлюза в `NvM 0x7C` (`0xDC0C`): отклонённые донорские сертификаты с чужим `VCRN` выносятся в отдельный список `foreign_fscs`, больше не подставляют чужой `VIN` автомобиля-донора в паспорт блока / диалоги SWaP и не считаются активными функциями.
+  - В `apply_dflash_swap_fecs()` добавлена проверка совпадения `VCRN` перед сохранением существующего слота: сертификаты с чужим `VCRN` теперь гарантированно пересобираются в `Multi-FSC` под текущий `VCRN` шлюза (как при настройке SWaP в GUI/CLI, так и при автоактивации `can_activate_swap` во время загрузки параметрии ZDC), а невыбранные донорские слоты очищаются при замене списка функций.
+  - В GUI (раздел «SWaP / FEC» и диалог настройки SWaP) и в CLI (`inspect --dflash`) донорские слоты с чужим `VCRN` отображаются отдельно с понятным предупреждением.
+- **Уточнение идентификатора `VCRN`:** в отчёте CLI и документации исправлен UDS DID для 5-байтового `VCRN` шлюза с `0x3C03` на **`0x3C0A`**.
+
+### 🇬🇧 Fixed
+- **Proper handling of leftover foreign-`VCRN` SWaP certificates on used gateways after online CP adaptation:**
+  - `analyze_dflash_swap()` now compares each `FSC` slot's 5-byte `VCRN` (`0xDD00..0xE780`) against the gateway's current `VCRN` in `NvM 0x7C` (`0xDC0C`): rejected donor certificates with a mismatched `VCRN` are separated into `foreign_fscs`, no longer leak the donor vehicle's `VIN` into the ECU passport or SWaP dialogs, and are not reported as active features.
+  - `apply_dflash_swap_fecs()` now requires a matching `VCRN` before preserving an existing slot byte-for-byte: foreign-`VCRN` donor slots are always rebuilt as `Multi-FSC` records bound to the gateway's current `VCRN` (both in GUI/CLI SWaP configuration and in `can_activate_swap` during ZDC dataset upload), and unselected donor slots are erased when replacing the feature set.
+  - The GUI SWaP screen, SWaP activation dialog, and CLI `inspect --dflash` report now display foreign-`VCRN` donor slots separately with an explicit warning.
+- **Corrected `VCRN` UDS DID label:** updated the gateway 5-byte `VCRN` DID reference from `0x3C03` to **`0x3C0A`** in CLI output and documentation.
+
 ## 2.1.3 — 2026-11-18
 
 ### 🇷🇺 Исправлено

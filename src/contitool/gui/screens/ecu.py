@@ -812,6 +812,7 @@ class EcuScreen(QWidget):
         )
         self._swap_live_block(lay)
         features = status.active_features_detailed(self.ws)
+        foreign = status.foreign_features_detailed(self.ws)
         if features:
             self._table(
                 lay,
@@ -826,8 +827,37 @@ class EcuScreen(QWidget):
                     for _, code, name, factory, ds_ok in features
                 ],
             )
-        else:
+        elif not foreign:
             self._text(lay, st.detail or tr("Включённых функций нет.", "No features enabled."), primary=True)
+
+        if foreign:
+            vcrns = ", ".join(dict.fromkeys(v for _, _, _, v, _ in foreign if v))
+            vins = ", ".join(dict.fromkeys(v for _, _, _, _, v in foreign if v))
+            vin_part = f", VIN {vins}" if vins else ""
+            self._note(
+                lay,
+                tr(
+                    f"В DataFlash найдено {len(foreign)} сертификат(ов) от другого блока (чужой VCRN {vcrns}{vin_part}) — "
+                    "такое бывает на б/у шлюзе после онлайн-перепривязки CP. Шлюз их не принимает, а их VIN относится "
+                    "к автомобилю-донору. Откройте «Настроить функции SWaP…», чтобы пересобрать нужные функции под текущий VCRN.",
+                    f"DataFlash holds {len(foreign)} certificate(s) from another ECU (foreign VCRN {vcrns}{vin_part}) — "
+                    "typical on a used gateway after online CP adaptation. The gateway rejects them, and their VIN belongs "
+                    "to the donor vehicle. Open “Configure SWaP features…” to rebuild the needed features for this ECU's VCRN.",
+                ),
+                tone="warn",
+            )
+            self._table(
+                lay,
+                tr("Отклонённые слоты в DataFlash (чужой VCRN)", "Rejected slots in DataFlash (foreign VCRN)"),
+                [
+                    (
+                        code,
+                        name,
+                        f"VCRN {vcrn}" + (f" · VIN {dvin}" if dvin else ""),
+                    )
+                    for _, code, name, vcrn, dvin in foreign
+                ],
+            )
 
         unsup_active = status.unsupported_active_fecs(self.ws)
         if unsup_active:

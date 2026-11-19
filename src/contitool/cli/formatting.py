@@ -439,7 +439,7 @@ def format_dflash_report(
             )
         )
         lines.append(f"  VIN:               {swap_summary.vin or '—'}")
-        lines.append(f"  VCRN (DID 0x3C03): {swap_summary.vcrn.hex().upper() if swap_summary.vcrn else '—'}")
+        lines.append(f"  VCRN (DID 0x3C0A): {swap_summary.vcrn.hex().upper() if swap_summary.vcrn else '—'}")
         lines.append(f"  SWaP RSA NvM 0x7C: {_rsa_label(swap_summary.swap_rsa_mod, STOCK_SWAP_MODULUS)}")
         lines.append(
             f"  {tr('Сертификаты FSC', 'Active FSCs')}:   "
@@ -460,6 +460,19 @@ def format_dflash_report(
             lines.append(
                 f"    • #{fsc.slot_idx:02d} @ 0x{fsc.dflash_off:04X}: FeC 0x{fsc.fec_code:08X} {kind_tag} ({desc}){ds_badge}"
             )
+        if swap_summary.foreign_fscs:
+            lines.append(
+                f"  {tr('Чужой VCRN (отклонённые FSC)', 'Foreign VCRN (rejected FSCs)')}: "
+                f"{st.badge_warn(str(len(swap_summary.foreign_fscs)))}"
+            )
+            for fsc in swap_summary.foreign_fscs:
+                fec_names = KNOWN_GATEWAY_FECS.get(fsc.fec_code)
+                desc = (fec_names[1] if get_lang() == "en" else fec_names[0]) if fec_names else "Custom FeC"
+                vin_tag = f", VIN={fsc.vin}" if fsc.vin else ""
+                lines.append(
+                    f"    • #{fsc.slot_idx:02d} @ 0x{fsc.dflash_off:04X}: FeC 0x{fsc.fec_code:08X} "
+                    f"[VCRN={fsc.vcrn_hex.upper()}{vin_tag}] ({desc})"
+                )
 
     return "\n".join(lines)
 

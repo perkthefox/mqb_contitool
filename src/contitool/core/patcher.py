@@ -469,9 +469,9 @@ def apply_dflash_swap_fecs(
 
     disable_list = [c for c in disable_list if c not in enable_set]  # enabling wins: never erase a kept certificate
     if not preserve_existing_active:
-        for active_slot in sw_before.active_fscs:
-            if active_slot.fec_code not in enable_set and active_slot.fec_code not in disable_list:
-                disable_list.append(active_slot.fec_code)
+        for existing_slot in (*sw_before.active_fscs, *sw_before.foreign_fscs):
+            if existing_slot.fec_code not in enable_set and existing_slot.fec_code not in disable_list:
+                disable_list.append(existing_slot.fec_code)
 
     effective_vin = sw_before.vin if vin is None else vin.strip().upper()
     if effective_vin and (len(effective_vin) != 17 or not all(0x20 <= ord(ch) <= 0x7E for ch in effective_vin)):
@@ -546,6 +546,8 @@ def apply_dflash_swap_fecs(
         )
 
     existing_active_by_fec = {f.fec_code: f for f in sw_before.active_fscs}
+    existing_foreign_by_fec = {f.fec_code: f for f in sw_before.foreign_fscs}
+    vcrn_hex_lc = vcrn_5b.hex().lower()
     erased_slot = b"\xff" * DFLASH_FSC_STRIDE
     disabled_applied: list[int] = []
 
@@ -578,19 +580,31 @@ def apply_dflash_swap_fecs(
         off = DFLASH_FSC_BASE_OFF + slot * DFLASH_FSC_STRIDE
         ent_slice = slice(0x10E + slot * 14, 0x10E + (slot + 1) * 14)
         cur_active = existing_active_by_fec.get(fec)
+        cur_foreign = existing_foreign_by_fec.get(fec)
         if (
             cur_active is not None
             and cur_active.slot_idx == slot
             and cur_active.crc_ok
+            and cur_active.vcrn_matches
+            and cur_active.vcrn_hex.lower() == vcrn_hex_lc
             and (vin is None or cur_active.vin == effective_vin)
             and timestamp_unix is None
         ):
-            # A valid certificate stays byte for byte: rebuilding a VAG-signed one would drop its signature.
+            # A valid certificate for this ECU stays byte for byte: rebuilding a VAG-signed one would drop its signature.
             if pay[ent_slice][12] != 0xFF:
                 pay[ent_slice] = b"\x00\x00\x00\x00" + struct.pack(">II", fec, cur_active.timestamp) + b"\xff\x01"
             enabled_applied.append(fec)
             continue
-        if cur_active is not None and cur_active.crc_ok and not cur_active.factory_eol:
+        if cur_foreign is not None:
+            reporter.info(
+                tr(
+                    f"Сертификат 0x{fec:08X} от другого блока (чужой VCRN {cur_foreign.vcrn_hex.upper()}) "
+                    f"заменяется записью Multi-FSC под текущий VCRN {vcrn_5b.hex().upper()}",
+                    f"Replacing foreign-VCRN certificate 0x{fec:08X} (donor VCRN {cur_foreign.vcrn_hex.upper()}) "
+                    f"with a Multi-FSC record for this ECU's VCRN {vcrn_5b.hex().upper()}",
+                )
+            )
+        elif cur_active is not None and cur_active.crc_ok and not cur_active.factory_eol:
             reporter.warning(
                 tr(
                     f"Подписанный сертификат 0x{fec:08X} заменяется записью без подписи (другой VIN или время) — "
@@ -649,6 +663,7 @@ def apply_dflash_swap_fecs(
         "enabled_fecs": [f"0x{c:08X}" for c in enabled_applied],
         "disabled_fecs": [f"0x{c:08X}" for c in disabled_applied],
         "active_fecs": [f"0x{f.fec_code:08X}" for f in sw_after.active_fscs],
+        "foreign_fecs": [f"0x{f.fec_code:08X}" for f in sw_after.foreign_fscs],
         "unsupported_fecs": [f"0x{c:08X}" for c in unsupported_fecs],
         "warnings": warnings,
     }

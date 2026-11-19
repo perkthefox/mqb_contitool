@@ -85,7 +85,7 @@ class SwapActivateDialog(Dialog):
 
         active_set = {f.fec_code for f in swap_summary.active_fscs}
         fecs: list[int] = list(GATEWAY_SWAP_SLOT_ORDER)
-        for f in swap_summary.active_fscs:
+        for f in (*swap_summary.active_fscs, *swap_summary.foreign_fscs):
             if f.fec_code not in fecs:
                 fecs.append(f.fec_code)
         self._fecs = fecs
@@ -116,6 +116,26 @@ class SwapActivateDialog(Dialog):
             )
         self.lbl_dataset = hint(ds_line)
         self.body.addWidget(self.lbl_dataset)
+
+        self.foreign_callout = Callout("warn")
+        self.foreign_callout.label.setTextFormat(Qt.TextFormat.PlainText)
+        if swap_summary.foreign_fscs:
+            f_vcrns = ", ".join(dict.fromkeys(f.vcrn_hex.upper() for f in swap_summary.foreign_fscs if f.vcrn_hex))
+            cur_vcrn = swap_summary.vcrn.hex().upper()
+            self.foreign_callout.label.setText(
+                tr(
+                    f"В DataFlash найдено {len(swap_summary.foreign_fscs)} старых сертификат(ов) с чужим VCRN ({f_vcrns}). "
+                    f"При применении выбранные функции будут пересобраны под текущий VCRN ({cur_vcrn}), "
+                    "а неотмеченные донорские слоты очистятся.",
+                    f"DataFlash holds {len(swap_summary.foreign_fscs)} old certificate(s) with a foreign VCRN ({f_vcrns}). "
+                    f"Applying will rebuild the selected features for this ECU's VCRN ({cur_vcrn}) "
+                    "and clear unselected donor slots.",
+                )
+            )
+            self.foreign_callout.setVisible(True)
+        else:
+            self.foreign_callout.setVisible(False)
+        self.body.addWidget(self.foreign_callout)
 
         # 1. Feature table + quick selection buttons
         self.btn_supported = button(

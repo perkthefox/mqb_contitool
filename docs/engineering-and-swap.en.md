@@ -194,7 +194,7 @@ Both signature verifiers on the gateway (`SWaP` in Application and `.odx` in `Uf
 
 1. **`SWaP / FeC` Key (`--target swap`) — synchronized in two places:**
    - in `CodeFlash.bin`: 128 bytes immediately following the unique 38-byte header `00 1B 00 FF FF FF` + `(31 × 0x00)` + `03`;
-   - in `DataFlash.bin` (`NvM 0x7C @ 0xDB00`): **ContiTool** writes the 128-byte modulus at **`0xDB04`**, **preserves the gateway's original 5-byte hardware `VCRN` at `0xDC0C`** (`DID 0x3C03`), and recomputes the `IEEE CRC-32` (`480` bytes `0xDB04..0xDCE3`) at **`0xDCE4`**.
+   - in `DataFlash.bin` (`NvM 0x7C @ 0xDB00`): **ContiTool** writes the 128-byte modulus at **`0xDB04`**, **preserves the gateway's original 5-byte hardware `VCRN` at `0xDC0C`** (`DID 0x3C0A`), and recomputes the `IEEE CRC-32` (`480` bytes `0xDB04..0xDCE3`) at **`0xDCE4`**.
 2. **`FBL / ODX` Key (`--target fbl`):**
    - resides in `Sector 5` of the full `1.5 MB` `CodeFlash.bin`: 128-byte exponent (`127 × 0x00 + 0x03`) at **`0x0000A277`** and 128-byte modulus `N` at **`0x0000A2F7`**.
 
@@ -207,7 +207,7 @@ Each certificate comprises a **43-byte signed body (`0x00..0x2A`)** and a **128-
 | `+0x00` | `2` B | `11 02` | `VAG FSC v2` container header |
 | `+0x02` | `4` B | `FeC_BE32` | Feature Enablement Code Big-Endian (e.g., `10 00 01 00` `FPA`, `10 00 03 00` `MKE`) |
 | `+0x06` | `1` B | `03` | Individualization ID type (`VCRN`) |
-| `+0x07` | `5` B | `VCRN[0..4]` | Gateway 5-byte hardware `VCRN` from `DataFlash @ 0xDC0C` (`DID 0x3C03`) |
+| `+0x07` | `5` B | `VCRN[0..4]` | Gateway 5-byte hardware `VCRN` from `DataFlash @ 0xDC0C` (`DID 0x3C0A`) |
 | `+0x0C` | `18` B | `VIN_17B + 0x00` | 17 ASCII `VIN` characters + `0x00` terminator (or `18` zero bytes) |
 | `+0x1E` | `4` B | `Timestamp_BE32` | Certificate issue timestamp (`Unix UTC`, Big-Endian) |
 | `+0x22` | `9` B | `00 × 9` | Validity restriction block (`00..00` = permanent license) |
@@ -217,7 +217,7 @@ Each certificate comprises a **43-byte signed body (`0x00..0x2A`)** and a **128-
 
 1. `10 40` — enter `EOLSession` (`31 01 C0 01` is rejected in `10 03`).
 2. `27 03` → `27 04 <Seed + 0x00004E87>` — unlock `SecurityAccess Level 3` (open login `20103`).
-3. *(Optional)* read `VCRN` via `22 3C 03`.
+3. *(Optional)* read `VCRN` via `22 3C 0A`.
 4. `2E 3C 01 <171-byte FSC>` — stage certificate into RAM buffer `0xFEDF590D`.
 5. **`31 01 C0 01`** *(strictly 4 bytes with zero inline parameters — appending `FSC` bytes to `31 01` returns `7F 31 13`!)* → poll **`31 03 C0 01`** (delete an installed `FeC`: `31 01 C0 02 <4B FeC>`).
 
