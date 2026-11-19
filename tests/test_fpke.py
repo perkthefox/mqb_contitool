@@ -45,16 +45,24 @@ from contitool.fpke import (  # noqa: E402
     analyze_fpke_dflash,
     analyze_fpke_extra_area,
     build_fd11_proof,
+    build_fpke_dflash_bc_applet,
+    build_fpke_dflash_write_applet,
+    build_fpke_swresa_reset_applet,
     can_fpke_full_read,
     can_fpke_read_region,
+    can_fpke_write_dflash,
     detect_fpke_files,
     eel_cs24,
+    eel_faci_word_mask,
+    extract_fpke_eel_updates,
     flood_payload,
     format_fpke_report,
     fpke_eel_layout,
     is_fpke_dflash,
     is_fpke_extra_area,
     is_fpke_ident,
+    normalize_fpke_dflash_for_faci,
+    summarize_fpke_dflash_changes,
     validate_fpke_extra_area,
     verify_fpke_self_tests,
 )
@@ -427,20 +435,29 @@ def test_fpke_extra_area_validation_and_report() -> None:
 
 
 class FakeFpkeBus:
-    """Simulates an Audi FPK_E (83A920700E) instrument cluster on 0x714/0x77E, 0x1BFCA2xx, 0x17FA0E14, and 0x6F1."""
+    """Simulates a VAG FPK_E (83A920700E SW 83A or 5E0920790A SW 1703/1711) cluster on 0x714/0x77E, 0x1BFCA2xx, 0x17FA0E14, and 0x6F1."""
 
-    def __init__(self, *, enable_stream_0x6f1: bool = True) -> None:
+    def __init__(self, *, enable_stream_0x6f1: bool = True, sw_profile: str = "83a") -> None:
+        from contitool.can.fpke import fpke_get_profile
+
         self.enable_stream_0x6f1 = enable_stream_0x6f1
+        self.sw_profile = sw_profile.strip().lower()
+        self.prof = fpke_get_profile(self.sw_profile)
         self.rx: list[can.Message] = []
         self.dflash = build_synthetic_fpke_dflash()
+        self.faci_mask = eel_faci_word_mask(fpke_eel_layout(None, self.dflash), self.dflash)
+        self.faci_busy_countdown = 0
+        self.faci_erases = 0
+        self.faci_words_written = 0
+        self.swresa_resets = 0
         self.extra = build_synthetic_extra_area()
         self.cflash_head = FPKE_CFLASH_CONTROL_PREFIX + bytes(range(1, 13))
         self.ram: dict[int, bytes] = {
-            FPKE_APPLET_ENTRY: b"\x11" * 256,
-            FPKE_SOURCE_PARAM: b"\x22" * 8,
-            FPKE_RESULT_ADDR: b"\x33" * FPKE_RESULT_SIZE,
-            FPKE_MARKER_ADDR: b"\x44" * 32,
-            FPKE_SAVED_RETURN: FPKE_CALLER_RETURN.to_bytes(4, "little"),
+            int(self.prof["applet_entry"]): b"\x11" * 256,
+            int(self.prof["source_param"]): b"\x22" * 8,
+            int(self.prof["result_addr"]): b"\x33" * FPKE_RESULT_SIZE,
+            int(self.prof["marker_addr"]): b"\x44" * 32,
+            int(self.prof["saved_return"]): int(self.prof["caller_return"]).to_bytes(4, "little"),
             BFASELR_ADDR: b"\x00",
         }
         self.idst = b"\x01\x00\x00\x00"
@@ -454,15 +471,25 @@ class FakeFpkeBus:
         self._stream_idx = 0
         self.sent_std: list[tuple[int, bytes]] = []
         self.dtcs_cleared = False
+        if self.sw_profile in ("1703", "1711"):
+            part_b = b"5E0920790A "
+            hw_b = b"5E0920790  "
+            sw_b = self.sw_profile.encode("ascii")
+            odx_b = b"EV_DashBoardVDDMQBAB"
+        else:
+            part_b = b"83A920700E "
+            hw_b = b"83A920700  "
+            sw_b = b"6181"
+            odx_b = b"EV_DashBoardAU27X"
         self.ident_map = {
-            0xF187: b"83A920700E ",
-            0xF191: b"83A920700  ",
-            0xF189: b"6181",
+            0xF187: part_b,
+            0xF191: hw_b,
+            0xF189: sw_b,
             0xF1A3: b"103",
             0xF197: b"FPK_E       ",
             0xF190: b"TESTVIN0123456789",
             0xF17C: b"XX0-00018.08.2300010000",
-            0xF19E: b"EV_DashBoardAU27X",
+            0xF19E: odx_b,
             0x02ED: bytes([0x01, 0x00, 0x03, 0x4C, 0x02, 0x06, 0x00, 0x00, 0x00, 0x00]),
             0x02EF: bytes([0, 0, 0, 0, 0, 0]),
             0x03DE: bytes([0x00, 0x00]),
@@ -499,7 +526,9 @@ class FakeFpkeBus:
                         )
                     )
             elif msg.arbitration_id == FPKE_BLOCK_ID:
-                if self._stream_idx == FPKE_POINTER_FRAME and raw[:4] == FPKE_FORGED_PTR.to_bytes(4, "little"):
+                exp_frame = int(self.prof["pointer_frame"])
+                exp_ptr = int(self.prof["forged_ptr"]).to_bytes(4, "little")
+                if self._stream_idx == exp_frame and raw[:4] == exp_ptr:
                     self.forged_ptr_seen = True
                 self._stream_idx += 1
                 self.ed_count += 1
@@ -553,7 +582,14 @@ class FakeFpkeBus:
         if addr == IDAUTH_ADDR + 0x0C:
             return b"\x00\x00\x00\x00"
         if addr in self.ram:
-            return self.ram[addr][:size]
+            buf = self.ram[addr]
+            pad_b = {
+                int(self.prof["applet_entry"]): b"\x11",
+                int(self.prof["source_param"]): b"\x22",
+                int(self.prof["result_addr"]): b"\x33",
+                int(self.prof["marker_addr"]): b"\x44",
+            }.get(addr, b"\x22")
+            return buf[:size].ljust(size, pad_b)
         return b"\xaa" * size
 
     def _handle_uds(self, req: bytes) -> None:
@@ -628,10 +664,90 @@ class FakeFpkeBus:
             data = req[10 : 10 + size]
             if addr == IDAUTH_ADDR:
                 self.idst = b"\x00\x00\x00\x00" if data == self.extra[0x50:0x60] else b"\x01\x00\x00\x00"
-            elif addr == FPKE_SAVED_RETURN and data == FPKE_APPLET_ENTRY.to_bytes(4, "little"):
-                param = self.ram.get(FPKE_SOURCE_PARAM, b"")
-                if len(param) == 8:
-                    # Streaming applet trigger
+            elif addr == int(self.prof["saved_return"]) and data == int(self.prof["applet_entry"]).to_bytes(4, "little"):
+                app_entry = int(self.prof["applet_entry"])
+                src_param = int(self.prof["source_param"])
+                res_addr = int(self.prof["result_addr"])
+                mark_addr = int(self.prof["marker_addr"])
+                app_code = self.ram.get(app_entry, b"")
+                param = self.ram.get(src_param, b"")
+                bc_code = build_fpke_dflash_bc_applet(
+                    applet_entry=app_entry,
+                    caller_return=int(self.prof["caller_return"]),
+                    caller_r29=int(self.prof["caller_r29"]),
+                )
+                wr_code = build_fpke_dflash_write_applet(
+                    applet_entry=app_entry,
+                    caller_return=int(self.prof["caller_return"]),
+                )
+                rst_code = build_fpke_swresa_reset_applet()
+                if app_code.startswith(rst_code):
+                    self.swresa_resets += 1
+                    self.vendor_level = 0
+                    info = analyze_fpke_dflash(self.dflash)
+                    meta = info.get("metadata") or {}
+                    if meta.get("vin"):
+                        self.ident_map[0xF190] = str(meta["vin"]).encode("ascii")
+                    if meta.get("coding_hex"):
+                        self.ident_map[0x0600] = bytes.fromhex(str(meta["coding_hex"]))
+                elif app_code.startswith(bc_code):
+                    df_off, groups = struct.unpack_from("<II", param, 0)
+                    if self.faci_busy_countdown > 0:
+                        self.faci_busy_countdown -= 1
+                        self.ram[res_addr] = (b"\x00" * 256) + b"BUSY"
+                    else:
+                        out_words: list[int] = []
+                        for grp in range(groups):
+                            bits = 0
+                            base_off = df_off + grp * 128
+                            for w_idx in range(32):
+                                pos = base_off + w_idx * 4
+                                if any(self.faci_mask[pos : pos + 4]):
+                                    bits |= 1 << w_idx
+                            out_words.append(bits)
+                        packed = struct.pack(f"<{len(out_words)}I", *out_words).ljust(256, b"\x00")
+                        self.ram[res_addr] = packed + b"SCAN"
+                elif app_code.startswith(wr_code):
+                    blk_off, do_erase, prog_mask_shifted = struct.unpack_from("<HHI", param, 0)
+                    prog_mask = (prog_mask_shifted >> 16) & 0xFFFF
+                    blk_data = param[8:72]
+                    if self.faci_busy_countdown > 0:
+                        self.faci_busy_countdown -= 1
+                        res_hdr = struct.pack("<II", 6, 0x00008000).ljust(256, b"\x00")
+                        self.ram[res_addr] = res_hdr + b"SCAN"
+                    elif self.idst != b"\x00\x00\x00\x00":
+                        res_hdr = struct.pack("<II", 4, 0x00009000).ljust(256, b"\x00")
+                        self.ram[res_addr] = res_hdr + b"SCAN"
+                    else:
+                        df_mut = bytearray(self.dflash)
+                        mask_mut = bytearray(self.faci_mask)
+                        if do_erase:
+                            self.faci_erases += 1
+                            df_mut[blk_off : blk_off + 64] = b"\xff" * 64
+                            mask_mut[blk_off : blk_off + 64] = b"\x00" * 64
+                        status = 1
+                        fstatr = 0x00008000
+                        for w_idx in range(16):
+                            if not ((prog_mask >> w_idx) & 1):
+                                continue
+                            pos = blk_off + w_idx * 4
+                            if any(mask_mut[pos : pos + 4]):
+                                status = 4
+                                fstatr = 0x00009000
+                                break
+                            df_mut[pos : pos + 4] = blk_data[w_idx * 4 : w_idx * 4 + 4]
+                            mask_mut[pos : pos + 4] = b"\xff\xff\xff\xff"
+                            self.faci_words_written += 1
+                        if status == 1:
+                            self.dflash = bytes(df_mut)
+                            self.faci_mask = mask_mut
+                        res_hdr = struct.pack("<II", status, fstatr).ljust(256, b"\x00")
+                        self.ram[res_addr] = res_hdr + b"SCAN"
+                elif len(param) == 8:
+                    # Streaming applet trigger (auto-increments source_addr at source_param)
+                    exp_ret = int(self.prof["caller_return"]).to_bytes(4, "little")
+                    if exp_ret not in app_code:
+                        raise RuntimeError(f"Stream applet caller_return mismatch on {self.sw_profile}")
                     src_addr, frame_cnt = struct.unpack("<II", param)
                     if self.enable_stream_0x6f1:
                         blob = self._read_region_slice(src_addr, frame_cnt * 8)
@@ -643,12 +759,16 @@ class FakeFpkeBus:
                                     is_extended_id=False,
                                 )
                             )
-                        self.ram[FPKE_MARKER_ADDR] = b"SCAN" + self.ram[FPKE_MARKER_ADDR][4:]
+                        self.ram[src_param] = struct.pack("<II", (src_addr + frame_cnt * 8) & 0xFFFFFFFF, frame_cnt)
+                        self.ram[mark_addr] = b"SCAN" + self.ram[mark_addr][4:]
                 else:
                     # 256-byte buffer applet trigger
+                    exp_ret = int(self.prof["caller_return"]).to_bytes(4, "little")
+                    if exp_ret not in app_code:
+                        raise RuntimeError(f"Buffer applet caller_return mismatch on {self.sw_profile}")
                     src_addr = int.from_bytes(param[:4], "little")
                     chunk256 = self._read_region_slice(src_addr, 256)
-                    self.ram[FPKE_RESULT_ADDR] = chunk256 + b"SCAN"
+                    self.ram[res_addr] = chunk256 + b"SCAN"
             else:
                 self.ram[addr] = data
             self._push_uds_reply(b"\x7d" + req[1:10])
@@ -702,7 +822,17 @@ def test_fpke_strict_dflash_read_uses_zero_0x3d_writes(tmp_path: Path) -> None:
 
 
 def test_fpke_fast_stream_0x6f1_and_automatic_fallback_to_uds_0x23(tmp_path: Path) -> None:
-    # 1. Fast RSCAN0 TM17 stream succeeds
+    from contitool.can.fpke import FPKE_STREAM_CHUNK_BYTES, build_fpke_can_stream_applet
+
+    assert FPKE_STREAM_CHUNK_BYTES == 1024
+    for mode in ("direct", "bflash", "uflash"):
+        app_blob = build_fpke_can_stream_applet(mode)
+        # Must save PSW into caller-saved r18 (`stsr 5, r18, 0; di` = e5974000e0076001) and restore r29 + PSW from r18
+        assert app_blob.startswith(bytes.fromhex("e5974000e0076001"))
+        assert bytes.fromhex("3d06c831dffe3f060ecf09000052f22f20007f00") in app_blob
+        assert bytes.fromhex("edff") not in app_blob
+
+    # 1. Fast RSCAN0 TM17 stream succeeds with auto-incremented 0xFEDF1900 (only 1 param write + 64 triggers + 4 guard writes = 69 total 0x3D)
     bus_fast = FakeFpkeBus(enable_stream_0x6f1=True)
     res_fast = can_fpke_read_region(
         "fake",
@@ -714,10 +844,19 @@ def test_fpke_fast_stream_0x6f1_and_automatic_fallback_to_uds_0x23(tmp_path: Pat
         bus=bus_fast,
     )
     assert res_fast["read"]["protocol"] == "rscan_stream_0x6F1"
+    assert res_fast["read"]["chunk_size"] == 1024
+    assert res_fast["read"]["requests"] == 64
+    assert bus_fast.writes_0x3d == 69
     assert Path(res_fast["output"]).read_bytes() == bus_fast.dflash
 
-    # 2. If 0x6F1 frames are dropped/blocked, automatically falls back to UDS 0x23
-    bus_fallback = FakeFpkeBus(enable_stream_0x6f1=False)
+    # 2. If 0x6F1 frames are dropped/blocked (even if session drops to Default Session), automatically re-establishes level 8 and falls back to UDS 0x23
+    class DropAndResetStreamBus(FakeFpkeBus):
+        def _handle_uds(self, req: bytes) -> None:
+            if req[:6] == b"\x3d\x44\xfe\xdc\x3b\x78":
+                self.vendor_level = 0
+            super()._handle_uds(req)
+
+    bus_fallback = DropAndResetStreamBus(enable_stream_0x6f1=False)
     res_fb = can_fpke_read_region(
         "fake",
         mode="dflash",
@@ -1012,6 +1151,8 @@ def test_fpke_can_panel_async_lifecycle_and_human_dtc_dialog(tmp_path: Path, mon
     try:
         set_lang("ru")
         win = MainWindow()
+        failures: list[Any] = []
+        monkeypatch.setattr(win, "offer_problem_report", lambda f: failures.append(f))
         win.conn.port = "fake-port"
         win.conn.interface = "slcan"
         dump_dir = tmp_path / "kombi_live"
@@ -1771,3 +1912,348 @@ def test_fpke_link_release_problem_report_dumps_and_public_exports(tmp_path: Pat
                     if not name.startswith("_"):
                         imported_set.add(name)
         assert imported_set == all_set, f"{rel} mismatch: missing={imported_set - all_set}, extra={all_set - imported_set}"
+
+
+def test_fpke_faci_normalization_and_cpu_read_floating_gate_noise() -> None:
+    from contitool.core.fpke import apply_fpke_dflash_edits, eel_parse_pool
+
+    base_df = build_synthetic_fpke_dflash()
+    lay = fpke_eel_layout(None, base_df)
+    clean_base, mask_base = normalize_fpke_dflash_for_faci(base_df)
+
+    # Simulate a CPU-read (UDS 0x23) dump where erased RV40F cells contain floating-gate noise (including 0x55555555 ghosts)
+    noisy = bytearray(clean_base)
+    for off in range(0, len(noisy), 4):
+        if not any(mask_base[off : off + 4]):
+            # Fill blank words with realistic floating-gate residue (0x57555455 / 0x55555555)
+            noisy[off : off + 4] = struct.pack("<I", 0x55555555 if (off % 32 == 8) else 0x57555455)
+
+    # Prepared VB 3 has P=0x55555555 and EC=eel_cs24(12), plus ghost A0=0x55555555 and a ghost DRP for EEL 0x30
+    b3 = 3 * 0x800
+    struct.pack_into("<I", noisy, b3 + 0x04, EEL_MARK)
+    struct.pack_into("<I", noisy, b3 + 0x08, EEL_MARK)
+    struct.pack_into("<I", noisy, b3 + 0x10, eel_cs24(12))
+    struct.pack_into("<4I", noisy, b3 + 0x18, EEL_MARK, EEL_MARK, EEL_MARK, 0x30 | (0x7F0 << 16))
+
+    # Appending odometer + coding onto noisy CPU-read dump must fit inside active head VB 2 and pass 0x30 verification
+    edited = apply_fpke_dflash_edits(
+        bytes(noisy),
+        odometer_km=77_700,
+        coding_hex="44FD0A0F67840008100777021000000000001D03",
+    )
+    norm_edited, mask_edited = normalize_fpke_dflash_for_faci(edited)
+    blocks_after, _ = eel_parse_pool(lay, norm_edited, mask_edited)
+    active_vbs = [b["vb"] for b in blocks_after if b["state"] == "active"]
+    assert active_vbs == [2]
+    assert blocks_after[3]["state"] == "prepared"
+
+    chg = summarize_fpke_dflash_changes(bytes(noisy), edited)
+    assert chg["changed"] is True
+    assert chg["is_pure_eel_update"] is True
+    assert chg["changed_eel_ids"] == ["0x30", "0x35", "0x60"]
+
+
+def test_can_fpke_write_dflash_smart_eel_zero_erase_and_backup_restore(tmp_path: Path) -> None:
+    from contitool.can.fpke import close_active_fpke_link
+    from contitool.core.fpke import apply_fpke_dflash_edits
+
+    close_active_fpke_link()
+    bus = FakeFpkeBus()
+    orig_dflash = bus.dflash
+
+    try:
+        # 1. Edit VIN, odometer, and learned keys -> smart EEL append writes into blank cells with ZERO erases!
+        cand_df = apply_fpke_dflash_edits(
+            orig_dflash,
+            vin="WRITEVIN000012345",
+            odometer_km=64_200,
+            key_display_ids=["11223344", "55667788", "AABBCCDD"] + [None] * 5,
+            learned_keys=3,
+            allowed_keys=8,
+        )
+        # Also simulate transient R_EEL_Handler FENTRYD contention on the first 2 applet invocations
+        bus.faci_busy_countdown = 2
+
+        rep = can_fpke_write_dflash(
+            "fake",
+            cand_df,
+            base_dflash=orig_dflash,
+            session_dir=tmp_path / "smart_write",
+            frame_delay=0.0,
+            wake_seconds=0.0,
+            keep_open=True,
+            bus=bus,
+        )
+        assert rep["ok"] is True
+        assert rep["mode"] == "smart_eel_append"
+        assert rep["blocks_erased"] == 0
+        assert rep["blocks_written"] >= 2
+        assert bus.faci_erases == 0
+        assert bus.swresa_resets == 1
+        assert rep["idauth"]["idst_after_idcode"] == "00000000"
+        assert rep["idauth"]["idst_after_relock"] == "01000000"
+        assert rep["secrets"]["metadata"]["vin"] == "WRITEVIN000012345"
+        assert rep["secrets"]["metadata"]["odometer_km"] == 64_200
+        assert rep["secrets"]["transponder_records"]["learned_keys"] == 3
+        assert bus.ident_map[0xF190] == b"WRITEVIN000012345"
+        assert (tmp_path / "smart_write" / "Dflash_before.bin").read_bytes() == orig_dflash
+        assert (tmp_path / "smart_write" / "Dflash_readback.bin").read_bytes() == bus.dflash
+
+        # 2. Foreign cluster FD11 safety check refuses a dump with a different FD11 identifier
+        from contitool.core.fpke import eel_append_records
+
+        r63_foreign = bytearray(b"\xff" * EEL_83A_IDS[0x63])
+        r63_foreign[:2] = struct.pack("<H", len(r63_foreign))
+        r63_foreign[2:17] = b"5E0920790A 1703"
+        foreign_df = eel_append_records(orig_dflash, {0x63: bytes(r63_foreign)})
+        with pytest.raises(RuntimeError, match="FD11"):
+            can_fpke_write_dflash(
+                "fake",
+                foreign_df,
+                session_dir=tmp_path / "foreign_write",
+                frame_delay=0.0,
+                wake_seconds=0.0,
+                bus=bus,
+            )
+
+        # 3. Full backup restore (full_rewrite=True) erases the newly written blocks and restores orig_dflash 1:1
+        rep_restore = can_fpke_write_dflash(
+            "fake",
+            orig_dflash,
+            base_dflash=None,
+            full_rewrite=True,
+            session_dir=tmp_path / "restore_write",
+            frame_delay=0.0,
+            wake_seconds=0.0,
+            keep_open=False,
+            bus=bus,
+        )
+        assert rep_restore["ok"] is True
+        assert rep_restore["mode"] == "full_blank_checked_diff"
+        assert rep_restore["blocks_erased"] >= 2
+        assert bus.dflash == orig_dflash
+        assert bus.ident_map[0xF190] == b"TESTVIN0123456789"
+    finally:
+        close_active_fpke_link()
+
+
+def test_fpke_gui_one_click_write_to_ecu_staged_write_bar_and_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from contitool.can.fpke import FpkeCanLink, close_active_fpke_link, set_active_fpke_link
+    from contitool.cli.main import main
+    from contitool.core.fpke import apply_fpke_dflash_edits
+    from contitool.gui import main_window
+    from contitool.gui.main_window import MainWindow
+    from contitool.gui.screens import fpke as fpke_gui
+    from contitool.gui.theme import apply_theme
+
+    app = QApplication.instance() or QApplication([])
+    apply_theme(app)  # type: ignore[arg-type]
+
+    close_active_fpke_link()
+    bus = FakeFpkeBus()
+    bus.vendor_level = 8
+    link = FpkeCanLink("fake-port", interface="slcan", bus=bus)
+    link.level8_active = True
+    set_active_fpke_link(link)
+
+    try:
+        set_lang("ru")
+        monkeypatch.setattr(fpke_gui, "ensure_ready", lambda *_a: True)
+        monkeypatch.setattr(main_window, "ensure_ready", lambda *_a: True)
+        monkeypatch.setattr(QMessageBox, "question", lambda *_a, **_k: QMessageBox.StandardButton.Yes)
+
+        win = MainWindow()
+        failures: list[Any] = []
+        monkeypatch.setattr(win, "offer_problem_report", lambda f: failures.append(f))
+        win.conn.port = "fake-port"
+        win.conn.interface = "slcan"
+        win.conn.out_dir = tmp_path / "runs"
+        win.fpke_screen._wake_seconds = 0.0
+
+        unit_dir = tmp_path / "gui_write_unit"
+        unit_dir.mkdir()
+        orig_df = bus.dflash
+        (unit_dir / "Dflash.bin").write_bytes(orig_df)
+        (unit_dir / "ExtraArea.bin").write_bytes(bus.extra)
+        win.open_folder(str(unit_dir))
+        win.show()
+        win.resize(1180, 840)
+        app.processEvents()
+
+        def wait_idle() -> None:
+            deadline = time.monotonic() + 5.0
+            while win.runner.is_busy and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.005)
+            for _ in range(15):
+                app.processEvents()
+                time.sleep(0.003)
+
+        # 1. Stage an edit into ContiTool_edited/Dflash.bin -> WriteBar appears with semantic summary and "Записать в блок"
+        staged_df = apply_fpke_dflash_edits(orig_df, odometer_km=44_000, vin="GUIWRITEVIN000001")
+        win.fpke_screen._commit_dflash_bytes(staged_df, "staged")
+        app.processEvents()
+        assert win.fpke_screen.is_dflash_modified is True
+        assert win.fpke_screen.write_bar.isHidden() is False
+        assert "44 000" in win.fpke_screen.lbl_write_bar.text()
+        assert win.fpke_screen.btn_write_ecu.text() == "Записать в блок"
+
+        # 2. Clicking "Записать в блок" on WriteBar writes changes over CAN, clears modified state, and updates IdentityBar
+        win.fpke_screen.btn_write_ecu.click()
+        wait_idle()
+        assert win.fpke_screen.is_dflash_modified is False
+        assert win.fpke_screen.write_bar.isHidden() is True
+        assert win.fpke_screen.dflash_info["metadata"]["odometer_km"] == 44_000
+        assert win.fpke_screen.dflash_info["metadata"]["vin"] == "GUIWRITEVIN000001"
+        assert analyze_fpke_dflash(bus.dflash)["metadata"]["odometer_km"] == 44_000
+
+        # 3. Restore original backup via restore_dflash_from_file
+        backup_file = tmp_path / "orig_backup.bin"
+        backup_file.write_bytes(orig_df)
+        win.fpke_screen.restore_dflash_from_file(backup_file, confirm=True)
+        wait_idle()
+        assert bus.dflash == orig_df
+        assert win.fpke_screen.dflash_info["metadata"]["vin"] == "TESTVIN0123456789"
+        win.close()
+
+        # 4. CLI fpke write-dflash --yes roundtrip
+        cli_cand = tmp_path / "cli_cand.bin"
+        cli_base = tmp_path / "cli_base.bin"
+        cli_base.write_bytes(orig_df)
+        cli_cand.write_bytes(apply_fpke_dflash_edits(orig_df, odometer_km=88_000))
+        link2 = FpkeCanLink("fake-port", interface="slcan", bus=bus)
+        link2.level8_active = True
+        set_active_fpke_link(link2)
+        rc = main(
+            [
+                "--no-color",
+                "fpke",
+                "write-dflash",
+                "--port",
+                "fake-port",
+                "--dflash",
+                str(cli_cand),
+                "--base-dflash",
+                str(cli_base),
+                "--wake-seconds",
+                "0",
+                "--output-dir",
+                str(tmp_path / "cli_runs"),
+                "--yes",
+            ]
+        )
+        assert rc == 0
+        assert analyze_fpke_dflash(bus.dflash)["metadata"]["odometer_km"] == 88_000
+    finally:
+        close_active_fpke_link()
+
+
+def test_fpke_sw1703_and_sw1711_level8_read_and_write(tmp_path: Path) -> None:
+    from contitool.can.fpke import (
+        FPKE_1703_APPLET_ENTRY,
+        FPKE_1703_CALLER_RETURN,
+        FPKE_1703_FORGED_PTR,
+        FPKE_1703_POINTER_FRAME,
+        FPKE_1711_CALLER_RETURN,
+        FpkeCanLink,
+        build_fpke_bflash_buf_applet,
+        build_fpke_can_stream_applet,
+        build_fpke_uflash_buf_applet,
+        can_fpke_full_read,
+        can_fpke_write_dflash,
+        close_active_fpke_link,
+        flood_payload,
+        fpke_detect_sw_profile,
+        fpke_establish_level8,
+        fpke_get_profile,
+    )
+    from contitool.core.fpke import apply_fpke_dflash_edits
+
+    assert fpke_detect_sw_profile(f189="1703", f187="5E0920790A") == "1703"
+    assert fpke_detect_sw_profile(f189="1711", f187="5E0920790A") == "1711"
+    assert fpke_detect_sw_profile(f189="", f187="5E0 920 790 A") == "1703"
+    assert fpke_detect_sw_profile(f189="6181", f187="83A920700E") == "83a"
+    assert fpke_get_profile("1703")["applet_entry"] == FPKE_1703_APPLET_ENTRY == 0xFEDF4400
+    assert fpke_get_profile("1703")["caller_return"] == FPKE_1703_CALLER_RETURN
+    assert fpke_get_profile("1711")["caller_return"] == FPKE_1711_CALLER_RETURN
+    assert flood_payload(FPKE_1703_POINTER_FRAME, profile="1703")[:4] == FPKE_1703_FORGED_PTR.to_bytes(4, "little")
+
+    # Verify MPM (SR 0, sel 5) & ICCTRL/CDBCR (SR 24, sel 4 / sel 13) encodings in generated applets
+    stsr_mpm_r19 = bytes.fromhex("e09f4028")  # stsr 0, r19, 5
+    ldsr_r19_mpm = bytes.fromhex("f3072028")  # ldsr r19, 0, 5
+    stsr_cdbcr = bytes.fromhex("f8674068")    # stsr 24, r12, 13
+    ldsr_cdbcr = bytes.fromhex("ecc72068")    # ldsr r12, 24, 13
+    for prof_name in ("83a", "1703", "1711"):
+        uf_buf = build_fpke_uflash_buf_applet(prof_name)
+        uf_str = build_fpke_can_stream_applet("uflash", profile=prof_name)
+        bf_str = build_fpke_can_stream_applet("bflash", profile=prof_name)
+        assert stsr_mpm_r19 in uf_buf and ldsr_r19_mpm in uf_buf
+        assert stsr_mpm_r19 in uf_str and ldsr_r19_mpm in uf_str
+        assert stsr_cdbcr in bf_str and ldsr_cdbcr in bf_str
+        if prof_name in ("1703", "1711"):
+            bf_buf = build_fpke_bflash_buf_applet(prof_name)
+            assert stsr_cdbcr in bf_buf and ldsr_cdbcr in bf_buf
+
+    for prof_name in ("1703", "1711"):
+        close_active_fpke_link()
+        bus = FakeFpkeBus(sw_profile=prof_name, enable_stream_0x6f1=True)
+        if prof_name == "1711":
+            # Simulate a 1711 cluster whose F189 initially reports 1703 to verify stack-based refinement before applet build
+            bus.ident_map[0xF189] = b"1703"
+        read_dir = tmp_path / f"read_{prof_name}"
+        rep = can_fpke_full_read(
+            "fake",
+            session_dir=read_dir,
+            frame_delay=0.0,
+            wake_seconds=0.0,
+            use_stream=True,
+            read_uflash=True,
+            bus=bus,
+        )
+        assert rep["sw_profile"] == prof_name
+        assert f"SW {prof_name}" in rep["target"]
+        assert rep["exploit"]["sw_profile"] == prof_name
+        assert rep["exploit"]["pointer_frame"] == FPKE_1703_POINTER_FRAME
+        assert bus.ed_count == FPKE_1703_POINTER_FRAME + 1  # 965 frames
+        assert (read_dir / "Dflash.bin").read_bytes() == bus.dflash
+        assert (read_dir / "ExtraArea.bin").read_bytes() == bus.extra
+        assert (read_dir / "Uflash.bin").stat().st_size == 0x8000
+
+        edited_df = apply_fpke_dflash_edits(bus.dflash, odometer_km=77_700 if prof_name == "1703" else 99_900)
+        write_dir = tmp_path / f"write_{prof_name}"
+        wr_rep = can_fpke_write_dflash(
+            "fake",
+            edited_df,
+            base_dflash=bus.dflash,
+            session_dir=write_dir,
+            frame_delay=0.0,
+            wake_seconds=0.0,
+            keep_open=False,
+            bus=bus,
+        )
+        assert wr_rep["ok"] is True
+        assert wr_rep["sw_profile"] == prof_name
+        assert (write_dir / "fpke.can.log").is_file()
+        assert (write_dir / "fpke.can.log").stat().st_size > 0
+        assert analyze_fpke_dflash(bus.dflash)["metadata"]["odometer_km"] == (
+            77_700 if prof_name == "1703" else 99_900
+        )
+
+    # Verify persistent FpkeCanLink re-probes sw_profile when swapped from 83A cluster to 1711 cluster
+    bus_83a = FakeFpkeBus(sw_profile="83a")
+    link = FpkeCanLink("fake", interface="slcan", bus=bus_83a)
+    try:
+        res_83a = fpke_establish_level8(link, frame_delay=0.0, wake_seconds=0.0, post_exploit_sleep=0.0)
+        assert res_83a["sw_profile"] == "83a"
+        link.bus = FakeFpkeBus(sw_profile="1711")
+        res_1711 = fpke_establish_level8(link, frame_delay=0.0, wake_seconds=0.0, post_exploit_sleep=0.0)
+        assert res_1711["sw_profile"] == "1711"
+    finally:
+        link.close()
+        close_active_fpke_link()
+

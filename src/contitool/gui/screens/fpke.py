@@ -41,6 +41,7 @@ from contitool.can.fpke import (
     FPKE_NATIVE_INTERFACES,
     can_fpke_full_read,
     can_fpke_read_region,
+    can_fpke_write_dflash,
     close_active_fpke_link,
     fpke_coil_poll_transponder,
     fpke_extract_live_s0_s1_from_coil,
@@ -67,6 +68,7 @@ from contitool.core.fpke import (
     fpke_verify_s0_s1,
     is_fpke_dflash,
     plan_fpke_a_to_b_transfer,
+    summarize_fpke_dflash_changes,
     transfer_fpke_donor_to_target,
 )
 from contitool.gui import theme
@@ -181,6 +183,7 @@ class FpkeScreen(QWidget):
         self._opt_uflash = False
         self._opt_bflash = False
         self._opt_cflash = False
+        self._wake_seconds: float = 4.0
         self._can_status_msg = ""
         self._can_status_tone = "muted"
         self._last_dtcs: list[dict[str, Any]] | None = None
@@ -191,6 +194,7 @@ class FpkeScreen(QWidget):
         self._working_dflash_path: Path | None = None
         self._working_dflash_bytes: bytes | None = None
         self._cflash_bytes: bytes | None = None
+        self._page_commit_fn: Callable[[bool], bool] | None = None
 
         self._donor_path: Path | None = None
         self._donor_dflash: bytes | None = None
@@ -313,7 +317,15 @@ class FpkeScreen(QWidget):
                 self._orig_dflash_bytes = df_raw
                 self._working_dflash_path = detected["dflash"]
                 self._working_dflash_bytes = df_raw
-                self.dflash_info = analyze_fpke_dflash(df_raw, self._cflash_bytes)
+                edit_cand = detected["dflash"].parent / "ContiTool_edited" / detected["dflash"].name
+                if edit_cand.is_file():
+                    with contextlib.suppress(Exception):
+                        edit_raw = edit_cand.read_bytes()
+                        if is_fpke_dflash(edit_raw) and edit_raw != df_raw:
+                            self._working_dflash_path = edit_cand
+                            self._working_dflash_bytes = edit_raw
+                            self.files["dflash"] = edit_cand
+                self.dflash_info = analyze_fpke_dflash(self._working_dflash_bytes, self._cflash_bytes)
             except Exception as exc:
                 self.note.emit(tr(f"Ошибка разбора DataFlash: {exc}", f"DataFlash parse error: {exc}"))
 
@@ -389,10 +401,14 @@ class FpkeScreen(QWidget):
         """Restore the original unmodified DataFlash dump."""
         if self._orig_dflash_bytes is None:
             return
+        old_work = self._working_dflash_path
         self._working_dflash_bytes = self._orig_dflash_bytes
         if self._orig_dflash_path is not None:
             self._working_dflash_path = self._orig_dflash_path
             self.files["dflash"] = self._orig_dflash_path
+            if old_work is not None and old_work != self._orig_dflash_path and old_work.parent.name == "ContiTool_edited":
+                with contextlib.suppress(OSError):
+                    old_work.unlink()
         self.dflash_info = analyze_fpke_dflash(self._orig_dflash_bytes, self._cflash_bytes)
         self.refresh()
         self.changed.emit()
@@ -631,18 +647,18 @@ class FpkeScreen(QWidget):
             recipient_cflash=cf_open,
         )
 
-    def apply_donor_transfer_to_current(self) -> None:
+    def apply_donor_transfer_to_current(self) -> bool:
         """Apply checked donor transfer categories into the currently open DataFlash working copy."""
         df_open, cf_open = self._own_dflash_and_cflash()
         if df_open is None or self._donor_passport is None:
-            return
+            return False
         if not any((self._xfer_immo, self._xfer_keys, self._xfer_odo, self._xfer_cp)):
             QMessageBox.information(
                 self,
                 tr("Ничего не выбрано", "Nothing selected"),
                 tr("Отметьте хотя бы один блок данных для переноса.", "Select at least one data group to transfer."),
             )
-            return
+            return False
         try:
             new_df, summary = transfer_fpke_donor_to_target(
                 self._donor_passport,
@@ -655,7 +671,7 @@ class FpkeScreen(QWidget):
             )
         except Exception as exc:
             QMessageBox.warning(self, tr("Ошибка переноса", "Transfer error"), str(exc))
-            return
+            return False
 
         parts: list[str] = []
         if summary["copied_sections"]["immo"]:
@@ -671,6 +687,12 @@ class FpkeScreen(QWidget):
             f"Donor transfer applied: {', '.join(parts)}",
         )
         self._commit_dflash_bytes(new_df, msg)
+        return True
+
+    def apply_and_write_donor_transfer(self) -> None:
+        """Transfer selected donor fields into the working dump and immediately write them to the cluster over CAN."""
+        if self.apply_donor_transfer_to_current():
+            self.write_dflash_to_ecu()
 
     def show_transfer_plan_dialog(self) -> None:
         plan = self._current_transfer_plan()
@@ -732,10 +754,12 @@ class FpkeScreen(QWidget):
         lay.setSpacing(10)
         self.lbl_write_bar = QLabel()
         self.lbl_write_bar.setObjectName("FieldLabel")
+        self.lbl_write_bar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         lay.addWidget(self.lbl_write_bar, 1)
         self.btn_revert_df = button("", "GhostBtn", slot=self.revert_dflash_edits)
-        self.btn_save_df = button("", "PrimaryBtn", slot=self.save_edited_dflash_as)
-        for b in (self.btn_revert_df, self.btn_save_df):
+        self.btn_save_df = button("", slot=self.save_edited_dflash_as)
+        self.btn_write_ecu = button("", "PrimaryBtn", slot=self.write_dflash_to_ecu)
+        for b in (self.btn_revert_df, self.btn_save_df, self.btn_write_ecu):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             lay.addWidget(b)
         bar.setVisible(False)
@@ -746,19 +770,32 @@ class FpkeScreen(QWidget):
         self.write_bar.setVisible(modified)
         if not modified:
             return
-        work_rel = (
-            f"{self._working_dflash_path.parent.name}/{self._working_dflash_path.name}"
-            if self._working_dflash_path and self._working_dflash_path != self._orig_dflash_path
-            else "DataFlash"
-        )
+        busy = self.runner.is_busy
+        short_desc = "DataFlash"
+        tip_lines: list[str] = []
+        if self._orig_dflash_bytes is not None and self._working_dflash_bytes is not None:
+            with contextlib.suppress(Exception):
+                chg = summarize_fpke_dflash_changes(
+                    self._orig_dflash_bytes,
+                    self._working_dflash_bytes,
+                    self._cflash_bytes,
+                )
+                if chg.get("short_summary"):
+                    short_desc = str(chg["short_summary"])
+                tip_lines = list(chg.get("lines") or [])
         self.lbl_write_bar.setText(
             tr(
-                f"Изменён дамп DataFlash ({work_rel} — исходный файл сохранён без изменений)",
-                f"DataFlash modified ({work_rel} — original dump is untouched)",
+                f"Не записано в блок: {short_desc}",
+                f"Pending write to ECU: {short_desc}",
             )
         )
-        self.btn_revert_df.setText(tr("Откатить к оригиналу", "Revert to original"))
-        self.btn_save_df.setText(tr("Сохранить дамп как…", "Save dump as…"))
+        self.lbl_write_bar.setToolTip("\n".join(tip_lines))
+        self.btn_revert_df.setText(tr("Отменить", "Discard"))
+        self.btn_revert_df.setEnabled(not busy)
+        self.btn_save_df.setText(tr("Сохранить дамп…", "Save dump…"))
+        self.btn_save_df.setEnabled(not busy)
+        self.btn_write_ecu.setText(tr("Записать в блок", "Write to ECU"))
+        self.btn_write_ecu.setEnabled(not busy)
 
     def _build_identity(self) -> QWidget:
         self.sec_id = QFrame()
@@ -792,10 +829,11 @@ class FpkeScreen(QWidget):
         head.addSpacing(8)
 
         self.btn_can_ctrl = button("", slot=self.open_can_control_dialog)
+        self.btn_restore = button("", slot=self.restore_dflash_from_file)
         self.btn_export = button("", slot=self.export_backup)
         self.btn_report = button("", slot=self.show_report)
         self.btn_close = button("", "GhostBtn", slot=self.close_requested.emit)
-        for b in (self.btn_can_ctrl, self.btn_export, self.btn_report, self.btn_close):
+        for b in (self.btn_can_ctrl, self.btn_restore, self.btn_export, self.btn_report, self.btn_close):
             b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             head.addWidget(b)
@@ -963,6 +1001,14 @@ class FpkeScreen(QWidget):
         self.btn_can_ctrl.setToolTip(
             tr("Открыть отдельное окно управления по CAN", "Open standalone CAN control window")
         )
+        self.btn_restore.setText(tr("Залить бэкап…", "Write backup…"))
+        self.btn_restore.setToolTip(
+            tr(
+                "Записать сохранённый 64 КБ дамп DataFlash в приборную панель по CAN",
+                "Write a saved 64 KB DataFlash backup dump to the cluster over CAN",
+            )
+        )
+        self.btn_restore.setEnabled(not self.runner.is_busy)
         self.btn_export.setText(tr("Экспорт бэкапа", "Export backup"))
         self.btn_export.setToolTip(
             tr("Копирует считанные дампы в выбранную папку", "Copies the dumps to a folder you pick")
@@ -1122,6 +1168,7 @@ class FpkeScreen(QWidget):
 
     def _render_page(self) -> None:
         self._active_can_panel = None
+        self._page_commit_fn = None
         page = QWidget()
         page.setObjectName("PageCanvas")
         outer = QHBoxLayout(page)
@@ -1550,10 +1597,10 @@ class FpkeScreen(QWidget):
 
         sec_mac.body.addLayout(nodes_row)
 
-        def _save_immo_changes() -> None:
+        def _save_immo_changes(silent_if_unchanged: bool = False) -> bool:
             df_cur, cf_cur = self._own_dflash_and_cflash()
             if df_cur is None:
-                return
+                return False
             base_mask = int(immo_cfg.get("partners_mask") or 0)
             for _code, (chk_w, _ed_w, bit_idx) in partner_controls.items():
                 if chk_w.isChecked():
@@ -1579,23 +1626,37 @@ class FpkeScreen(QWidget):
                 )
             except Exception as exc:
                 QMessageBox.warning(self, tr("Ошибка проверки полей", "Validation error"), str(exc))
-                return
+                return False
+            if silent_if_unchanged and new_df == df_cur:
+                return True
             self._commit_dflash_bytes(
                 new_df,
-                tr("Данные иммобилайзера и MAC сохранены в рабочую копию дампа.", "Immobilizer and MAC fields saved to working dump."),
+                ""
+                if silent_if_unchanged
+                else tr(
+                    "Данные иммобилайзера и MAC сохранены в рабочую копию дампа.",
+                    "Immobilizer and MAC fields saved to working dump.",
+                ),
             )
+            return True
 
-        btn_apply_immo = button(
-            tr("Применить изменения иммобилайзера", "Apply immobilizer changes"),
+        self._page_commit_fn = _save_immo_changes
+        btn_write_immo = button(
+            tr("Записать в блок", "Write to ECU"),
             "PrimaryBtn",
-            slot=_save_immo_changes,
+            slot=lambda: self.write_dflash_to_ecu() if _save_immo_changes(True) else None,
+        )
+        btn_write_immo.setEnabled(not self.runner.is_busy)
+        btn_apply_immo = button(
+            tr("В дамп", "Apply to dump"),
+            slot=lambda: _save_immo_changes(False),
         )
         btn_reset_immo = button(
             tr("Сбросить поля", "Reset fields"),
             "GhostBtn",
             slot=self._render_page,
         )
-        sec_mac.add_footer(btn_apply_immo, btn_reset_immo)
+        sec_mac.add_footer(btn_write_immo, btn_apply_immo, btn_reset_immo)
         lay.addWidget(sec_mac)
 
     # ────────────────────────────── Page 2: Component Protection (CP) ──────────────────────────────
@@ -1612,8 +1673,8 @@ class FpkeScreen(QWidget):
         sec_cp.set_text(
             tr("Защита компонентов (CP)", "Component Protection (CP)"),
             tr(
-                "Индивидуальный ключ IKA (16 байт) связывает приборку со шлюзом J533; ключ GFA — с системой KESSY.",
-                "The 16-byte IKA key binds the cluster to the J533 gateway; the GFA key binds it to KESSY.",
+                "Индивидуальный ключ IKA (/3, 00BE) связывает приборку со шлюзом J533; ключ слота /1 (GFA, 00BD) используется для обмена с узлом 0x0E (BCM 09, радиоканал ключей) и проверки 0x29E→0x29F.",
+                "The 16-byte IKA (/3, 00BE) key binds the cluster to the J533 gateway; the /1 slot key (GFA, 00BD) is used for channel 3 node 0x0E (BCM 09, remote key sync) and 0x29E→0x29F.",
             ),
         )
         err_cnt = cp_st.get("error_counter")
@@ -1665,10 +1726,10 @@ class FpkeScreen(QWidget):
             slot=lambda: self._copy_hex(ed_gfa.text(), "GFA"),
         )
         c_gfa, b_gfa = self._field_box(
-            tr("КЛЮЧ GFA ДЛЯ БЛОКА KESSY (16 БАЙТ)", "GFA KEY FOR KESSY MODULE (16 BYTES)"),
+            tr("КЛЮЧ СЛОТА /1 — GFA / УЗЕЛ 0x0E (BCM 09, 16 БАЙТ)", "CP /1 KEY — GFA / NODE 0x0E (BCM 09, 16 BYTES)"),
             ed_gfa,
             trailing=(btn_gen_gfa, btn_cp_gfa),
-            tip="EEL 0x6B + 0x12..0x21 (CP /1 slot)",
+            tip="EEL 0x6B + 0x12..0x21 (UDS 00BD: 0x17F8140E & 0x29E/0x29F)",
         )
         self._bind_hex_validator(ed_gfa, b_gfa, 16)
         sec_cp.body.addWidget(c_gfa)
@@ -1699,10 +1760,10 @@ class FpkeScreen(QWidget):
             ds_lay.addStretch(1)
             sec_cp.body.addWidget(diag_strip)
 
-        def _save_cp_changes() -> None:
+        def _save_cp_changes(silent_if_unchanged: bool = False) -> bool:
             df_cur, cf_cur = self._own_dflash_and_cflash()
             if df_cur is None:
-                return
+                return False
             try:
                 new_df = apply_fpke_dflash_edits(
                     df_cur,
@@ -1713,19 +1774,33 @@ class FpkeScreen(QWidget):
                 )
             except Exception as exc:
                 QMessageBox.warning(self, tr("Ошибка проверки ключей CP", "CP validation error"), str(exc))
-                return
+                return False
+            if silent_if_unchanged and new_df == df_cur:
+                return True
             self._commit_dflash_bytes(
                 new_df,
-                tr("Ключи защиты компонентов сохранены в рабочую копию дампа.", "Component Protection keys saved to working dump."),
+                ""
+                if silent_if_unchanged
+                else tr(
+                    "Ключи защиты компонентов сохранены в рабочую копию дампа.",
+                    "Component Protection keys saved to working dump.",
+                ),
             )
+            return True
 
-        btn_apply_cp = button(
-            tr("Применить настройки защиты компонентов", "Apply Component Protection changes"),
+        self._page_commit_fn = _save_cp_changes
+        btn_write_cp = button(
+            tr("Записать в блок", "Write to ECU"),
             "PrimaryBtn",
-            slot=_save_cp_changes,
+            slot=lambda: self.write_dflash_to_ecu() if _save_cp_changes(True) else None,
+        )
+        btn_write_cp.setEnabled(not self.runner.is_busy)
+        btn_apply_cp = button(
+            tr("В дамп", "Apply to dump"),
+            slot=lambda: _save_cp_changes(False),
         )
         btn_reset_cp = button(tr("Сбросить поля", "Reset fields"), "GhostBtn", slot=self._render_page)
-        sec_cp.add_footer(btn_apply_cp, btn_reset_cp)
+        sec_cp.add_footer(btn_write_cp, btn_apply_cp, btn_reset_cp)
         lay.addWidget(sec_cp)
 
     # ────────────────────────────── Page 3: Keys & Odometer ──────────────────────────────
@@ -1889,10 +1964,10 @@ class FpkeScreen(QWidget):
 
         sec_tp.body.addLayout(key_grid)
 
-        def _save_keys_and_odo() -> None:
+        def _save_keys_and_odo(silent_if_unchanged: bool = False) -> bool:
             df_cur, cf_cur = self._own_dflash_and_cflash()
             if df_cur is None:
-                return
+                return False
             cod_txt = ed_coding.text().strip()
             try:
                 new_df = apply_fpke_dflash_edits(
@@ -1907,24 +1982,38 @@ class FpkeScreen(QWidget):
                 )
             except Exception as exc:
                 QMessageBox.warning(self, tr("Ошибка проверки полей", "Validation error"), str(exc))
-                return
+                return False
+            if silent_if_unchanged and new_df == df_cur:
+                return True
             self._commit_dflash_bytes(
                 new_df,
-                tr("Ключи и пробег сохранены в рабочую копию дампа.", "Keys and odometer saved to working dump."),
+                ""
+                if silent_if_unchanged
+                else tr(
+                    "Ключи и пробег сохранены в рабочую копию дампа.",
+                    "Keys and odometer saved to working dump.",
+                ),
             )
+            return True
 
-        btn_apply_keys = button(
-            tr("Применить ключи и пробег", "Apply keys & odometer"),
+        self._page_commit_fn = _save_keys_and_odo
+        btn_write_keys = button(
+            tr("Записать в блок", "Write to ECU"),
             "PrimaryBtn",
-            slot=_save_keys_and_odo,
+            slot=lambda: self.write_dflash_to_ecu() if _save_keys_and_odo(True) else None,
+        )
+        btn_write_keys.setEnabled(not self.runner.is_busy)
+        btn_apply_keys = button(
+            tr("В дамп", "Apply to dump"),
+            slot=lambda: _save_keys_and_odo(False),
         )
         btn_coil_wizard = button(
             tr("Через катушку…", "Via LF coil…"),
             "GhostBtn",
             slot=self.open_coil_key_learn_dialog,
         )
-        btn_reset_keys = button(tr("Сбросить поля", "Reset fields"), "GhostBtn", slot=self._render_page)
-        sec_tp.add_footer(btn_apply_keys, btn_coil_wizard, btn_reset_keys)
+        btn_reset_keys = button(tr("Сбросить", "Reset"), "GhostBtn", slot=self._render_page)
+        sec_tp.add_footer(btn_write_keys, btn_apply_keys, btn_coil_wizard, btn_reset_keys)
         lay.addWidget(sec_tp)
 
     # ────────────────────────────── Page 4: Donor -> Target Transfer ──────────────────────────────
@@ -2149,7 +2238,7 @@ class FpkeScreen(QWidget):
         prev_cp = (
             f"IKA: {(cp_d.get('ika_cp3') or '—')[:16]}…  •  SAFE CP → 0"
             if donor_passport
-            else tr("Опционально: ключи IKA (J533) и GFA (KESSY)", "Optional: IKA (J533) and GFA (KESSY) keys")
+            else tr("Опционально: ключи IKA (J533) и GFA /1 (BCM 09 / 0x0E)", "Optional: IKA (J533) and GFA /1 (BCM 09 / 0x0E) keys")
         )
         sec_apply.body.addWidget(
             _xfer_option_row(
@@ -2160,13 +2249,18 @@ class FpkeScreen(QWidget):
             )
         )
 
-        btn_exec_xfer = button(
-            tr("Перенести в текущий дамп", "Transfer to current dump"),
+        btn_write_xfer = button(
+            tr("Перенести и записать", "Transfer & write"),
             "PrimaryBtn",
+            slot=self.apply_and_write_donor_transfer,
+        )
+        btn_write_xfer.setEnabled(donor_passport is not None and not self.runner.is_busy)
+        btn_exec_xfer = button(
+            tr("В дамп", "To dump"),
             slot=self.apply_donor_transfer_to_current,
         )
         btn_exec_xfer.setEnabled(donor_passport is not None)
-        footer_btns: list[QWidget] = [btn_exec_xfer]
+        footer_btns: list[QWidget] = [btn_write_xfer, btn_exec_xfer]
         if donor_passport is not None:
             btn_cmp_pair = button(
                 tr("Сверить…", "Compare…"),
@@ -2176,7 +2270,7 @@ class FpkeScreen(QWidget):
             footer_btns.append(btn_cmp_pair)
         if self._donor_dflash is not None:
             btn_plan_rep = button(
-                tr("Отчёт плана…", "Plan report…"),
+                tr("План…", "Plan…"),
                 "GhostBtn",
                 slot=self.show_transfer_plan_dialog,
             )
@@ -2355,7 +2449,18 @@ class FpkeScreen(QWidget):
             slot=self._run_full_read,
         )
         btn_full.setEnabled(not busy and native_ok)
-        sec_full.add_footer(btn_full)
+        btn_write_cur = button(
+            tr("Записать в блок", "Write to ECU"),
+            slot=self.write_dflash_to_ecu,
+        )
+        btn_write_cur.setEnabled(not busy and native_ok and self.dflash_info is not None)
+        btn_restore_file = button(
+            tr("Залить бэкап…", "Write backup…"),
+            "GhostBtn",
+            slot=self.restore_dflash_from_file,
+        )
+        btn_restore_file.setEnabled(not busy and native_ok)
+        sec_full.add_footer(btn_full, btn_write_cur, btn_restore_file)
         lay.addWidget(sec_full)
 
         sec_ind = Section()
@@ -2475,6 +2580,252 @@ class FpkeScreen(QWidget):
             tr(f"Чтение области {mode.upper()}", f"Reading {mode.upper()} area"),
             task,
             on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+        )
+
+    def _adopt_written_session(self, res: dict[str, Any], fallback_dir: Path) -> None:
+        if not _qt_valid(self) or not self.is_open:
+            return
+        old_work = self._working_dflash_path
+        if old_work is not None and old_work != self._orig_dflash_path and old_work.parent.name == "ContiTool_edited":
+            with contextlib.suppress(OSError):
+                old_work.unlink()
+        out_folder = Path(str(res.get("session_dir", fallback_dir)))
+        rb_path = out_folder / "Dflash.bin"
+        if not rb_path.is_file():
+            rb_path = out_folder / "Dflash_readback.bin"
+        if rb_path.is_file():
+            rb_bytes = rb_path.read_bytes()
+            self._orig_dflash_path = rb_path
+            self._orig_dflash_bytes = rb_bytes
+            self._working_dflash_path = rb_path
+            self._working_dflash_bytes = rb_bytes
+            self.files["dflash"] = rb_path
+            self.dflash_info = analyze_fpke_dflash(rb_bytes, self._cflash_bytes)
+        ex_path = out_folder / "ExtraArea.bin"
+        if ex_path.is_file():
+            ex_bytes = ex_path.read_bytes()
+            self.extra_raw = ex_bytes
+            self.extra_info = analyze_fpke_extra_area(ex_bytes)
+            self.files["extra"] = ex_path
+        if isinstance(res.get("idauth"), dict):
+            self.idauth_info = res["idauth"]
+        new_ident = res.get("ident")
+        if isinstance(new_ident, list) and new_ident:
+            by_did = {it.get("did"): dict(it) for it in self.ident_items if it.get("did")}
+            for it in new_ident:
+                if isinstance(it, dict) and it.get("did"):
+                    by_did[it["did"]] = dict(it)
+            if self.ident_items:
+                seen: set[str] = set()
+                merged_ident: list[dict[str, str]] = []
+                for it in self.ident_items:
+                    d = it.get("did", "")
+                    if d in by_did:
+                        merged_ident.append(by_did[d])
+                        seen.add(d)
+                for d, it in by_did.items():
+                    if d and d not in seen:
+                        merged_ident.append(it)
+                self.ident_items = merged_ident
+            else:
+                self.ident_items = list(new_ident)
+        self.folder = out_folder
+        self.source = "can"
+        self.refresh()
+        self.changed.emit()
+        blks = int(res.get("blocks_written", 0))
+        erased = int(res.get("blocks_erased", 0))
+        short_s = res.get("short_summary") or "DataFlash"
+        self.note.emit(
+            tr(
+                f"Запись в приборную панель завершена и проверена: {short_s} ({blks} бл., стёрто {erased}).",
+                f"Cluster write completed & verified: {short_s} ({blks} blocks, erased {erased}).",
+            )
+        )
+
+    def write_dflash_to_ecu(self, *, confirm: bool = True) -> None:
+        """Commit any pending form edits on the current tab and write the working DataFlash to the cluster over CAN."""
+        if self.runner.is_busy:
+            return
+        if self._page_commit_fn is not None:
+            if not self._page_commit_fn(True):
+                return
+        cand_bytes, cf_bytes = self._own_dflash_and_cflash()
+        if cand_bytes is None:
+            QMessageBox.information(
+                self,
+                tr("Нет данных для записи", "No DataFlash loaded"),
+                tr("Сначала считайте приборную панель или откройте дамп DataFlash.", "Read the cluster or open a DataFlash dump first."),
+            )
+            return
+
+        orig_bytes = self._orig_dflash_bytes if self._orig_dflash_bytes is not None else cand_bytes
+        chg = summarize_fpke_dflash_changes(orig_bytes, cand_bytes, cf_bytes)
+        full_rewrite = not bool(chg.get("changed"))
+
+        if not ensure_ready(self.conn, self):
+            return
+        iface = self.conn.interface or "slcan"
+        if iface not in FPKE_NATIVE_INTERFACES:
+            QMessageBox.warning(
+                self,
+                tr("Неподдерживаемый адаптер", "Unsupported adapter"),
+                tr(
+                    f"Выбран адаптер «{iface}». Для записи приборной панели FPK требуется нативный CAN-адаптер (CANable / SLCAN / candleLight).",
+                    f"Adapter “{iface}” is selected. Writing to an FPK cluster requires a native CAN adapter (CANable / SLCAN / candleLight).",
+                ),
+            )
+            return
+
+        if confirm:
+            bullets = "\n".join(f"  • {line}" for line in (chg.get("lines") or []))
+            if not bullets:
+                bullets = tr(
+                    "  • Полная перезапись текущего образа DataFlash (64 КБ)",
+                    "  • Full rewrite of current DataFlash image (64 KB)",
+                )
+            prompt_txt = tr(
+                f"Записать следующие изменения в приборную панель {self.part_number} по CAN?\n\n"
+                f"{bullets}\n\n"
+                "Перед записью ContiTool автоматически сохранит резервную копию текущего DataFlash "
+                "(Dflash_before.bin), выполнит побайтовую проверку и перезапустит панель. "
+                "Не отключайте питание +12 В до завершения.",
+                f"Write the following changes to instrument cluster {self.part_number} over CAN?\n\n"
+                f"{bullets}\n\n"
+                "ContiTool will automatically save a live DataFlash backup (Dflash_before.bin) before writing, "
+                "verify every written block, and reboot the cluster. Keep +12 V power connected.",
+            )
+            ans = QMessageBox.question(
+                self,
+                tr("Запись в приборную панель", "Write to instrument cluster"),
+                prompt_txt,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        port = self.conn.port
+        ident_list = list(self.ident_items or [{"did": "F187", "value": self.part_number}])
+        sdir = new_session(
+            self.conn.out_dir,
+            unit_of_ident(ident_list),
+            "fpke_write",
+            dumps=True,
+        )
+
+        def task(rep: Any) -> dict[str, Any]:
+            return can_fpke_write_dflash(
+                port,
+                cand_bytes,
+                interface=iface,
+                base_dflash=None if full_rewrite else orig_bytes,
+                cflash_bytes=cf_bytes,
+                session_dir=sdir,
+                wake_seconds=self._wake_seconds,
+                full_rewrite=full_rewrite,
+                reset_after=True,
+                keep_open=True,
+                reporter=rep,
+            )
+
+        self.runner.run_task(
+            tr("Запись изменений в приборную панель", "Writing changes to instrument cluster"),
+            task,
+            on_success=lambda res: QTimer.singleShot(0, lambda: self._adopt_written_session(res, sdir)),
+        )
+
+    def restore_dflash_from_file(self, path: Path | None = None, *, confirm: bool = True) -> None:
+        """Write a saved 64 KiB DataFlash backup file to the cluster over CAN (`full_rewrite=True`)."""
+        if self.runner.is_busy:
+            return
+        if path is None:
+            picked, _ = QFileDialog.getOpenFileName(
+                self,
+                tr("Выберите бэкап DataFlash (64 КБ) для записи в приборную панель", "Select DataFlash backup (64 KB) to write to cluster"),
+                str(self.folder.parent if self.folder else self.conn.out_dir),
+                "DataFlash 64 KB (*.bin);;All files (*)",
+            )
+            if not picked:
+                return
+            path = Path(picked)
+
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка чтения файла", "File read error"), str(exc))
+            return
+        if not is_fpke_dflash(raw):
+            QMessageBox.warning(
+                self,
+                tr("Некорректный файл DataFlash", "Invalid DataFlash file"),
+                tr(
+                    f"Файл «{path.name}» ({len(raw)} Б) не является валидным 64 КБ дампом DataFlash FPK_E.",
+                    f"File “{path.name}” ({len(raw)} B) is not a valid 64 KB FPK_E DataFlash dump.",
+                ),
+            )
+            return
+
+        if not ensure_ready(self.conn, self):
+            return
+        iface = self.conn.interface or "slcan"
+        if iface not in FPKE_NATIVE_INTERFACES:
+            QMessageBox.warning(
+                self,
+                tr("Неподдерживаемый адаптер", "Unsupported adapter"),
+                tr(
+                    f"Выбран адаптер «{iface}». Для записи приборной панели FPK требуется нативный CAN-адаптер (CANable / SLCAN / candleLight).",
+                    f"Adapter “{iface}” is selected. Writing to an FPK cluster requires a native CAN adapter (CANable / SLCAN / candleLight).",
+                ),
+            )
+            return
+
+        _, cf_bytes = self._own_dflash_and_cflash()
+        if confirm:
+            prompt_txt = tr(
+                f"Записать бэкап DataFlash из файла «{path.name}» ({path.parent.name}) в приборную панель {self.part_number}?\n\n"
+                "Перед записью текущий DataFlash панели будет автоматически сохранён в Dflash_before.bin.",
+                f"Write DataFlash backup from “{path.name}” ({path.parent.name}) to cluster {self.part_number}?\n\n"
+                "The cluster's current DataFlash will be backed up to Dflash_before.bin before writing.",
+            )
+            ans = QMessageBox.question(
+                self,
+                tr("Залить бэкап DataFlash", "Write DataFlash backup"),
+                prompt_txt,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        port = self.conn.port
+        ident_list = list(self.ident_items or [{"did": "F187", "value": self.part_number}])
+        sdir = new_session(
+            self.conn.out_dir,
+            unit_of_ident(ident_list),
+            "fpke_restore",
+            dumps=True,
+        )
+
+        def task(rep: Any) -> dict[str, Any]:
+            return can_fpke_write_dflash(
+                port,
+                raw,
+                interface=iface,
+                base_dflash=None,
+                cflash_bytes=cf_bytes,
+                session_dir=sdir,
+                wake_seconds=self._wake_seconds,
+                full_rewrite=True,
+                reset_after=True,
+                keep_open=True,
+                reporter=rep,
+            )
+
+        self.runner.run_task(
+            tr("Запись бэкапа DataFlash в приборную панель", "Writing DataFlash backup to cluster"),
+            task,
+            on_success=lambda res: QTimer.singleShot(0, lambda: self._adopt_written_session(res, sdir)),
         )
 
     def _build_can_ctrl_page(self, lay: QVBoxLayout) -> None:
@@ -3586,8 +3937,8 @@ class FpkeCoilKeyLearnDialog(Dialog):
 
         self.chk_sync_ch3 = QCheckBox(
             tr(
-                "При завершении передать очередь 0x6A внешнему блоку 0x0E по каналу 3 (80 01 — в автомобиле)",
-                "Send queue 0x6A to external node 0x0E on channel 3 upon finish (80 01 — in vehicle)",
+                "При завершении передать очередь 0x6A узлу 0x0E (BCM 09, радиоканал) по каналу 3 (80 01 — в автомобиле)",
+                "Send queue 0x6A to node 0x0E (BCM 09, remote key sync) on channel 3 upon finish (80 01 — in vehicle)",
             )
         )
         self.chk_sync_ch3.setChecked(False)

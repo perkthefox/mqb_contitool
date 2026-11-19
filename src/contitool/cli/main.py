@@ -16,6 +16,7 @@ from contitool.can import (
     can_backup,
     can_fpke_full_read,
     can_fpke_read_region,
+    can_fpke_write_dflash,
     can_health_check,
     can_identify,
     can_learn_mfl_button,
@@ -1058,7 +1059,7 @@ def cmd_fpke(args: argparse.Namespace) -> int:
     action = args.fpke_action
     if action == "check":
         verify_fpke_self_tests()
-        print(tr("✓ Все самопроверки модуля FPK_E (SW 83A, 83A920700E) пройдены успешно.", "✓ All FPK_E (SW 83A, 83A920700E) self-tests passed."))
+        print(tr("✓ Все самопроверки модуля FPK_E (SW 83A / 1703 / 1711) пройдены успешно.", "✓ All FPK_E (SW 83A / 1703 / 1711) self-tests passed."))
         return 0
 
     if action == "inspect":
@@ -1161,6 +1162,45 @@ def cmd_fpke(args: argparse.Namespace) -> int:
     disp = _make_cli_display(args)
     rep = disp.create_reporter()
     try:
+        if action == "write-dflash":
+            if not args.dflash:
+                raise ValueError(
+                    tr(
+                        "Для fpke write-dflash укажите --dflash ПУТЬ_К_DFLASH.bin",
+                        "fpke write-dflash requires --dflash PATH_TO_DFLASH.bin",
+                    )
+                )
+            if not getattr(args, "yes", False):
+                raise ValueError(
+                    tr(
+                        "Операция 'fpke write-dflash' записывает изменения в DataFlash приборной панели по CAN. "
+                        "Убедитесь в стабильном питании +12 В и добавьте флаг --yes.",
+                        "Operation 'fpke write-dflash' writes changes to cluster DataFlash over CAN. "
+                        "Confirm stable +12V bench power and pass --yes.",
+                    )
+                )
+            sdir = default_session_dir(base_out, "fpke_write")
+            base_df = clean_user_path(args.base_dflash) if getattr(args, "base_dflash", None) else None
+            res = can_fpke_write_dflash(
+                args.port,
+                clean_user_path(args.dflash),
+                interface=args.interface,
+                base_dflash=base_df,
+                cflash_bytes=cf_bytes,
+                session_dir=sdir,
+                frame_delay=args.frame_delay,
+                wake_seconds=args.wake_seconds,
+                full_rewrite=getattr(args, "full_rewrite", False),
+                allow_foreign=getattr(args, "allow_foreign", False),
+                reset_after=not getattr(args, "no_reset", False),
+                keep_open=False,
+                reporter=rep,
+            )
+            print(
+                f"\n✓ DataFlash written & verified ({res['blocks_written']} blocks, erased {res['blocks_erased']}) "
+                f"| Session: {res['session_dir']}"
+            )
+            return 0
         if args.mode == "report":
             sdir = out_file.parent if out_file is not None else default_session_dir(base_out, "fpke_read")
             res = can_fpke_full_read(
@@ -1477,16 +1517,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_fpke = _add(
         "fpke",
         tr(
-            "Работа с приборной панелью VAG / Audi FPK_E (Kombi, 83A920700E, RH850/D1L): чтение по нативному CAN и разбор EEL T01",
-            "VAG / Audi FPK_E (Kombi, 83A920700E, RH850/D1L) instrument cluster: native CAN reading & EEL T01 analysis",
+            "Работа с приборной панелью VAG FPK_E (Audi 83A920700E SW 83A, VW/Škoda 5E0920790A SW 1703/1711, RH850/D1L): чтение/запись по нативному CAN и разбор EEL T01",
+            "VAG FPK_E (Audi 83A920700E SW 83A, VW/Škoda 5E0920790A SW 1703/1711, RH850/D1L) instrument cluster: native CAN read/write & EEL T01 analysis",
         ),
     )
     p_fpke.add_argument(
         "fpke_action",
-        choices=("check", "inspect", "read", "export-immo", "compare-immo", "plan-transfer"),
+        choices=("check", "inspect", "read", "write-dflash", "export-immo", "compare-immo", "plan-transfer"),
         help=tr(
-            "Действие: check, inspect, read, export-immo, compare-immo, plan-transfer",
-            "Action: check, inspect, read, export-immo, compare-immo, plan-transfer",
+            "Действие: check, inspect, read, write-dflash, export-immo, compare-immo, plan-transfer",
+            "Action: check, inspect, read, write-dflash, export-immo, compare-immo, plan-transfer",
         ),
     )
     p_fpke.add_argument("--port", help=tr("Порт нативного CAN-адаптера (CANable / SLCAN / candleLight)", "Native CAN adapter port (CANable / SLCAN / candleLight)"))
@@ -1497,7 +1537,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="report",
         help=tr("Режим чтения по CAN (по умолчанию report: Extra Area + IDAUTH + DFlash + секреты)", "CAN read mode (default report: Extra Area + IDAUTH + DFlash + secrets)"),
     )
-    p_fpke.add_argument("--dflash", "--donor-dflash", dest="dflash", help=tr("Путь к Dflash.bin (64 КБ) / Донор A", "Path to Dflash.bin (64 KB) / Donor A"))
+    p_fpke.add_argument("-i", "--dflash", "--donor-dflash", dest="dflash", help=tr("Путь к Dflash.bin (64 КБ) / Донор A", "Path to Dflash.bin (64 KB) / Donor A"))
+    p_fpke.add_argument("--base-dflash", help=tr("Опциональный исходный Dflash.bin для вычисления дельты записей EEL", "Optional original Dflash.bin to compute EEL record delta"))
+    p_fpke.add_argument("--full-rewrite", action="store_true", help=tr("Полная перезапись всех изменённых блоков 64 КБ DataFlash", "Full differential rewrite of all 64 KB DataFlash blocks"))
+    p_fpke.add_argument("--allow-foreign", action="store_true", help=tr("Разрешить запись дампа с отличающимся идентификатором FD11", "Allow writing a dump with a different FD11 identifier"))
+    p_fpke.add_argument("--no-reset", action="store_true", help=tr("Не выполнять аппаратный сброс SWRESA после записи", "Skip SWRESA hardware reset after write"))
+    p_fpke.add_argument("--yes", action="store_true", help=tr("Подтвердить запись в DataFlash по CAN", "Confirm CAN DataFlash write"))
     p_fpke.add_argument("--dflash-b", "--recipient-dflash", dest="dflash_b", help=tr("Второй дамп Dflash.bin / Реципиент B (для compare-immo / plan-transfer)", "Second Dflash.bin / Recipient B (for compare-immo / plan-transfer)"))
     p_fpke.add_argument("--extra", help=tr("Путь к ExtraArea.bin (256 Б) для inspect", "Path to ExtraArea.bin (256 B) for inspect"))
     p_fpke.add_argument("--cflash", "--donor-cflash", dest="cflash", help=tr("Опциональный путь к Cflash.bin (2 МБ) / Донор A", "Optional Cflash.bin (2 MB) / Donor A"))

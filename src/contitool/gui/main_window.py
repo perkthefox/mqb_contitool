@@ -451,7 +451,15 @@ class MainWindow(QMainWindow):
         dlg = EcuFoundDialog(ident, self.conn, self)
         if run_dialog(dlg) and not dlg.unsupported:
             if dlg.restore_chosen:
-                self.restore_backup()
+                if is_kombi:
+                    if self.ws.is_open:
+                        self.ws.close()
+                    self.fpke_screen.open_from_ident(ident)
+                    self._refresh_header()
+                    self._refresh_screen()
+                    self.fpke_screen.restore_dflash_from_file()
+                else:
+                    self.restore_backup()
             elif is_kombi:
                 self._read_fpke_over_can(ident)
             else:
@@ -541,6 +549,9 @@ class MainWindow(QMainWindow):
     def restore_backup(self) -> None:
         """Write backup files the user picks back into the ECU; the workflow refuses a backup of another ECU."""
         self.set_mode("ecu")  # frees the adapter if the terminal holds it
+        if self.fpke_screen.is_open:
+            self.fpke_screen.restore_dflash_from_file()
+            return
         dlg = RestoreDialog(self, str(self.ws.folder or self.conn.out_dir))
         if not run_dialog(dlg) or not dlg.kinds or not ensure_ready(self.conn, self):
             return
@@ -557,6 +568,17 @@ class MainWindow(QMainWindow):
 
     def close_ecu(self) -> None:
         if self.fpke_screen.is_open:
+            if self.fpke_screen.is_dflash_modified and QMessageBox.question(
+                self,
+                tr("Закрыть блок", "Close the ECU"),
+                tr(
+                    "Есть изменения DataFlash, не записанные в приборную панель. Изменённый дамп останется на диске.\n\nЗакрыть?",
+                    "There are DataFlash changes that were not written to the cluster. The edited dump stays on disk.\n\nClose?",
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
             self.fpke_screen.close_kombi()
             return
         if not self.ws.is_open:

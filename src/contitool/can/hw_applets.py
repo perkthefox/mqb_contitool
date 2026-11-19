@@ -137,6 +137,9 @@ class _Rh850Builder:
     def synci(self) -> None:
         self._emit(struct.pack("<H", 0x001C))
 
+    def syncp(self) -> None:
+        self._emit(struct.pack("<H", 0x001F))
+
     def nop(self) -> None:
         self._emit(struct.pack("<H", 0x0000))
 
@@ -194,6 +197,18 @@ class _Rh850Builder:
         if not -16 <= imm5 <= 15:
             raise ValueError(f"imm5 out of range: {imm5}")
         self._emit(struct.pack("<H", 0x0260 | (imm5 & 0x1F) | ((reg & 0x1F) << 11)))
+
+    def or_reg(self, r1: int, r2: int) -> None:
+        """`r2 <- r2 | r1` (Format I `001000`, updates Z/S)."""
+        self._emit(struct.pack("<H", 0x0100 | (r1 & 0x1F) | ((r2 & 0x1F) << 11)))
+
+    def and_reg(self, r1: int, r2: int) -> None:
+        """`r2 <- r2 & r1` (Format I `001010`, updates Z/S)."""
+        self._emit(struct.pack("<H", 0x0140 | (r1 & 0x1F) | ((r2 & 0x1F) << 11)))
+
+    def add_reg(self, r1: int, r2: int) -> None:
+        """`r2 <- r2 + r1` (Format I `001110`, updates CY/OV/S/Z)."""
+        self._emit(struct.pack("<H", 0x01C0 | (r1 & 0x1F) | ((r2 & 0x1F) << 11)))
 
     def cmp_reg(self, r1: int, r2: int) -> None:
         self._emit(struct.pack("<H", 0x01E0 | (r1 & 0x1F) | ((r2 & 0x1F) << 11)))
@@ -1020,6 +1035,278 @@ def build_cflash_faci_stub() -> bytes:
     """Build parameterized RH850/F1L CodeFlash / Extended User Area FACI writer stub."""
     stub, _ = _build_faci_code_stub(is_uflash=False)
     return stub
+
+
+def _emit_fpke_enter(b: _Rh850Builder) -> None:
+    b.stsr(5, 18, 0)
+    b.di()
+
+
+def _emit_fpke_leave(b: _Rh850Builder, caller_return: int = 0x0009CF0E) -> None:
+    b.mov_imm(caller_return, 31)
+    b.mov_imm5(0, 10)
+    b.ldsr(18, 5, 0)
+    b.jmp_lp()
+
+
+def _emit_fpke_bfaselr_switch_subroutine(b: _Rh850Builder, label_name: str = "SUB_SWITCH_BFLASH") -> None:
+    """Switch `BFASELR` (`r6` = 0 or 1), flush I-cache (`ICCTRL`), and clear code buffer (`CDBCR` on G3M / `0xFFBC0700` on G3K).
+
+    Matches the cluster's own `R_FDL_IFct_InitRAM_Asm` (`0x14AFD2` / `0x14B4C8`) using only caller-saved `r11..r12`.
+    """
+    b.label(label_name)
+    b.movhi(0xFFC6, 0, 11)
+    b.st_b(6, -0x6FF8, 11)        # BFASELR = 0xFFC59008 = 0xFFC60000 - 0x6FF8
+    b.ld_bu(-0x6FF8, 11, 12)      # dummy read
+    b.synci()
+    # Flush CPU instruction cache via ICCTRL (SR 24, sel 4, bit 8 = ICHCLR)
+    b.stsr(24, 12, 4)
+    b.ori(0x0100, 12, 12)
+    b.ldsr(12, 24, 4)
+    b.label("_D1L_ICACHE_WAIT")
+    b.stsr(24, 12, 4)
+    b.andi(0x0100, 12, 12)        # sets Z flag directly
+    b.bne_short("_D1L_ICACHE_WAIT")
+    b.synci()
+    # Dispatch by PID (SR 6, sel 1) & 0xE0: 0x20 = G3K (BWCBUFEN 0xFFBC0700), else G3M/D1L (CDBCR SR 24 sel 13 bit 1)
+    b.stsr(6, 12, 1)
+    b.andi(0x00E0, 12, 12)
+    b.addi(-0x0020, 12, 12)       # sets Z=1 iff (PID & 0xE0) == 0x20
+    b.be_short("_D1L_G3K_BUF")
+    b.stsr(24, 12, 13)
+    b.ori(0x0002, 12, 12)
+    b.ldsr(12, 24, 13)
+    b.stsr(24, 12, 13)
+    b.br_short("_D1L_BUF_DONE")
+    b.label("_D1L_G3K_BUF")
+    b.movhi(0xFFBC, 0, 11)
+    b.mov_imm5(1, 12)
+    b.st_b(12, 0x0700, 11)
+    b.ld_bu(0x0700, 11, 12)
+    b.st_b(0, 0x0700, 11)
+    b.ld_bu(0x0700, 11, 12)
+    b.label("_D1L_BUF_DONE")
+    b.synci()
+    b.jmp_lp()
+
+
+def build_fpke_dflash_bc_applet(
+    *,
+    applet_entry: int = 0xFEDF1800,
+    caller_return: int = 0x0009CF0E,
+    caller_r29: int = 0xFEDF31C8,
+) -> bytes:
+    """Build RH850/D1L DataFlash blank-check helper (`<= 256` bytes).
+
+    Parameters at `applet_entry + 0x100` (`0xFEDF1900` on 83A, `0xFEDF4500` on 1703/1711):
+      - `+0x00`: `u32` LE `df_offset` (`0x0000..0xFFFF`)
+      - `+0x04`: `u32` LE `u32_groups` (`1..16`, where each group blank-checks 32 × 4B words = 128 B)
+    Outputs:
+      - `applet_entry + 0x200 .. + 4 * u32_groups`: `BCST` bitmask (`1` = programmed, `0` = blank)
+      - `applet_entry + 0x300`: `b"SCAN"` on success, or `b"BUSY"` if `FENTRYR != 0`
+    Uses only caller-saved registers `r6..r19` (`r20..r28` remain untouched).
+    """
+    result_addr = (applet_entry + 0x200) & 0xFFFFFFFF
+    b = _Rh850Builder()
+    _emit_fpke_enter(b)
+    b.movhi(0xFFA1, 0, 14)
+    b.movhi(0xFFA2, 0, 15)
+    b.mov_imm(result_addr, 16)
+    b.mov_u16(0x0050, 12)
+    b.ld_hu(FACI_FENTRYR_OFF, 14, 6)
+    b.cmp_imm5(0, 6)
+    b.be_short("IDLE")
+    b.mov_imm(0x59535542, 7)
+    b.br_short("MARK")
+    b.label("IDLE")
+    b.mov_u16(0xAA80, 6)
+    b.jarl("SUB_PE")
+    b.ld_w(-0x100, 16, 8)
+    b.ld_w(-0x0FC, 16, 17)
+    b.mov_reg(16, 9)
+    b.label("OUTER")
+    b.mov_imm5(0, 11)
+    b.mov_imm5(1, 19)
+    b.label("W_BC")
+    b.st_w(8, FACI_FSADDR_OFF, 14)
+    b.mov_reg(8, 6)
+    b.add_imm5(3, 6)
+    b.st_w(6, FACI_FEADDR_OFF, 14)
+    b.st_b(12, 0, 15)
+    b.mov_u16(0x0071, 6)
+    b.st_b(6, 0, 15)
+    b.mov_u16(0x00D0, 6)
+    b.st_b(6, 0, 15)
+    b.label("WT_BC")
+    b.ld_w(FACI_FSTATR_OFF, 14, 6)
+    b.andi(0x8000, 6, 7)
+    b.be_short("WT_BC")
+    b.andi(0x7000, 6, 7)
+    b.be_short("RD_BC")
+    b.jarl("SUB_CLR")
+    b.or_reg(19, 11)
+    b.br_short("NXT")
+    b.label("RD_BC")
+    b.ld_bu(0xD4, 14, 6)
+    b.andi(1, 6, 6)
+    b.be_short("NXT")
+    b.or_reg(19, 11)
+    b.label("NXT")
+    b.add_imm5(4, 8)
+    b.add_reg(19, 19)
+    b.bne_short("W_BC")
+    b.st_w(11, 0, 9)
+    b.add_imm5(4, 9)
+    b.add_imm5(-1, 17)
+    b.bne_short("OUTER")
+    b.mov_u16(0xAA00, 6)
+    b.jarl("SUB_PE")
+    b.mov_imm(0x4E414353, 7)
+    b.label("MARK")
+    b.st_w(7, 0x0100, 16)
+    b.mov_imm(caller_r29, 29)
+    _emit_fpke_leave(b, caller_return=caller_return)
+
+    b.label("SUB_PE")
+    b.andi(0x00FF, 6, 7)
+    b.st_h(6, FACI_FENTRYR_OFF, 14)
+    b.label("WT_PE")
+    b.ld_hu(FACI_FENTRYR_OFF, 14, 6)
+    b.cmp_reg(7, 6)
+    b.bne_short("WT_PE")
+    b.synci()
+    b.label("SUB_CLR")
+    b.mov_u16(0x0010, 6)
+    b.st_b(6, FACI_FASTAT_OFF, 14)
+    b.st_b(12, 0, 15)
+    b.jmp_lp()
+    return b.build()
+
+
+def build_fpke_dflash_write_applet(
+    *,
+    applet_entry: int = 0xFEDF1800,
+    caller_return: int = 0x0009CF0E,
+) -> bytes:
+    """Build RH850/D1L DataFlash 64-byte block erase + 4-byte word program helper (`<= 256` bytes).
+
+    Parameters at `applet_entry + 0x100` (`72` bytes):
+      - `+0x00`: `u16` LE `blk_off` (`0x0000..0xFFC0`, 64B-aligned zero-based DataFlash offset)
+      - `+0x02`: `u16` LE `do_erase` (`1` = erase 64B block before programming, `0` = program into blank cells)
+      - `+0x04`: `u32` LE `prog_mask << 16` (bits `31..16`: bit `16 + i` = program word `i`)
+      - `+0x08..+0x47`: `64` bytes (`16 × u32`) of target block data
+    Outputs at `applet_entry + 0x200`:
+      - `+0x00`: `u32` LE `status` (`1` = OK, `3` = `ERSERR`, `4` = `PRGERR`, `6` = `EEL_BUSY`)
+      - `+0x04`: `u32` LE `fstatr`
+      - `applet_entry + 0x300`: `b"SCAN"`
+    Uses only caller-saved registers `r6..r19` (`r20..r28` remain untouched).
+    """
+    source_data_addr = (applet_entry + 0x108) & 0xFFFFFFFF
+    b = _Rh850Builder()
+    _emit_fpke_enter(b)
+    b.movhi(0xFFA1, 0, 14)
+    b.movhi(0xFFA2, 0, 15)
+    b.mov_imm(source_data_addr, 16)
+    b.mov_u16(0x0050, 12)
+    b.mov_imm5(6, 10)
+    b.ld_hu(FACI_FENTRYR_OFF, 14, 6)
+    b.cmp_imm5(0, 6)
+    b.bne_short("W_DONE")
+    b.mov_u16(0xAA80, 6)
+    b.jarl("SUB_PE")
+    b.ld_hu(-8, 16, 8)
+    b.ld_hu(-6, 16, 6)
+    b.ld_w(-4, 16, 9)
+    b.mov_reg(16, 11)
+    b.cmp_imm5(0, 6)
+    b.be_short("W_INIT")
+    b.mov_imm5(3, 10)
+    b.mov_u16(0x003F, 6)
+    b.mov_u16(0x0020, 7)
+    b.jarl("SUB_CMD")
+    b.jarl("SUB_FIN")
+    b.label("W_INIT")
+    b.mov_imm5(4, 10)
+    b.movhi(1, 0, 19)
+    b.label("W_LP")
+    b.mov_reg(9, 6)
+    b.and_reg(19, 6)
+    b.be_short("W_SKP")
+    b.mov_imm5(3, 6)
+    b.mov_u16(0x00E8, 7)
+    b.jarl("SUB_CMD")
+    b.mov_imm5(2, 6)
+    b.st_h(6, 0, 15)
+    b.ld_hu(0, 11, 6)
+    b.st_h(6, 0, 15)
+    b.ld_hu(2, 11, 6)
+    b.st_h(6, 0, 15)
+    b.jarl("SUB_FIN")
+    b.label("W_SKP")
+    b.add_imm5(4, 8)
+    b.add_imm5(4, 11)
+    b.add_reg(19, 19)
+    b.bne_short("W_LP")
+    b.mov_imm5(1, 10)
+    b.label("W_EXIT")
+    b.mov_u16(0xAA00, 6)
+    b.jarl("SUB_PE")
+    b.label("W_DONE")
+    b.st_w(10, 0x00F8, 16)
+    b.mov_imm(0x4E414353, 7)
+    b.st_w(7, 0x01F8, 16)
+    _emit_fpke_leave(b, caller_return=caller_return)
+
+    b.label("SUB_PE")
+    b.andi(0x00FF, 6, 7)
+    b.st_h(6, FACI_FENTRYR_OFF, 14)
+    b.label("WT_PE")
+    b.ld_hu(FACI_FENTRYR_OFF, 14, 6)
+    b.cmp_reg(7, 6)
+    b.bne_short("WT_PE")
+    b.synci()
+    b.mov_u16(0x0010, 6)
+    b.st_b(6, FACI_FASTAT_OFF, 14)
+    b.st_b(12, 0, 15)
+    b.jmp_lp()
+
+    b.label("SUB_CMD")
+    b.add_reg(8, 6)
+    b.st_w(8, FACI_FSADDR_OFF, 14)
+    b.st_w(6, FACI_FEADDR_OFF, 14)
+    b.st_b(12, 0, 15)
+    b.st_h(7, 0, 15)
+    b.jmp_lp()
+
+    b.label("SUB_FIN")
+    b.mov_u16(0x00D0, 6)
+    b.st_h(6, 0, 15)
+    b.label("SUB_FRDY")
+    b.ld_w(FACI_FSTATR_OFF, 14, 6)
+    b.andi(0x8000, 6, 7)
+    b.be_short("SUB_FRDY")
+    b.st_w(6, 0x00FC, 16)
+    b.andi(0x7000, 6, 7)
+    b.bne_short("W_EXIT")
+    b.jmp_lp()
+    return b.build()
+
+
+def build_fpke_swresa_reset_applet() -> bytes:
+    """Build RH850/D1L immediate hardware software reset helper (`SWRESA = 0xFFF80A04`)."""
+    b = _Rh850Builder()
+    _emit_fpke_enter(b)
+    b.movhi(0xFFF8, 0, 14)
+    b.mov_u16(0x00A5, 6)
+    b.mov_imm5(1, 7)
+    b.mov_imm5(-2, 8)
+    b.st_w(6, 0x0000, 14)
+    b.st_w(7, 0x0A04, 14)
+    b.st_w(8, 0x0A04, 14)
+    b.st_w(7, 0x0A04, 14)
+    b.label("RST_SPIN")
+    b.br_short("RST_SPIN")
+    return b.build()
 
 
 OPBT_READER_STUB = build_opbt_reader_payload()

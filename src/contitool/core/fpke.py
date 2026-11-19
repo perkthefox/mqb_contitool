@@ -647,6 +647,225 @@ def eel_remask(lay: dict[str, Any], df: bytes) -> bytearray:
     return mask
 
 
+def eel_faci_word_mask(lay: dict[str, Any], df: bytes) -> bytearray:
+    """Return exact 65,536-byte programmed-word mask (`0xFF*4` = `BCST 1`, `0x00*4` = blank `BCST 0`) for RV40F FACI.
+
+    Handles both blank-checked dumps and raw CPU-read (`UDS 0x23`) dumps where erased RV40F DataFlash cells
+    contain floating-gate residue (including ghost `0x55555555` words from prior EEL cycles):
+      - `active` VB: marks `P/A0/A1/EC/RWP`, active DRPs up to true separator, and all referenced data words, while
+        keeping `I0 (+0x00)`, `[separator .. next_top]`, and `I1 (+vb-4)` genuinely blank (`BCST 0`).
+      - `prepared` VB: marks only `P (+0x04)` and valid `EC (+0x10)`, keeping `I0`, `A0`, `A1`, `RWP`, body, and `I1` blank.
+      - `invalid` VB: marks valid header/footer markers (`I0`, `I1`, `P`, `A0`, `A1`, `EC`, `RWP`) and historical DRPs/records.
+      - Non-EEL tail (`pool_end .. 0xFFFF`): marks words `!= 0xFFFFFFFF`.
+    """
+    mask = bytearray(FPKE_DFLASH_SIZE)
+    vb_sz = lay["vb"]
+    n_vb = lay["n_vb"]
+
+    def word(addr: int) -> int:
+        return struct.unpack_from("<I", df, addr)[0]
+
+    def put(addr: int) -> None:
+        if 0 <= addr <= FPKE_DFLASH_SIZE - 4:
+            mask[addr : addr + 4] = b"\xff\xff\xff\xff"
+
+    def _scan_drps(b: int, limit_addr: int, strict_packed: bool) -> tuple[int, list[tuple[int, int, int]]]:
+        a = b + 0x18
+        exp_widx = vb_sz - 8
+        entries: list[tuple[int, int, int]] = []
+        while a + 0x10 <= limit_addr and word(a) == EEL_MARK:
+            if not (word(a + 4) == EEL_MARK or word(a + 8) == EEL_MARK):
+                break
+            drp = word(a + 0xC)
+            ident, widx = drp & 0xFFFF, (drp >> 16) & 0x7FFF
+            rec_sz = lay["ids"].get(ident, 0)
+            if strict_packed:
+                if not rec_sz or (widx & 3) != 0 or not (0x18 <= widx <= exp_widx):
+                    break
+                if struct.unpack_from("<H", df, b + widx)[0] != rec_sz:
+                    break
+                exp_widx = widx - ((rec_sz + 3) & ~3)
+            entries.append((a, b + widx, (rec_sz + 3) & ~3 if rec_sz and widx > 0 else 0))
+            a += 0x10
+        return a, entries
+
+    def _emit_entries(b: int, entries: list[tuple[int, int, int]]) -> None:
+        for drp_addr, top, rec_len in entries:
+            for o in (0, 4, 8, 0xC):
+                put(drp_addr + o)
+            for i in range(0, rec_len, 4):
+                if b + 0x18 <= top - i <= b + vb_sz - 8:
+                    put(top - i)
+
+    has_fg_noise = False
+    vb_meta: list[dict[str, Any]] = []
+    for n in range(n_vb):
+        b = lay["base"] + n * vb_sz
+        w_i0, w_p, w_a0, w_a1, w_ec, w_rwp = struct.unpack_from("<6I", df, b)
+        w_i1 = word(b + vb_sz - 4)
+        if any(v not in (0xFFFFFFFF, EEL_MARK) for v in (w_i0, w_p, w_a0, w_a1, w_i1)):
+            has_fg_noise = True
+        ec_ok = w_ec != 0xFFFFFFFF and eel_cs24(w_ec) == w_ec
+        rwp_ok = w_rwp != 0xFFFFFFFF and eel_cs24(w_rwp) == w_rwp
+        vb_meta.append(
+            {
+                "b": b,
+                "i0": w_i0 == EEL_MARK,
+                "i1": w_i1 == EEL_MARK,
+                "p": w_p == EEL_MARK,
+                "a0": w_a0 == EEL_MARK,
+                "a1": w_a1 == EEL_MARK,
+                "ec_ok": ec_ok,
+                "ec": (w_ec & 0xFFFFFF) if ec_ok else None,
+                "rwp_ok": rwp_ok,
+                "rwp": (w_rwp & 0xFFFFFF) if rwp_ok else None,
+            }
+        )
+
+    if has_fg_noise:
+        # Reconstruct exact active RWP-linked chain so ghost 0x55555555 words in prepared/erased cells are ignored
+        succ: dict[int, int] = {}
+        pred: dict[int, int] = {}
+        for n in range(n_vb):
+            cur = vb_meta[n]
+            nxt_idx = (n + 1) % n_vb
+            nxt = vb_meta[nxt_idx]
+            if not (cur["p"] and cur["a0"] and cur["ec_ok"] and nxt["p"] and nxt["a0"] and nxt["ec_ok"] and nxt["rwp_ok"]):
+                continue
+            exp_ec = cur["ec"] + (1 if nxt_idx == 0 else 0)
+            rwp_val = nxt["rwp"]
+            if nxt["ec"] == exp_ec and cur["b"] + 0x18 <= rwp_val <= cur["b"] + vb_sz - 4:
+                sep_end, _ = _scan_drps(cur["b"], rwp_val, True)
+                if sep_end == rwp_val:
+                    succ[n] = nxt_idx
+                    pred[nxt_idx] = n
+
+        best_chain: list[int] = []
+        for start in range(n_vb):
+            if start in pred or not (vb_meta[start]["p"] and vb_meta[start]["a0"] and vb_meta[start]["ec_ok"]):
+                continue
+            chain = [start]
+            cur_idx = start
+            while cur_idx in succ and succ[cur_idx] not in chain:
+                cur_idx = succ[cur_idx]
+                chain.append(cur_idx)
+            # Validate single-block candidate if no RWP chain exists
+            if len(chain) == 1:
+                if not vb_meta[start]["rwp_ok"] or (vb_meta[start]["i0"] and vb_meta[start]["i1"]):
+                    continue
+                _sep, ents = _scan_drps(vb_meta[start]["b"], vb_meta[start]["b"] + vb_sz - 4, True)
+                if not ents:
+                    continue
+            # Trim invalidated tail predecessor(s) at the start of the chain (e.g. VB 15 before active VB 16)
+            while len(chain) > 1 and vb_meta[chain[0]]["i0"] and vb_meta[chain[0]]["i1"]:
+                chain.pop(0)
+            if len(chain) > len(best_chain) or (
+                len(chain) == len(best_chain)
+                and best_chain
+                and (vb_meta[chain[-1]]["ec"] or 0) > (vb_meta[best_chain[-1]]["ec"] or 0)
+            ):
+                best_chain = chain
+
+        active_set = set(best_chain)
+        if len(best_chain) <= 1:
+            for n, m in enumerate(vb_meta):
+                if m["p"] and m["a0"] and m["ec_ok"] and m["rwp_ok"] and not (m["i0"] and m["i1"]):
+                    _sep, ents = _scan_drps(m["b"], m["b"] + vb_sz - 4, True)
+                    if ents:
+                        active_set.add(n)
+        for n, m in enumerate(vb_meta):
+            b = m["b"]
+            if n in active_set:
+                if m["p"]:
+                    put(b + 4)
+                put(b + 8)
+                if m["a1"]:
+                    put(b + 0xC)
+                if m["ec_ok"]:
+                    put(b + 0x10)
+                if m["rwp_ok"]:
+                    put(b + 0x14)
+                limit = vb_meta[succ[n]]["rwp"] if (n in succ and succ[n] in active_set) else (b + vb_sz - 4)
+                _sep, ents = _scan_drps(b, limit, True)
+                _emit_entries(b, ents)
+            elif m["i0"] and m["i1"] and (n in succ or (m["ec"] is not None and best_chain and m["ec"] < (vb_meta[best_chain[-1]]["ec"] or 0))):
+                put(b)
+                put(b + vb_sz - 4)
+                if m["p"]:
+                    put(b + 4)
+                if m["a0"]:
+                    put(b + 8)
+                    limit = vb_meta[succ[n]]["rwp"] if n in succ else (b + vb_sz - 4)
+                    _sep, ents = _scan_drps(b, limit, True)
+                    _emit_entries(b, ents)
+                if m["a1"]:
+                    put(b + 0xC)
+                if m["ec_ok"]:
+                    put(b + 0x10)
+                if m["rwp_ok"]:
+                    put(b + 0x14)
+            elif m["p"]:
+                put(b + 4)
+                if m["ec_ok"]:
+                    put(b + 0x10)
+    else:
+        for n, m in enumerate(vb_meta):
+            b = m["b"]
+            if m["i0"] and m["i1"]:
+                put(b)
+                put(b + vb_sz - 4)
+                if m["p"]:
+                    put(b + 4)
+                if m["a0"]:
+                    put(b + 8)
+                    _sep, ents = _scan_drps(b, b + vb_sz - 4, False)
+                    _emit_entries(b, ents)
+                if m["a1"]:
+                    put(b + 0xC)
+                if m["ec_ok"]:
+                    put(b + 0x10)
+                if m["rwp_ok"]:
+                    put(b + 0x14)
+            elif m["a0"]:
+                if m["p"]:
+                    put(b + 4)
+                put(b + 8)
+                if m["a1"]:
+                    put(b + 0xC)
+                if m["ec_ok"]:
+                    put(b + 0x10)
+                if m["rwp_ok"]:
+                    put(b + 0x14)
+                _sep, ents = _scan_drps(b, b + vb_sz - 4, False)
+                _emit_entries(b, ents)
+            elif m["p"]:
+                put(b + 4)
+                if m["ec_ok"]:
+                    put(b + 0x10)
+
+    pool_end = lay["base"] + n_vb * vb_sz
+    for off in range(pool_end, FPKE_DFLASH_SIZE, 4):
+        if word(off) != 0xFFFFFFFF:
+            put(off)
+    return mask
+
+
+def normalize_fpke_dflash_for_faci(
+    dflash: bytes,
+    cflash: bytes | None = None,
+) -> tuple[bytes, bytearray]:
+    """Strip CPU-read floating-gate noise from erased EEL cells and return `(clean_dflash, faci_word_mask)`."""
+    if len(dflash) != FPKE_DFLASH_SIZE:
+        raise ValueError(f"Expected 65,536-byte FPK_E DataFlash, got {len(dflash)} bytes")
+    lay = fpke_eel_layout(cflash, dflash)
+    mask = eel_faci_word_mask(lay, dflash)
+    clean = bytearray(dflash)
+    for off in range(0, FPKE_DFLASH_SIZE, 4):
+        if not any(mask[off : off + 4]):
+            clean[off : off + 4] = b"\xff\xff\xff\xff"
+    return bytes(clean), mask
+
+
 def eel_parse_pool(
     lay: dict[str, Any],
     df: bytes,
@@ -654,7 +873,7 @@ def eel_parse_pool(
 ) -> tuple[list[dict[str, Any]], dict[int, tuple[int, int, int]]]:
     """Parse EEL T01 virtual blocks and return `(blocks, latest_active_refs)`."""
     if mask is None:
-        mask = eel_remask(lay, df)
+        mask = eel_faci_word_mask(lay, df)
 
     def word(addr: int) -> int:
         return struct.unpack_from("<I", df, addr)[0]
@@ -1661,7 +1880,8 @@ def eel_append_records(
     for ident, rec in pending:
         size = lay["ids"][ident]
         padded = (size + 3) & ~3
-        blocks, _ = eel_parse_pool(lay, bytes(df))
+        faci_mask = eel_faci_word_mask(lay, bytes(df))
+        blocks, _ = eel_parse_pool(lay, bytes(df), faci_mask)
         active_nums = {b["vb"] for b in blocks if b["state"] == "active"}
         ring_start = 0
         if 0 in active_nums and (lay["n_vb"] - 1) in active_nums and len(active_nums) < lay["n_vb"]:
@@ -1681,11 +1901,13 @@ def eel_append_records(
         ref_addr = b_addr + int(head.get("separator", 0x18))
         next_top = int(head.get("next_top", b_addr + lay["vb"] - 8))
 
-        # Leave at least one clean 4-byte separator word (`ref_addr + 0x10 .. ref_addr + 0x13`) between refs and data
+        # Leave at least one clean 4-byte separator word (`ref_addr + 0x10 .. ref_addr + 0x13`) between refs and data.
+        # Check `faci_mask` rather than raw `0xFF` bytes so CPU-read (`UDS 0x23`) dumps with floating-gate residue in
+        # erased RV40F DataFlash cells still append inside `VB_head` without false rollover.
         fits = (
             ref_addr + 0x14 <= next_top - padded + 4
-            and df[ref_addr : ref_addr + 0x14] == b"\xff" * 0x14
-            and df[next_top - padded + 4 : next_top + 4] == b"\xff" * padded
+            and not any(faci_mask[ref_addr : ref_addr + 0x14])
+            and not any(faci_mask[next_top - padded + 4 : next_top + 4])
         )
         if not fits:
             next_vb = (head["vb"] + 1) % lay["n_vb"]
@@ -1700,12 +1922,16 @@ def eel_append_records(
                 )
             nb = lay["base"] + next_vb * lay["vb"]
             old_sep = ref_addr  # full DataFlash pool byte offset of previous head's separator (`0x14D10A`)
+            df[old_sep : old_sep + 4] = b"\xff\xff\xff\xff"
             expected_ec = (head["ec"] or 1) + (1 if next_vb == 0 else 0)
             if (
                 blocks[next_vb]["state"] == "prepared"
                 and (blocks[next_vb]["ec"] or 0) == expected_ec
-                and df[nb + 0x18 : nb + lay["vb"] - 4] == b"\xff" * (lay["vb"] - 0x1C)
+                and not any(faci_mask[nb + 0x18 : nb + lay["vb"] - 4])
             ):
+                df[nb] = 0xFF
+                df[nb : nb + 4] = b"\xff\xff\xff\xff"
+                df[nb + 0x18 : nb + lay["vb"]] = b"\xff" * (lay["vb"] - 0x18)
                 struct.pack_into("<I", df, nb + 0x08, EEL_MARK)
                 struct.pack_into("<I", df, nb + 0x14, eel_cs24(old_sep))
                 struct.pack_into("<I", df, nb + 0x0C, EEL_MARK)
@@ -1732,6 +1958,7 @@ def eel_append_records(
         widx = next_top - b_addr
         drp = (ident & 0xFFFF) | ((widx & 0x7FFF) << 16)
         struct.pack_into("<4I", df, ref_addr, EEL_MARK, EEL_MARK, EEL_MARK, drp)
+        df[ref_addr + 0x10 : ref_addr + 0x14] = b"\xff\xff\xff\xff"
 
     out_bytes = bytes(df)
     for ident, expected_rec in pending:
@@ -2025,6 +2252,204 @@ def transfer_fpke_donor_to_target(
         "odometer_km": (after_passport.get("cluster_metadata") or {}).get("odometer_km"),
     }
     return updated_df, summary
+
+
+def extract_fpke_eel_updates(
+    before_dflash: bytes,
+    after_dflash: bytes,
+    cflash: bytes | None = None,
+) -> dict[int, bytes]:
+    """Return `{ident: record_bytes}` for every active EEL ID added or modified in `after_dflash` vs `before_dflash`."""
+    lay_before = fpke_eel_layout(cflash, before_dflash)
+    lay_after = fpke_eel_layout(cflash, after_dflash)
+    updates: dict[int, bytes] = {}
+    for ident in sorted(lay_after["ids"]):
+        try:
+            rec_after, src_after = eel_read_record_any(lay_after, after_dflash, ident)
+        except KeyError:
+            continue
+        if src_after.get("generation") != "current":
+            continue
+        rec_before: bytes | None = None
+        if ident in lay_before["ids"]:
+            with contextlib.suppress(KeyError):
+                cand, src_before = eel_read_record_any(lay_before, before_dflash, ident)
+                if src_before.get("generation") == "current":
+                    rec_before = cand
+        if rec_before != rec_after:
+            updates[ident] = rec_after
+    return updates
+
+
+def summarize_fpke_dflash_changes(
+    before_dflash: bytes,
+    after_dflash: bytes,
+    cflash: bytes | None = None,
+) -> dict[str, Any]:
+    """Build a human-readable bilingual summary of semantic and EEL changes between two 64 KiB FPK_E DataFlash images."""
+    norm_before, mask_before = normalize_fpke_dflash_for_faci(before_dflash, cflash)
+    norm_after, mask_after = normalize_fpke_dflash_for_faci(after_dflash, cflash)
+    updates = extract_fpke_eel_updates(norm_before, norm_after, cflash)
+
+    is_pure_eel_update = False
+    if updates:
+        with contextlib.suppress(Exception):
+            lay_chk = fpke_eel_layout(cflash, norm_after)
+            pool_end = lay_chk["base"] + lay_chk["n_vb"] * lay_chk["vb"]
+            replayed, mask_replayed = normalize_fpke_dflash_for_faci(
+                eel_append_records(norm_before, updates, cflash),
+                cflash,
+            )
+            if (norm_after == replayed) and (mask_after == mask_replayed):
+                is_pure_eel_update = True
+            elif (
+                norm_before[pool_end:] == norm_after[pool_end:]
+                and mask_before[pool_end:] == mask_after[pool_end:]
+                and all(
+                    any(mask_after[off : off + 4]) and norm_before[off : off + 4] == norm_after[off : off + 4]
+                    for off in range(0, pool_end, 4)
+                    if any(mask_before[off : off + 4])
+                )
+            ):
+                is_pure_eel_update = True
+
+    raw_diff_blocks = sum(
+        1
+        for blk_off in range(0, FPKE_DFLASH_SIZE, 64)
+        if norm_before[blk_off : blk_off + 64] != norm_after[blk_off : blk_off + 64]
+        or mask_before[blk_off : blk_off + 64] != mask_after[blk_off : blk_off + 64]
+    )
+    changed = bool(updates) or raw_diff_blocks > 0
+    if not changed:
+        return {
+            "changed": False,
+            "is_pure_eel_update": False,
+            "changed_eel_ids": [],
+            "raw_diff_blocks": 0,
+            "lines": [],
+            "short_summary": tr("Изменений нет", "No changes"),
+        }
+
+    p1 = extract_fpke_immo_passport(norm_before, cflash)
+    p2 = extract_fpke_immo_passport(norm_after, cflash)
+    im1, im2 = p1["immo"], p2["immo"]
+    m1, m2 = p1.get("cluster_metadata") or {}, p2.get("cluster_metadata") or {}
+    cp1, cp2 = p1.get("component_protection_separate") or {}, p2.get("component_protection_separate") or {}
+
+    lines: list[str] = []
+    short_tags: list[str] = []
+
+    if im1.get("vin") != im2.get("vin"):
+        lines.append(f"VIN: {im1.get('vin') or '—'} → {im2.get('vin') or '—'}")
+        short_tags.append(f"VIN → {im2.get('vin') or '—'}")
+
+    if im1.get("cs") != im2.get("cs"):
+        c_old = (im1.get("cs") or "—")[:8]
+        c_new = (im2.get("cs") or "—")[:8]
+        lines.append(f"CS / Kc: {c_old}… → {c_new}…")
+        short_tags.append("CS/Kc")
+
+    if (im1.get("crc32_a_le"), im1.get("crc32_b_le")) != (im2.get("crc32_a_le"), im2.get("crc32_b_le")):
+        lines.append(
+            f"VDO CS+: {im1.get('crc32_a_le') or '—'}/{im1.get('crc32_b_le') or '—'} → "
+            f"{im2.get('crc32_a_le') or '—'}/{im2.get('crc32_b_le') or '—'}"
+        )
+        short_tags.append("VDO CS+")
+
+    if 0x69 in updates:
+        lines.append(tr("Слоты S0 / S1 (EEL 0x69): обновлены", "Slots S0 / S1 (EEL 0x69): updated"))
+        short_tags.append("S0/S1")
+
+    if im1.get("power_class_hex") != im2.get("power_class_hex"):
+        lines.append(f"PowerClass: {im1.get('power_class_hex') or '—'} → {im2.get('power_class_hex') or '—'}")
+        short_tags.append(f"PC → {im2.get('power_class_hex') or '—'}")
+
+    mf1, mf2 = im1.get("mode_and_flags") or {}, im2.get("mode_and_flags") or {}
+    if (
+        mf1.get("immo_mode") != mf2.get("immo_mode")
+        or mf1.get("key_over_can") != mf2.get("key_over_can")
+        or mf1.get("partners_mask") != mf2.get("partners_mask")
+    ):
+        lines.append(
+            tr(
+                f"Режим и флаги иммо: mode={mf2.get('immo_mode')}, партнёры={mf2.get('partners_mask_hex')}",
+                f"Immo mode & flags: mode={mf2.get('immo_mode')}, partners={mf2.get('partners_mask_hex')}",
+            )
+        )
+        short_tags.append(tr("режим иммо", "immo mode"))
+
+    if im1.get("mac_fields") != im2.get("mac_fields"):
+        lines.append(f"MAC IDs (EEL 0x66): MAC4={im1.get('mac4') or '—'} → {im2.get('mac4') or '—'}")
+        short_tags.append("MAC")
+
+    cnt1, cnt2 = im1.get("counts") or {}, im2.get("counts") or {}
+    if im1.get("keys") != im2.get("keys") or cnt1 != cnt2:
+        k_Summary = f"{cnt2.get('learned_keys', 0)}/{cnt2.get('allowed_keys', 0)}"
+        lines.append(
+            tr(
+                f"Ключи и транспондеры (EEL 0x67): обучено {cnt1.get('learned_keys', 0)}/{cnt1.get('allowed_keys', 0)} → {k_Summary}",
+                f"Keys & transponders (EEL 0x67): learned {cnt1.get('learned_keys', 0)}/{cnt1.get('allowed_keys', 0)} → {k_Summary}",
+            )
+        )
+        short_tags.append(tr(f"ключи ({k_Summary})", f"keys ({k_Summary})"))
+
+    odo1, odo2 = m1.get("odometer_km"), m2.get("odometer_km")
+    if odo1 != odo2 or 0x60 in updates:
+        o1_s = f"{odo1:,}".replace(",", " ") if odo1 is not None else "—"
+        o2_s = f"{odo2:,}".replace(",", " ") if odo2 is not None else "—"
+        lines.append(tr(f"Пробег (EEL 0x60): {o1_s} км → {o2_s} км", f"Odometer (EEL 0x60): {o1_s} km → {o2_s} km"))
+        short_tags.append(tr(f"пробег → {o2_s} км", f"odo → {o2_s} km"))
+
+    if cp1 != cp2 or 0x6B in updates or 0x6D in updates:
+        lines.append(
+            tr(
+                "Защита компонентов (EEL 0x6B / 0x6D): ключи IKA/GFA или статус SAFE CP обновлены",
+                "Component Protection (EEL 0x6B / 0x6D): IKA/GFA keys or SAFE CP status updated",
+            )
+        )
+        short_tags.append("CP/IKA")
+
+    if m1.get("coding_hex") != m2.get("coding_hex") or 0x30 in updates:
+        lines.append(
+            tr(
+                f"Кодировка (EEL 0x30): {(m2.get('coding_hex') or '—')[:16]}…",
+                f"Coding (EEL 0x30): {(m2.get('coding_hex') or '—')[:16]}…",
+            )
+        )
+        short_tags.append(tr("кодировка", "coding"))
+
+    covered_ids = {0x68, 0x69, 0x66, 0x67, 0x60, 0x35, 0x6B, 0x6D, 0x30}
+    extra_ids = [f"0x{i:02X}" for i in sorted(updates) if i not in covered_ids]
+    if extra_ids or not lines:
+        if extra_ids:
+            lines.append(
+                tr(
+                    f"Дополнительные записи EEL: {', '.join(extra_ids)}",
+                    f"Additional EEL records: {', '.join(extra_ids)}",
+                )
+            )
+            short_tags.append(f"EEL {', '.join(extra_ids[:3])}")
+        elif raw_diff_blocks:
+            lines.append(
+                tr(
+                    f"Прямые изменения образа DataFlash: {raw_diff_blocks} бл. по 64 Б",
+                    f"Direct DataFlash image changes: {raw_diff_blocks} × 64 B blocks",
+                )
+            )
+            short_tags.append(tr(f"{raw_diff_blocks} бл. DataFlash", f"{raw_diff_blocks} DataFlash blocks"))
+
+    short_summary = ", ".join(short_tags[:4])
+    if len(short_tags) > 4:
+        short_summary += f" (+{len(short_tags) - 4})"
+
+    return {
+        "changed": True,
+        "is_pure_eel_update": is_pure_eel_update,
+        "changed_eel_ids": [f"0x{i:02X}" for i in sorted(updates)],
+        "raw_diff_blocks": raw_diff_blocks,
+        "lines": lines,
+        "short_summary": short_summary,
+    }
 
 
 # ────────────────────────────── Bilingual Text Reports ──────────────────────────────
