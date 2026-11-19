@@ -356,7 +356,7 @@ FPA_TARGET_MODE_NAMES: dict[int, tuple[str, str]] = {
 # Steering-wheel LIN MFL_Tastencode presets (DID 0x1F07 byte 1)
 MFL_KEYCODE_PRESETS: tuple[tuple[int, str, str], ...] = (
     (0x19, "Голосовое управление / Микрофон (рекомендуется)", "Voice Control / Mic (recommended)"),
-    (0x23, "Кнопка VIEW (смена вида приборки)", "VIEW button (cluster view)"),
+    (0x23, "Кнопка VIEW (смена вида панели приборов)", "VIEW button (cluster view)"),
     (0x74, "Кнопка меню ассистентов на руле", "Assistants menu button on wheel"),
     (0x2B, "Кнопка обогрева руля", "Steering-wheel heating button"),
     (0x2A, "Кнопка R / Звёздочка (Joker)", "R / Star / Joker button"),

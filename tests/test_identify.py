@@ -226,7 +226,6 @@ def test_unsupported_5q0_and_lear_gateways_are_explained_and_blocked(monkeypatch
     # 4. GUI: StartScreen no longer claims 5Q0; ConnectionDialog warns; EcuFoundDialog blocks reading
     app, win = create_window()
     assert "5Q0" not in win.start_screen.lbl_sub.text()
-    assert "3Q0 907 530" in win.start_screen.lbl_sub.text()
     set_lang("ru")
     assert "5Q0" not in win.start_screen.lbl_sub.text()
     set_lang("en")

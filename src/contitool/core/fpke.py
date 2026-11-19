@@ -191,6 +191,24 @@ def aes128_ecb_encrypt(key: bytes, plaintext: bytes) -> bytes:
 # 10-byte ROM constant for `2E 02E1` MAC block (SW 1703 `0x19D1D8`, SW 83A `0x196E68`)
 FPKE_02E1_C10 = bytes.fromhex("01020304050607080910")
 
+# 16-byte ROM constant C16 (FPK_E `0x19DA90`) for FFB radio channel secret: `K_ffb = AES128_ECB_ENC(K_c, C16)`
+FPKE_FFB_C16 = bytes.fromhex("e7ad3585e2f937e81c75df6e47f11a71")
+
+
+def fpke_derive_k_ffb(kc: bytes | str) -> bytes:
+    """Derive 16-byte FFB remote key radio-channel secret `K_ffb = AES128_ECB_ENC(K_c, C16)` (`FPK_E` ROM `0x19DA90`)."""
+    if isinstance(kc, (bytes, bytearray, memoryview)):
+        raw = bytes(kc)
+    else:
+        cleaned = "".join(str(kc).split()).replace("0x", "").replace("0X", "")
+        try:
+            raw = bytes.fromhex(cleaned)
+        except ValueError as exc:
+            raise ValueError(f"K_c must be 32 hex digits (16 bytes), got {kc!r}") from exc
+    if len(raw) != 16:
+        raise ValueError(f"K_c must be 16 bytes (32 hex digits), got {len(raw)} bytes")
+    return aes128_ecb_encrypt(raw, FPKE_FFB_C16)
+
 
 def fpke_crc16_ccitt(data: bytes) -> int:
     """Compute firmware CRC-16/CCITT (`0x13F4A2`: polynomial `0x1021`, init `0xFFFF`)."""
@@ -1112,6 +1130,7 @@ def parse_fpke_immo_config(
     has_66 = r66 is not None and len(r66) >= 0x16
     cs_raw = r68[0x28:0x38] if (r68 is not None and len(r68) >= 0x38) else None
     cs_personalized = cs_raw is not None and cs_raw != b"\xff" * 16
+    k_ffb_hex = fpke_derive_k_ffb(cs_raw).hex().upper() if (cs_personalized and cs_raw is not None) else ""
     power_class = r68[0x40] if (r68 is not None and len(r68) > 0x40) else None
     partners_mask = r68[0x41] if (r68 is not None and len(r68) > 0x41 and r68[0x41] != 0xFF) else 0
     lf_cfg = r68[0x42] if (r68 is not None and len(r68) > 0x42) else None
@@ -1173,6 +1192,7 @@ def parse_fpke_immo_config(
         "EEL_0x68_present": has_68,
         "EEL_0x66_present": has_66,
         "personalized": cs_personalized,
+        "k_ffb_hex": k_ffb_hex,
         "power_class": power_class if pc_valid else None,
         "power_class_hex": f"0x{power_class:02X}" if pc_valid and power_class is not None else None,
         "power_class_byte": f"{power_class:02X}" if pc_valid and power_class is not None else None,
@@ -1625,6 +1645,7 @@ def extract_fpke_immo_passport(
             "vin_state": vin_state,
             "cs": cs_val,
             "kc": cs_val,
+            "k_ffb": immo_cfg.get("k_ffb_hex") or None,
             "cs_state": cs_state,
             "vdo_cs_plus": vdo_cs_plus,
             "crc32_a_le": crc_a_le,
@@ -1783,6 +1804,7 @@ def plan_fpke_a_to_b_transfer(
         "transfer_from_a": {
             "vin": im_a["vin"],
             "cs": im_a["cs"],
+            "k_ffb": im_a["k_ffb"],
             "vdo_cs_plus": im_a["vdo_cs_plus"],
             "crc32_a_le": im_a["crc32_a_le"],
             "crc32_b_le": im_a["crc32_b_le"],
@@ -2676,6 +2698,8 @@ def format_fpke_report(
         lines.append(tr("── Паспорт иммобилайзера Immo 4.0 (EEL 0x66 / 0x68 / 0x69) ──", "── Immobilizer Immo 4.0 Passport (EEL 0x66 / 0x68 / 0x69) ──"))
         if "kc" in by_id:
             lines.append(f"  {'CS / K_c (0x68+0x28)':<28} : {by_id['kc']['hex'].upper()}")
+        if immo_cfg.get("k_ffb_hex"):
+            lines.append(f"  {'K_ffb (AES_Kc(C16), FFB)':<28} : {immo_cfg['k_ffb_hex']}")
         if slots.get("A_crc32_le") or slots.get("B_crc32_le"):
             lines.append(
                 f"  {'VDO CS+ (CRC-32 A / B)':<28} : {slots.get('A_crc32_le', '').upper()} / {slots.get('B_crc32_le', '').upper()}"

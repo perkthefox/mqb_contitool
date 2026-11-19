@@ -1060,11 +1060,73 @@ def unsupported_ecu_reason(ident: list[dict[str, str]]) -> str | None:
     return None
 
 
+BCM_UDS_TX_ID = 0x70E
+BCM_UDS_RX_ID = 0x778
+
+
 def _send_fpke_keepalive_burst(link: J533CanLink) -> None:
     for arb_id, ka_data in FPKE_KEEPALIVE_PATTERN:
         with contextlib.suppress(*LINK_ERRORS):
             link.send_frame(arb_id, ka_data)
         time.sleep(0.002)
+
+
+def _probe_bcm_uds_once(link: J533CanLink, *, timeout: float) -> tuple[bool, bool]:
+    """Single UDS probe on `09` BCM (`0x70E -> 0x778`), tolerating NRC `0x22` (e.g. KL15 off) via `10 01`."""
+    link.UDS_TX_ID = BCM_UDS_TX_ID
+    link.UDS_RX_ID = BCM_UDS_RX_ID
+    try:
+        link.request_uds(b"\x10\x03", 0x50, timeout=timeout)
+        with contextlib.suppress(*LINK_ERRORS):
+            link.request_uds(b"\x3e\x00", 0x7E, timeout=min(0.4, timeout))
+        return True, False
+    except UdsNegativeResponse as exc:
+        if _is_fbl_session_nrc(exc):
+            return True, True
+        with contextlib.suppress(*LINK_ERRORS):
+            link.request_uds(b"\x10\x01", 0x50, timeout=min(0.5, timeout))
+        return True, False
+    except LINK_ERRORS:
+        return False, False
+
+
+def _send_bcm_nm_wake(link: J533CanLink) -> None:
+    """Send one MQB Komfort CAN AUTOSAR NM wake frame (`0x1B000010`) + KL15 (`0x3C0`) on direct native CAN."""
+    import can
+
+    with contextlib.suppress(*LINK_ERRORS):
+        link.bus.send(
+            can.Message(arbitration_id=0x1B000010, data=b"\x10\x40\x00\x00\x00\x00\x00\x00", is_extended_id=True),
+            timeout=0.2,
+        )
+    _send_fpke_keepalive_burst(link)
+
+
+def _probe_bcm_uds_with_wake(
+    link: J533CanLink,
+    *,
+    bus: Any | None,
+    interface: str,
+    reporter: OperationReporter,
+) -> tuple[bool, bool]:
+    """Probe `09` BCM (`0x70E -> 0x778`), sending short NM + KL15 wake pulses on direct native CAN if needed."""
+    ok, fbl = _probe_bcm_uds_once(link, timeout=0.35 if bus is not None else 0.7)
+    if ok or bus is not None or interface not in FPKE_NATIVE_INTERFACES:
+        return ok, fbl
+    reporter.info(
+        tr(
+            "Пробуждение и опрос блока бортовой сети BCM (09, 0x70E → 0x778)…",
+            "Waking and probing Central Electrics BCM (09, 0x70E → 0x778)…",
+        )
+    )
+    for _ in range(3):
+        reporter.check_cancelled()
+        _send_bcm_nm_wake(link)
+        ok, fbl = _probe_bcm_uds_once(link, timeout=0.35)
+        if ok:
+            return True, fbl
+        time.sleep(0.15)
+    return False, False
 
 
 def _probe_fpke_uds_with_wake(
@@ -1136,9 +1198,14 @@ def can_identify(
 
     if bus is None:
         close_active_fpke_link()
-    result: dict[str, Any] = {"responding": False, "ident": [], "ecu_kind": "fpke" if target == "fpke" else "j533"}
+    result: dict[str, Any] = {
+        "responding": False,
+        "ident": [],
+        "ecu_kind": target if target in ("fpke", "bcm") else "j533",
+    }
     in_fbl = False
     probed_fpke = False
+    probed_bcm = False
     keep_fpke_alive = False
     with J533CanLink(port, interface=interface, bus=bus) as link:
         if link.interface == "dpdu" and callable(getattr(link.bus, "describe", None)):
@@ -1159,6 +1226,18 @@ def can_identify(
                     )
                 )
             probed_fpke = True
+        elif target == "bcm":
+            ok_bcm, in_fbl = _probe_bcm_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
+            if not ok_bcm:
+                raise RuntimeError(
+                    tr(
+                        "Блок бортовой сети BCM (09, 0x70E → 0x778) не отвечает по CAN. Проверьте питание +12 В, массу, "
+                        "линии CAN-H / CAN-L и терминатор 120 Ом.",
+                        "Central Electrics BCM (09, 0x70E → 0x778) does not answer on CAN. Check +12 V power, ground, "
+                        "CAN-H / CAN-L lines, and the 120 Ω terminator.",
+                    )
+                )
+            probed_bcm = True
         else:
             try:
                 link.request_uds(b"\x10\x03", 0x50, timeout=1.2)
@@ -1168,23 +1247,37 @@ def can_identify(
                 if _is_fbl_session_nrc(exc):
                     in_fbl = True
                 else:
-                    ok_fpke, fbl_fpke = _probe_fpke_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
-                    if ok_fpke:
-                        probed_fpke = True
-                        in_fbl = fbl_fpke
+                    # Fast check for an already-awake 09 BCM before spending ~4 s waking a Kombi
+                    ok_bcm, fbl_bcm = _probe_bcm_uds_once(link, timeout=0.2 if bus is not None else 0.35)
+                    if ok_bcm:
+                        probed_bcm = True
+                        in_fbl = fbl_bcm
                     else:
-                        link.UDS_TX_ID = J533CanLink.UDS_TX_ID
-                        link.UDS_RX_ID = J533CanLink.UDS_RX_ID
-                        raise RuntimeError(
-                            tr(
-                                f"Блок не отвечает на базовые диагностические запросы UDS ({exc}). Проверьте питание +12 В, "
-                                "массу, линии CAN-H / CAN-L (шлюз T20: Pin 19 и Pin 9; приборка T18: Pin 18 и Pin 17) "
-                                "и что включён CAN-терминатор 120 Ом (см. «Справка»).",
-                                f"The ECU does not answer basic UDS diagnostic requests ({exc}). Check +12 V, ground, "
-                                "CAN-H / CAN-L (gateway T20: Pin 19 and Pin 9; cluster T18: Pin 18 and Pin 17) "
-                                "and that 120 Ω CAN termination is on (see “Help”).",
-                            )
-                        ) from exc
+                        ok_fpke, fbl_fpke = _probe_fpke_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
+                        if ok_fpke:
+                            probed_fpke = True
+                            in_fbl = fbl_fpke
+                        else:
+                            # Retry 09 BCM once after NM + KL15 wake pulses in case it was asleep on direct bench CAN
+                            if bus is None and interface in FPKE_NATIVE_INTERFACES:
+                                _send_bcm_nm_wake(link)
+                            ok_bcm, fbl_bcm = _probe_bcm_uds_once(link, timeout=0.2 if bus is not None else 0.45)
+                            if ok_bcm:
+                                probed_bcm = True
+                                in_fbl = fbl_bcm
+                            else:
+                                link.UDS_TX_ID = J533CanLink.UDS_TX_ID
+                                link.UDS_RX_ID = J533CanLink.UDS_RX_ID
+                                raise RuntimeError(
+                                    tr(
+                                        f"Блок не отвечает на базовые диагностические запросы UDS ({exc}). Проверьте питание +12 В, "
+                                        "массу, линии CAN-H / CAN-L (шлюз T20: Pin 19 и Pin 9; панель приборов T18: Pin 18 и Pin 17; BCM: 0x70E) "
+                                        "и что включён CAN-терминатор 120 Ом (см. «Справка»).",
+                                        f"The ECU does not answer basic UDS diagnostic requests ({exc}). Check +12 V, ground, "
+                                        "CAN-H / CAN-L (gateway T20: Pin 19 and Pin 9; cluster T18: Pin 18 and Pin 17; BCM: 0x70E) "
+                                        "and that 120 Ω CAN termination is on (see “Help”).",
+                                    )
+                                ) from exc
         result["responding"] = True
         reporter.step(2, 2, tr("Чтение идентификации блока", "Reading the ECU identification"))
         for did, ru, en in ECU_IDENT_DIDS:
@@ -1203,14 +1296,26 @@ def can_identify(
             result["ident"].append({"did": f"{did:04X}", "label_ru": ru, "label_en": en, "value": value})
             reporter.info(f"{did:04X} {tr(ru, en)}: {value}")
 
-        if probed_fpke or is_fpke_ident(result["ident"]):
+        if probed_bcm:
+            result["ecu_kind"] = "bcm"
+            result["diag_addr"] = "09"
+            result["uds_tx_id"] = f"0x{BCM_UDS_TX_ID:03X}"
+            result["uds_rx_id"] = f"0x{BCM_UDS_RX_ID:03X}"
+            result["memory_unavailable_reason"] = tr(
+                "Чтение и редактирование дампов BCM (09) запланировано в следующих версиях. "
+                "Сейчас доступны идентификация, чтение/сброс DTC и CAN-терминал.",
+                "BCM (09) memory dump read/edit is planned for a future release. "
+                "UDS identification, DTC read/clear, and the CAN terminal are available now.",
+            )
+            skip_gateway_checks = True
+        elif probed_fpke or is_fpke_ident(result["ident"]):
             result["ecu_kind"] = "fpke"
             result["uds_tx_id"] = f"0x{FPKE_UDS_TX_ID:03X}"
             result["uds_rx_id"] = f"0x{FPKE_UDS_RX_ID:03X}"
             if interface not in FPKE_NATIVE_INTERFACES:
                 fpke_unsupported = tr(
-                    "Работа с приборной панелью Kombi / FPK_E поддерживается только через нативный CAN-адаптер "
-                    "(CANable / SLCAN / candleLight). Чтение и запись через VNCI / D-PDU / J2534 для приборки не поддерживаются.",
+                    "Работа с панелью приборов Kombi / FPK_E поддерживается только через нативный CAN-адаптер "
+                    "(CANable / SLCAN / candleLight). Чтение и запись через VNCI / D-PDU / J2534 для панели приборов не поддерживаются.",
                     "Kombi / FPK_E instrument cluster operations require a native CAN adapter "
                     "(CANable / SLCAN / candleLight). Reading/writing via VNCI / D-PDU / J2534 is not supported for FPK.",
                 )
@@ -1218,10 +1323,10 @@ def can_identify(
                 reporter.warning(fpke_unsupported)
             else:
                 keep_fpke_alive = bus is None
-            break_fpke = True
+            skip_gateway_checks = True
         else:
-            break_fpke = False
-        if not break_fpke:
+            skip_gateway_checks = False
+        if not skip_gateway_checks:
             # Cold-boot FBL Default Session answers `10 03 -> 50 03`, omits Application-only DIDs (`F197`, `0600`),
             # and reports bit 2 (`0x04`, e.g. `0x44`) in `22 F1 DF` when the Application is erased or invalid.
             answered = {item["did"] for item in result["ident"]}

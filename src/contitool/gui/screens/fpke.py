@@ -41,6 +41,7 @@ from contitool.can.fpke import (
     FPKE_NATIVE_INTERFACES,
     can_fpke_full_read,
     can_fpke_read_region,
+    can_fpke_run_level8_action,
     can_fpke_write_dflash,
     close_active_fpke_link,
     fpke_coil_poll_transponder,
@@ -63,6 +64,7 @@ from contitool.core.fpke import (
     format_fpke_immo_comparison,
     format_fpke_report,
     format_fpke_transfer_plan,
+    fpke_derive_k_ffb,
     fpke_s0_s1_from_slots,
     fpke_slots_from_s0_s1,
     fpke_verify_s0_s1,
@@ -170,6 +172,9 @@ class FpkeScreen(QWidget):
         self.runner = runner
         self.is_open = False
         self.source = ""  # "can" or "disk"
+        self.via_gateway: bool = False
+        self.gateway_bridge: bool = False
+        self.gateway_channel: int = 0
         self.folder: Path | None = None
         self.files: dict[str, Path] = {}
         self.ident_items: list[dict[str, str]] = []
@@ -259,6 +264,11 @@ class FpkeScreen(QWidget):
     def open_from_ident(self, ident: dict[str, Any]) -> None:
         self.is_open = True
         self.source = "can"
+        self.via_gateway = bool(ident.get("via_gateway", False))
+        self.gateway_bridge = bool(
+            ident.get("gateway_bridge", ident.get("bridge_available", False))
+        )
+        self.gateway_channel = int(ident.get("gateway_channel") or 0)
         self.ident_items = list(ident.get("ident") or [])
         self._key = "read"
         self.select("read")
@@ -271,9 +281,24 @@ class FpkeScreen(QWidget):
         *,
         folder: Path | None = None,
         source: str = "disk",
+        via_gateway: bool | None = None,
+        gateway_bridge: bool | None = None,
+        gateway_channel: int | None = None,
     ) -> None:
         self.is_open = True
         self.source = source
+        if via_gateway is not None:
+            self.via_gateway = bool(via_gateway)
+        elif source != "can":
+            self.via_gateway = False
+        if gateway_bridge is not None:
+            self.gateway_bridge = bool(gateway_bridge)
+        elif source != "can":
+            self.gateway_bridge = False
+        if gateway_channel is not None:
+            self.gateway_channel = int(gateway_channel)
+        elif source != "can":
+            self.gateway_channel = 0
         self.folder = folder or next((p.parent for p in detected.values()), None)
         self.files = dict(detected)
         self.dflash_info = None
@@ -307,6 +332,10 @@ class FpkeScreen(QWidget):
                     self.dflash_info = rep["secrets"]
                 if not self.extra_info and isinstance(rep.get("extra_analysis"), dict):
                     self.extra_info = rep["extra_analysis"]
+                if source == "can" and via_gateway is None and "via_gateway" in rep:
+                    self.via_gateway = bool(rep.get("via_gateway"))
+                if source == "can" and gateway_bridge is None and "gateway_bridged" in rep:
+                    self.gateway_bridge = bool(rep.get("gateway_bridged"))
             except Exception:
                 pass
 
@@ -354,6 +383,9 @@ class FpkeScreen(QWidget):
         close_active_fpke_link()
         self.is_open = False
         self.source = ""
+        self.via_gateway = False
+        self.gateway_bridge = False
+        self.gateway_channel = 0
         self.folder = None
         self.files.clear()
         self.ident_items.clear()
@@ -453,6 +485,9 @@ class FpkeScreen(QWidget):
             initial_dtcs=self._last_dtcs or [],
             status_sink=self._record_can_status,
             dtcs_sink=self._record_can_dtcs,
+            via_gateway=self.via_gateway,
+            gateway_bridge=self.gateway_bridge,
+            gateway_channel=self.gateway_channel,
             parent=self,
         )
         dlg.note.connect(self.note.emit)
@@ -606,7 +641,7 @@ class FpkeScreen(QWidget):
         picked, _ = QFileDialog.getOpenFileName(
             self,
             tr(
-                "Выберите дамп DataFlash (64 КБ) или Immo-паспорт (.json) старой приборки (Донора)",
+                "Выберите дамп DataFlash (64 КБ) или Immo-паспорт (.json) старой панели приборов (Донора)",
                 "Select 64 KB DataFlash dump or Immo passport (.json) of the old donor cluster",
             ),
             str(self.folder.parent if self.folder else Path.home()),
@@ -986,10 +1021,18 @@ class FpkeScreen(QWidget):
         self.lbl_sys.setText(sys_txt)
 
         is_can = self.source == "can"
-        self.pill_source.setText(
-            tr("Считан по CAN", "Read over CAN") if is_can else tr("Открыт из файлов", "Opened from files")
-        )
-        set_tone(self.pill_source, "info" if is_can else "muted")
+        if self.via_gateway:
+            self.pill_source.setText(
+                tr("Через шлюз J533 (RAM-мост ch0)", "Via J533 gateway (RAM-Bridge ch0)")
+                if self.gateway_bridge
+                else tr("Через шлюз J533 (UDS)", "Via J533 gateway (UDS)")
+            )
+            set_tone(self.pill_source, "ok" if self.gateway_bridge else "info")
+        else:
+            self.pill_source.setText(
+                tr("Считан по CAN", "Read over CAN") if is_can else tr("Открыт из файлов", "Opened from files")
+            )
+            set_tone(self.pill_source, "info" if is_can else "muted")
         self.lbl_folder.setVisible(bool(self.folder))
         if self.folder:
             self.lbl_folder.set_path(self.folder.name)
@@ -1347,9 +1390,80 @@ class FpkeScreen(QWidget):
 
     # ────────────────────────────── Page 1: Immobilizer (Immo 4.0) ──────────────────────────────
 
+    def _build_k_ffb_calculator_card(self, lay: QVBoxLayout, initial_kc: str = "") -> None:
+        """Standalone K_ffb = AES128_ECB_ENC(K_c, C16) calculator card when no DataFlash dump is loaded yet."""
+        sec_calc = _FpkeCanControlPanel._compact_section(Section())
+        sec_calc.set_text(
+            tr("Калькулятор ключа радиоканала K_ffb", "Radio channel secret K_ffb calculator"),
+            tr(
+                "Расчёт 16-байтного секрета радиоканала брелоков K_ffb = AES-128-ECB(K_c, C16) из мастер-ключа панели приборов CS / K_c (EEL 0x68+0x28, ROM C16 @ 0x19DA90) для блока 09 BCM.",
+                "Derive the 16-byte remote key radio-channel secret K_ffb = AES-128-ECB(K_c, C16) from the cluster master key CS / K_c (EEL 0x68+0x28, ROM C16 @ 0x19DA90) for 09 BCM.",
+            ),
+        )
+        row_calc = QHBoxLayout()
+        row_calc.setSpacing(10)
+
+        ed_kc_in = QLineEdit(initial_kc)
+        ed_kc_in.setFont(mono_font(12, bold=True))
+        ed_kc_in.setMinimumWidth(0)
+        ed_kc_in.setPlaceholderText("32 HEX (16 B, EEL 0x68+0x28)")
+        btn_cp_kc_in = button(
+            tr("Копировать", "Copy"),
+            "GhostBtn",
+            slot=lambda: self._copy_hex(ed_kc_in.text(), "CS / Kc"),
+        )
+        c_kc_in, b_kc_in = self._field_box(
+            tr("СЕКРЕТ ИММОБИЛАЙЗЕРА CS / KC (16 БАЙТ)", "IMMOBILIZER SECRET CS / KC (16 BYTES)"),
+            ed_kc_in,
+            trailing=(btn_cp_kc_in,),
+            tip="EEL 0x68 + 0x28..0x37 (16 bytes)",
+        )
+        self._bind_hex_validator(ed_kc_in, b_kc_in, 16)
+
+        ed_kffb_out = QLineEdit()
+        ed_kffb_out.setReadOnly(True)
+        ed_kffb_out.setFont(mono_font(12, bold=True))
+        ed_kffb_out.setMinimumWidth(0)
+        ed_kffb_out.setPlaceholderText("AES-128-ECB(K_c, C16)")
+        btn_cp_kffb_out = button(
+            tr("Копировать", "Copy"),
+            "GhostBtn",
+            slot=lambda: self._copy_hex(ed_kffb_out.text(), "K_ffb"),
+        )
+        c_kffb_out, b_kffb_out = self._field_box(
+            tr("КЛЮЧ РАДИОКАНАЛА K_FFB (16 БАЙТ, ДЛЯ 09 BCM)", "RADIO CHANNEL KEY K_FFB (16 BYTES, FOR 09 BCM)"),
+            ed_kffb_out,
+            trailing=(btn_cp_kffb_out,),
+            tip="K_ffb = AES128_ECB_ENC(K_c, e7ad3585e2f937e81c75df6e47f11a71)",
+        )
+
+        def _sync_standalone_kffb(txt: str) -> None:
+            raw = "".join(txt.split()).replace("0x", "").replace("0X", "").upper()
+            if len(raw) == 32 and all(c in "0123456789ABCDEF" for c in raw) and raw != "FF" * 16:
+                derived = fpke_derive_k_ffb(raw).hex().upper()
+                ed_kffb_out.setText(derived)
+                b_kffb_out.setText("AES_Kc(C16)")
+                set_tone(b_kffb_out, "ok")
+                btn_cp_kffb_out.setEnabled(True)
+            else:
+                ed_kffb_out.setText("")
+                b_kffb_out.setText(tr("нужен K_c", "needs K_c"))
+                set_tone(b_kffb_out, "muted")
+                btn_cp_kffb_out.setEnabled(False)
+            b_kffb_out.setVisible(True)
+
+        ed_kc_in.textChanged.connect(_sync_standalone_kffb)
+        _sync_standalone_kffb(ed_kc_in.text())
+
+        row_calc.addWidget(c_kc_in, 1)
+        row_calc.addWidget(c_kffb_out, 1)
+        sec_calc.body.addLayout(row_calc)
+        lay.addWidget(sec_calc)
+
     def _build_secrets_page(self, lay: QVBoxLayout) -> None:
         if not self.dflash_info:
             self._empty_dflash_callout(lay)
+            self._build_k_ffb_calculator_card(lay)
             return
 
         by_id = {it["key_id"]: it for it in self.dflash_info.get("items", [])}
@@ -1497,7 +1611,43 @@ class FpkeScreen(QWidget):
         )
         self._bind_hex_validator(ed_crc_b, b_crc_b, 4)
 
-        row2.addWidget(c_kc, 6)
+        ed_k_ffb = QLineEdit()
+        ed_k_ffb.setReadOnly(True)
+        ed_k_ffb.setFont(mono_font(12, bold=True))
+        ed_k_ffb.setMinimumWidth(0)
+        ed_k_ffb.setPlaceholderText("AES-128-ECB(K_c, C16)")
+        btn_copy_k_ffb = button(
+            tr("Копировать", "Copy"),
+            "GhostBtn",
+            slot=lambda: self._copy_hex(ed_k_ffb.text(), "K_ffb"),
+        )
+        c_k_ffb, b_k_ffb = self._field_box(
+            tr("КЛЮЧ РАДИОКАНАЛА K_FFB (09 BCM)", "RADIO CHANNEL KEY K_FFB (09 BCM)"),
+            ed_k_ffb,
+            trailing=(btn_copy_k_ffb,),
+            tip="K_ffb = AES128_ECB_ENC(K_c, C16 @ 0x19DA90: e7ad3585e2f937e81c75df6e47f11a71)",
+        )
+
+        def _sync_live_k_ffb(txt: str) -> None:
+            raw = "".join(txt.split()).replace("0x", "").replace("0X", "").upper()
+            if len(raw) == 32 and all(c in "0123456789ABCDEF" for c in raw) and raw != "FF" * 16:
+                derived = fpke_derive_k_ffb(raw).hex().upper()
+                ed_k_ffb.setText(derived)
+                b_k_ffb.setText("AES_Kc(C16)")
+                set_tone(b_k_ffb, "ok")
+                btn_copy_k_ffb.setEnabled(True)
+            else:
+                ed_k_ffb.setText("")
+                b_k_ffb.setText(tr("нужен K_c", "needs K_c"))
+                set_tone(b_k_ffb, "muted")
+                btn_copy_k_ffb.setEnabled(False)
+            b_k_ffb.setVisible(True)
+
+        ed_kc.textChanged.connect(_sync_live_k_ffb)
+        _sync_live_k_ffb(ed_kc.text())
+
+        row2.addWidget(c_kc, 5)
+        row2.addWidget(c_k_ffb, 5)
         row2.addWidget(c_crc_a, 2)
         row2.addWidget(c_crc_b, 2)
         sec_immo.body.addLayout(row2)
@@ -1530,14 +1680,14 @@ class FpkeScreen(QWidget):
         dt_lay.setSpacing(4)
         dt_top = QHBoxLayout()
         dt_top.setSpacing(4)
-        lbl_dash_t = QLabel(tr("Приборка", "Cluster"))
+        lbl_dash_t = QLabel(tr("Панель приборов", "Cluster"))
         lbl_dash_t.setObjectName("FieldLabel")
+        lbl_dash_t.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         lbl_dash_tag = QLabel("DASH")
         lbl_dash_tag.setFont(mono_font(10))
         set_tone(lbl_dash_tag, "info")
-        dt_top.addWidget(lbl_dash_t)
-        dt_top.addStretch(1)
-        dt_top.addWidget(lbl_dash_tag)
+        dt_top.addWidget(lbl_dash_t, 1)
+        dt_top.addWidget(lbl_dash_tag, 0)
         dt_lay.addLayout(dt_top)
 
         ed_mac_dash = QLineEdit(immo_cfg.get("cluster_mac_id") or "")
@@ -1673,7 +1823,7 @@ class FpkeScreen(QWidget):
         sec_cp.set_text(
             tr("Защита компонентов (CP)", "Component Protection (CP)"),
             tr(
-                "Индивидуальный ключ IKA (/3, 00BE) связывает приборку со шлюзом J533; ключ слота /1 (GFA, 00BD) используется для обмена с узлом 0x0E (BCM 09, радиоканал ключей) и проверки 0x29E→0x29F.",
+                "Индивидуальный ключ IKA (/3, 00BE) связывает панель приборов со шлюзом J533; ключ слота /1 (GFA, 00BD) используется для обмена с узлом 0x0E (BCM 09, радиоканал ключей) и проверки 0x29E→0x29F.",
                 "The 16-byte IKA (/3, 00BE) key binds the cluster to the J533 gateway; the /1 slot key (GFA, 00BD) is used for channel 3 node 0x0E (BCM 09, remote key sync) and 0x29E→0x29F.",
             ),
         )
@@ -1808,11 +1958,13 @@ class FpkeScreen(QWidget):
     def _build_keys_page(self, lay: QVBoxLayout) -> None:
         if not self.dflash_info:
             self._empty_dflash_callout(lay)
+            self._build_k_ffb_calculator_card(lay)
             return
 
         tp = self.dflash_info.get("transponder_records") or {}
         meta = self.dflash_info.get("metadata") or {}
         odo = self.dflash_info.get("odometer") or {}
+        immo_cfg = self.dflash_info.get("immo_config") or {}
         learned = int(tp.get("learned_keys", 0))
         allowed = int(tp.get("allowed_keys", 8) or 8)
         xor_fl = int(tp.get("session_xor_flags", 0))
@@ -1867,8 +2019,30 @@ class FpkeScreen(QWidget):
         if cur_cod:
             self._bind_hex_validator(ed_coding, b_cod, 20, allow_empty=True)
 
+        cur_k_ffb = str(immo_cfg.get("k_ffb_hex") or "").upper()
+        ed_keys_kffb = QLineEdit(cur_k_ffb)
+        ed_keys_kffb.setReadOnly(True)
+        ed_keys_kffb.setFont(mono_font(12, bold=True))
+        ed_keys_kffb.setMinimumWidth(0)
+        ed_keys_kffb.setPlaceholderText("AES-128-ECB(K_c, C16)")
+        btn_cp_keys_kffb = button(
+            tr("Копировать", "Copy"),
+            "GhostBtn",
+            slot=lambda: self._copy_hex(ed_keys_kffb.text(), "K_ffb"),
+        )
+        btn_cp_keys_kffb.setEnabled(bool(cur_k_ffb))
+        c_keys_kffb, _ = self._field_box(
+            tr("КЛЮЧ РАДИОКАНАЛА K_FFB (09 BCM)", "RADIO CHANNEL KEY K_FFB (09 BCM)"),
+            ed_keys_kffb,
+            badge_text="AES_Kc(C16)" if cur_k_ffb else tr("нет K_c", "no K_c"),
+            badge_tone="ok" if cur_k_ffb else "muted",
+            trailing=(btn_cp_keys_kffb,),
+            tip="K_ffb = AES128_ECB_ENC(K_c, C16 @ 0x19DA90: e7ad3585e2f937e81c75df6e47f11a71)",
+        )
+
         odo_row.addWidget(c_odo, 2)
-        odo_row.addWidget(c_cod, 5)
+        odo_row.addWidget(c_cod, 4)
+        odo_row.addWidget(c_keys_kffb, 4)
         sec_odo.body.addLayout(odo_row)
         lay.addWidget(sec_odo)
 
@@ -2040,7 +2214,7 @@ class FpkeScreen(QWidget):
             sec_donor.head.addWidget(status_readout(tr("Не выбран", "Not loaded"), "warn"), 0, Qt.AlignmentFlag.AlignVCenter)
             lbl_empty_d = QLabel(
                 tr(
-                    "Загрузите дамп DataFlash (64 КБ) или сохранённый Immo-паспорт (.json) родной приборки автомобиля, "
+                    "Загрузите дамп DataFlash (64 КБ) или сохранённый Immo-паспорт (.json) родной панели приборов автомобиля, "
                     "из которой нужно перенести иммобилайзер, ключи и пробег.",
                     "Load the 64 KB DataFlash dump or exported Immo passport (.json) of the car's original cluster "
                     "to transfer its immobilizer identity, keys, and mileage.",
@@ -2229,7 +2403,7 @@ class FpkeScreen(QWidget):
         sec_apply.body.addWidget(
             _xfer_option_row(
                 self._xfer_odo,
-                tr("Пробег со старой приборки", "Odometer from donor cluster"),
+                tr("Пробег со старой панели приборов", "Odometer from donor cluster"),
                 prev_odo,
                 lambda v: setattr(self, "_xfer_odo", bool(v)),
             )
@@ -2393,18 +2567,30 @@ class FpkeScreen(QWidget):
     def _build_read_page(self, lay: QVBoxLayout) -> None:
         busy = self.runner.is_busy
         iface = self.conn.interface or "slcan"
-        native_ok = iface in FPKE_NATIVE_INTERFACES
+        native_ok = iface in FPKE_NATIVE_INTERFACES and (not self.via_gateway or self.gateway_bridge)
 
         if not native_ok:
             warn = Callout("err")
-            warn.label.setText(
-                tr(
-                    f"<b>Выбран адаптер «{iface}».</b> Для чтения приборной панели требуется нативный CAN-адаптер "
-                    "(CANable / SLCAN / candleLight).",
-                    f"<b>Adapter “{iface}” is selected.</b> Reading this instrument cluster requires a native CAN adapter "
-                    "(CANable / SLCAN / candleLight).",
+            if self.via_gateway and not self.gateway_bridge:
+                warn.label.setText(
+                    tr(
+                        "<b>Чтение памяти уровня 8 через этот шлюз недоступно.</b> "
+                        "Для прозрачного RAM-моста требуется шлюз Continental 3Q0 907 530 и нативный CAN-адаптер "
+                        "(CANable / SLCAN / candleLight), либо прямое подключение к CAN приборной панели (T18).",
+                        "<b>Level-8 memory access is unavailable through this gateway.</b> "
+                        "Transparent RAM-bridging requires a Continental 3Q0 907 530 gateway and a native CAN adapter "
+                        "(CANable / SLCAN / candleLight), or a direct connection to the cluster CAN bus (T18).",
+                    )
                 )
-            )
+            else:
+                warn.label.setText(
+                    tr(
+                        f"<b>Выбран адаптер «{iface}».</b> Для чтения приборной панели требуется нативный CAN-адаптер "
+                        "(CANable / SLCAN / candleLight).",
+                        f"<b>Adapter “{iface}” is selected.</b> Reading this instrument cluster requires a native CAN adapter "
+                        "(CANable / SLCAN / candleLight).",
+                    )
+                )
             lay.addWidget(warn)
 
         sec_full = Section()
@@ -2415,6 +2601,23 @@ class FpkeScreen(QWidget):
                 "Reads DataFlash (64 KB) and the MCU configuration Extra Area (256 B). Nothing is written to flash.",
             ),
         )
+        if self.via_gateway and self.gateway_bridge and iface in FPKE_NATIVE_INTERFACES:
+            gw_badge = status_readout(
+                tr(
+                    f"Через шлюз J533 (RAM-мост ch{self.gateway_channel})",
+                    f"Via J533 gateway (RAM-Bridge ch{self.gateway_channel})",
+                ),
+                "ok",
+            )
+            gw_badge.setToolTip(
+                tr(
+                    "На время чтения или записи памяти шлюз J533 автоматически переводится в прозрачный двунаправленный "
+                    "CAN-мост (Diagnosis CAN ↔ Komfort CAN), а по завершении возвращается в штатный режим.",
+                    "During memory read or write, the J533 gateway automatically acts as a transparent bidirectional "
+                    "CAN bridge (Diagnosis CAN ↔ Komfort CAN) and returns to Application mode on completion.",
+                )
+            )
+            sec_full.head.addWidget(gw_badge, 0, Qt.AlignmentFlag.AlignVCenter)
 
         opts = QGridLayout()
         opts.setHorizontalSpacing(24)
@@ -2517,6 +2720,10 @@ class FpkeScreen(QWidget):
         read_bf = self._opt_bflash
         read_cf = self._opt_cflash
 
+        via_gw = self.via_gateway
+        gw_bridge = self.gateway_bridge
+        gw_ch = self.gateway_channel
+
         def task(rep: Any) -> dict[str, Any]:
             return can_fpke_full_read(
                 port,
@@ -2527,7 +2734,10 @@ class FpkeScreen(QWidget):
                 read_bflash=read_bf,
                 read_cflash=read_cf,
                 ident=ident_list,
-                keep_open=True,
+                keep_open=not via_gw,
+                via_gateway=via_gw,
+                gateway_bridge=gw_bridge,
+                gateway_channel=gw_ch,
                 reporter=rep,
             )
 
@@ -2537,7 +2747,14 @@ class FpkeScreen(QWidget):
             out_folder = Path(str(res.get("session_dir", sdir)))
             detected = detect_fpke_files([out_folder])
             self.idauth_info = res.get("idauth")
-            self.open_from_files(detected, folder=out_folder, source="can")
+            self.open_from_files(
+                detected,
+                folder=out_folder,
+                source="can",
+                via_gateway=via_gw,
+                gateway_bridge=gw_bridge,
+                gateway_channel=gw_ch,
+            )
 
         self.runner.run_task(
             tr("Чтение памяти блока", "Reading the ECU memory"),
@@ -2555,6 +2772,9 @@ class FpkeScreen(QWidget):
             f"fpke_{mode}",
             dumps=True,
         )
+        via_gw = self.via_gateway
+        gw_bridge = self.gateway_bridge
+        gw_ch = self.gateway_channel
 
         def task(rep: Any) -> dict[str, Any]:
             return can_fpke_read_region(
@@ -2563,7 +2783,10 @@ class FpkeScreen(QWidget):
                 interface=iface,
                 session_dir=sdir,
                 use_stream=use_stream,
-                keep_open=True,
+                keep_open=not via_gw,
+                via_gateway=via_gw,
+                gateway_bridge=gw_bridge,
+                gateway_channel=gw_ch,
                 reporter=rep,
             )
 
@@ -2574,7 +2797,14 @@ class FpkeScreen(QWidget):
             detected = detect_fpke_files([out_folder])
             merged = dict(self.files)
             merged.update(detected)
-            self.open_from_files(merged, folder=out_folder, source="can")
+            self.open_from_files(
+                merged,
+                folder=out_folder,
+                source="can",
+                via_gateway=via_gw,
+                gateway_bridge=gw_bridge,
+                gateway_channel=gw_ch,
+            )
 
         self.runner.run_task(
             tr(f"Чтение области {mode.upper()}", f"Reading {mode.upper()} area"),
@@ -2676,6 +2906,18 @@ class FpkeScreen(QWidget):
                 ),
             )
             return
+        if self.via_gateway and not self.gateway_bridge:
+            QMessageBox.warning(
+                self,
+                tr("RAM-мост недоступен", "RAM bridge unavailable"),
+                tr(
+                    "Запись DataFlash приборной панели через шлюз требует шлюз Continental 3Q0 907 530 с поддержкой "
+                    "прозрачного RAM-моста, либо прямое подключение к CAN приборной панели (T18).",
+                    "Writing cluster DataFlash through a gateway requires a Continental 3Q0 907 530 gateway with "
+                    "transparent RAM-bridging, or a direct connection to the cluster CAN bus (T18).",
+                ),
+            )
+            return
 
         if confirm:
             bullets = "\n".join(f"  • {line}" for line in (chg.get("lines") or []))
@@ -2714,6 +2956,10 @@ class FpkeScreen(QWidget):
             dumps=True,
         )
 
+        via_gw = self.via_gateway
+        gw_bridge = self.gateway_bridge
+        gw_ch = self.gateway_channel
+
         def task(rep: Any) -> dict[str, Any]:
             return can_fpke_write_dflash(
                 port,
@@ -2725,7 +2971,10 @@ class FpkeScreen(QWidget):
                 wake_seconds=self._wake_seconds,
                 full_rewrite=full_rewrite,
                 reset_after=True,
-                keep_open=True,
+                keep_open=not via_gw,
+                via_gateway=via_gw,
+                gateway_bridge=gw_bridge,
+                gateway_channel=gw_ch,
                 reporter=rep,
             )
 
@@ -2779,6 +3028,18 @@ class FpkeScreen(QWidget):
                 ),
             )
             return
+        if self.via_gateway and not self.gateway_bridge:
+            QMessageBox.warning(
+                self,
+                tr("RAM-мост недоступен", "RAM bridge unavailable"),
+                tr(
+                    "Запись DataFlash приборной панели через шлюз требует шлюз Continental 3Q0 907 530 с поддержкой "
+                    "прозрачного RAM-моста, либо прямое подключение к CAN приборной панели (T18).",
+                    "Writing cluster DataFlash through a gateway requires a Continental 3Q0 907 530 gateway with "
+                    "transparent RAM-bridging, or a direct connection to the cluster CAN bus (T18).",
+                ),
+            )
+            return
 
         _, cf_bytes = self._own_dflash_and_cflash()
         if confirm:
@@ -2807,6 +3068,10 @@ class FpkeScreen(QWidget):
             dumps=True,
         )
 
+        via_gw = self.via_gateway
+        gw_bridge = self.gateway_bridge
+        gw_ch = self.gateway_channel
+
         def task(rep: Any) -> dict[str, Any]:
             return can_fpke_write_dflash(
                 port,
@@ -2818,7 +3083,10 @@ class FpkeScreen(QWidget):
                 wake_seconds=self._wake_seconds,
                 full_rewrite=True,
                 reset_after=True,
-                keep_open=True,
+                keep_open=not via_gw,
+                via_gateway=via_gw,
+                gateway_bridge=gw_bridge,
+                gateway_channel=gw_ch,
                 reporter=rep,
             )
 
@@ -2839,6 +3107,9 @@ class FpkeScreen(QWidget):
             initial_dtcs=self._last_dtcs or [],
             status_sink=self._record_can_status,
             dtcs_sink=self._record_can_dtcs,
+            via_gateway=self.via_gateway,
+            gateway_bridge=self.gateway_bridge,
+            gateway_channel=self.gateway_channel,
         )
         panel.note.connect(self.note.emit)
         panel.state_changed.connect(self._refresh_nav)
@@ -2886,6 +3157,9 @@ class FpkeScreen(QWidget):
             initial_s1_hex=self._cached_s1_hex,
             on_s0_s1_cached=_on_s0_s1_cached,
             on_learned_keys_synced=_on_learned_keys_synced,
+            via_gateway=self.via_gateway,
+            gateway_bridge=self.gateway_bridge,
+            gateway_channel=self.gateway_channel,
             parent=self.window(),
         )
         dlg.note.connect(self.note.emit)
@@ -3065,6 +3339,9 @@ class _FpkeCanControlPanel(QWidget):
         initial_dtcs: list[dict[str, Any]] | None = None,
         status_sink: Callable[[str, str], None] | None = None,
         dtcs_sink: Callable[[list[dict[str, Any]]], None] | None = None,
+        via_gateway: bool = False,
+        gateway_bridge: bool = False,
+        gateway_channel: int = 0,
     ) -> None:
         super().__init__(parent)
         self.conn = conn
@@ -3076,6 +3353,10 @@ class _FpkeCanControlPanel(QWidget):
         self._dtcs_sink = dtcs_sink
         self._last_dtcs: list[dict[str, Any]] = list(initial_dtcs or [])
         self._proc_buttons: list[QWidget] = []
+        self._mfl_buttons: list[QWidget] = []
+        self.via_gateway = bool(via_gateway)
+        self.gateway_bridge = bool(gateway_bridge)
+        self.gateway_channel = int(gateway_channel)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -3137,14 +3418,18 @@ class _FpkeCanControlPanel(QWidget):
 
     def _ensure_link(self):
         link = get_active_fpke_link(self.conn.port or None, self.conn.interface or None)
-        if link is not None:
+        if link is not None and link.via_gateway == self.via_gateway:
             return link
         if not ensure_ready(self.conn, self):
             return None
         if not _qt_valid(self):
             return None
         try:
-            return open_or_reuse_fpke_link(self.conn.port, interface=self.conn.interface or "slcan")
+            return open_or_reuse_fpke_link(
+                self.conn.port,
+                interface=self.conn.interface or "slcan",
+                via_gateway=self.via_gateway,
+            )
         except Exception as exc:
             self._set_status(str(exc), "err")
             return None
@@ -3354,6 +3639,7 @@ class _FpkeCanControlPanel(QWidget):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             if tip:
                 b.setToolTip(tip)
+            self._mfl_buttons.append(b)
             return b
 
         btn_assist = mfl_btn(
@@ -3593,14 +3879,36 @@ class _FpkeCanControlPanel(QWidget):
     def _run_proc(self, proc_id: str, title: str) -> None:
         if self.runner.is_busy:
             return
-        link = self._ensure_link()
-        if link is None or not _qt_valid(self):
-            return
+        needs_l8 = proc_id == "ensure_level8"
+        if self.via_gateway and needs_l8:
+            if not ensure_ready(self.conn, self) or not _qt_valid(self):
+                return
+            port = self.conn.port
+            iface = self.conn.interface or "slcan"
+            via_gw = self.via_gateway
+            gw_br = self.gateway_bridge
+            gw_ch = self.gateway_channel
+
+            def task(rep: Any) -> dict[str, Any]:
+                return can_fpke_run_level8_action(
+                    port,
+                    lambda lnk, r: fpke_run_procedure(lnk, proc_id, reporter=r),
+                    interface=iface,
+                    via_gateway=via_gw,
+                    gateway_bridge=gw_br,
+                    gateway_channel=gw_ch,
+                    reporter=rep,
+                )
+        else:
+            link = self._ensure_link()
+            if link is None or not _qt_valid(self):
+                return
+
+            def task(rep: Any) -> dict[str, Any]:
+                return fpke_run_procedure(link, proc_id, reporter=rep)
+
         sink = self._status_sink
         dtcs_sink = self._dtcs_sink
-
-        def task(rep: Any) -> dict[str, Any]:
-            return fpke_run_procedure(link, proc_id, reporter=rep)
 
         def done(res: dict[str, Any]) -> None:
             summary = str(res.get("summary", title))
@@ -3639,8 +3947,23 @@ class _FpkeCanControlPanel(QWidget):
         if not _qt_valid(self) or not _qt_valid(self.sw_kl15):
             return
         link = get_active_fpke_link()
-        kl15_on = bool(link and link.is_keepalive_running())
-        drv_on = bool(link and link.is_drive_simulation_running())
+        direct_only = not self.via_gateway
+        gw_tip = (
+            tr(
+                "Доступно только при прямом подключении к CAN приборной панели (T18). Через шлюз J533 работают UDS-процедуры.",
+                "Available only on a direct connection to the cluster CAN bus (T18). UDS procedures work via J533 gateway.",
+            )
+            if not direct_only
+            else ""
+        )
+        for ctrl in (self.sw_kl15, self.sw_drive, self.sld_speed, self.sld_rpm, self.btn_auto_sweep, *self._mfl_buttons):
+            if _qt_valid(ctrl):
+                ctrl.setEnabled(direct_only and not self.runner.is_busy)
+                if not direct_only:
+                    ctrl.setToolTip(gw_tip)
+
+        kl15_on = bool(direct_only and link and link.is_keepalive_running())
+        drv_on = bool(direct_only and link and link.is_drive_simulation_running())
         lvl8_on = bool(link and link.level8_active)
 
         self.sw_kl15.blockSignals(True)
@@ -3654,7 +3977,15 @@ class _FpkeCanControlPanel(QWidget):
         if link is not None and drv_on and link.sim_auto_sweep and not self._sweep_timer.isActive():
             self._sweep_timer.start()
 
-        if lvl8_on:
+        if self.via_gateway:
+            self.lbl_access_state.setText(
+                tr("Через шлюз J533 (RAM-мост)", "Via J533 gateway (RAM-Bridge)")
+                if self.gateway_bridge
+                else tr("Через шлюз J533 (UDS)", "Via J533 gateway (UDS)")
+            )
+            set_tone(self.lbl_access_state, "ok" if self.gateway_bridge else "info")
+            self.lbl_access_state.setVisible(True)
+        elif lvl8_on:
             self.lbl_access_state.setText(tr("● Уровень 8", "● Level 8"))
             set_tone(self.lbl_access_state, "ok")
             self.lbl_access_state.setVisible(True)
@@ -3683,6 +4014,9 @@ class FpkeCanDialog(Dialog):
         initial_dtcs: list[dict[str, Any]] | None = None,
         status_sink: Callable[[str, str], None] | None = None,
         dtcs_sink: Callable[[list[dict[str, Any]]], None] | None = None,
+        via_gateway: bool = False,
+        gateway_bridge: bool = False,
+        gateway_channel: int = 0,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(
@@ -3704,6 +4038,9 @@ class FpkeCanDialog(Dialog):
             initial_dtcs=initial_dtcs,
             status_sink=status_sink,
             dtcs_sink=dtcs_sink,
+            via_gateway=via_gateway,
+            gateway_bridge=gateway_bridge,
+            gateway_channel=gateway_channel,
         )
         self.panel.note.connect(self.note.emit)
         self.panel.state_changed.connect(self._adjust_for_result)
@@ -3737,8 +4074,14 @@ class FpkeCoilKeyLearnDialog(Dialog):
         initial_s1_hex: str = "",
         on_s0_s1_cached: Callable[[str, str], None] | None = None,
         on_learned_keys_synced: Callable[[list[str], int, int], None] | None = None,
+        via_gateway: bool = False,
+        gateway_bridge: bool = False,
+        gateway_channel: int = 0,
         parent: QWidget | None = None,
     ) -> None:
+        self.via_gateway = bool(via_gateway)
+        self.gateway_bridge = bool(gateway_bridge)
+        self.gateway_channel = int(gateway_channel)
         by_id = {it["key_id"]: it for it in dflash_info.get("items", [])}
         meta = dflash_info.get("metadata") or {}
         immo_cfg = dflash_info.get("immo_config") or {}
@@ -3926,7 +4269,7 @@ class FpkeCoilKeyLearnDialog(Dialog):
         lbl_lrn_hint = QLabel(
             tr(
                 "По очереди прикладывайте каждый ключ к катушке и нажимайте «2. Обучить ключ в катушке (40 00)». "
-                "В чистую болванку Megamos AES (бит 1 в 0x01F = 1) приборка запишет K_c, слоты A/B и метку 0x9911 (~3–5 с).",
+                "В чистую болванку Megamos AES (бит 1 в 0x01F = 1) панель приборов запишет K_c, слоты A/B и метку 0x9911 (~3–5 с).",
                 "Place each key on the coil one by one and click “2. Learn key in coil (40 00)”. "
                 "For a blank Megamos AES chip (bit 1 of 0x01F = 1), the cluster writes K_c, slots A/B, and marker 0x9911 (~3–5 s).",
             )
@@ -4011,10 +4354,57 @@ class FpkeCoilKeyLearnDialog(Dialog):
         if not ensure_ready(self.conn, self):
             return None
         try:
-            return open_or_reuse_fpke_link(self.conn.port, interface=self.conn.interface)
+            return open_or_reuse_fpke_link(
+                self.conn.port,
+                interface=self.conn.interface,
+                via_gateway=self.via_gateway,
+            )
         except Exception as exc:
             self._set_status(str(exc), "err")
             return None
+
+    def _run_l8_task(
+        self,
+        title: str,
+        fn: Callable[[Any, Any], dict[str, Any]],
+        on_done: Callable[[dict[str, Any]], None],
+        *,
+        needs_level8: bool = True,
+    ) -> None:
+        if self.runner.is_busy:
+            return
+        if self.via_gateway and needs_level8:
+            if not ensure_ready(self.conn, self):
+                return
+            port = self.conn.port
+            iface = self.conn.interface or "slcan"
+            via_gw = self.via_gateway
+            gw_br = self.gateway_bridge
+            gw_ch = self.gateway_channel
+
+            def task(rep: Any) -> dict[str, Any]:
+                return can_fpke_run_level8_action(
+                    port,
+                    fn,
+                    interface=iface,
+                    via_gateway=via_gw,
+                    gateway_bridge=gw_br,
+                    gateway_channel=gw_ch,
+                    reporter=rep,
+                )
+        else:
+            link = self._ensure_link()
+            if link is None:
+                return
+
+            def task(rep: Any) -> dict[str, Any]:
+                return fn(link, rep)
+
+        self.runner.run_task(
+            title,
+            task,
+            on_success=lambda res: QTimer.singleShot(0, lambda: on_done(res)),
+        )
 
     def _set_status(self, msg: str, tone: str = "info") -> None:
         if not _qt_valid(self) or not _qt_valid(self.lbl_live_status):
@@ -4049,21 +4439,8 @@ class FpkeCoilKeyLearnDialog(Dialog):
         )
 
     def run_extract_s0_s1(self) -> None:
-        if self.runner.is_busy:
-            return
-        link = self._ensure_link()
-        if link is None:
-            return
         exp_a = self._expected_crc_a or None
         exp_b = self._expected_crc_b or None
-
-        def task(rep: Any) -> dict[str, Any]:
-            return fpke_extract_live_s0_s1_from_coil(
-                link,
-                expected_crc_a_le=exp_a,
-                expected_crc_b_le=exp_b,
-                reporter=rep,
-            )
 
         def done(res: dict[str, Any]) -> None:
             if not _qt_valid(self):
@@ -4073,26 +4450,35 @@ class FpkeCoilKeyLearnDialog(Dialog):
             self._update_s01_validation()
             self._set_status(str(res.get("summary") or ""), "ok")
 
-        self.runner.run_task(
-            tr("Чтение S0 / S1 из ОЗУ приборки", "Extracting S0 / S1 from cluster RAM"),
-            task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+        self._run_l8_task(
+            tr("Чтение S0 / S1 из ОЗУ панели приборов", "Extracting S0 / S1 from cluster RAM"),
+            lambda lnk, rep: fpke_extract_live_s0_s1_from_coil(
+                lnk,
+                expected_crc_a_le=exp_a,
+                expected_crc_b_le=exp_b,
+                reporter=rep,
+            ),
+            done,
         )
 
     def run_prepare_additive_mode4(self) -> None:
-        if self.runner.is_busy:
-            return
-        link = self._ensure_link()
-        if link is None:
-            return
         s0_h = self._clean_hex(self.ed_s0.text())
         s1_h = self._clean_hex(self.ed_s1.text())
         target_n = self.spn_target_keys.value()
         existing_ids = list(self._existing_key_ids)
 
-        def task(rep: Any) -> dict[str, Any]:
-            return fpke_prepare_additive_coil_learning(
-                link,
+        def done(res: dict[str, Any]) -> None:
+            if not _qt_valid(self):
+                return
+            self._set_status(str(res.get("summary") or ""), "ok")
+
+        self._run_l8_task(
+            tr(
+                "Активация режима дообучения 5 в ОЗУ (без удаления старых ключей)",
+                "Activating additive learning mode 5 in RAM (keeping existing keys)",
+            ),
+            lambda lnk, rep: fpke_prepare_additive_coil_learning(
+                lnk,
                 s0_hex=s0_h,
                 s1_hex=s1_h,
                 kc_hex=self._kc_hex,
@@ -4101,35 +4487,24 @@ class FpkeCoilKeyLearnDialog(Dialog):
                 expected_crc_a_le=self._expected_crc_a or None,
                 expected_crc_b_le=self._expected_crc_b or None,
                 reporter=rep,
-            )
+            ),
+            done,
+        )
+
+    def run_start_learning_02f7(self) -> None:
+        s0_h = self._clean_hex(self.ed_s0.text())
+        s1_h = self._clean_hex(self.ed_s1.text())
+        target_n = self.spn_target_keys.value()
 
         def done(res: dict[str, Any]) -> None:
             if not _qt_valid(self):
                 return
             self._set_status(str(res.get("summary") or ""), "ok")
 
-        self.runner.run_task(
-            tr(
-                "Активация режима дообучения 5 в ОЗУ (без удаления старых ключей)",
-                "Activating additive learning mode 5 in RAM (keeping existing keys)",
-            ),
-            task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
-        )
-
-    def run_start_learning_02f7(self) -> None:
-        if self.runner.is_busy:
-            return
-        link = self._ensure_link()
-        if link is None:
-            return
-        s0_h = self._clean_hex(self.ed_s0.text())
-        s1_h = self._clean_hex(self.ed_s1.text())
-        target_n = self.spn_target_keys.value()
-
-        def task(rep: Any) -> dict[str, Any]:
-            return fpke_start_coil_key_learning(
-                link,
+        self._run_l8_task(
+            tr("Открытие режима обучения ключей (2E 02F7)", "Opening key learning session (2E 02F7)"),
+            lambda lnk, rep: fpke_start_coil_key_learning(
+                lnk,
                 vin=self._vin,
                 s0_hex=s0_h,
                 s1_hex=s1_h,
@@ -4142,50 +4517,26 @@ class FpkeCoilKeyLearnDialog(Dialog):
                 expected_crc_a_le=self._expected_crc_a or None,
                 expected_crc_b_le=self._expected_crc_b or None,
                 reporter=rep,
-            )
-
-        def done(res: dict[str, Any]) -> None:
-            if not _qt_valid(self):
-                return
-            self._set_status(str(res.get("summary") or ""), "ok")
-
-        self.runner.run_task(
-            tr("Открытие режима обучения ключей (2E 02F7)", "Opening key learning session (2E 02F7)"),
-            task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+            ),
+            done,
+            needs_level8=False,
         )
 
     def run_learn_next_key(self) -> None:
-        if self.runner.is_busy:
-            return
-        link = self._ensure_link()
-        if link is None:
-            return
-
-        def task(rep: Any) -> dict[str, Any]:
-            return fpke_learn_next_key_on_coil(link, param=0x00, reporter=rep)
-
         def done(res: dict[str, Any]) -> None:
             if not _qt_valid(self):
                 return
             self._set_status(str(res.get("summary") or ""), "ok")
 
-        self.runner.run_task(
+        self._run_l8_task(
             tr("Обучение ключа в штатной катушке (2E 02E1 40 00)", "Learning key in stock LF coil (2E 02E1 40 00)"),
-            task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+            lambda lnk, rep: fpke_learn_next_key_on_coil(lnk, param=0x00, reporter=rep),
+            done,
+            needs_level8=False,
         )
 
     def run_finish_learning(self) -> None:
-        if self.runner.is_busy:
-            return
-        link = self._ensure_link()
-        if link is None:
-            return
         sync_ch3 = self.chk_sync_ch3.isChecked()
-
-        def task(rep: Any) -> dict[str, Any]:
-            return fpke_finish_coil_key_learning(link, sync_channel3=sync_ch3, reporter=rep)
 
         def done(res: dict[str, Any]) -> None:
             if not _qt_valid(self):
@@ -4196,8 +4547,9 @@ class FpkeCoilKeyLearnDialog(Dialog):
             if learned_ids and self._on_learned_keys_synced is not None:
                 self._on_learned_keys_synced(learned_ids, learned_cnt, learned_cnt)
 
-        self.runner.run_task(
+        self._run_l8_task(
             tr("Завершение обучения ключей (2E 02E1 80 00)", "Finishing key learning (2E 02E1 80 00)"),
-            task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+            lambda lnk, rep: fpke_finish_coil_key_learning(lnk, sync_channel3=sync_ch3, reporter=rep),
+            done,
+            needs_level8=bool((self._key_flags & 0x80) and self.gateway_bridge),
         )

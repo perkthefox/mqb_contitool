@@ -749,6 +749,62 @@ def build_stylesheet() -> str:
         border: 1px solid #262A33;
         border-radius: 8px;
     }}
+    QFrame#TargetCard {{
+        background-color: #15171C;
+        border: 1px solid #282C36;
+        border-radius: 7px;
+    }}
+    QFrame#TargetCard:hover {{
+        background-color: #1A1D24;
+        border-color: #3A4050;
+    }}
+    QFrame#TargetCard[selected="true"] {{
+        background-color: #172236;
+        border: 1px solid {ACCENT_HOVER};
+    }}
+    QFrame#DropStrip {{
+        background-color: #191B20;
+        border: 1px dashed #323744;
+        border-radius: 8px;
+    }}
+    QFrame#DropStrip:hover {{
+        border-color: #464D5E;
+        background-color: #1C1E24;
+    }}
+    QFrame#DropStrip[drag="true"] {{
+        border: 1px dashed {ACCENT_HOVER};
+        background-color: #162033;
+    }}
+    QLabel#AddrBadge {{
+        background-color: #20242E;
+        color: {TEXT_SECONDARY};
+        border: 1px solid #2E3340;
+        border-radius: 4px;
+        padding: 1px 6px;
+        font-weight: bold;
+    }}
+    QLabel#AddrBadge[tone="accent"] {{
+        background-color: #1A2B4C;
+        color: #82B1FF;
+        border-color: #2E4D88;
+    }}
+    QLabel#AddrBadge[tone="ok"] {{
+        background-color: #152B22;
+        color: #5CD09D;
+        border-color: #244F3D;
+    }}
+    QLabel#AddrBadge[tone="can"] {{
+        background-color: #241E38;
+        color: #B9A5FA;
+        border-color: #3F3466;
+    }}
+    QLabel#DumpTag {{
+        background-color: #14161B;
+        color: {TEXT_SECONDARY};
+        border: 1px solid #262A34;
+        border-radius: 4px;
+        padding: 1px 6px;
+    }}
 
     /* ── Tabs ── */
     QTabWidget::pane {{

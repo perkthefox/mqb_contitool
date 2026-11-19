@@ -327,6 +327,7 @@ class TerminalScreen(QWidget):
         self.cmb_target = QComboBox()
         self.cmb_target.addItem("", ("710", "77A"))
         self.cmb_target.addItem("", ("714", "77E"))
+        self.cmb_target.addItem("", ("70E", "778"))
         self.cmb_target.currentIndexChanged.connect(self._on_target_changed)
         self.ed_tx = self._id_edit("710")
         self.ed_rx = self._id_edit("77A")
@@ -358,8 +359,9 @@ class TerminalScreen(QWidget):
             self.ed_rx.setText(pair[1])
 
     def set_target_ecu(self, kind: str) -> None:
-        """Select default UDS IDs for gateway (`j533` -> 710/77A) or instrument cluster (`fpke` -> 714/77E)."""
-        idx = 1 if kind == "fpke" else 0
+        """Select default UDS IDs for gateway (`j533`), instrument cluster (`fpke`), or BCM (`bcm`)."""
+        idx_map = {"j533": 0, "fpke": 1, "bcm": 2}
+        idx = idx_map.get(kind.strip().lower(), 0)
         self.cmb_target.setCurrentIndex(idx)
         self._on_target_changed(idx)
 
@@ -425,6 +427,7 @@ class TerminalScreen(QWidget):
         self.btn_mode_uds.setText(tr("UDS-запрос", "UDS request"))
         self.cmb_target.setItemText(0, tr("Шлюз (710/77A)", "Gateway (710/77A)"))
         self.cmb_target.setItemText(1, tr("Панель (714/77E)", "Cluster (714/77E)"))
+        self.cmb_target.setItemText(2, tr("BCM (70E/778)", "BCM (70E/778)"))
         self.lbl_id.setText("ID")
         self.lbl_data_frame.setText(tr("Данные / шаблон", "Data / preset"))
         self.lbl_tx.setText(tr("Запрос", "Request"))

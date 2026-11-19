@@ -2257,3 +2257,64 @@ def test_fpke_sw1703_and_sw1711_level8_read_and_write(tmp_path: Path) -> None:
         link.close()
         close_active_fpke_link()
 
+
+def test_fpke_k_ffb_derivation_and_gui_calculator(tmp_path: Path) -> None:
+    from PySide6.QtWidgets import QApplication, QLineEdit
+
+    from contitool.core.bcm import bcm_derive_k_ffb
+    from contitool.fpke import (
+        FPKE_FFB_C16,
+        aes128_ecb_encrypt,
+        extract_fpke_immo_passport,
+        fpke_derive_k_ffb,
+        plan_fpke_a_to_b_transfer,
+    )
+    from contitool.gui.main_window import MainWindow
+
+    df = build_synthetic_fpke_dflash()
+    info = analyze_fpke_dflash(df)
+    by_id = {it["key_id"]: it for it in info["items"]}
+    kc_hex = by_id["kc"]["hex"].upper()
+    expected_k_ffb = aes128_ecb_encrypt(bytes.fromhex(kc_hex), FPKE_FFB_C16).hex().upper()
+
+    assert fpke_derive_k_ffb(kc_hex).hex().upper() == expected_k_ffb
+    assert fpke_derive_k_ffb(bytes.fromhex(kc_hex)).hex().upper() == expected_k_ffb
+    assert bcm_derive_k_ffb(bytes.fromhex(kc_hex)).hex().upper() == expected_k_ffb
+    assert info["immo_config"]["k_ffb_hex"] == expected_k_ffb
+    assert expected_k_ffb in format_fpke_report(dflash_info=info)
+
+    passport = extract_fpke_immo_passport(df)
+    assert passport["immo"]["k_ffb"] == expected_k_ffb
+    plan = plan_fpke_a_to_b_transfer(df, df)
+    assert plan["transfer_from_a"]["k_ffb"] == expected_k_ffb
+
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    try:
+        # 1. Standalone K_ffb calculator when no DataFlash dump is loaded yet
+        win.fpke_screen.open_from_ident({"ident": []})
+        win.fpke_screen.select("secrets")
+        app.processEvents()
+        edits_empty = win.fpke_screen.page_area.findChildren(QLineEdit)
+        assert len(edits_empty) >= 2
+        edits_empty[0].setText(kc_hex)
+        app.processEvents()
+        assert any(e.text().strip().upper() == expected_k_ffb for e in edits_empty)
+
+        # 2. Loaded DataFlash shows live K_ffb on both Immobilizer ('secrets') and Keys ('keys') pages
+        df_file = tmp_path / "Dflash.bin"
+        df_file.write_bytes(df)
+        win.fpke_screen.open_from_files(
+            {"dflash": df_file},
+            folder=tmp_path,
+            source="disk",
+        )
+        for nav_key in ("secrets", "keys"):
+            win.fpke_screen.select(nav_key)
+            app.processEvents()
+            page_edits = win.fpke_screen.page_area.findChildren(QLineEdit)
+            assert any(e.text().strip().upper() == expected_k_ffb for e in page_edits)
+    finally:
+        win.close()
+
+

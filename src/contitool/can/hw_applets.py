@@ -1317,3 +1317,424 @@ EXPECTED_OPBT_READER_STUB_SHA256 = "a5b1a7a12a8547e164ab0f4357257e6d422cec178024
 EXPECTED_EEPROM_READER_STUB_SHA256 = "aeda839eeba9d6f307fe06f9278181b9feb11cb361125508f0cff2304ba63830"
 EXPECTED_UFLASH_FACI_STUB_SHA256 = "a7667b232516aca547885d5069d8e2ee12046bf4da6344396ef376060dcc3f32"
 EXPECTED_CFLASH_FACI_STUB_SHA256 = "f7ee469253d89afbfc8bc73f884ec639962f404cd684fea1a20595e5847f9187"
+
+
+# ────────────────────────────── J533 Transparent RSCAN0 CAN Bridge Applet ──────────────────────────────
+
+J533_RSCAN0_BASE = 0xFFD00000
+J533_BRIDGE_DIAG_CHANNEL = 3
+
+# Verified from Continental 3Q0 907 530 Cflash (0x0D474..0x0D5DC, 0x0DA40, 0x0446BC CanTrcv switch, 0x0C5B4 Port_Config)
+J533_BUS_CHANNELS: dict[int, tuple[str, str, str]] = {
+    0: ("komfort", "Komfort CAN (панель приборов 17, BCM 09)", "Komfort CAN (cluster 17, BCM 09)"),
+    1: ("antrieb", "Antrieb CAN (двигатель 01, КПП 02)", "Drivetrain CAN (engine 01, TCU 02)"),
+    2: ("extended", "Extended CAN (ассистенты 13, A5, 3C)", "Extended CAN (ADAS 13, A5, 3C)"),
+    4: ("infotainment", "Infotainment CAN (MIB 5F, звук 47)", "Infotainment CAN (MIB 5F, sound 47)"),
+    5: ("fahrwerk", "Fahrwerk CAN (ESP 03, руль 44)", "Chassis CAN (ESP 03, steering 44)"),
+}
+
+J533_BRIDGE_READY_ID = 0x6F1
+J533_BRIDGE_READY_DATA = b"J533BRDG"
+J533_BRIDGE_STOP_ID = 0x6F0
+J533_BRIDGE_STOP_DATA = b"STOPBRDG"
+J533_BRIDGE_END_ID = 0x6F1
+J533_BRIDGE_END_DATA = b"BRDG-END"
+
+# Port registers for CAN0..CAN5 TX/RX alternate functions and active-low transceiver STB pins (3Q0 907 530 Port_Config)
+_P0 = 0xFFC10000
+_PM0 = 0xFFC10300
+_PMC0 = 0xFFC10400
+_PFC0 = 0xFFC10500
+_PFCE0 = 0xFFC10600
+_PFCAE0 = 0xFFC10A00
+_PIBC0 = 0xFFC14000
+
+_P1 = 0xFFC10004
+_PM1 = 0xFFC10304
+_PMC1 = 0xFFC10404
+_PFC1 = 0xFFC10504
+_PFCE1 = 0xFFC10604
+_PIBC1 = 0xFFC14004
+
+_P8 = 0xFFC10020
+_PM8 = 0xFFC10320
+_PMC8 = 0xFFC10420
+
+_P11 = 0xFFC1002C
+_PM11 = 0xFFC1032C
+_PMC11 = 0xFFC1042C
+
+
+def build_j533_can_bridge_applet(target_channel: int = 0, *, idle_limit: int = 40_000_000) -> bytes:
+    """Build RH850/F1L RAM-loader applet that transparently bridges Diagnosis CAN (`ch3`) <-> `target_channel`.
+
+    Verified against Continental 3Q0 907 530 (`R7F7010543` / `R7F7010563`) `Uflash` + `Cflash`:
+      - Configures Port 0/1/8/11 alternate CAN pins identically to `Port_GstConfiguration` (`0x0C5B4`) and drives
+        the active-low CAN transceiver `STB` pin LOW only for `ch3` (`P8_10`) and `target_channel`
+        (`ch0: P11_12`, `ch1: P11_13`, `ch2: P0_6`, `ch4: P0_8`, `ch5: P8_2`).
+      - Copies FBL's live 500 kbit/s bit-timing from `C3CFG` (`0xFFD00030`) to `CtargetCFG` without touching `GCFG`.
+      - Sets 2 wildcard `GAFL` receive rules (`GAFLID=0, GAFLM=0`, matching ALL 11-bit and 29-bit frames) into
+        32-deep RX FIFO 0 (`ch3 -> target`) and RX FIFO 1 (`target -> ch3`).
+      - Uses one TX buffer per direction (`TM48` on `ch3`, `TM[16*target]` on `target`) to preserve strict FIFO order.
+      - Sends `J533BRDG` on `0x6F1` once both channels are in Communication Mode.
+      - Refreshes `WDTA0` / `WDTA1` every loop iteration; aborts stalled sub-bus TX after a short timeout so an
+        unplugged bus never blocks `STOPBRDG`; auto-exits after `idle_limit` idle iterations with no `ch3` traffic.
+      - On `0x6F0: STOPBRDG` (or idle timeout), replies `0x6F1: BRDG-END` and triggers `SWRESA` (`0xFFF80A04`)
+        with WDTA reset fallback so the gateway boots cleanly back into its normal Application firmware.
+    """
+    if target_channel not in J533_BUS_CHANNELS:
+        raise ValueError(
+            f"Unsupported J533 bridge target_channel={target_channel} (expected one of {tuple(J533_BUS_CHANNELS)})"
+        )
+    if idle_limit <= 0:
+        raise ValueError(f"idle_limit must be positive, got {idle_limit}")
+
+    diag_ch = J533_BRIDGE_DIAG_CHANNEL
+    tgt_ctr_off = 0x0004 + 0x10 * target_channel
+    tgt_sts_off = 0x0008 + 0x10 * target_channel
+    tgt_cfg_off = 0x0000 + 0x10 * target_channel
+    tgt_tmid_addr = J533_RSCAN0_BASE + 0x1000 + 0x100 * target_channel
+    tgt_tmc_addr = J533_RSCAN0_BASE + 0x0250 + 0x10 * target_channel
+    tgt_tmsts_addr = J533_RSCAN0_BASE + 0x02D0 + 0x10 * target_channel
+
+    diag_tmid_addr = J533_RSCAN0_BASE + 0x1300
+    diag_tmc_addr = J533_RSCAN0_BASE + 0x0280
+    diag_tmsts_addr = J533_RSCAN0_BASE + 0x0300
+
+    # GAFLCFG0 (ch0..ch3 in bytes 3..0) and GAFLCFG1 (ch4..ch5 in bytes 3..2)
+    gaflcfg0 = 1 << (8 * (3 - diag_ch))
+    gaflcfg1 = 0
+    if target_channel < 4:
+        gaflcfg0 |= 1 << (8 * (3 - target_channel))
+    else:
+        gaflcfg1 |= 1 << (8 * (7 - target_channel))
+    # Rule order follows channel number 0..5: FIFO 0 = bit 0 (diag->tgt), FIFO 1 = bit 1 (tgt->diag)
+    if target_channel < diag_ch:
+        rule0_p1, rule1_p1 = 0x00000002, 0x00000001
+    else:
+        rule0_p1, rule1_p1 = 0x00000001, 0x00000002
+
+    # Active-low transceiver STB bits: drive LOW (0) for diag ch3 and target_channel, HIGH (1) for inactive buses
+    stb_p0 = (0 if target_channel == 2 else 0x0040) | (0 if target_channel == 4 else 0x0100)
+    stb_p8 = 0 if target_channel == 5 else 0x0004  # P8_10 stays 0 (Diag CAN active)
+    stb_p11 = (0 if target_channel == 0 else 0x1000) | (0 if target_channel == 1 else 0x2000)
+
+    def _wr_h(b_ref: _Rh850Builder, addr: int, val16: int) -> None:
+        b_ref.mov_imm(addr, 6)
+        b_ref.mov_u16(val16 & 0xFFFF, 7)
+        b_ref.st_h(7, 0, 6)
+
+    def _poll_rscan_mode(b_ref: _Rh850Builder, sts_off: int, want: int, tag: str) -> None:
+        b_ref.mov_imm(200_000, 10)
+        b_ref.label(f"WAIT_{tag}")
+        b_ref.jarl("SUB_WDT")
+        b_ref.ld_w(sts_off, 14, 6)
+        b_ref.andi(0x0007, 6, 6)
+        b_ref.cmp_imm5(want, 6)
+        b_ref.be(f"DONE_{tag}")
+        b_ref.add_imm5(-1, 10)
+        b_ref.cmp_imm5(0, 10)
+        b_ref.bne(f"WAIT_{tag}")
+        b_ref.label(f"DONE_{tag}")
+
+    b = _Rh850Builder()
+    b.di()
+    b.synci()
+    b.jarl("SUB_WDT")
+
+    # 1. Configure Port 0 / Port 1 CAN pins + transceiver STB GPIOs (exact 3Q0 907 530 Port_Config)
+    _mod_port16(b, _P0, ~0x0140 & 0xFFFF, stb_p0)
+    _wr_h(b, _PIBC0, 0x2236)
+    _wr_h(b, _PFC0, 0x009F)
+    _wr_h(b, _PFCE0, 0x0000)
+    _wr_h(b, _PFCAE0, 0x6600)
+    _wr_h(b, _PMC0, 0x66BF)
+    _wr_h(b, _PM0, 0xA236)
+
+    _wr_h(b, _PIBC1, 0x0115)
+    _wr_h(b, _PFC1, 0x0000)
+    _wr_h(b, _PFCE1, 0x0000)
+    _wr_h(b, _PMC1, 0x031F)
+    _wr_h(b, _PM1, 0xF115)
+
+    _mod_port16(b, _PMC8, ~0x0404 & 0xFFFF, 0)
+    _mod_port16(b, _P8, ~0x0404 & 0xFFFF, stb_p8)
+    _mod_port16(b, _PM8, ~0x0404 & 0xFFFF, 0)
+
+    _mod_port16(b, _PMC11, ~0x3000 & 0xFFFF, 0)
+    _mod_port16(b, _P11, ~0x3000 & 0xFFFF, stb_p11)
+    _mod_port16(b, _PM11, ~0x3000 & 0xFFFF, 0)
+
+    # 2. Save live FBL 500 kbit/s bit-timing from C3CFG (0xFFD00030) before entering RSCAN0 Global Reset
+    b.mov_imm(J533_RSCAN0_BASE, 14)
+    b.ld_w(0x0030, 14, 20)
+
+    # 3. RSCAN0 Global Reset + Channel Reset (ch3 and target_channel)
+    b.mov_imm5(1, 7)
+    b.st_w(7, 0x0088, 14)  # GCTR = 1 (Global Reset, awake)
+    _poll_rscan_mode(b, 0x008C, 1, "GRST")
+
+    b.mov_imm5(1, 7)
+    b.st_w(7, 0x0034, 14)  # C3CTR = 1 (Channel Reset, awake)
+    _poll_rscan_mode(b, 0x0038, 1, "C3RST")
+
+    b.mov_imm5(1, 7)
+    b.st_w(7, tgt_ctr_off, 14)  # CtargetCTR = 1
+    _poll_rscan_mode(b, tgt_sts_off, 1, "CTGTRST")
+
+    # 4. Program identical 500 kbit/s bit-timing on ch3 and target_channel
+    b.st_w(20, 0x0030, 14)
+    b.st_w(20, tgt_cfg_off, 14)
+
+    # 5. Program 2 wildcard GAFL receive rules (all 11-bit + all 29-bit frames) -> RX FIFO 0 & RX FIFO 1
+    b.mov_u16(0x0100, 6)
+    b.st_w(6, 0x0098, 14)  # GAFLECTR = AFLDAE(1), page 0
+    b.mov_imm(gaflcfg0, 6)
+    b.st_w(6, 0x009C, 14)  # GAFLCFG0
+    b.mov_imm(gaflcfg1, 6)
+    b.st_w(6, 0x00A0, 14)  # GAFLCFG1
+
+    b.st_w(0, 0x0500, 14)  # GAFLID0 = 0
+    b.st_w(0, 0x0504, 14)  # GAFLM0  = 0 (wildcard: IDE/RTR/ID ignored)
+    b.st_w(0, 0x0508, 14)  # GAFLP0_0 = 0
+    b.mov_imm5(rule0_p1, 6)
+    b.st_w(6, 0x050C, 14)  # GAFLP1_0
+
+    b.st_w(0, 0x0510, 14)  # GAFLID1 = 0
+    b.st_w(0, 0x0514, 14)  # GAFLM1  = 0
+    b.st_w(0, 0x0518, 14)  # GAFLP0_1 = 0
+    b.mov_imm5(rule1_p1, 6)
+    b.st_w(6, 0x051C, 14)  # GAFLP1_1
+
+    b.st_w(0, 0x0098, 14)  # GAFLECTR = 0 (lock rule table)
+
+    # 6. Configure 32-deep RX FIFO 0 & RX FIFO 1 (RFDC=4 -> 0x0400) and disable unused FIFOs 2..7
+    b.st_w(0, 0x00A4, 14)  # RMNB = 0
+    b.mov_u16(0x0400, 6)
+    b.st_w(6, 0x00B8, 14)  # RFCC0
+    b.st_w(6, 0x00BC, 14)  # RFCC1
+    for unused_off in range(0x00C0, 0x00D8, 4):
+        b.st_w(0, unused_off, 14)
+
+    # 7. Enter Global Operating Mode, enable RX FIFOs 0 & 1, enter Channel Communication Mode
+    b.st_w(0, 0x0088, 14)  # GCTR = 0 (Global Operating)
+    _poll_rscan_mode(b, 0x008C, 0, "GOP")
+
+    b.mov_u16(0x0401, 6)
+    b.st_w(6, 0x00B8, 14)  # RFCC0.RFE = 1
+    b.st_w(6, 0x00BC, 14)  # RFCC1.RFE = 1
+    b.st_w(0, 0x00D8, 14)  # clear RFSTS0 flags
+    b.st_w(0, 0x00DC, 14)  # clear RFSTS1 flags
+
+    b.st_w(0, 0x0034, 14)  # C3CTR = 0 (Communication Mode)
+    _poll_rscan_mode(b, 0x0038, 0, "C3COM")
+    b.st_w(0, tgt_ctr_off, 14)  # CtargetCTR = 0 (Communication Mode)
+    _poll_rscan_mode(b, tgt_sts_off, 0, "CTGTCOM")
+
+    # 8. Load hot-loop constants into callee-saved registers r15..r29
+    stop_d0, stop_d1 = struct.unpack("<II", J533_BRIDGE_STOP_DATA)
+    ready_d0, ready_d1 = struct.unpack("<II", J533_BRIDGE_READY_DATA)
+    end_d0, end_d1 = struct.unpack("<II", J533_BRIDGE_END_DATA)
+
+    b.mov_u16(J533_BRIDGE_STOP_ID, 15)
+    b.mov_imm(stop_d0, 16)
+    b.mov_imm(stop_d1, 17)
+    b.mov_imm(0xF0000000, 18)
+    b.mov_u16(0x00FF, 19)
+    b.mov_imm(0xDFFFFFFF, 20)  # mask IDE|RTR|ID29, clear THLEN (bit 29)
+    b.mov_imm5(0, 21)          # idle counter = 0
+    b.mov_imm(idle_limit, 22)
+    b.mov_imm(tgt_tmid_addr, 24)
+    b.mov_imm(diag_tmid_addr, 25)
+    b.mov_imm(tgt_tmc_addr, 26)
+    b.mov_imm(tgt_tmsts_addr, 27)
+    b.mov_imm(diag_tmc_addr, 28)
+    b.mov_imm(diag_tmsts_addr, 29)
+
+    # 9. Emit bridge-ready beacon `J533BRDG` on ch3 0x6F1
+    b.st_b(0, 0, 29)
+    b.mov_u16(J533_BRIDGE_READY_ID, 6)
+    b.st_w(6, 0x00, 25)
+    b.mov_imm(0x80000000, 6)  # DLC = 8
+    b.st_w(6, 0x04, 25)
+    b.mov_imm(ready_d0, 6)
+    b.st_w(6, 0x08, 25)
+    b.mov_imm(ready_d1, 6)
+    b.st_w(6, 0x0C, 25)
+    b.mov_imm5(1, 6)
+    b.st_b(6, 0, 28)  # TMC48 = 1
+
+    b.mov_imm(100_000, 10)
+    b.label("WAIT_READY_TX")
+    b.jarl("SUB_WDT")
+    b.ld_bu_0(29, 6)
+    b.andi(0x0006, 6, 6)
+    b.cmp_imm5(0, 6)
+    b.bne("READY_TX_DONE")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("WAIT_READY_TX")
+    b.label("READY_TX_DONE")
+    b.st_b(0, 0, 29)
+
+    # 10. Tight bidirectional transparent bridge loop
+    b.label("BRIDGE_LOOP")
+    b.jarl("SUB_WDT")
+
+    # ── Direction A: ch3 (Diag CAN) RX FIFO 0 -> target_channel TX buffer 0 ──
+    b.ld_w(0x00D8, 14, 6)  # RFSTS0
+    b.andi(0x0001, 6, 6)   # RFEMP == 0 means frame waiting
+    b.cmp_imm5(0, 6)
+    b.bne("CHECK_FIFO1")
+
+    b.ld_w(0x0E00, 14, 6)  # RFID0
+    b.ld_w(0x0E04, 14, 7)  # RFPTR0
+    b.ld_w(0x0E08, 14, 8)  # RFDF00
+    b.ld_w(0x0E0C, 14, 9)  # RFDF10
+    b.and_reg(20, 6)       # clear THLEN bit 29; preserve IDE|RTR|ID29
+
+    # Check stop magic BEFORE touching target TX (so unplugged sub-bus can never block STOPBRDG!)
+    b.cmp_reg(15, 6)       # id == 0x6F0 (standard, IDE=0)?
+    b.bne("FWD_TO_TGT")
+    b.cmp_reg(16, 8)       # df0 == "STOP"?
+    b.bne("FWD_TO_TGT")
+    b.cmp_reg(17, 9)       # df1 == "BRDG"?
+    b.bne("FWD_TO_TGT")
+    b.st_w(19, 0x00F8, 14)  # RFPCTR0 = 0xFF
+    b.jr("EXIT_BRIDGE")
+
+    b.label("FWD_TO_TGT")
+    b.mov_imm5(0, 21)      # reset idle counter on live ch3 activity
+    # Wait for target TX buffer to become free (bounded ~5-10 ms with WDT refresh; abort if sub-bus has no ACK)
+    b.mov_imm(60_000, 10)
+    b.label("WAIT_TGT_TX")
+    b.jarl("SUB_WDT")
+    b.ld_bu_0(27, 23)      # TMSTStgt
+    b.andi(0x0001, 23, 23) # TMTSTS
+    b.cmp_imm5(0, 23)
+    b.be("TGT_TX_FREE")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("WAIT_TGT_TX")
+    # Sub-bus TX stalled (no ACK): abort pending TX so bridge stays responsive
+    b.mov_imm5(2, 23)
+    b.st_b(23, 0, 26)      # TMCtgt = 2 (TMTAR abort)
+    b.mov_u16(2000, 10)
+    b.label("WAIT_TGT_ABT")
+    b.jarl("SUB_WDT")
+    b.ld_bu_0(27, 23)
+    b.andi(0x0001, 23, 23)
+    b.cmp_imm5(0, 23)
+    b.be("TGT_TX_FREE")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("WAIT_TGT_ABT")
+    b.st_w(19, 0x00F8, 14) # discard frame and move on
+    b.jr("CHECK_FIFO1")
+
+    b.label("TGT_TX_FREE")
+    b.st_b(0, 0, 27)       # clear TMSTStgt (TMTRF := 00)
+    b.and_reg(18, 7)       # keep DLC bits 31:28 only
+    b.st_w(6, 0x00, 24)    # TMIDtgt
+    b.st_w(7, 0x04, 24)    # TMPTRtgt
+    b.st_w(8, 0x08, 24)    # TMDF0tgt
+    b.st_w(9, 0x0C, 24)    # TMDF1tgt
+    b.mov_imm5(1, 23)
+    b.st_b(23, 0, 26)      # TMCtgt = 1 (TMTR)
+    b.st_w(19, 0x00F8, 14) # RFPCTR0 = 0xFF
+
+    # ── Direction B: target_channel RX FIFO 1 -> ch3 (Diag CAN) TX buffer 0 (TM48) ──
+    b.label("CHECK_FIFO1")
+    b.ld_w(0x00DC, 14, 6)  # RFSTS1
+    b.andi(0x0001, 6, 6)   # RFEMP == 0?
+    b.cmp_imm5(0, 6)
+    b.bne("CHECK_IDLE")
+
+    b.ld_bu_0(29, 23)      # TMSTS48
+    b.andi(0x0001, 23, 23) # TMTSTS == 0?
+    b.cmp_imm5(0, 23)
+    b.bne("CHECK_IDLE")    # leave frame queued in 32-deep FIFO 1 until ch3 TX finishes
+
+    b.ld_w(0x0E10, 14, 6)  # RFID1
+    b.ld_w(0x0E14, 14, 7)  # RFPTR1
+    b.ld_w(0x0E18, 14, 8)  # RFDF01
+    b.ld_w(0x0E1C, 14, 9)  # RFDF11
+    b.st_w(19, 0x00FC, 14) # RFPCTR1 = 0xFF
+
+    b.and_reg(20, 6)       # preserve IDE|RTR|ID29, clear THLEN
+    b.and_reg(18, 7)       # keep DLC bits 31:28
+    b.st_b(0, 0, 29)       # clear TMSTS48
+    b.st_w(6, 0x00, 25)    # TMID48
+    b.st_w(7, 0x04, 25)    # TMPTR48
+    b.st_w(8, 0x08, 25)    # TMDF0_48
+    b.st_w(9, 0x0C, 25)    # TMDF1_48
+    b.mov_imm5(1, 23)
+    b.st_b(23, 0, 28)      # TMC48 = 1
+
+    b.label("CHECK_IDLE")
+    b.add_imm5(1, 21)
+    b.cmp_reg(22, 21)
+    b.bne("BRIDGE_LOOP")
+
+    # 11. Clean bridge exit: send `BRDG-END` on ch3 0x6F1, then trigger SWRESA (+ WDTA fallback)
+    b.label("EXIT_BRIDGE")
+    b.mov_u16(10000, 10)
+    b.label("WAIT_END_FREE")
+    b.jarl("SUB_WDT")
+    b.ld_bu_0(29, 6)
+    b.andi(0x0001, 6, 6)
+    b.cmp_imm5(0, 6)
+    b.be("SEND_END_FRAME")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("WAIT_END_FREE")
+    b.mov_imm5(2, 6)
+    b.st_b(6, 0, 28)  # abort stuck ch3 TX before sending BRDG-END
+    b.mov_u16(1000, 10)
+    b.label("WAIT_END_ABT")
+    b.ld_bu_0(29, 6)
+    b.andi(0x0001, 6, 6)
+    b.cmp_imm5(0, 6)
+    b.be("SEND_END_FRAME")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("WAIT_END_ABT")
+
+    b.label("SEND_END_FRAME")
+    b.st_b(0, 0, 29)
+    b.mov_u16(J533_BRIDGE_END_ID, 6)
+    b.st_w(6, 0x00, 25)
+    b.mov_imm(0x80000000, 6)
+    b.st_w(6, 0x04, 25)
+    b.mov_imm(end_d0, 6)
+    b.st_w(6, 0x08, 25)
+    b.mov_imm(end_d1, 6)
+    b.st_w(6, 0x0C, 25)
+    b.mov_imm5(1, 6)
+    b.st_b(6, 0, 28)
+
+    b.mov_imm(40_000, 10)
+    b.label("WAIT_END_TX")
+    b.jarl("SUB_WDT")
+    b.ld_bu_0(29, 6)
+    b.andi(0x0006, 6, 6)
+    b.cmp_imm5(0, 6)
+    b.bne("DO_SWRESA")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("WAIT_END_TX")
+
+    b.label("DO_SWRESA")
+    b.movhi(0xFFF8, 0, 14)
+    b.mov_u16(0x00A5, 6)
+    b.mov_imm5(1, 7)
+    b.mov_imm5(-2, 8)
+    b.st_w(6, 0x0000, 14)  # PROTCMD0 = 0xA5
+    b.st_w(7, 0x0A04, 14)  # SWRESA = 1
+    b.st_w(8, 0x0A04, 14)  # SWRESA = ~1
+    b.st_w(7, 0x0A04, 14)  # SWRESA = 1
+    b.label("BRIDGE_RST_SPIN")
+    b.br_short("BRIDGE_RST_SPIN")
+
+    _emit_wdt_subroutine(b, "SUB_WDT")
+    return b.build()

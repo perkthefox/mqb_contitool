@@ -468,7 +468,10 @@ class ConnectionDialog(Dialog):
     def _check_ok(self, res: dict[str, Any]) -> None:
         values = {i["did"]: i["value"] for i in res.get("ident", [])}
         found = ", ".join(filter(None, (values.get("F187"), values.get("F197"), values.get("F189") and f"SW {values['F189']}")))
-        unsupported = res.get("unsupported") or unsupported_ecu_reason(res.get("ident", []))
+        ecu_kind = str(res.get("ecu_kind") or "")
+        unsupported = res.get("unsupported") or (
+            "" if ecu_kind in ("fpke", "bcm") else unsupported_ecu_reason(res.get("ident", []))
+        )
         if unsupported:
             msg = "⚠ " + tr("Блок отвечает, но не поддерживается", "ECU answers, but is not supported")
             self._check_done(msg + (f": {found}" if found else "") + f" — {unsupported}", "warn")
@@ -481,7 +484,8 @@ class ConnectionDialog(Dialog):
             msg = "✓ " + tr("Блок отвечает (в режиме загрузчика FBL)", "ECU answers (in FBL bootloader mode)")
             self._check_done(msg + (f": {found}" if found else ""), "warn")
             return
-        self._check_done("✓ " + tr("Блок отвечает", "ECU answers") + (f": {found}" if found else ""), "ok")
+        tag = " [09 BCM]" if ecu_kind == "bcm" else (" [17 FPK_E]" if ecu_kind == "fpke" else "")
+        self._check_done("✓ " + tr("Блок отвечает", "ECU answers") + tag + (f": {found}" if found else ""), "ok")
 
     def _check_done(self, text: str, tone: str) -> None:
         if self._check is not None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contitool.core.dtc_bcm import BCM_DTCS
 from contitool.core.dtc_fpke import FPKE_DTCS
 from contitool.core.dtc_j533 import J533_DTCS
 from contitool.i18n import tr
@@ -40,6 +41,15 @@ def describe_fpke(code: int) -> tuple[str, str]:
     hit = FPKE_DTCS.get(code)
     if hit is None:
         return sae_code(code), tr("Неизвестный код неисправности приборной панели", "Unknown cluster trouble code")
+    display, ru, en = hit
+    return display or sae_code(code), tr(ru, en)
+
+
+def describe_bcm(code: int) -> tuple[str, str]:
+    """(ODIS display code, description) for MQB 09 BCM / J519 (BV_CentrElectUDS)."""
+    hit = BCM_DTCS.get(code)
+    if hit is None:
+        return sae_code(code), tr("Неизвестный код неисправности 09 BCM", "Unknown 09 BCM trouble code")
     display, ru, en = hit
     return display or sae_code(code), tr(ru, en)
 

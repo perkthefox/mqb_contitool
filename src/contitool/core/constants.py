@@ -237,7 +237,7 @@ SLAVE_SLOTS: tuple[SlotSpec, ...] = (
         details_ru="Kombiinstrument / Virtual Cockpit (IKA_WFS, LL_DashBoardUDS)",
         details_en="Instrument Cluster / Virtual Cockpit (IKA_WFS, LL_DashBoardUDS)",
         notes_ru=(
-            "Помимо защиты компонентов (CP), приборка 17 на MQB хранит данные "
+            "Помимо защиты компонентов (CP), панель приборов 17 на MQB хранит данные "
             "иммобилайзера WFS5 (ключи/CS/MAC). Одной привязки CP для запуска двигателя недостаточно."
         ),
         notes_en=(

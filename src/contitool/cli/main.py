@@ -14,6 +14,12 @@ from contitool.can import (
     FPKE_NATIVE_INTERFACES,
     SUPPORTED_CAN_INTERFACES,
     can_backup,
+    can_bcm_adapt_ffb,
+    can_bcm_adapt_ffb_from_cluster,
+    can_bcm_read_gfa,
+    can_bcm_read_keys,
+    can_bcm_status,
+    can_bcm_write_keys,
     can_fpke_full_read,
     can_fpke_read_region,
     can_fpke_write_dflash,
@@ -23,6 +29,7 @@ from contitool.can import (
     can_read_eeprom,
     can_read_memory,
     can_read_opbt,
+    can_scan_bus,
     can_turnkey_read_patch_flash,
     can_upload_zdc_datasets,
     can_verify,
@@ -858,11 +865,35 @@ def cmd_can(args: argparse.Namespace) -> int:
         )
 
     base_out = clean_user_path(args.output_dir) if args.output_dir else None
-    session_dir = default_session_dir(base_out, action.replace("-", "_"))
+    session_dir = None if action == "scan" else default_session_dir(base_out, action.replace("-", "_"))
     disp = _make_cli_display(args)
     rep = disp.create_reporter()
 
     try:
+        if action == "scan":
+            scan_res = can_scan_bus(
+                args.port,
+                interface=args.interface,
+                target_kind=getattr(args, "target", "all"),
+                reporter=rep,
+            )
+            print(
+                tr(
+                    f"\n✓ Топология шины CAN: {scan_res.topology} (найдено блоков: {len(scan_res.ecus)})",
+                    f"\n✓ CAN bus topology: {scan_res.topology} ({len(scan_res.ecus)} ECU(s) discovered)",
+                )
+            )
+            for ecu in scan_res.ecus:
+                route = (
+                    tr(f"через шлюз J533 ({ecu.bus_label})", f"via J533 gateway ({ecu.bus_label})")
+                    if ecu.via_gateway
+                    else tr("прямой CAN", "direct CAN")
+                )
+                print(
+                    f"  [{ecu.diag_addr}] {ecu.part_number:<14} "
+                    f"0x{ecu.uds_tx_id:03X}->0x{ecu.uds_rx_id:03X}  {route:<32}  {ecu.access_summary}"
+                )
+            return 0
         if action == "verify":
             res = can_verify(args.port, interface=args.interface, session_dir=session_dir, reporter=rep)
             print(f"✓ RSA status: {res['rsa_status']} | Session: {res['session_dir']}")
@@ -1181,6 +1212,8 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 )
             sdir = default_session_dir(base_out, "fpke_write")
             base_df = clean_user_path(args.base_dflash) if getattr(args, "base_dflash", None) else None
+            via_gw = bool(getattr(args, "via_gateway", False))
+            gw_ch = int(getattr(args, "gateway_channel", 0) or 0)
             res = can_fpke_write_dflash(
                 args.port,
                 clean_user_path(args.dflash),
@@ -1194,6 +1227,9 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 allow_foreign=getattr(args, "allow_foreign", False),
                 reset_after=not getattr(args, "no_reset", False),
                 keep_open=False,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
                 reporter=rep,
             )
             print(
@@ -1201,6 +1237,8 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 f"| Session: {res['session_dir']}"
             )
             return 0
+        via_gw = bool(getattr(args, "via_gateway", False))
+        gw_ch = int(getattr(args, "gateway_channel", 0) or 0)
         if args.mode == "report":
             sdir = out_file.parent if out_file is not None else default_session_dir(base_out, "fpke_read")
             res = can_fpke_full_read(
@@ -1215,6 +1253,9 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 read_bflash=args.read_bflash,
                 read_cflash=args.read_cflash,
                 cflash_bytes=cf_bytes,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
                 reporter=rep,
             )
             print(
@@ -1241,6 +1282,9 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 fd11_key_hex=args.fd11_key,
                 output_path=out_file,
                 session_dir=sdir,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
                 reporter=rep,
             )
             if "secrets" in res or "extra_analysis" in res:
@@ -1254,6 +1298,125 @@ def cmd_fpke(args: argparse.Namespace) -> int:
             print(f"\n✓ Output: {res['output']} | Report: {res['report_path']}")
     finally:
         disp.finish()
+    return 0
+
+
+def cmd_bcm(args: argparse.Namespace) -> int:
+    import json
+
+    action = args.bcm_action
+    via_gw = bool(getattr(args, "via_gateway", False))
+    gw_ch = int(getattr(args, "gateway_channel", 0) or 0)
+    sw_prof = getattr(args, "profile", None)
+    disp = _make_cli_display(args)
+    rep = disp.create_reporter()
+    try:
+        if action == "status":
+            res = can_bcm_status(
+                args.port,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                include_nvm_slots=True,
+                reporter=rep,
+            )
+        elif action == "read-gfa":
+            res = can_bcm_read_gfa(
+                args.port,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                reporter=rep,
+            )
+        elif action == "read-keys":
+            res = can_bcm_read_keys(
+                args.port,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                reporter=rep,
+            )
+        elif action == "write-keys":
+            if not getattr(args, "current_ika", None):
+                raise ValueError("--current-ika is required for bcm write-keys")
+            res = can_bcm_write_keys(
+                args.port,
+                current_ika=args.current_ika,
+                new_ika=getattr(args, "new_ika", None),
+                new_gfa=getattr(args, "new_gfa", None),
+                hard_reset=not bool(getattr(args, "no_reset", False)),
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                reporter=rep,
+            )
+        elif action == "adapt-ffb":
+            if getattr(args, "from_live_cluster", False) or getattr(args, "cluster_dflash", None):
+                df_bytes = (
+                    clean_user_path(args.cluster_dflash).read_bytes()
+                    if getattr(args, "cluster_dflash", None)
+                    else None
+                )
+                res = can_bcm_adapt_ffb_from_cluster(
+                    args.port,
+                    fpke_dflash=df_bytes,
+                    gfa_override=getattr(args, "new_gfa", None),
+                    sync_bcm_gfa_to_cluster=bool(getattr(args, "sync_gfa", False)),
+                    current_bcm_ika=getattr(args, "current_ika", None),
+                    interface=args.interface,
+                    via_gateway=via_gw,
+                    gateway_bridge=via_gw,
+                    gateway_channel=gw_ch,
+                    sw_profile=sw_prof,
+                    reporter=rep,
+                )
+            else:
+                keys_arg: list[dict[str, object]] = []
+                for idx, k_spec in enumerate(getattr(args, "ffb_keys", None) or [], start=1):
+                    parts = str(k_spec).split(":", 1)
+                    ser_hex = parts[0].strip()
+                    cnt_val = int(parts[1], 0) if len(parts) > 1 and parts[1].strip() else 0
+                    keys_arg.append(
+                        {
+                            "slot_number": idx,
+                            "serial_id": ser_hex,
+                            "rolling_counter": cnt_val,
+                        }
+                    )
+                res = can_bcm_adapt_ffb(
+                    args.port,
+                    gfa=getattr(args, "new_gfa", None),
+                    kc=getattr(args, "kc", None),
+                    k_ffb=getattr(args, "k_ffb", None),
+                    keys=keys_arg or None,
+                    freq_code=getattr(args, "freq", None),
+                    clear_all=bool(getattr(args, "clear_all", False)),
+                    interface=args.interface,
+                    via_gateway=via_gw,
+                    gateway_bridge=via_gw,
+                    gateway_channel=gw_ch,
+                    sw_profile=sw_prof,
+                    reporter=rep,
+                )
+        else:
+            raise ValueError(f"Unsupported bcm action: {action}")
+    finally:
+        disp.finish()
+
+    out_txt = json.dumps(res, ensure_ascii=False, indent=2)
+    print(out_txt)
+    if getattr(args, "output", None):
+        out_path = clean_user_path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(out_txt + "\n", encoding="utf-8")
     return 0
 
 
@@ -1473,10 +1636,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_can = _add("can", tr("Работа со шлюзом по Diagnosis CAN (500 кбит/с, нужен CAN-терминатор или резистор 120 Ом)", "Live Diagnosis CAN operations (500 kbit/s, CAN termination or a 120 Ohm resistor required)"))
     p_can.add_argument(
         "can_action",
-        choices=("ports", "verify", "backup", "read-mem", "read-eeprom", "read-opbt", "write-uflash", "write-dflash", "write-cflash", "zdc-upload", "learn-mfl", "health", "turnkey"),
+        choices=("ports", "scan", "verify", "backup", "read-mem", "read-eeprom", "read-opbt", "write-uflash", "write-dflash", "write-cflash", "zdc-upload", "learn-mfl", "health", "turnkey"),
     )
     p_can.add_argument("--port", help=tr("Порт адаптера (напр. COM4 или /dev/cu.usbmodem...)", "Adapter port (e.g. COM4 or /dev/cu.usbmodem...)"))
     p_can.add_argument("--interface", choices=iface_choices, default="slcan")
+    p_can.add_argument(
+        "--target",
+        choices=("all", "j533", "fpke", "bcm"),
+        default="all",
+        help=tr("Целевой блок для can scan (all, j533, fpke, bcm)", "Target ECU for can scan (all, j533, fpke, bcm)"),
+    )
     p_can.add_argument(
         "-i",
         "--input",
@@ -1551,16 +1720,53 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_fpke.add_argument("--length", type=lambda x: int(x, 0), help=tr("Переопределить длину чтения в байтах", "Override read length in bytes"))
     p_fpke.add_argument("--chunk", type=lambda x: int(x, 0), default=500, help=tr("Размер блока UDS 0x23 (1..500, по умолчанию 500)", "UDS 0x23 chunk size (1..500, default 500)"))
     p_fpke.add_argument("--frame-delay", type=float, default=FPKE_DEFAULT_FRAME_DELAY, help=tr("Пауза между кадрами потока (с, по умолчанию 0.00035)", "Inter-frame delay for block stream (s, default 0.00035)"))
-    p_fpke.add_argument("--wake-seconds", type=float, default=4.0, help=tr("Время пробуждения приборки CAN-посылками (по умолчанию 4.0 с)", "CAN keepalive wake duration (default 4.0 s)"))
+    p_fpke.add_argument("--wake-seconds", type=float, default=4.0, help=tr("Время пробуждения панели приборов CAN-посылками (по умолчанию 4.0 с)", "CAN keepalive wake duration (default 4.0 s)"))
     p_fpke.add_argument("--stream", action="store_true", help=tr("Использовать быстрый поток RSCAN0 TM17 (0x6F1) с авто-откатом на UDS 0x23", "Use fast RSCAN0 TM17 (0x6F1) stream with auto-fallback to UDS 0x23"))
     p_fpke.add_argument("--read-uflash", action="store_true", help=tr("В режиме report также считать UFlash (32 КБ)", "Also read UFlash (32 KB) in report mode"))
     p_fpke.add_argument("--read-bflash", action="store_true", help=tr("В режиме report также считать BFlash (96 КБ)", "Also read BFlash (96 KB) in report mode"))
     p_fpke.add_argument("--read-cflash", action="store_true", help=tr("В режиме report также считать CodeFlash (2 МБ)", "Also read CodeFlash (2 MB) in report mode"))
     p_fpke.add_argument("--idcode", help=tr("Опциональный 16-байтный IDCODE (32 hex) для проверки IDAUTH", "Optional 16-byte IDCODE (32 hex) for IDAUTH verification"))
     p_fpke.add_argument("--fd11-key", help=tr("Известный 16-байтный ключ FD11 (32 hex) для режима known-key", "Known 16-byte FD11 key (32 hex) for known-key mode"))
+    p_fpke.add_argument("--via-gateway", action="store_true", help=tr("Работать с панелью приборов через диагностический CAN шлюза J533 (прозрачный RAM-мост ch3 ↔ ch0)", "Access cluster through J533 gateway Diagnosis CAN (transparent RAM-Bridge ch3 ↔ ch0)"))
+    p_fpke.add_argument("--gateway-channel", type=int, default=0, help=tr("Канал RSCAN0 шлюза J533 (по умолчанию 0 — Komfort CAN)", "J533 RSCAN0 sub-bus channel (default 0 — Komfort CAN)"))
     p_fpke.add_argument("-o", "--output", help=tr("Путь к выходному файлу .bin", "Output .bin file path"))
     p_fpke.add_argument("--output-dir", help=tr("Папка для сохранения сессии", "Base output directory for session"))
     p_fpke.set_defaults(func=cmd_fpke)
+
+    p_bcm = _add(
+        "bcm",
+        tr(
+            "Работа с блоком бортовой сети 09 BCM / J519 (5Q0 937 084 / 086, MPC5607B): чтение/запись IKA и GFA, адаптация радиоключей FFB (WFS Ch 3)",
+            "09 BCM / J519 Central Electrics (5Q0 937 084 / 086, MPC5607B): read/write IKA & GFA, FFB remote key adaptation (WFS Ch 3)",
+        ),
+    )
+    p_bcm.add_argument(
+        "bcm_action",
+        choices=("status", "read-gfa", "read-keys", "write-keys", "adapt-ffb"),
+        help=tr(
+            "Действие: status, read-gfa, read-keys, write-keys, adapt-ffb",
+            "Action: status, read-gfa, read-keys, write-keys, adapt-ffb",
+        ),
+    )
+    p_bcm.add_argument("--port", required=True, help=tr("Порт CAN-адаптера", "CAN adapter port"))
+    p_bcm.add_argument("--interface", choices=iface_choices, default="slcan")
+    p_bcm.add_argument("--via-gateway", action="store_true", help=tr("Работать через диагностический CAN шлюза J533 (RAM-мост ch3 ↔ ch0 для XCP/WFS)", "Access BCM through J533 gateway Diagnosis CAN (RAM-Bridge ch3 ↔ ch0 for XCP/WFS)"))
+    p_bcm.add_argument("--gateway-channel", type=int, default=0, help=tr("Канал RSCAN0 шлюза J533 (по умолчанию 0 — Komfort CAN)", "J533 RSCAN0 sub-bus channel (default 0 — Komfort CAN)"))
+    p_bcm.add_argument("--profile", choices=("ea_0511", "dd_0273"), help=tr("Явный профиль адресов ОЗУ BCM (ea_0511 или dd_0273)", "Explicit BCM RAM profile (ea_0511 or dd_0273)"))
+    p_bcm.add_argument("--current-ika", help=tr("Текущий 16-байтный IKA блока BCM (32 hex) для write-keys", "Current 16-byte BCM IKA (32 hex) for write-keys"))
+    p_bcm.add_argument("--new-ika", help=tr("Новый 16-байтный IKA (32 hex) для записи в DID 0x00BE", "New 16-byte IKA (32 hex) to write to DID 0x00BE"))
+    p_bcm.add_argument("--new-gfa", "--gfa", dest="new_gfa", help=tr("16-байтный групповой ключ GFA (32 hex) для write-keys (0x00BD) или adapt-ffb", "16-byte vehicle group key GFA (32 hex) for write-keys (0x00BD) or adapt-ffb"))
+    p_bcm.add_argument("--no-reset", action="store_true", help=tr("Не отправлять 11 01 HardReset после write-keys", "Skip 11 01 HardReset after write-keys"))
+    p_bcm.add_argument("--kc", help=tr("16-байтный мастер-ключ иммо K_c панели приборов (32 hex) для adapt-ffb", "16-byte cluster immobilizer master key K_c (32 hex) for adapt-ffb"))
+    p_bcm.add_argument("--k-ffb", dest="k_ffb", help=tr("16-байтный производный секрет радиоканала K_ffb (32 hex)", "16-byte derived FFB secret K_ffb (32 hex)"))
+    p_bcm.add_argument("--cluster-dflash", help=tr("Путь к Dflash.bin (64 КБ) панели приборов 17 FPK_E для adapt-ffb", "Path to 17 FPK_E cluster Dflash.bin (64 KB) for adapt-ffb"))
+    p_bcm.add_argument("--from-live-cluster", action="store_true", help=tr("Считать панель приборов 17 FPK_E по CAN и адаптировать радиоключи FFB в 09 BCM", "Read 17 FPK_E cluster over CAN and adapt FFB remote keys in 09 BCM"))
+    p_bcm.add_argument("--sync-gfa", action="store_true", help=tr("Записать GFA (/1) панели приборов в 09 BCM (2E 00BD) перед адаптацией FFB", "Write cluster GFA (/1) to 09 BCM (2E 00BD) before FFB adaptation"))
+    p_bcm.add_argument("--key", dest="ffb_keys", action="append", metavar="SERIAL[:COUNTER]", help=tr("Серийный ID радиоключа 8 hex (опционально :COUNTER) для adapt-ffb", "FFB key Serial ID 8 hex (optionally :COUNTER) for adapt-ffb"))
+    p_bcm.add_argument("--freq", type=lambda x: int(x, 0), help=tr("Код частоты DID 0x0A65 (0x01=315MHz, 0x02=433.92MHz, 0x04=868MHz)", "DID 0x0A65 frequency code (0x01=315MHz, 0x02=433.92MHz, 0x04=868MHz)"))
+    p_bcm.add_argument("--clear-all", action="store_true", help=tr("Очистить все слоты радиоключей FFB (80 02 00)", "Clear all FFB remote key slots (80 02 00)"))
+    p_bcm.add_argument("-o", "--output", help=tr("Путь к выходному JSON-файлу", "Output JSON file path"))
+    p_bcm.set_defaults(func=cmd_bcm)
 
     return ap
 

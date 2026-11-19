@@ -259,7 +259,7 @@ class KombiPinoutCard(Section):
             lbl.setText(desc_ru if get_lang() == "ru" else desc_en)
         self.lbl_warn.setText(
             tr(
-                "<b>Пробуждение по CAN и адаптер:</b> отдельной линии KL15 на T18 нет — ContiTool пробуждает приборку "
+                "<b>Пробуждение по CAN и адаптер:</b> отдельной линии KL15 на T18 нет — ContiTool пробуждает панель приборов "
                 "автоматически по CAN (<code>0x3C0 / 0x663 / 0x585 / 0x3BE</code>). Требуется нативный CAN-адаптер "
                 "(CANable / SLCAN / candleLight) и терминатор 120 Ом между Pin 18 (CAN-H) и Pin 17 (CAN-L).",
                 "<b>CAN wake-up & adapter:</b> T18 has no dedicated KL15 wire — ContiTool wakes the cluster "
