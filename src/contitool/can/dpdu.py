@@ -560,6 +560,8 @@ class DPduBus(can.BusABC):
         self._nonraw_verified = False
         self._raw_rx_verified = False
         self._raw_monitor_deaf = False
+        self._raw_needs_prime = False
+        self._raw_prime_unproven = False
         self._silent_raw_probe_at = 0.0
         self.uds_only = False
 
@@ -909,13 +911,19 @@ class DPduBus(can.BusABC):
         self._wake_all()
         if self._rx_thread is not None:
             self._rx_thread.join(timeout=2.0)
-            self._rx_thread = None
+            if not self._rx_thread.is_alive():
+                self._rx_thread = None
+        rx_err, rx_spent = self._rx_error, self.spent
         try:
+            if rx_spent or self._rx_thread is not None:
+                return False
             return self._prime_raw(ids)
         finally:
-            self._rx_error = None
+            self._rx_error = rx_err
+            if rx_spent:
+                self.spent = True
             self._stop.clear()
-            if restart:
+            if restart and not self.spent and self._rx_thread is None:
                 self._rx_thread = threading.Thread(target=self._rx_loop, name="dpdu-rx", daemon=True)
                 self._rx_thread.start()
 
@@ -929,9 +937,13 @@ class DPduBus(can.BusABC):
             return
         if not (self._raw_needs_prime or self._raw_prime_unproven) or self.nonraw or self.uds_only:
             return
+        self._check_rx()
+        if self.h_tx:
+            self._drain(self.h_tx)
         if self._prime_paused(want) or self._prime_paused(want):
             return
         self.spent = True  # a monitor filtering out the answers would only look like a silent ECU
+        self._check_rx()
         raise can.CanOperationError(tr(
             f"D-PDU: не удалось переключить приём CAN1 на 0x{want[1]:03X} (запуск канала ISO-TP не удался)",
             f"D-PDU: could not switch CAN1 reception to 0x{want[1]:03X} (starting the ISO-TP link failed)",
@@ -942,6 +954,8 @@ class DPduBus(can.BusABC):
 
     def _raw_answers_after_prime(self) -> bool:
         """Prime CAN1 and ask `3E 00` through the RawMode links: True if the ECU answers on 0x77A."""
+        if isinstance(self._rx_error, FrameError):
+            self._rx_error = None
         primed = self._prime_paused(restart=True)
         self._raw_prime_unproven = primed
         if not primed:
@@ -1007,6 +1021,7 @@ class DPduBus(can.BusABC):
         try:
             if self._open_nonraw(self.bitrate, verify=True):
                 self._raw_monitor_deaf = True
+                self._raw_prime_unproven = False
                 self.spent = False
                 self._rx_error = None
                 self._stop.clear()
@@ -1020,6 +1035,7 @@ class DPduBus(can.BusABC):
         self.spent = False
         if self._probe_uds_only_fallback(verify=True):
             self._raw_monitor_deaf = True
+            self._raw_prime_unproven = False
             self.spent = False
             self._rx_error = None
             self._refresh_last_module()
@@ -1478,8 +1494,9 @@ class DPduBus(can.BusABC):
         raw = bytes(r.pDataBytes[: min(r.NumDataBytes, 4128)]) if r.NumDataBytes else b""
         flags = bytes(r.RxFlag.pFlagData[: r.RxFlag.NumFlagBytes]) if r.RxFlag.NumFlagBytes else b""
         if len(flags) >= 4 and flags[3] & 0x01:
-            if self.echo_trace is not None:
-                self.echo_trace.append((time.time(), raw, flags))
+            trace = self.echo_trace
+            if trace is not None:
+                trace.append((time.time(), raw, flags))
             return  # the VCI's echo of a frame we sent
         if rx_id is not None:
             # A link with fixed ids carries the payload alone; the id is the one its URID table was set to.

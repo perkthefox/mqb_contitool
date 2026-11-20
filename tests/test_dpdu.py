@@ -1902,3 +1902,41 @@ def test_a_vci_that_needs_no_priming_is_not_primed_for_the_loader_either() -> No
     bus.send(can.Message(arbitration_id=0x6F0, is_extended_id=False, data=LOADER_SYNC))
     assert not api.uds_links and bus._primed_ids is None
     bus.shutdown()
+
+
+def test_drop_module_resets_priming_flags_and_prime_for_preserves_pending_rx_errors(monkeypatch) -> None:
+    from contitool.can.dpdu import FrameError
+
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.5)
+    api = UnstartedCan1PduApi()
+    bus = DPduBus(dll=api)
+    can_identify("", bus=bus)
+    assert bus._raw_needs_prime and bus._primed_ids == (0x710, 0x77A)
+
+    # 1. A pending FrameError from dpdu-rx must be raised by send() instead of wiped by _prime_for/_prime_paused
+    bus._rx_error = FrameError("packed result")
+    with pytest.raises(FrameError, match="packed result"):
+        bus.send(can.Message(arbitration_id=0x6F0, is_extended_id=False, data=LOADER_SYNC))
+    assert not bus.spent and bus._primed_ids == (0x710, 0x77A)
+
+    # 2. _drop_module clears module-scoped priming flags so another candidate starts clean
+    bus._raw_prime_unproven = True
+    bus._drop_module()
+    assert not bus._raw_needs_prime and not bus._raw_prime_unproven and bus._primed_ids is None
+    bus.shutdown()
+
+
+def test_closing_link_while_echoes_arrive_never_races_echo_trace(tmp_path) -> None:
+    from contitool.can.transport import J533CanLink
+
+    api = FakePduApi()
+    bus = DPduBus(dll=api)
+    log = tmp_path / "can.jsonl"
+    for _ in range(8):
+        with J533CanLink("", bus=bus, log_path=log) as link:
+            for _ in range(16):
+                api._result((0x6F0).to_bytes(4, "big") + LOADER_SYNC, b"\x00\x00\x00\x01")
+            link.send_frame(0x6F0, LOADER_SYNC)
+    assert not bus.spent and bus._rx_error is None and bus.echo_trace is None
+    bus.shutdown()
