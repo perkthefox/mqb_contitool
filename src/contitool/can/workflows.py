@@ -303,6 +303,10 @@ class FblRejectedAppError(RuntimeError):
     """`31 01 02 02` did not pass: the factory bootloader wants a signature we do not have."""
 
 
+class FblEraseFailedError(RuntimeError):
+    """`31 01 FF 00` returned a non-zero routine status (e.g. `71 01 FF 00 01` on `R_FCL_ERR_PROTECTION`)."""
+
+
 class Stage1SilentError(TimeoutError):
     """Stage 1 of the RAM-loader entry went unanswered, so the entry stopped before its key (STAGE1_SILENT).
     A retry would be just as silent; can_cure_fbl_fingerprint is the cure."""
@@ -2808,7 +2812,10 @@ def _program_application_uds(
             )
         )
         erase_resp = link.request_uds(bytes.fromhex("3101ff000101"), 0x71, timeout=120.0, allow_pending=True)
-        _routine_ok(erase_resp, "EraseMemory (FF00)")
+        try:
+            _routine_ok(erase_resp, "EraseMemory (FF00)")
+        except RuntimeError as exc:
+            raise FblEraseFailedError(str(exc)) from exc
         info["erase_completed"] = True
         info["erase_response"] = erase_resp.hex()
 
@@ -3028,7 +3035,20 @@ def can_write_cflash(
             "first; once it runs, the boot area through the RAM-loader, then the readback.",
         ))
         result["flash_commands_sent"] = True
-        result["uds_first"] = _restore_app_over_uds(port, raw_cand, interface, out_dir / "uds_first", reporter)
+        try:
+            result["uds_first"] = _restore_app_over_uds(port, raw_cand, interface, out_dir / "uds_first", reporter)
+        except FblEraseFailedError as erase_exc:
+            raw_faci = True
+            result["raw_faci"] = True
+            result["uds_first_erase_failed"] = str(erase_exc)
+            reporter.warning(
+                tr(
+                    f"Загрузчик FBL отклонил стирание EraseMemory ({erase_exc}) — "
+                    "восстанавливаем CodeFlash напрямую через FACI в RAM-Loader.",
+                    f"The FBL bootloader rejected EraseMemory ({erase_exc}) — "
+                    "restoring CodeFlash directly via FACI in RAM-Loader.",
+                )
+            )
 
     with J533CanLink(port, interface=interface, log_path=out_dir / "can.jsonl") as link:
         try:
@@ -3088,7 +3108,10 @@ def can_write_cflash(
                 physical_before = expected_before_cflash
 
             live_selfid = physical_before[SELFID_OFFSET : SELFID_OFFSET + SELFID_SIZE]
-            faci_selfid = _resolve_live_selfid(link, live_selfid, reporter=reporter)
+            extra_prot = probe_extra_area_protection(link, reporter=reporter)
+            if extra_prot is not None:
+                result["extra_area_protection"] = {k: v for k, v in extra_prot.items() if k != "idcode_bytes"}
+            faci_selfid = _resolve_live_selfid(link, live_selfid, extra_prot=extra_prot, reporter=reporter)
             expected_full = bytearray(prefix + bytes(app))
             expected_full[0xC000:0xC004] = FBL_PRESENCE_MAGIC.to_bytes(4, "little")
             expected_full[0xC100:0xC104] = b"\xff\xff\xff\xff"
@@ -3116,6 +3139,27 @@ def can_write_cflash(
             result["changed_boot_blocks"] = boot_blocks
             result["changed_app_blocks"] = app_blocks
 
+            use_raw_faci = raw_faci
+            if not use_raw_faci and app_blocks and faci_selfid != live_selfid:
+                # FBL's built-in R_FCL (0x0100147A / 0x01004EE0) only loads Cflash+0xAB00 into FLID0..3.
+                # When the MCU's Extra Area IDCODE (@ 0xFF300050, e.g. blank 0xFF*16) differs from Cflash+0xAB00,
+                # UDS 31 01 FF 00 fails immediately with 71 01 FF 00 01 (R_FCL_ERR_PROTECTION); direct FACI
+                # authenticates with `faci_selfid` (and automatic 0xFF*16 fallback) inside the active RAM-Loader.
+                use_raw_faci = True
+                result["raw_faci"] = True
+                result["raw_faci_reason"] = "idcode_mismatch"
+                reporter.warning(
+                    tr(
+                        f"IDCODE процессора в Extra Area ({faci_selfid.hex().upper()}) отличается от SELFID в "
+                        f"CodeFlash+0xAB00 ({live_selfid.hex().upper()}) — штатное стирание FBL по UDS "
+                        "(31 01 FF 00) не пройдёт проверку IDST; переключаемся на прямую запись изменённых блоков "
+                        "CodeFlash через FACI.",
+                        f"The MCU's Extra Area IDCODE ({faci_selfid.hex().upper()}) differs from CodeFlash+0xAB00 "
+                        f"SELFID ({live_selfid.hex().upper()}) — FBL UDS EraseMemory (31 01 FF 00) cannot "
+                        "authenticate IDST; switching to direct FACI programming of modified CodeFlash blocks.",
+                    )
+                )
+
             if not changed_blocks:
                 reporter.success(
                     tr(
@@ -3124,7 +3168,7 @@ def can_write_cflash(
                     )
                 )
                 result["already_matching"] = True
-            elif raw_faci:
+            elif use_raw_faci:
                 reporter.step(
                     3,
                     total_steps,
@@ -3210,20 +3254,81 @@ def can_write_cflash(
                             ),
                         )
                         result["flash_commands_sent"] = True
-                        result["uds_programming"] = _program_application_uds(
-                            link,
-                            bytes(app),
-                            signature_128b=signature_128b,
-                            reporter=reporter,
-                        )
-                        reporter.step(5, total_steps, tr("Повторный вход в RAM-Loader и побайтовая сверка всех 1.5 МБ CodeFlash", "Re-entering RAM-Loader & verifying full 1.5 MB CodeFlash readback"))
-                        enter_ram_loader(link, reporter=reporter)
-                        if record_after:
-                            reporter.can_log(tr("Запись загрузчика о программировании (блок 4) — из образа, после UDS",
-                                                "The FBL's programming record (block 4) — from the image, after UDS"))
-                            result["fbl_record_faci"] = _program_cflash_blocks_in_loader(
-                                link, bytes(expected_full), [FBL_RECORD_BLOCK], flid_16b=faci_selfid, reporter=reporter
+                        try:
+                            result["uds_programming"] = _program_application_uds(
+                                link,
+                                bytes(app),
+                                signature_128b=signature_128b,
+                                reporter=reporter,
                             )
+                        except FblEraseFailedError as erase_exc:
+                            result["uds_erase_failed"] = str(erase_exc)
+                            result["uds_fallback_faci"] = True
+                            reporter.warning(
+                                tr(
+                                    f"Загрузчик FBL отклонил стирание EraseMemory ({erase_exc}) — "
+                                    "переходим на прямую запись изменённых блоков CodeFlash через FACI в RAM-Loader.",
+                                    f"The FBL bootloader rejected EraseMemory ({erase_exc}) — "
+                                    "falling back to direct FACI programming of modified CodeFlash blocks in RAM-Loader.",
+                                )
+                            )
+                            with contextlib.suppress(*LINK_ERRORS):
+                                link.request_uds(b"\x11\x01", 0x51, timeout=2.0, resend=False)
+                            time.sleep(2.5)
+                            reporter.step(
+                                5,
+                                total_steps,
+                                tr(
+                                    "Повторный вход в RAM-Loader, запись через FACI и побайтовая сверка всех 1.5 МБ CodeFlash",
+                                    "Re-entering RAM-Loader, direct FACI write & full 1.5 MB CodeFlash readback",
+                                ),
+                            )
+                            enter_ram_loader(link, allow_already_active=False, reporter=reporter)
+                            b4_live = read_memory_bytes(link, 0x8000, 0x30)
+                            b6_live = read_memory_bytes(link, 0xC000, 0x240)
+                            if (
+                                b4_live == physical_before[0x8000:0x8030]
+                                and b6_live == physical_before[0xC000:0xC240]
+                            ):
+                                fallback_blocks = (
+                                    ([FBL_RECORD_BLOCK] if (FBL_RECORD_BLOCK in boot_blocks and record_after) else [])
+                                    + app_blocks
+                                )
+                            else:
+                                live_after_path = backup_dir / "Cflash_after_uds_erase_fail.bin"
+                                read_memory_area(
+                                    link,
+                                    CFLASH_ADDR_START,
+                                    CFLASH_ADDR_START + CFLASH_SIZE,
+                                    live_after_path,
+                                    label="Cflash Live Check (1.5 MB)",
+                                    reporter=reporter,
+                                )
+                                live_after = live_after_path.read_bytes()
+                                fallback_blocks = [
+                                    idx
+                                    for idx, s, e in ranges
+                                    if _cflash_block_differs(live_after, bytes(expected_full), s, e)
+                                    and (idx != FBL_RECORD_BLOCK or record_after)
+                                ]
+                            result["faci_fallback_blocks"] = fallback_blocks
+                            if fallback_blocks:
+                                result["faci_blocks"] = _program_cflash_blocks_in_loader(
+                                    link,
+                                    bytes(expected_full),
+                                    fallback_blocks,
+                                    flid_16b=faci_selfid,
+                                    reporter=reporter,
+                                )
+                        else:
+                            reporter.step(5, total_steps, tr("Повторный вход в RAM-Loader и побайтовая сверка всех 1.5 МБ CodeFlash", "Re-entering RAM-Loader & verifying full 1.5 MB CodeFlash readback"))
+                            enter_ram_loader(link, reporter=reporter)
+                            if record_after:
+                                reporter.can_log(tr("Запись загрузчика о программировании (блок 4) — из образа, после UDS",
+                                                    "The FBL's programming record (block 4) — from the image, after UDS"))
+                                result["fbl_record_faci"] = _program_cflash_blocks_in_loader(
+                                    link, bytes(expected_full), [FBL_RECORD_BLOCK], flid_16b=faci_selfid, reporter=reporter
+                                )
                     else:
                         reporter.step(4, total_steps, tr("Прикладная область 0x00C200..0x17FFFF без изменений — UDS перезапись не требуется", "Application area 0x00C200..0x17FFFF unchanged — skipping UDS reflash"))
                         reporter.step(5, total_steps, tr("Побайтовая сверка всех 1.5 МБ CodeFlash", "Verifying full 1.5 MB CodeFlash readback"))

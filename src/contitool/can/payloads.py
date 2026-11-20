@@ -86,7 +86,7 @@ DFLASH_BLOCK_SIZE = 64
 DFLASH_ICUS_RESERVED_OFFSET = 0xF800  # Top 2 KB (0xF800..0xFFFF) hardware-guarded for ICUSB SHE keys
 MAX_DFLASH_BLOCKS_PER_PACKET = 400
 
-# 6. Parameterized FACI CodeFlash / Extended User Area Writer Stub (722 bytes RH850 machine code, built in hw_applets.py)
+# 6. Parameterized FACI CodeFlash / Extended User Area Writer Stub (724 bytes RH850 machine code, built in hw_applets.py)
 #    Supports 8 KB boot blocks (0x00000000..0x0000FFFF), 32 KB app blocks (0x00010000..0x0017FFFF),
 #    and Extended User Area (0x01000000..0x01007FFF) with FLMDCNT=1 / FPMON.FWE check and WDTA0/WDTA1 servicing.
 MAX_CFLASH_PAGES_PER_PACKET = 96
@@ -522,13 +522,13 @@ def verify_payload_self_tests() -> None:
         raise RuntimeError("Embedded RSA_PROBE_PAYLOAD SHA-256 self-test failed")
     if build_rsa_probe_payload(0x01003416)[RSA_PROBE_FN_IMM_OFFSET : RSA_PROBE_FN_IMM_OFFSET + 4] != b"\x16\x34\x00\x01":
         raise RuntimeError("build_rsa_probe_payload(0x01003416) self-test failed")
-    if len(UFLASH_FACI_STUB) != 660 or hashlib.sha256(UFLASH_FACI_STUB).hexdigest() != EXPECTED_UFLASH_FACI_STUB_SHA256:
+    if len(UFLASH_FACI_STUB) != 660 or len(UFLASH_FACI_STUB) % 4 != 0 or hashlib.sha256(UFLASH_FACI_STUB).hexdigest() != EXPECTED_UFLASH_FACI_STUB_SHA256:
         raise RuntimeError("Embedded UFLASH_FACI_STUB SHA-256 self-test failed")
-    if len(DFLASH_FACI_STUB) != 784 or hashlib.sha256(DFLASH_FACI_STUB).hexdigest() != EXPECTED_DFLASH_FACI_STUB_SHA256:
+    if len(DFLASH_FACI_STUB) != 784 or len(DFLASH_FACI_STUB) % 4 != 0 or hashlib.sha256(DFLASH_FACI_STUB).hexdigest() != EXPECTED_DFLASH_FACI_STUB_SHA256:
         raise RuntimeError("Embedded DFLASH_FACI_STUB SHA-256 self-test failed")
-    if len(CFLASH_FACI_STUB) != 722 or hashlib.sha256(CFLASH_FACI_STUB).hexdigest() != EXPECTED_CFLASH_FACI_STUB_SHA256:
+    if len(CFLASH_FACI_STUB) != 724 or len(CFLASH_FACI_STUB) % 4 != 0 or hashlib.sha256(CFLASH_FACI_STUB).hexdigest() != EXPECTED_CFLASH_FACI_STUB_SHA256:
         raise RuntimeError("Embedded CFLASH_FACI_STUB SHA-256 self-test failed")
-    if len(DFLASH_READER_STUB) != 652 or hashlib.sha256(DFLASH_READER_STUB).hexdigest() != EXPECTED_DFLASH_READER_STUB_SHA256:
+    if len(DFLASH_READER_STUB) != 652 or len(DFLASH_READER_STUB) % 4 != 0 or hashlib.sha256(DFLASH_READER_STUB).hexdigest() != EXPECTED_DFLASH_READER_STUB_SHA256:
         raise RuntimeError("Embedded DFLASH_READER_STUB SHA-256 self-test failed")
     if build_fed_reader_payload(0x11223344, 0x1000, 2) != _FED_READER_ASSEMBLED_2X:
         raise RuntimeError("Fed reader builder differs from its assembled template")

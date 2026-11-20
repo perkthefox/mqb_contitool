@@ -827,14 +827,20 @@ class SimulatedRh850FaciMcu:
                 pc += 4
                 continue
 
-            # Format VII loads/stores (32-bit)
+            # Format VII loads/stores (32-bit) — enforce RH850/F1L MCTL.MA=0 hardware alignment (MAE vector 0x00C0)
             hw1 = struct.unpack_from("<H", self.ram, ram_off + 2)[0]
             if op6 == 0b111001:  # ld.h / ld.w disp16[reg1], reg2
                 disp = _sext(hw1 & 0xFFFE, 16)
                 addr = (regs[reg1] + disp) & 0xFFFFFFFF
                 if hw1 & 1:
+                    assert (addr & 3) == 0, (
+                        f"RH850 MAE (vector 0x00C0): unaligned ld.w @ 0x{addr:08X} from PC=0x{pc:08X}"
+                    )
                     val = int.from_bytes(self.read_phys(addr, 4), "little")
                 else:
+                    assert (addr & 1) == 0, (
+                        f"RH850 MAE (vector 0x00C0): unaligned ld.h @ 0x{addr:08X} from PC=0x{pc:08X}"
+                    )
                     val = _sext(int.from_bytes(self.read_phys(addr, 2), "little"), 16) & 0xFFFFFFFF
                 if reg2 != 0:
                     regs[reg2] = val
@@ -843,6 +849,9 @@ class SimulatedRh850FaciMcu:
             if op6 == 0b111111 and (hw1 & 1):  # ld.hu disp16[reg1], reg2
                 disp = _sext(hw1 & 0xFFFE, 16)
                 addr = (regs[reg1] + disp) & 0xFFFFFFFF
+                assert (addr & 1) == 0, (
+                    f"RH850 MAE (vector 0x00C0): unaligned ld.hu @ 0x{addr:08X} from PC=0x{pc:08X}"
+                )
                 val = int.from_bytes(self.read_phys(addr, 2), "little")
                 if reg2 != 0:
                     regs[reg2] = val
@@ -860,8 +869,14 @@ class SimulatedRh850FaciMcu:
                 disp = _sext(hw1 & 0xFFFE, 16)
                 addr = (regs[reg1] + disp) & 0xFFFFFFFF
                 if hw1 & 1:
+                    assert (addr & 3) == 0, (
+                        f"RH850 MAE (vector 0x00C0): unaligned st.w @ 0x{addr:08X} from PC=0x{pc:08X}"
+                    )
                     self.write_phys(addr, struct.pack("<I", regs[reg2] & 0xFFFFFFFF))
                 else:
+                    assert (addr & 1) == 0, (
+                        f"RH850 MAE (vector 0x00C0): unaligned st.h @ 0x{addr:08X} from PC=0x{pc:08X}"
+                    )
                     self.write_phys(addr, struct.pack("<H", regs[reg2] & 0xFFFF))
                 pc += 4
                 continue
@@ -904,6 +919,8 @@ class SimulatedJ533CanBus:
         self._dl_offset = 0
         self._dl_buf = bytearray()
         self._seed = 0x2468ACE1
+        self.fbl_erase_fail: str | None = None  # None | "fast" | "partial"
+        self.uds_erase_calls = 0
 
     def recv(self, timeout: float = 0.0):
         return self.rx_queue.pop(0) if self.rx_queue else None
@@ -1032,8 +1049,20 @@ class SimulatedJ533CanBus:
         elif req.startswith(b"\x2e\xf1\x5a"):
             self._reply_uds(b"\x6e\xf1\x5a")
         elif req == bytes.fromhex("3101ff000101"):
-            self.mcu.cflash[0xC000:CFLASH_SIZE] = b"\xff" * (CFLASH_SIZE - 0xC000)
-            self._reply_uds(b"\x71\x01\xff\x00\x00")
+            self.uds_erase_calls += 1
+            # Real FBL R_FCL (Uflash 0x0100147A / 0x01004EE0) only loads Cflash+0xAB00 into FLID0..3:
+            # if Extra Area IDCODE (@ 0xFF300050) differs, R_FCL fails with R_FCL_ERR_PROTECTION -> 71 01 FF 00 01.
+            cflash_id = bytes(self.mcu.cflash[0xAB00:0xAB10])
+            extra_id = bytes(self.mcu.extra_area[0x50:0x60])
+            if self.fbl_erase_fail == "fast" or cflash_id != extra_id:
+                self._reply_uds(b"\x71\x01\xff\x00\x01")
+            elif self.fbl_erase_fail == "partial":
+                self.mcu.cflash[0x8023] = 0xFF
+                self.mcu.cflash[0xC000:0x10000] = b"\xff" * 0x4000  # erases Block 6 + unchanged Block 7
+                self._reply_uds(b"\x71\x01\xff\x00\x01")
+            else:
+                self.mcu.cflash[0xC000:CFLASH_SIZE] = b"\xff" * (CFLASH_SIZE - 0xC000)
+                self._reply_uds(b"\x71\x01\xff\x00\x00")
         elif req.startswith(b"\x34\x00\x44"):
             self._dl_offset = int.from_bytes(req[3:7], "big")
             dl_size = int.from_bytes(req[7:11], "big")
@@ -1773,3 +1802,170 @@ def test_blank_or_mismatched_extra_area_idcode_and_otp_uflash_fallback(
     assert rest_lock["uflash"]["already_matching"] is True
     assert bytes(mcu_faci_lock.cflash) == patched_cf
     assert bytes(mcu_faci_lock.uflash) == synth_uflash
+
+
+def test_cflash_faci_stub_word_aligned_and_no_mae(
+    synth_cflash: bytes, synth_uflash: bytes, synth_dflash: bytes
+) -> None:
+    """Issues #38, #40, #42: RH850/F1L raises MAE (vector 0x00C0) on unaligned `ld.w` reads when `CFLASH_FACI_STUB`
+    is not 4-byte aligned (722 B -> PAYLOAD_DATA @ 0xFEDF840A). Verify every stub is word-aligned, executes with
+    strict MAE checks, and that the emulator genuinely catches a 2-byte misaligned `ld.w`."""
+    from contitool.can.hw_applets import (
+        EEPROM_M95640_READER_STUB,
+        OPBT_READER_STUB,
+        PAYLOAD_ENTRY_ADDR,
+        UFLASH_FACI_STUB,
+        _Rh850Builder,
+    )
+    from contitool.can.payloads import (
+        DFLASH_FACI_STUB,
+        DFLASH_READER_STUB,
+        RSA_PROBE_PAYLOAD,
+        build_uflash_faci_payloads,
+    )
+    from contitool.core import apply_uflash_rsa_patch
+
+    for name, stub in [
+        ("CFLASH_FACI_STUB", CFLASH_FACI_STUB),
+        ("UFLASH_FACI_STUB", UFLASH_FACI_STUB),
+        ("DFLASH_FACI_STUB", DFLASH_FACI_STUB),
+        ("DFLASH_READER_STUB", DFLASH_READER_STUB),
+        ("OPBT_READER_STUB", OPBT_READER_STUB),
+        ("EEPROM_M95640_READER_STUB", EEPROM_M95640_READER_STUB),
+        ("RSA_PROBE_PAYLOAD", RSA_PROBE_PAYLOAD),
+    ]:
+        assert len(stub) % 4 == 0, f"{name} length {len(stub)} is not 4-byte aligned!"
+        assert (PAYLOAD_ENTRY_ADDR + len(stub)) % 4 == 0, f"{name} PAYLOAD_DATA is not 4-byte aligned!"
+
+    # Verify the RH850 emulator really raises MAE on a 2-byte misaligned ld.w (like v2.1.3's 0xFEDF840A)
+    bad = _Rh850Builder()
+    bad.mov_imm(PAYLOAD_ENTRY_ADDR + 0x2D2, 23)
+    bad.ld_w(0, 23, 12)
+    bad.jmp_lp()
+    mcu_bad = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash)
+    with pytest.raises(AssertionError, match="RH850 MAE"):
+        mcu_bad.execute_loader_payload(bad.build())
+
+    # Execute CFLASH_FACI_STUB on Boot Block #4 (Issue #42), Boot Block #5 (Issues #38/#40), and custom-FLID Uflash
+    selfid = bytes.fromhex("A2A874A31E1E5EB3C44983B1F870F765")
+    mcu = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash, selfid=selfid)
+
+    b4_new = bytearray(mcu.cflash[0x8000:0xA000])
+    b4_new[0x0023] = 0x00
+    b4_new[0x0100:0x0104] = b"NIGB"
+    for pkt in build_cflash_faci_block_payloads(0x00008000, bytes(b4_new), flid_16b=selfid):
+        res = mcu.execute_loader_payload(pkt)
+        assert res["marker"] == 1 and res["fstatr"] == 0x8000
+    assert bytes(mcu.cflash[0x8000:0xA000]) == bytes(b4_new)
+
+    b5_new = bytearray(mcu.cflash[0xA000:0xC000])
+    b5_new[0x0167] = 0x00  # Engineering Mode OTP byte @ 0xA167 (Issue #38)
+    for pkt in build_cflash_faci_block_payloads(0x0000A000, bytes(b5_new), flid_16b=selfid):
+        res = mcu.execute_loader_payload(pkt)
+        assert res["marker"] == 1 and res["fstatr"] == 0x8000
+    assert bytes(mcu.cflash[0xA000:0xC000]) == bytes(b5_new)
+
+    uf_eng, _ = apply_uflash_rsa_patch(synth_uflash)
+    uf_pkts, _ = build_uflash_faci_payloads(uf_eng, flid_16b=selfid)
+    assert len(uf_pkts) == 1 and uf_pkts[0].startswith(CFLASH_FACI_STUB)
+    res_uf = mcu.execute_loader_payload(uf_pkts[0])
+    assert res_uf["marker"] == 1 and res_uf["fstatr"] == 0x8000
+    assert bytes(mcu.uflash) == uf_eng
+
+
+def test_issue41_idcode_mismatch_and_fbl_erase_7101ff0001_fallback(
+    synth_cflash: bytes,
+    synth_uflash: bytes,
+    synth_dflash: bytes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #41: When FBL `31 01 FF 00` cannot erase CodeFlash (`71 01 FF 00 01`), either because Extra Area IDCODE
+    differs from `Cflash+0xAB00` (e.g. blank `0xFF*16`) or because FBL rejects EraseMemory at runtime (fast fail or
+    partial erase), `can_write_cflash` falls back cleanly to direct FACI programming in RAM-Loader."""
+    import time
+
+    from contitool.core import apply_uflash_rsa_patch
+    from contitool.i18n import set_lang
+
+    set_lang("en")
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+
+    selfid_41 = bytes.fromhex("41BAECDB34DCB7247FA5BF707155AE42")
+    spec_5f = parse_slot_selector("5F")
+    ika_5f = parse_hex_key("112233445566778899AABBCCDDEEFF00")
+
+    # Case A: Blank Extra Area IDCODE (0xFF*16) != Cflash+0xAB00 (exact strtgs #31/#41 ECU state).
+    # Uflash + Dflash succeed via FACI, and can_write_cflash proactively switches to direct FACI without hitting 7101ff0001.
+    mcu_a = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash, selfid=selfid_41)
+    mcu_a.extra_area[0x50:0x60] = b"\xff" * 16
+    bus_a = SimulatedJ533CanBus(mcu_a)
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: bus_a)
+
+    mod_cf_a, mod_df_a, _ = bind_cp_turnkey(bytes(mcu_a.cflash), synth_dflash, [(spec_5f, ika_5f)])
+    uf_a = can_write_uflash("mock0", session_dir=tmp_path / "a_uf", skip_full_backup=True, return_to_app=False)
+    assert uf_a["complete"] is True
+    df_a = can_write_dflash("mock0", mod_df_a, session_dir=tmp_path / "a_df", skip_full_backup=True, return_to_app=False)
+    assert df_a["complete"] is True
+    cf_a = can_write_cflash("mock0", mod_cf_a, session_dir=tmp_path / "a_cf", skip_backup=True)
+    assert cf_a["complete"] is True
+    assert cf_a["raw_faci"] is True
+    assert cf_a["raw_faci_reason"] == "idcode_mismatch"
+    assert bus_a.uds_erase_calls == 0
+    assert bytes(mcu_a.cflash) == mod_cf_a
+    assert bytes(mcu_a.cflash[0xAB00:0xAB10]) == selfid_41
+
+    # Case B: Extra Area IDCODE matches Cflash+0xAB00, but FBL EraseMemory (31 01 FF 00) returns 7101ff0001 immediately
+    # without erasing any flash -> reactive fallback re-enters RAM-Loader and programs only changed app blocks via FACI.
+    uf_eng, _ = apply_uflash_rsa_patch(synth_uflash)
+    mcu_b = SimulatedRh850FaciMcu(synth_cflash, uf_eng, synth_dflash, selfid=selfid_41)
+    bus_b = SimulatedJ533CanBus(mcu_b)
+    bus_b.fbl_erase_fail = "fast"
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: bus_b)
+
+    mod_cf_b, _, _ = bind_cp_turnkey(bytes(mcu_b.cflash), synth_dflash, [(spec_5f, ika_5f)])
+    cf_b = can_write_cflash("mock0", mod_cf_b, session_dir=tmp_path / "b_cf", skip_backup=True)
+    assert cf_b["complete"] is True
+    assert bus_b.uds_erase_calls == 1
+    assert cf_b["uds_fallback_faci"] is True
+    assert "7101ff0001" in cf_b["uds_erase_failed"]
+    assert cf_b["faci_fallback_blocks"] == cf_b["changed_app_blocks"]
+    assert bytes(mcu_b.cflash) == mod_cf_b
+
+    # Case C: FBL EraseMemory corrupts Block 4 (0x8023 = 0xFF) & erases Block 6 + unchanged Block 7 before returning
+    # 7101ff0001 -> reactive fallback detects the partial erase via live readback and restores Blocks 4, 6, 7 + edits!
+    from contitool.core import app_crc
+
+    cf_c_base = bytearray(synth_cflash)
+    cf_c_base[0x8023] = 0x00  # realistic finished NIGB record
+    cf_c_base[0xE000:0xE010] = b"UNMODIFIED_BLK07"
+    _, base_crc = app_crc(cf_c_base[APP_BASE:])
+    struct.pack_into("<H", cf_c_base, 0xC21C, base_crc)
+    mcu_c = SimulatedRh850FaciMcu(bytes(cf_c_base), uf_eng, synth_dflash, selfid=selfid_41)
+    bus_c = SimulatedJ533CanBus(mcu_c)
+    bus_c.fbl_erase_fail = "partial"
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: bus_c)
+
+    mod_cf_c, _, _ = bind_cp_turnkey(bytes(mcu_c.cflash), synth_dflash, [(spec_5f, ika_5f)])
+    cf_c = can_write_cflash("mock0", mod_cf_c, session_dir=tmp_path / "c_cf", skip_backup=True)
+    assert cf_c["complete"] is True
+    assert cf_c["uds_fallback_faci"] is True
+    assert {4, 6, 7}.issubset(set(cf_c["faci_fallback_blocks"]))
+    assert mcu_c.cflash[0x8023] == 0x00
+    assert bytes(mcu_c.cflash[0xE000:0xE010]) == b"UNMODIFIED_BLK07"
+    assert bytes(mcu_c.cflash) == mod_cf_c
+
+    # Case D: ECU already stuck in FBL (invalid 0xC000) and FBL EraseMemory fails with 7101ff0001 ->
+    # can_write_cflash catches FblEraseFailedError from _restore_app_over_uds and recovers via raw_faci=True.
+    mcu_d = SimulatedRh850FaciMcu(synth_cflash, uf_eng, synth_dflash, selfid=selfid_41)
+    mod_cf_d, _, _ = bind_cp_turnkey(bytes(mcu_d.cflash), synth_dflash, [(spec_5f, ika_5f)])
+    mcu_d.cflash[0xC000:0xC004] = b"\xff\xff\xff\xff"  # ECU stuck in FBL (no running app)
+    bus_d = SimulatedJ533CanBus(mcu_d)
+    bus_d.fbl_erase_fail = "fast"
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: bus_d)
+
+    cf_d = can_write_cflash("mock0", mod_cf_d, session_dir=tmp_path / "d_cf", skip_backup=True)
+    assert cf_d["complete"] is True
+    assert cf_d["raw_faci"] is True
+    assert "7101ff0001" in cf_d["uds_first_erase_failed"]
+    assert bytes(mcu_d.cflash) == mod_cf_d

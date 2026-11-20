@@ -140,6 +140,13 @@ class _Rh850Builder:
     def nop(self) -> None:
         self._emit(struct.pack("<H", 0x0000))
 
+    def align(self, boundary: int = 4) -> None:
+        """Pad with 2-byte `nop` instructions until `pc` is a multiple of `boundary`."""
+        if boundary <= 0 or boundary % 2 != 0:
+            raise ValueError(f"Alignment boundary must be a positive even integer, got {boundary}")
+        while self._pc % boundary != 0:
+            self.nop()
+
     def jmp_lp(self) -> None:
         self._emit(struct.pack("<H", 0x007F))
 
@@ -1020,6 +1027,9 @@ def _build_faci_code_stub(*, is_uflash: bool) -> tuple[bytes, int]:
     _emit_flmd_subroutine(b, "SUB_SET_FLMD")
     _emit_wait_frdy_subroutine(b, "SUB_WAIT_FRDY")
     _emit_faci_wdt_subroutine(b, "SUB_WDT")
+    # PAYLOAD_ENTRY_ADDR (0xFEDF8138) is 4-byte aligned; RH850/F1L raises MAE (vector 0x00C0) on
+    # unaligned ld.w reads from the 40-byte CFLASH_FACI_STUB header placed at PAYLOAD_DATA.
+    b.align(4)
     b.label("PAYLOAD_DATA")
     return b.build(), pages_imm_offset
 
@@ -1042,4 +1052,4 @@ CFLASH_FACI_STUB = build_cflash_faci_stub()
 EXPECTED_OPBT_READER_STUB_SHA256 = "a5b1a7a12a8547e164ab0f4357257e6d422cec1780240d1c5716f4ac02f74067"
 EXPECTED_EEPROM_READER_STUB_SHA256 = "aeda839eeba9d6f307fe06f9278181b9feb11cb361125508f0cff2304ba63830"
 EXPECTED_UFLASH_FACI_STUB_SHA256 = "9718f50692f086cf2cea33287c9b9c0e1bb6c70bf0d961c4f3f7c65dc3fa549c"
-EXPECTED_CFLASH_FACI_STUB_SHA256 = "901176c722108bab9547a030b69f9360a7095b0774befe9a80af0803ed58ee75"
+EXPECTED_CFLASH_FACI_STUB_SHA256 = "0598491f25906507b1b7d21072e1df676e0449a4929735c1b557e101d6646e99"

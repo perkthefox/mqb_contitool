@@ -46,6 +46,7 @@ from contitool.can.ports import SUPPORTED_CAN_INTERFACES, DetectedCanPort, Found
 from contitool.can.j2534 import J2534Device, discover_j2534
 from contitool.can.transport import J533CanLink
 from contitool.can.workflows import (
+    FblEraseFailedError,
     UflashProtectedError,
     backup_identity,
     can_backup,
@@ -98,6 +99,7 @@ __all__ = [
     "EXPECTED_ONE_SHOT_PAYLOAD_SHA256",
     "EXPECTED_OPBT_READER_STUB_SHA256",
     "EXPECTED_RSA_PROBE_SHA256",
+    "FblEraseFailedError",
     "J533CanLink",
     "LOADER_PASSWORD",
     "LOADER_RESET_PAYLOAD",

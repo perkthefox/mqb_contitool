@@ -1,5 +1,19 @@
 # Changelog / История изменений
 
+## 2.1.5 — 2026-11-20
+
+### 🇷🇺 Исправлено
+- **Запись блоков `CodeFlash` через `FACI` в RAM-Loader (`No CAN frame from 0x6F1 within 60.0s`, #38, #40, #42):** исправлено невыровненное смещение заголовка `PAYLOAD_DATA` в стабе `CFLASH_FACI_STUB` (722 Б → `0xFEDF840A`, `mod 4 == 2`), которое приводило к аппаратному исключению RH850/F1L `MAE` (`0x00C0`) на первой инструкции `ld.w` и немедленному перезапуску процессора при записи загрузочных блоков `#4`/`#5` (Engineering Mode OTP `0xA167`, восстановление записи FBL после UDS), прямой записи `--raw-faci` и записи `Uflash` с явным `IDCODE`. Стаб `CFLASH_FACI_STUB` выровнен до 724 Б (`0xFEDF840C`, `% 4 == 0`), в самопроверки `verify_payload_self_tests()` и RH850-эмулятор добавлена строгая проверка 4-байтового выравнивания.
+- **Автоматический переход на прямую запись `CodeFlash` через `FACI` при отказе `EraseMemory` (`7101ff0001`, #41):**
+  - В `can_write_cflash()` добавлена предварительная проверка совпадения `IDCODE` из `Extra Area` (`0xFF300050`) с `SELFID` в `CodeFlash+0xAB00`: при расхождении (например, чистый `0xFF*16` в `Extra Area`) встроенный в FBL драйвер `R_FCL` не проходит проверку `IDST` и отклоняет `31 01 FF 00` с кодом `7101ff0001`, поэтому ContiTool сразу записывает изменённые блоки напрямую через `FACI` в активном RAM-Loader.
+  - Если загрузчик FBL всё же вернул ошибку на `EraseMemory (31 01 FF 00)` (`FblEraseFailedError`), выполняется автоматический fallback на прямую запись через `FACI` с проверкой целостности блоков `#4` и `#6` (и восстановлением любых частично стёртых блоков) и полной побайтовой сверкой всех 1.5 МБ `CodeFlash`.
+
+### 🇬🇧 Fixed
+- **FACI `CodeFlash` block programming in RAM-Loader (`No CAN frame from 0x6F1 within 60.0s`, #38, #40, #42):** fixed 2-byte misaligned `PAYLOAD_DATA` in `CFLASH_FACI_STUB` (722 B → `0xFEDF840A`, `mod 4 == 2`), which triggered an RH850/F1L hardware Misaligned Access Exception (`MAE`, vector `0x00C0`) on the first `ld.w` header read and immediately reset the MCU during boot block `#4`/`#5` writes (Engineering Mode OTP `0xA167`, post-UDS FBL record restore), `--raw-faci` writes, and custom-`IDCODE` `Uflash` writes. `CFLASH_FACI_STUB` is now 4-byte aligned to 724 B (`0xFEDF840C`), and both `verify_payload_self_tests()` and the RH850 test emulator strictly enforce word alignment.
+- **Automatic direct `FACI` fallback when FBL `EraseMemory` fails (`7101ff0001`, #41):**
+  - `can_write_cflash()` now checks whether the MCU's `Extra Area` `IDCODE` (`0xFF300050`) differs from `CodeFlash+0xAB00` `SELFID` (e.g. blank `0xFF*16`): because the stock FBL's `R_FCL` only authenticates with `CodeFlash+0xAB00` and rejects `31 01 FF 00` with `7101ff0001`, ContiTool now proactively switches to direct `FACI` programming of the modified blocks in the active RAM-Loader.
+  - If FBL still rejects `EraseMemory (31 01 FF 00)` (`FblEraseFailedError`), `can_write_cflash()` automatically recovers via direct `FACI` programming in RAM-Loader, checking blocks `#4` and `#6` (and restoring any partially erased blocks) followed by full 1.5 MB byte-for-byte readback verification.
+
 ## 2.1.4 — 2026-11-20
 
 ### 🇷🇺 Исправлено
