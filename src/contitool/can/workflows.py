@@ -481,7 +481,13 @@ def _stage2_and_trigger(
         info["trigger_response"] = trig_resp.hex()
     except TimeoutError:
         info["trigger_response"] = "loader"
-    return _probe_beacon_in_loader(link, reporter)
+    try:
+        return _probe_beacon_in_loader(link, reporter)
+    except LINK_ERRORS as exc:
+        raise RuntimeError(tr(
+            f"После триггера UDS 27 12 не удалось подтвердить готовность заводского RAM-Loader: {exc}",
+            f"Factory RAM-Loader readiness check failed after the UDS 27 12 trigger: {exc}",
+        )) from exc
 
 
 def _j2534_wrapper_bus(link: Any) -> Any:
@@ -602,11 +608,24 @@ def enter_ram_loader(
                 pass
         reporter.warning(
             tr(
-                f"Первая попытка входа не удалась ({first_err}) — выполняем мягкий сброс шлюза и повтор…",
-                f"Initial entry failed ({first_err}) — resetting gateway back to Application and retrying…",
+                f"Первая попытка входа не удалась ({first_err}) — пробуем восстановить связь перед повтором…",
+                f"Initial entry failed ({first_err}) — trying to restore communication before retrying…",
             )
         )
-        _reset_to_application(link, reporter=reporter, allow_fbl=True)
+        try:
+            _reset_to_application(link, reporter=reporter, allow_fbl=True)
+        except LINK_ERRORS as recovery_err:
+            # Keep the entry failure in the GUI and manifest: the recovery timeout alone hides which step failed.
+            raise RuntimeError(tr(
+                f"Вход в заводской RAM-Loader не удался: {first_err}. "
+                f"Автоматическое восстановление связи также не удалось: {recovery_err}. "
+                "Выключите питание шлюза на 10 секунд, включите снова и проверьте идентификацию блока. "
+                "Если связи нет, переподключите адаптер. Приложите отчёт о проблеме, если ошибка повторится.",
+                f"Factory RAM-Loader entry failed: {first_err}. "
+                f"Automatic communication recovery also failed: {recovery_err}. "
+                "Switch the gateway off for 10 seconds, on again, and check ECU identification. "
+                "If communication is still unavailable, reconnect the adapter. Attach a problem report if this repeats.",
+            )) from recovery_err
         return _enter_ram_loader_once(link, reporter)
 
 
@@ -984,11 +1003,16 @@ def _reset_to_application(
     except LINK_ERRORS:
         reporter.can_log(
             tr(
-                "Отправка команды сброса FE FF через заводской RAM-Loader (0x6F0)…",
-                "Sending FE FF MCU reset via factory RAM-Loader (0x6F0)…",
+                "Попытка сброса FE FF через заводской RAM-Loader (0x6F0)…",
+                "Trying FE FF MCU reset via factory RAM-Loader (0x6F0)…",
             )
         )
         info["loader_reset"] = _loader_reset_command(link)
+        if info["loader_reset"].startswith("sync-error:"):
+            reporter.warning(tr(
+                f"Не удалось передать сброс через заводской RAM-Loader: {info['loader_reset']}",
+                f"Factory RAM-Loader reset could not be completed: {info['loader_reset']}",
+            ))
         info["reset_method"] = "factory-loader"
         time.sleep(2.0)
         sess, in_fbl = _probe_app_or_fbl(link, attempts=10, allow_fbl=allow_fbl)
