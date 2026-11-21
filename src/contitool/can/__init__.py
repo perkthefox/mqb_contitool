@@ -149,6 +149,7 @@ from contitool.can.payloads import (
     build_m95640_reader_payload,
     build_opbt_reader_payload,
     build_reader_payload,
+    build_rsa_probe_payload,
     build_service_loader_uds_steps,
     build_uflash_faci_payloads,
     build_uflash_one_shot_payload,
@@ -204,6 +205,8 @@ from contitool.can.ports import SUPPORTED_CAN_INTERFACES, DetectedCanPort, Found
 from contitool.can.j2534 import J2534Device, discover_j2534
 from contitool.can.transport import J533CanLink
 from contitool.can.workflows import (
+    FblEraseFailedError,
+    UflashProtectedError,
     backup_identity,
     can_backup,
     can_health_check,
@@ -255,6 +258,7 @@ __all__ = [
     "EXPECTED_ONE_SHOT_PAYLOAD_SHA256",
     "EXPECTED_OPBT_READER_STUB_SHA256",
     "EXPECTED_RSA_PROBE_SHA256",
+    "FblEraseFailedError",
     "J533CanLink",
     "LOADER_PASSWORD",
     "LOADER_RESET_PAYLOAD",
@@ -266,6 +270,7 @@ __all__ = [
     "J2534Device",
     "SUPPORTED_CAN_INTERFACES",
     "UFLASH_FACI_STUB",
+    "UflashProtectedError",
     "build_cflash_faci_block_payloads",
     "build_dflash_faci_payloads",
     "build_dflash_reader_payload",
@@ -274,6 +279,7 @@ __all__ = [
     "build_m95640_reader_payload",
     "build_opbt_reader_payload",
     "build_reader_payload",
+    "build_rsa_probe_payload",
     "build_service_loader_uds_steps",
     "build_uflash_faci_payloads",
     "build_uflash_one_shot_payload",

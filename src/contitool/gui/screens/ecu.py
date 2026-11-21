@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from contitool.can import (
+    UflashProtectedError,
     can_activate_swap,
     can_health_check,
     can_learn_mfl_button,
@@ -49,6 +50,7 @@ from contitool.core import (
     STOCK_SWAP_MODULUS,
     UNSUPPORTED_DATASET_RU,
     UNSUPPORTED_DATASET_WARNING,
+    UnrecognisedUflashError,
     ZDC_UDS_UPLOAD_MAP,
     ZdcAutoParamConfig,
     analyze_eeprom,
@@ -810,6 +812,7 @@ class EcuScreen(QWidget):
         )
         self._swap_live_block(lay)
         features = status.active_features_detailed(self.ws)
+        foreign = status.foreign_features_detailed(self.ws)
         if features:
             self._table(
                 lay,
@@ -824,8 +827,37 @@ class EcuScreen(QWidget):
                     for _, code, name, factory, ds_ok in features
                 ],
             )
-        else:
+        elif not foreign:
             self._text(lay, st.detail or tr("Включённых функций нет.", "No features enabled."), primary=True)
+
+        if foreign:
+            vcrns = ", ".join(dict.fromkeys(v for _, _, _, v, _ in foreign if v))
+            vins = ", ".join(dict.fromkeys(v for _, _, _, _, v in foreign if v))
+            vin_part = f", VIN {vins}" if vins else ""
+            self._note(
+                lay,
+                tr(
+                    f"В DataFlash найдено {len(foreign)} сертификат(ов) от другого блока (чужой VCRN {vcrns}{vin_part}) — "
+                    "такое бывает на б/у шлюзе после онлайн-перепривязки CP. Шлюз их не принимает, а их VIN относится "
+                    "к автомобилю-донору. Откройте «Настроить функции SWaP…», чтобы пересобрать нужные функции под текущий VCRN.",
+                    f"DataFlash holds {len(foreign)} certificate(s) from another ECU (foreign VCRN {vcrns}{vin_part}) — "
+                    "typical on a used gateway after online CP adaptation. The gateway rejects them, and their VIN belongs "
+                    "to the donor vehicle. Open “Configure SWaP features…” to rebuild the needed features for this ECU's VCRN.",
+                ),
+                tone="warn",
+            )
+            self._table(
+                lay,
+                tr("Отклонённые слоты в DataFlash (чужой VCRN)", "Rejected slots in DataFlash (foreign VCRN)"),
+                [
+                    (
+                        code,
+                        name,
+                        f"VCRN {vcrn}" + (f" · VIN {dvin}" if dvin else ""),
+                    )
+                    for _, code, name, vcrn, dvin in foreign
+                ],
+            )
 
         unsup_active = status.unsupported_active_fecs(self.ws)
         if unsup_active:
@@ -1323,17 +1355,20 @@ class EcuScreen(QWidget):
 
     def _page_boot(self, lay: QVBoxLayout) -> None:
         st = self._head(lay, "boot")
+        uf_inf = self.ws.info("uflash")
+        uf_off = uf_inf.uflash_info.rsa_cmp_offset if (uf_inf and uf_inf.uflash_info) else None
+        addr_lbl = f"0x{0x01000000 + uf_off:08X}" if uf_off is not None else "0x0100342A / 0x01003444"
         self._text(
             lay,
             tr(
                 "Загрузчик (Uflash) записывает прошивку в блок. Заводской загрузчик принимает только CodeFlash с "
                 "подписью VAG, а любое изменение CodeFlash эту подпись нарушает. Инженерный загрузчик подпись не "
                 "проверяет — с ним изменённый CodeFlash записывается по CAN. От заводского он отличается одной "
-                "инструкцией: 4 байта по адресу 0x0100342A.",
+                f"инструкцией: 4 байта по адресу {addr_lbl}.",
                 "The bootloader (Uflash) writes firmware into the ECU. The factory bootloader accepts only CodeFlash "
                 "signed by VAG, and any change to CodeFlash breaks that signature. The engineering bootloader does not "
                 "check the signature, so a modified CodeFlash can be written over CAN. It differs from the factory one "
-                "by a single instruction: 4 bytes at 0x0100342A.",
+                f"by a single instruction: 4 bytes at {addr_lbl}.",
             ),
         )
         btns = []
@@ -2578,18 +2613,32 @@ class EcuScreen(QWidget):
                 cf_orig is None
                 or split_cflash_or_app(cf_path.read_bytes())[1] != split_cflash_or_app(cf_orig.read_bytes())[1]
             )
+            use_raw_faci = False
             if app_changed:
-                # UDS programming of the application needs the engineering bootloader; boot blocks go via FACI
-                out["uflash"] = can_write_uflash(
-                    port,
-                    restore_stock=False,
-                    interface=iface,
-                    session_dir=sdir / "uflash",
-                    skip_full_backup=did_backup,
-                    return_to_app=(df_path is None),
-                    reporter=rep,
-                )
-                did_backup = did_backup or not bool(out["uflash"].get("step3_skipped_backup"))
+                # UDS programming of the application needs the engineering bootloader; if Uflash is OTP-protected or
+                # an unrecognised build, fall back automatically to direct FACI programming of changed CodeFlash blocks.
+                try:
+                    out["uflash"] = can_write_uflash(
+                        port,
+                        restore_stock=False,
+                        interface=iface,
+                        session_dir=sdir / "uflash",
+                        skip_full_backup=did_backup,
+                        return_to_app=(df_path is None),
+                        reporter=rep,
+                    )
+                    did_backup = did_backup or not bool(out["uflash"].get("step3_skipped_backup"))
+                except (UflashProtectedError, UnrecognisedUflashError) as uf_exc:
+                    use_raw_faci = True
+                    out["uflash_skipped"] = str(uf_exc)
+                    rep.warning(
+                        tr(
+                            f"Загрузчик Uflash не может быть перезаписан ({uf_exc}) — изменённые блоки CodeFlash "
+                            "будут записаны напрямую через FACI в ОЗУ без модификации загрузчика.",
+                            f"The Uflash bootloader cannot be rewritten ({uf_exc}) — modified CodeFlash blocks "
+                            "will be programmed directly via FACI in RAM without modifying the bootloader.",
+                        )
+                    )
 
             if df_path is not None:
                 out["dflash"] = can_write_dflash(
@@ -2605,6 +2654,7 @@ class EcuScreen(QWidget):
                 did_backup = True
 
             if cf_path is not None:
+                cflash_extra_kw = {"raw_faci": True} if use_raw_faci else {}
                 out["cflash"] = can_write_cflash(
                     port,
                     cf_path,
@@ -2612,6 +2662,7 @@ class EcuScreen(QWidget):
                     session_dir=sdir / "cflash",
                     skip_backup=did_backup,  # a full read is on file, or the bootloader / DataFlash step took one
                     reporter=rep,
+                    **cflash_extra_kw,
                 )
                 zdc_blocks = out.get("dflash", {}).get("zdc_blocks_written")
                 if zdc_blocks:  # DataFlash went first without the application; its coding is due now

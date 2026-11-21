@@ -143,6 +143,13 @@ class _Rh850Builder:
     def nop(self) -> None:
         self._emit(struct.pack("<H", 0x0000))
 
+    def align(self, boundary: int = 4) -> None:
+        """Pad with 2-byte `nop` instructions until `pc` is a multiple of `boundary`."""
+        if boundary <= 0 or boundary % 2 != 0:
+            raise ValueError(f"Alignment boundary must be a positive even integer, got {boundary}")
+        while self._pc % boundary != 0:
+            self.nop()
+
     def jmp_lp(self) -> None:
         self._emit(struct.pack("<H", 0x007F))
 
@@ -774,20 +781,20 @@ def _emit_exit_pe_subroutine(b: _Rh850Builder, label_name: str = "SUB_EXIT_PE") 
 def _emit_wait_frdy_subroutine(b: _Rh850Builder, label_name: str = "SUB_WAIT_FRDY") -> None:
     """Poll `FSTATR.FRDY` (`0x8000`) while refreshing `WDTA0`/`WDTA1`; set `r18 = FSTATR` and `Z = (err == 0)`."""
     b.label(label_name)
-    b.mov_reg(31, 20)
-    b.mov_u16(4096, 21)
+    b.mov_reg(31, 6)
+    b.mov_u16(4096, 14)
     b.label("_FRDY_POLL")
     b.ld_w(FACI_FSTATR_OFF, 17, 18)
     b.andi(0x8000, 18, 11)
     b.bne_short("_FRDY_DONE")
-    b.add_imm5(-1, 21)
+    b.add_imm5(-1, 14)
     b.bne_short("_FRDY_POLL")
     b.jarl("SUB_WDT")
-    b.mov_u16(4096, 21)
+    b.mov_u16(4096, 14)
     b.br_short("_FRDY_POLL")
     b.label("_FRDY_DONE")
     b.andi(0x7000, 18, 11)
-    b.mov_reg(20, 31)
+    b.mov_reg(6, 31)
     b.jmp_lp()
 
 
@@ -798,11 +805,11 @@ def _build_faci_code_stub(*, is_uflash: bool) -> tuple[bytes, int]:
       - `+0x00` (`u32`): `marker` (`1`=OK, `2`=`FENTRYR` timeout, `3`=Erase err, `4`=Program err, `5`=`FPMON.FWE` low)
       - `+0x04` (`u32`): `fstatr` (`0xFFA10080`)
       - `+0x08` (`u32`): `last_offset`
-      - `+0x0C` (`4x u8`): `fpmon` (`+0x0C`), `flmdps` (`+0x0D`), `fastat` (`+0x0E`), reserved (`+0x0F`)
+      - `+0x0C` (`4x u8`): `fpmon` (`+0x0C`), `flmdps` (`+0x0D`), `fastat` (`+0x0E`), `idst` (`+0x0F`)
       - `+0x10` (`2x u16`): `fentryr` (`+0x10`), `fpckar` (`+0x12`)
     """
     b = _Rh850Builder()
-    saved_regs = (20, 21, 22, 31) if is_uflash else (20, 21, 22, 23, 31)
+    saved_regs = (22, 31) if is_uflash else (22, 23, 31)
     frame_bytes = len(saved_regs) * 4
     b.di()
     b.synci()
@@ -818,7 +825,6 @@ def _build_faci_code_stub(*, is_uflash: bool) -> tuple[bytes, int]:
     b.mov_u16(0x0050, 19)
     b.mov_imm5(2, 10)
     b.mov_imm5(0, 18)
-    b.st_w(10, 0x00, 7)
     b.mov_imm5(-1, 11)
     b.st_w(11, 0x08, 7)
     b.st_w(0, 0x0C, 7)
@@ -851,7 +857,8 @@ def _build_faci_code_stub(*, is_uflash: bool) -> tuple[bytes, int]:
     b.jr("CLEANUP")
     b.label("FPMON_OK")
 
-    # 3. Load 128-bit SELFID into FLID0..FLID3 + mandatory dummy ld.w of FLID3
+    # 3. Load 128-bit SELFID into FLID0..FLID3 + mandatory dummy ld.w of FLID3, then verify IDST (0xFFA08010 == 0)
+    #    with automatic fallback to 0xFFFFFFFF*4 if Extra Area IDCODE is blank.
     if is_uflash:
         b.mov_u16(SELFID_CODEFLASH_ADDR, 11)
     else:
@@ -866,16 +873,29 @@ def _build_faci_code_stub(*, is_uflash: bool) -> tuple[bytes, int]:
         b.mov_reg(23, 11)
         b.label("COPY_FLID")
 
+    b.mov_imm5(1, 6)
+    b.label("_FLID_TRY")
     b.addi(-0x8000, 17, 12)  # 0xFFA10000 - 0x8000 = 0xFFA08000 (FLID_BASE)
     b.mov_imm5(4, 13)
+    b.mov_imm5(-1, 14)
     b.label("_FLID_LOOP")
+    b.cmp_imm5(0, 6)
+    b.be_short("_FLID_STORE")
     b.ld_w(0, 11, 14)
-    b.st_w(14, 0, 12)
     b.add_imm5(4, 11)
+    b.label("_FLID_STORE")
+    b.st_w(14, 0, 12)
     b.add_imm5(4, 12)
     b.add_imm5(-1, 13)
     b.bne_short("_FLID_LOOP")
-    b.ld_w(-4, 12, 14)
+    b.ld_w(-4, 12, 14)       # mandatory dummy read of FLID3 (0xFFA0800C)
+    b.ld_w(0, 12, 14)        # read IDST @ 0xFFA08010 (0 = authenticated, 1 = locked)
+    b.st_b(14, 0x0F, 7)      # snapshot IDST byte at 0xFEDE900F
+    b.andi(0x0001, 14, 14)
+    b.be_short("FLID_AUTH_DONE")
+    b.add_imm5(-1, 6)
+    b.be_short("_FLID_TRY")
+    b.label("FLID_AUTH_DONE")
 
     # 4. Enter CodeFlash / Extended User Area P/E mode (FENTRYR = 0xAA01) and poll FENTRYR == 0x0001
     b.mov_u16(0xAA01, 12)
@@ -959,7 +979,7 @@ def _build_faci_code_stub(*, is_uflash: bool) -> tuple[bytes, int]:
     for cmd_byte in (0xE8, 0x80):
         b.mov_u16(cmd_byte, 12)
         b.st_b(12, 0x00, 16)
-    b.mov_u16(128, 13)
+    b.mov_reg(12, 13)  # 0x80 == 128 halfwords per 256-byte page
     b.label("_HW_LOOP")
     b.ld_hu(0, 9, 12)
     b.st_h(12, 0x00, 16)
@@ -1022,6 +1042,9 @@ def _build_faci_code_stub(*, is_uflash: bool) -> tuple[bytes, int]:
     _emit_flmd_subroutine(b, "SUB_SET_FLMD")
     _emit_wait_frdy_subroutine(b, "SUB_WAIT_FRDY")
     _emit_faci_wdt_subroutine(b, "SUB_WDT")
+    # PAYLOAD_ENTRY_ADDR (0xFEDF8138) is 4-byte aligned; RH850/F1L raises MAE (vector 0x00C0) on
+    # unaligned ld.w reads from the 40-byte CFLASH_FACI_STUB header placed at PAYLOAD_DATA.
+    b.align(4)
     b.label("PAYLOAD_DATA")
     return b.build(), pages_imm_offset
 
@@ -1315,8 +1338,8 @@ UFLASH_FACI_STUB, UFLASH_STUB_PAGES_IMM_OFFSET = build_uflash_faci_stub()
 CFLASH_FACI_STUB = build_cflash_faci_stub()
 EXPECTED_OPBT_READER_STUB_SHA256 = "a5b1a7a12a8547e164ab0f4357257e6d422cec1780240d1c5716f4ac02f74067"
 EXPECTED_EEPROM_READER_STUB_SHA256 = "aeda839eeba9d6f307fe06f9278181b9feb11cb361125508f0cff2304ba63830"
-EXPECTED_UFLASH_FACI_STUB_SHA256 = "a7667b232516aca547885d5069d8e2ee12046bf4da6344396ef376060dcc3f32"
-EXPECTED_CFLASH_FACI_STUB_SHA256 = "f7ee469253d89afbfc8bc73f884ec639962f404cd684fea1a20595e5847f9187"
+EXPECTED_UFLASH_FACI_STUB_SHA256 = "9718f50692f086cf2cea33287c9b9c0e1bb6c70bf0d961c4f3f7c65dc3fa549c"
+EXPECTED_CFLASH_FACI_STUB_SHA256 = "0598491f25906507b1b7d21072e1df676e0449a4929735c1b557e101d6646e99"
 
 
 # ────────────────────────────── J533 Transparent RSCAN0 CAN Bridge Applet ──────────────────────────────

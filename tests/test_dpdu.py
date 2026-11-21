@@ -31,6 +31,7 @@ from contitool.can.dpdu import (
     ResultData,
     UridTable,
 )
+from contitool.can.payloads import LOADER_SYNC
 from contitool.i18n import set_lang
 from test_identify import FakeGateway
 
@@ -41,8 +42,10 @@ U8 = C.c_uint8
 def _no_kept_link():
     """A kept-open D-PDU link is process-wide: never let one leak from a failed test into the next."""
     dpdu.close_session()
+    dpdu._prime_modules.clear()
     yield
     dpdu.close_session()
+    dpdu._prime_modules.clear()
 
 
 class FakePduApi:
@@ -1426,6 +1429,272 @@ def test_deaf_rawmode_monitor_falls_back_to_odis_uds_only_when_nonraw_fails_and_
     bus.shutdown()
 
 
+class _TesterPresentGateway(FakeGateway):
+    """FakeGateway that also answers `3E 00`, as the gateway does."""
+
+    def send(self, msg: can.Message, timeout: float | None = None) -> None:
+        if self.answers and msg.arbitration_id == 0x710 and bytes(msg.data[:3]) == b"\x02\x3e\x00":
+            self._reply(b"\x7e\x00")
+            return
+        super().send(msg, timeout)
+
+
+class UnstartedCan1PduApi(UdsCapablePduApi):
+    """A VCI whose RawMode frames only come back as echoes until a protocol link has been started on CAN1 while the
+    raw links are open; the unlock is lost once every raw link is closed."""
+
+    def __init__(self, *, needs_start: bool = True) -> None:
+        super().__init__()
+        self.gw = _TesterPresentGateway()
+        self.raw_links: set[int] = set()
+        self.needs_start = needs_start  # False: an adapter whose RawMode reaches the bus straight away
+        self.acks = True  # False: nothing on the bus acknowledges a frame (ECU unpowered), so it never finishes
+        self.can1_started = False
+        self.primes = 0
+        self.lost_frames = 0
+        self.unacked = 0
+        # The monitor only passes frames with the last priming link's response id.
+        self.rx_filter: int | None = None
+        self.filtered = 0
+        self.loader_running = False  # in the RAM-Loader: the sync on 0x6F0 is answered on 0x6F1, 0x710 is ignored
+
+    def PDUCreateComLogicalLink(self, hmod, rsc, resource, tag, phcll, flag) -> int:  # noqa: N802
+        rc = super().PDUCreateComLogicalLink(hmod, rsc, resource, tag, phcll, flag)
+        if rc == 0 and rsc is None and resource == RAWCAN_OBD6_14:
+            self.raw_links.add(phcll._obj.value)
+        return rc
+
+    def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+        if hcll in self.uds_links and cop == COPT_STARTCOMM and self.raw_links:
+            self.can1_started = True
+            self.primes += 1
+            self.rx_filter = self.uds_urid.get(hcll, {}).get(0x1D)  # CP_CanRespUSDTId of the priming link
+        if self.loader_running and hcll in self.raw_links and hcll != self.monitor and cop == COPT_SENDRECV and size:
+            raw = bytes(data[:size])
+            if self.can1_started or not self.needs_start:
+                hcop._obj.value = self.next_cop
+                self.tx_open.append(self.next_cop)
+                self.next_cop += 1
+                self._result(raw, b"\x00\x00\x00\x01")
+                if raw[:4] == (0x6F0).to_bytes(4, "big") and raw[4:] == LOADER_SYNC:
+                    self._result((0x6F1).to_bytes(4, "big") + b"\x84\x00", b"\x00\x00\x00\x00")
+                return 0
+        raw_tx = hcll in self.raw_links and hcll != self.monitor and cop == COPT_SENDRECV and size
+        if raw_tx and not self.acks and (self.can1_started or not self.needs_start):
+            hcop._obj.value = self.next_cop  # on the bus, retried for ever: no echo, no COPST_FINISHED
+            self.next_cop += 1
+            self.unacked += 1
+            return 0
+        if raw_tx and self.needs_start and not self.can1_started:
+            hcop._obj.value = self.next_cop
+            self.tx_open.append(self.next_cop)
+            self.next_cop += 1
+            self._result(bytes(data[:size]), b"\x00\x00\x00\x01")  # echoed, never on the bus
+            self.lost_frames += 1
+            return 0
+        return super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+
+    def _result(self, raw: bytes, flags: bytes, link: int | None = None) -> None:
+        received = len(flags) >= 4 and not flags[3] & 0x01 and link is None and len(raw) >= 4
+        if received and self.rx_filter is not None and self.raw_links:
+            if int.from_bytes(raw[:4], "big") != self.rx_filter:
+                self.filtered += 1
+                return
+        super()._result(raw, flags, link)
+
+    def PDUDestroyComLogicalLink(self, _hmod, hcll, *_a) -> int:  # noqa: N802
+        self.raw_links.discard(hcll)
+        if not self.raw_links:
+            self.can1_started = False
+            self.rx_filter = None
+        return 0
+
+
+def test_rawmode_kept_off_the_bus_until_can1_is_started_is_primed_and_stays_on_rawmode(monkeypatch) -> None:
+    from contitool.can import J533CanLink, workflows
+
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.5)
+    api = UnstartedCan1PduApi()
+    bus = DPduBus(dll=api)
+    assert bus.h_rx and bus.h_tx and not api.can1_started
+
+    res = can_identify("", bus=bus)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    assert api.lost_frames and api.primes == 1 and api.can1_started
+    assert bus._raw_needs_prime and bus._raw_rx_verified
+    assert not bus.nonraw and not bus.uds_only and not bus._uds_link and bus.h_rx and bus.h_tx
+    assert "raw CAN after starting an ISO-TP link" in bus.describe()
+    with J533CanLink("", interface="dpdu", bus=bus) as link:
+        workflows._refuse_memory_via_j2534_wrapper(link)  # the RAM-Loader is no longer refused
+
+    bus._recycle_raw_tx()  # the monitor stays open, so CAN1 stays started without another prime
+    assert api.can1_started and api.primes == 1
+
+    with bus.uds_session() as hw:  # closes every raw link: reopening them must prime CAN1 again
+        assert hw is True
+    assert api.can1_started and api.primes == 2 and bus.h_rx and bus.h_tx and not bus.uds_only
+    lost = api.lost_frames
+    res = can_identify("", bus=bus)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    assert api.lost_frames == lost
+    bus.shutdown()
+
+
+def test_a_vci_whose_rawmode_already_reaches_the_bus_is_never_primed() -> None:
+    """The verified RawMode path stays as it was: no ISO_15765 link is started unless RawMode got no answer."""
+    api = UdsCapablePduApi()
+    bus = DPduBus(dll=api)
+    res = can_identify("", bus=bus)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    with bus.uds_session() as hw:
+        assert hw is True
+    created_uds = len(api.uds_links)
+    bus._pause_raw()
+    bus._resume_raw()
+    assert not bus._raw_needs_prime and len(api.uds_links) == created_uds == 1
+    assert bus.describe().endswith(", raw CAN")
+    bus.shutdown()
+
+
+def test_a_vci_proven_to_need_priming_starts_primed_on_every_later_link_of_the_process(monkeypatch) -> None:
+    """A rebuilt link must not depend on the ECU confirming it again: it may be sitting in the RAM-Loader by then."""
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.5)
+    first = DPduBus(dll=UnstartedCan1PduApi())
+    can_identify("", bus=first)
+    assert first._raw_needs_prime
+    first.shutdown()
+
+    api = UnstartedCan1PduApi()
+    api.gw.answers = False  # in the RAM-Loader nothing answers on 0x710
+    bus = DPduBus(dll=api)
+    assert bus._raw_needs_prime and api.can1_started and api.primes == 1
+    bus.send(can.Message(arbitration_id=0x6F0, is_extended_id=False, data=bytes.fromhex("8400000000")))
+    assert api.lost_frames == 0
+    assert "raw CAN after starting an ISO-TP link" in bus.describe()
+    bus.shutdown()
+
+
+def test_a_silent_ecu_leaves_rawmode_primed_so_the_loader_channel_still_reaches_it(monkeypatch) -> None:
+    """Fresh process, ECU silent on 0x710 (unpowered or already in the RAM-Loader): priming cannot be proven, yet
+    the raw links restored afterwards must be on the bus, or a running loader could never be found again."""
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.05)
+    api = UnstartedCan1PduApi()
+    api.gw.answers = False
+    api.silent_uds = True  # the hardware ISO-TP link gets no answer from a silent ECU either
+    bus = DPduBus(dll=api)
+    assert bus.fallback_from_silent_raw() is False
+    assert not bus.nonraw and not bus.uds_only and bus.h_rx and bus.h_tx and not bus.spent
+    assert api.can1_started and bus._raw_prime_unproven and not bus._raw_needs_prime
+    assert bus.describe().endswith(", raw CAN") and not dpdu._prime_modules
+
+    lost = api.lost_frames
+    bus.send(can.Message(arbitration_id=0x6F0, is_extended_id=False, data=bytes.fromhex("8400000000")))
+    api.gw.answers, api.silent_uds = True, False  # powered on within the retry cooldown: no second probe needed
+    res = can_identify("", bus=bus)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    assert api.lost_frames == lost
+    bus.shutdown()
+
+
+def _unpowered(api: UnstartedCan1PduApi, off: bool = True) -> None:
+    api.acks, api.gw.answers, api.silent_uds = not off, not off, off
+
+
+def test_a_healthy_rawmode_adapter_with_an_unpowered_ecu_is_never_primed(monkeypatch) -> None:
+    """Its frame goes onto the bus and stays unacknowledged, which the echo-only VCI never shows: no ISO_15765
+    link is started next to the raw links, now or on any later reopen, and the check frame is not queued behind
+    the stuck one (that alone cost the 5 s send timeout)."""
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.05)
+    api = UnstartedCan1PduApi(needs_start=False)
+    _unpowered(api)
+    bus = DPduBus(dll=api)
+    bus.send(can.Message(arbitration_id=0x710, is_extended_id=False, data=bytes.fromhex("021003AAAAAAAAAA")))
+    t = time.monotonic()
+    assert bus.fallback_from_silent_raw() is False
+    assert time.monotonic() - t < 6.0 and api.unacked == 1
+    assert api.primes == 0 and not bus._raw_prime_unproven and not bus._raw_needs_prime
+    assert not bus.nonraw and not bus.uds_only and bus.h_rx and bus.h_tx and not bus.spent
+
+    _unpowered(api, False)
+    res = can_identify("", bus=bus)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    with bus.uds_session() as hw:
+        assert hw is True
+    assert api.primes == 0 and bus.describe().endswith(", raw CAN") and not dpdu._prime_modules
+    bus.shutdown()
+
+
+def test_a_healthy_rawmode_adapter_meeting_an_ecu_silent_on_0x710_is_primed_once_per_reopen_and_keeps_working(
+        monkeypatch) -> None:
+    """The one case that cannot be told apart from the VCI needing it: the ECU acknowledges frames but answers
+    nothing on 0x710 (it sits in the RAM-Loader). The price on an adapter that did not need it is one short
+    ISO_15765 start per reopen of the raw links — never per frame, per TX recycle or per operation."""
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.05)
+    api = UnstartedCan1PduApi(needs_start=False)
+    api.gw.answers, api.silent_uds = False, True
+    bus = DPduBus(dll=api)
+    assert bus.fallback_from_silent_raw() is False
+    assert api.primes == 2 and bus._raw_prime_unproven and not bus._raw_needs_prime  # the check, then the reopen
+    assert bus.describe().endswith(", raw CAN") and not dpdu._prime_modules
+
+    api.gw.answers, api.silent_uds = True, False
+    for _ in range(2):
+        res = can_identify("", bus=bus)
+        assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    bus._recycle_raw_tx()
+    bus.maybe_recycle_tx(0)
+    assert bus.fallback_from_silent_raw() is False  # RawMode has answered: nothing is probed any more
+    assert api.primes == 2 and api.lost_frames == 0
+    with bus.uds_session() as hw:
+        assert hw is True
+    assert api.primes == 3
+    res = can_identify("", bus=bus)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    bus.shutdown()
+
+
+def test_the_vci_needing_priming_with_an_unpowered_ecu_works_as_soon_as_the_ecu_is_powered(monkeypatch) -> None:
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.05)
+    monkeypatch.setattr(dpdu, "SILENT_RAW_RETRY_COOLDOWN", 0.0)
+    api = UnstartedCan1PduApi()
+    _unpowered(api)
+    bus = DPduBus(dll=api)
+    bus.send(can.Message(arbitration_id=0x710, is_extended_id=False, data=bytes.fromhex("021003AAAAAAAAAA")))
+    assert bus.fallback_from_silent_raw() is False  # echoed only, then primed, then unacknowledged
+    assert api.lost_frames == 1 and api.unacked == 1 and bus._raw_prime_unproven and api.can1_started
+
+    bus.send(can.Message(arbitration_id=0x710, is_extended_id=False, data=bytes.fromhex("021003AAAAAAAAAA")))
+    t = time.monotonic()
+    assert bus.fallback_from_silent_raw() is False  # second try, still unpowered: the stuck frame is not queued behind
+    assert time.monotonic() - t < 6.0 and api.can1_started and not bus.spent
+
+    _unpowered(api, False)
+    res = can_identify("", bus=bus)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    assert api.lost_frames == 1
+    bus.shutdown()
+
+
+def test_a_reopen_that_cannot_prime_a_vci_needing_it_is_spent_instead_of_left_mute(monkeypatch) -> None:
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.5)
+    api = UnstartedCan1PduApi()
+    bus = DPduBus(dll=api)
+    can_identify("", bus=bus)
+    assert bus._raw_needs_prime
+    tries: list[int] = []
+    monkeypatch.setattr(bus, "_prime_raw", lambda: bool(tries.append(1)))
+    bus._pause_raw()
+    with pytest.raises(can.CanOperationError, match="ISO-TP"):
+        bus._resume_raw()
+    assert len(tries) == 2 and bus.spent
+    bus.shutdown()
+
+
 def test_unpowered_ecu_on_healthy_rawmode_restores_rawmode_after_silent_probe(monkeypatch) -> None:
     set_lang("en")
     monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.05)
@@ -1527,3 +1796,147 @@ def test_issue_28_dpdu_stream_pacing_exact_end_frame_and_auto_return_to_app(monk
     bus.shutdown()
 
 
+def test_vci_echoes_of_short_frames_are_logged_for_diagnosis(tmp_path) -> None:
+    """The loader sync is the first frame shorter than 8 bytes: the trace must show what the VCI echoed for it.
+    Full 8-byte frames to 0x710 and 0x6F0 leave no echo line."""
+    import json
+
+    from contitool.can.transport import J533CanLink
+
+    api = FakePduApi()
+    bus = DPduBus(dll=api)
+    assert bus.echo_trace is None  # nothing is kept unless a logging link asks for it
+    log = tmp_path / "can.jsonl"
+    link = J533CanLink("", bus=bus, log_path=log)
+    assert bus.echo_trace is not None
+    link.send_frame(0x710, bytes.fromhex("023e00"), pad=0xAA)  # ordinary padded UDS: no echo line
+    link.send_frame(0x6F0, bytes.fromhex("8400000000"))  # loader sync, DLC 5
+    link.send_frame(0x6F0, bytes(8))  # loader packet data: no echo line
+    deadline = time.monotonic() + 1.0
+    while len(bus.echo_trace) < 3 and time.monotonic() < deadline:
+        bus.recv(0.01)
+    link.close()
+    assert bus.echo_trace is None  # handed back clean to the kept-open session
+    rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    echoes = [r for r in rows if r["direction"] == "tx_echo"]
+    assert echoes == [{"time": echoes[0]["time"], "direction": "tx_echo", "id": "0x6f0", "dlc": 5,
+                       "data": "8400000000", "flags": "00000001"}]
+    bus.shutdown()
+
+
+def test_a_primed_vci_switches_its_receive_filter_so_the_ram_loader_answer_on_0x6f1_arrives(monkeypatch) -> None:
+    """A VCI primed with 0x710/0x77A drops 0x6F1, so the RAM-Loader looked dead after `27 12`.
+    A frame to 0x6F0 primes CAN1 with the loader pair first, a frame to 0x710 switches it back."""
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.5)
+    api = UnstartedCan1PduApi()
+    bus = DPduBus(dll=api)
+    can_identify("", bus=bus)
+    assert bus._raw_needs_prime and api.primes == 1 and api.rx_filter == 0x77A
+    sync = can.Message(arbitration_id=0x6F0, is_extended_id=False, data=LOADER_SYNC)
+    api.loader_running = True
+
+    real_prime_for = bus._prime_for
+    bus._prime_for = lambda _tx_id: None  # what ContiTool did before: the loader answers, the VCI drops it
+    bus.send(sync)
+    assert bus.recv(0.3) is None and api.filtered == 1
+    bus._prime_for = real_prime_for
+
+    bus.send(sync)
+    msg = bus.recv(1.0)
+    assert (msg.arbitration_id, bytes(msg.data)) == (0x6F1, b"\x84\x00")
+    assert api.primes == 2 and api.rx_filter == 0x6F1 and bus._primed_ids == (0x6F0, 0x6F1)
+    bus.send(sync)  # staying on the loader costs nothing more
+    assert bus.recv(1.0).arbitration_id == 0x6F1 and api.primes == 2
+
+    api.loader_running = False  # back in the application: the next UDS frame switches the filter back
+    res = can_identify("", bus=bus)
+    assert {i["did"]: i["value"] for i in res["ident"]}["F187"] == "3Q0907530AA"
+    assert api.primes == 3 and api.rx_filter == 0x77A and bus._primed_ids == (0x710, 0x77A)
+    assert not bus.spent
+    bus.shutdown()
+
+
+def test_a_failed_receive_filter_switch_marks_the_link_spent_instead_of_leaving_it_deaf(monkeypatch) -> None:
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.5)
+    api = UnstartedCan1PduApi()
+    bus = DPduBus(dll=api)
+    can_identify("", bus=bus)
+    assert bus._raw_needs_prime
+    monkeypatch.setattr(bus, "_prime_raw", lambda ids=(0x710, 0x77A): False)
+    with pytest.raises(can.CanOperationError, match="could not switch CAN1 reception to 0x6F1"):
+        bus.send(can.Message(arbitration_id=0x6F0, is_extended_id=False, data=LOADER_SYNC))
+    assert bus.spent
+    bus.shutdown()
+
+
+def test_a_priming_link_the_vci_refuses_to_start_is_not_taken_for_a_switched_filter(monkeypatch) -> None:
+    """Connecting the priming link is not enough: only its STARTCOMM moves the receive filter."""
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.5)
+
+    class RefusedStart(UnstartedCan1PduApi):
+        refuse = False
+
+        def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+            if self.refuse and hcll in self.uds_links and cop == COPT_STARTCOMM:
+                return 0x01
+            return super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+
+    api = RefusedStart()
+    bus = DPduBus(dll=api)
+    can_identify("", bus=bus)
+    assert bus._raw_needs_prime and api.rx_filter == 0x77A
+    api.refuse = True
+    with pytest.raises(can.CanOperationError, match="could not switch CAN1 reception to 0x6F1"):
+        bus.send(can.Message(arbitration_id=0x6F0, is_extended_id=False, data=LOADER_SYNC))
+    assert bus.spent and bus._primed_ids == (0x710, 0x77A) and api.rx_filter == 0x77A
+    bus.shutdown()
+
+
+def test_a_vci_that_needs_no_priming_is_not_primed_for_the_loader_either() -> None:
+    api = UdsCapablePduApi()
+    bus = DPduBus(dll=api)
+    can_identify("", bus=bus)
+    bus.send(can.Message(arbitration_id=0x6F0, is_extended_id=False, data=LOADER_SYNC))
+    assert not api.uds_links and bus._primed_ids is None
+    bus.shutdown()
+
+
+def test_drop_module_resets_priming_flags_and_prime_for_preserves_pending_rx_errors(monkeypatch) -> None:
+    from contitool.can.dpdu import FrameError
+
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.5)
+    api = UnstartedCan1PduApi()
+    bus = DPduBus(dll=api)
+    can_identify("", bus=bus)
+    assert bus._raw_needs_prime and bus._primed_ids == (0x710, 0x77A)
+
+    # 1. A pending FrameError from dpdu-rx must be raised by send() instead of wiped by _prime_for/_prime_paused
+    bus._rx_error = FrameError("packed result")
+    with pytest.raises(FrameError, match="packed result"):
+        bus.send(can.Message(arbitration_id=0x6F0, is_extended_id=False, data=LOADER_SYNC))
+    assert not bus.spent and bus._primed_ids == (0x710, 0x77A)
+
+    # 2. _drop_module clears module-scoped priming flags so another candidate starts clean
+    bus._raw_prime_unproven = True
+    bus._drop_module()
+    assert not bus._raw_needs_prime and not bus._raw_prime_unproven and bus._primed_ids is None
+    bus.shutdown()
+
+
+def test_closing_link_while_echoes_arrive_never_races_echo_trace(tmp_path) -> None:
+    from contitool.can.transport import J533CanLink
+
+    api = FakePduApi()
+    bus = DPduBus(dll=api)
+    log = tmp_path / "can.jsonl"
+    for _ in range(8):
+        with J533CanLink("", bus=bus, log_path=log) as link:
+            for _ in range(16):
+                api._result((0x6F0).to_bytes(4, "big") + LOADER_SYNC, b"\x00\x00\x00\x01")
+            link.send_frame(0x6F0, LOADER_SYNC)
+    assert not bus.spent and bus._rx_error is None and bus.echo_trace is None
+    bus.shutdown()

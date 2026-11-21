@@ -443,3 +443,177 @@ def test_a_profile_taken_out_of_the_menu_is_no_fault(synth_cflash, synth_dflash,
     win.ws.commit("dflash", tmp_path / "e2.bin")
     assert status.unsupported_active_fecs(win.ws) == [0x10001600]
     win.close()
+
+
+def _make_donor_dflash(base_dflash: bytes, *, donor_fecs: tuple[int, ...] = (0x10000100, 0x10001200, 0x10001700)) -> bytes:
+    """Simulate a used gateway re-adapted online: NvM 0x7C holds new VCRN 1122334455, while FSC slots still carry
+    VAG-signed certificates from a donor car (VCRN AABBCCDDEE, VIN WVWZZZAUZJW000002, NvM status 0xFB)."""
+    from contitool.core.constants import DFLASH_FSC_PAY_SIZE, DFLASH_SWAP_CRC_OFF, DFLASH_SWAP_PAY_SIZE, FSC_SIGNED_BODY_SIZE
+
+    df = bytearray(make_dflash_with_zdc(base_dflash))
+    pay_start = DFLASH_SWAP_NVM_OFF + 4
+    pay = bytearray(df[pay_start : pay_start + DFLASH_SWAP_PAY_SIZE])
+    donor_vcrn = bytes.fromhex("AABBCCDDEE")
+    for canon_idx, canon_fec in enumerate(GATEWAY_SWAP_SLOT_ORDER):
+        ent_slice = slice(0x10E + canon_idx * 14, 0x10E + (canon_idx + 1) * 14)
+        if canon_fec in donor_fecs:
+            slot_rec, _, _ = build_factory_multi_fsc_slot(
+                canon_fec,
+                donor_vcrn,
+                "WVWZZZAUZJW000002",
+                timestamp_unix=0x6175116F,
+            )
+            rec = bytearray(slot_rec)
+            rec[4 + FSC_SIGNED_BODY_SIZE : 4 + FSC_SIGNED_BODY_SIZE + 128] = b"\x5a" * 128  # donor RSA signature
+            crc = zlib.crc32(bytes(rec[4 : 4 + DFLASH_FSC_PAY_SIZE])) & 0xFFFFFFFF
+            struct.pack_into("<I", rec, 0xB0, crc)
+            off = DFLASH_FSC_BASE_OFF + canon_idx * DFLASH_FSC_STRIDE
+            df[off : off + DFLASH_FSC_STRIDE] = rec
+            pay[ent_slice] = b"\x00\x00\x00\x00" + struct.pack(">II", canon_fec, 0x6175116F) + b"\xfb\x00"
+        else:
+            pay[ent_slice] = b"\x00\x00\x00\x00" + struct.pack(">II", canon_fec, 0) + b"\xb0\x02"
+    df[pay_start : pay_start + DFLASH_SWAP_PAY_SIZE] = pay
+    struct.pack_into("<I", df, DFLASH_SWAP_CRC_OFF, zlib.crc32(pay) & 0xFFFFFFFF)
+    return bytes(df)
+
+
+def test_foreign_vcrn_donor_certificates_excluded_from_vin_and_rebuilt_on_activate(synth_dflash: bytes) -> None:
+    """Certificates from a donor vehicle (slot VCRN != NvM 0x7C VCRN) must never leak the donor VIN, must not be
+    reported as active for this ECU, and must be rebuilt under the ECU's current VCRN when activated."""
+    from contitool.core.constants import DFLASH_FSC_PAY_SIZE, FSC_SIGNED_BODY_SIZE
+
+    set_lang("en")
+    donor_df = _make_donor_dflash(synth_dflash)
+
+    # 1. Analysis separates foreign-VCRN slots and refuses to inherit donor VIN
+    sw = analyze_dflash_swap(donor_df)
+    assert sw.crc_ok and sw.vcrn == bytes.fromhex("1122334455")
+    assert sw.vin == ""
+    assert sw.active_fscs == []
+    assert [f.fec_code for f in sw.foreign_fscs] == [0x10000100, 0x10001200, 0x10001700]
+    assert all(not f.vcrn_matches and f.vcrn_hex == "aabbccddee" and f.vin == "WVWZZZAUZJW000002" for f in sw.foreign_fscs)
+    assert all(f.nvm_status == 0xFB for f in sw.foreign_fscs)
+
+    # 2. Additive activation (can_activate_swap path: vin=None, preserve_existing_active=True) rebuilds requested FeCs
+    #    with this ECU's real VCRN and empty VIN (never keeping donor VCRN or stamping donor VIN!)
+    logs: list[tuple[str, str]] = []
+    rep = OperationReporter(on_log=lambda e: logs.append((e.level, e.message)))
+    rebuilt_add, sum_add = apply_dflash_swap_fecs(
+        donor_df,
+        enable_fecs=[0x10000100, 0x10001200],
+        reporter=rep,
+    )
+    sw_add = analyze_dflash_swap(rebuilt_add)
+    assert sw_add.crc_ok
+    assert [f.fec_code for f in sw_add.active_fscs] == [0x10000100, 0x10001200]
+    assert all(f.vcrn_matches and f.vcrn_hex == "1122334455" and f.vin == "" and f.factory_eol for f in sw_add.active_fscs)
+    assert [f.fec_code for f in sw_add.foreign_fscs] == [0x10001700]
+    assert sw_add.vin == ""
+    assert sum_add["foreign_fecs"] == ["0x10001700"]
+    assert any(lvl == "info" and "AABBCCDDEE" in msg and "1122334455" in msg for lvl, msg in logs)
+    assert not any(lvl == "warning" and "signed certificate" in msg for lvl, msg in logs)
+
+    # 3. Replace activation (GUI path: preserve_existing_active=False) rebuilds selected FeCs and erases unselected donor slots
+    rebuilt_rep, sum_rep = apply_dflash_swap_fecs(
+        donor_df,
+        enable_fecs=[0x10000100, 0x10001200],
+        vin="WVWZZZAUZJW000001",
+        preserve_existing_active=False,
+    )
+    sw_rep = analyze_dflash_swap(rebuilt_rep)
+    assert sw_rep.crc_ok and sw_rep.vin == "WVWZZZAUZJW000001"
+    assert [f.fec_code for f in sw_rep.active_fscs] == [0x10000100, 0x10001200]
+    assert sw_rep.foreign_fscs == []
+    assert sum_rep["foreign_fecs"] == []
+    slot8_off = DFLASH_FSC_BASE_OFF + 8 * DFLASH_FSC_STRIDE
+    assert rebuilt_rep[slot8_off : slot8_off + DFLASH_FSC_STRIDE] == b"\xff" * DFLASH_FSC_STRIDE
+
+    # 4. Mixed dump (valid matching-VCRN VAG-signed cert + foreign-VCRN donor cert): keep valid cert byte-for-byte,
+    #    inherit VIN only from the matching cert, and rebuild the foreign-VCRN cert
+    mixed_df, _ = apply_dflash_swap_fecs(donor_df, enable_fecs=[0x10000300], vin="WVWZZZAUZJW000001")
+    mixed = bytearray(mixed_df)
+    mke_slot = analyze_dflash_swap(bytes(mixed)).active_fscs[0]
+    assert mke_slot.fec_code == 0x10000300
+    mixed[mke_slot.dflash_off + 4 + FSC_SIGNED_BODY_SIZE : mke_slot.dflash_off + 4 + FSC_SIGNED_BODY_SIZE + 128] = b"\x3c" * 128
+    struct.pack_into(
+        "<I",
+        mixed,
+        mke_slot.dflash_off + 0xB0,
+        zlib.crc32(bytes(mixed[mke_slot.dflash_off + 4 : mke_slot.dflash_off + 4 + DFLASH_FSC_PAY_SIZE])) & 0xFFFFFFFF,
+    )
+    sw_mixed = analyze_dflash_swap(bytes(mixed))
+    assert sw_mixed.vin == "WVWZZZAUZJW000001"
+    assert [f.fec_code for f in sw_mixed.active_fscs] == [0x10000300]
+    assert [f.fec_code for f in sw_mixed.foreign_fscs] == [0x10000100, 0x10001200, 0x10001700]
+
+    out_mixed, _ = apply_dflash_swap_fecs(
+        bytes(mixed),
+        enable_fecs=[0x10000300, 0x10000100],
+        preserve_existing_active=False,
+    )
+    assert out_mixed[mke_slot.dflash_off : mke_slot.dflash_off + DFLASH_FSC_STRIDE] == mixed[mke_slot.dflash_off : mke_slot.dflash_off + DFLASH_FSC_STRIDE]
+    sw_out_mixed = analyze_dflash_swap(out_mixed)
+    assert [f.fec_code for f in sw_out_mixed.active_fscs] == [0x10000300, 0x10000100]
+    assert sw_out_mixed.foreign_fscs == []
+    gra_slot = next(f for f in sw_out_mixed.active_fscs if f.fec_code == 0x10000100)
+    assert gra_slot.vcrn_hex == "1122334455" and gra_slot.vin == "WVWZZZAUZJW000001" and gra_slot.factory_eol
+
+
+def test_foreign_vcrn_gui_and_cli_reporting(
+    synth_cflash: bytes,
+    synth_dflash: bytes,
+    synth_uflash: bytes,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """GUI passport hides donor VIN, SWaP screen & dialog warn about foreign VCRN, and CLI shows DID 0x3C0A + foreign list."""
+    from PySide6.QtWidgets import QLabel
+
+    from contitool.gui.screens import status
+
+    set_lang("en")
+    donor_df = _make_donor_dflash(synth_dflash)
+
+    # 1. CLI inspect shows DID 0x3C0A, no donor VIN in VIN header, and explicit Foreign VCRN section
+    df_path = tmp_path / "Dflash_donor.bin"
+    df_path.write_bytes(donor_df)
+    capsys.readouterr()
+    rc = main(["-l", "en", "--no-color", "inspect", "--dflash", str(df_path)])
+    out, _ = capsys.readouterr()
+    assert rc == 0
+    assert "VCRN (DID 0x3C0A): 1122334455" in out
+    assert "VIN:               —" in out
+    assert "Foreign VCRN (rejected FSCs)" in out
+    assert "VCRN=AABBCCDDEE" in out
+
+    # 2. GUI passport, status pill, SWaP page, and SwapActivateDialog
+    app, win = create_window()
+    folder = tmp_path / "donor_dumps"
+    folder.mkdir()
+    (folder / "Cflash.bin").write_bytes(synth_cflash)
+    (folder / "Dflash.bin").write_bytes(donor_df)
+    (folder / "Uflash.bin").write_bytes(synth_uflash)
+
+    win.open_folder(str(folder))
+    app.processEvents()
+    p_rows = status.passport_rows(win.ws)
+    assert ("VCRN", "1122334455", "muted") in p_rows
+    assert not any(lbl == "VIN" for lbl, _, _ in p_rows)
+    assert status.swap_features(win.ws).key == "warn"
+    assert len(status.foreign_features_detailed(win.ws)) == 3
+
+    win.ecu_screen.select("swap")
+    app.processEvents()
+    page_texts = " ".join(lbl.text() for lbl in win.ecu_screen.page_area.widget().findChildren(QLabel))
+    assert "AABBCCDDEE" in page_texts
+    assert "REJECTED SLOTS IN DATAFLASH (FOREIGN VCRN)" in page_texts
+
+    dlg = SwapActivateDialog(analyze_dflash_swap(donor_df), analyze_dflash_datasets(donor_df))
+    dlg.show()
+    app.processEvents()
+    assert dlg.foreign_callout.isVisible()
+    assert "AABBCCDDEE" in dlg.foreign_callout.label.text()
+    assert dlg.ed_vin.text() == ""
+    assert dlg.selected_fecs == []
+    dlg.close()
+    win.close()

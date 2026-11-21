@@ -300,3 +300,58 @@ def test_faci_block_packets_respect_the_page_cap() -> None:
     block = bytes(range(256)) * 40 + b"\xff" * (0x8000 - 40 * 256)  # 40 used pages in a 32 KB block
     pkts = build_cflash_faci_block_payloads(0x10000, block, max_pages_per_packet=32)
     assert [len(p) for p in pkts] == sorted([len(p) for p in pkts], reverse=True) and len(pkts) == 2  # 32 + 8 pages
+
+
+def test_write_to_ecu_falls_back_to_raw_faci_when_uflash_is_otp_protected(
+    synth_cflash: bytes, synth_dflash: bytes, synth_uflash: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issues #31 & #34: when Uflash is OTP/write-protected on the ECU, 'Write to ECU' writes DataFlash and
+    modified CodeFlash blocks directly via raw FACI without failing on the bootloader step."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from contitool.can import UflashProtectedError
+    from contitool.gui.app import create_window
+    from contitool.gui.screens import ecu
+
+    set_lang("en")
+    app, win = create_window()
+    folder = tmp_path / "dumps"
+    folder.mkdir()
+    for name, raw in (("Cflash.bin", synth_cflash), ("Dflash.bin", synth_dflash), ("Uflash.bin", synth_uflash)):
+        (folder / name).write_bytes(raw)
+    win.open_folder(str(folder))
+
+    edited_cf = bytearray(synth_cflash)
+    edited_cf[APP_BASE + 0x100] ^= 0xFF
+    edited_df = bytearray(synth_dflash)
+    edited_df[0xC000] ^= 0xFF
+    (tmp_path / "Cflash_edit.bin").write_bytes(edited_cf)
+    (tmp_path / "Dflash_edit.bin").write_bytes(edited_df)
+    win.ws.commit("cflash", tmp_path / "Cflash_edit.bin")
+    win.ws.commit("dflash", tmp_path / "Dflash_edit.bin")
+    app.processEvents()
+
+    calls: list[tuple[str, dict]] = []
+    win.conn.out_dir = tmp_path / "runs"
+    monkeypatch.setattr(ecu, "ensure_ready", lambda *_a: True)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+
+    def locked_uflash(*_a, **kw):
+        calls.append(("uflash", kw))
+        raise UflashProtectedError("Uflash OTP protected")
+
+    monkeypatch.setattr(ecu, "can_write_uflash", locked_uflash)
+    monkeypatch.setattr(ecu, "can_write_dflash", lambda *a, **kw: calls.append(("dflash", kw)) or {})
+    monkeypatch.setattr(ecu, "can_write_cflash", lambda *a, **kw: calls.append(("cflash", kw)) or {})
+
+    win.ecu_screen._write_to_ecu()
+    loop = QEventLoop()
+    results: list[tuple[bool, str]] = []
+    win.runner.operation_finished.connect(lambda ok, msg: (results.append((ok, msg)), loop.quit()))
+    QTimer.singleShot(8000, loop.quit)
+    loop.exec()
+
+    assert results and results[0][0] is True, results
+    assert [name for name, _ in calls] == ["uflash", "dflash", "cflash"]
+    assert calls[2][1].get("raw_faci") is True
+    win.close()

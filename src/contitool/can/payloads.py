@@ -40,20 +40,22 @@ EXPECTED_BEACON_SHA256 = "9f64fb6ecc4a0e3d0bbce2af7f27abd07e378e4fe6d576539f0ffb
 # 2. Native Flash/RAM Reader Template (28 bytes -> calls 0x010010F0(r6=address, r7=length))
 READER_PAYLOAD_SUFFIX = bytes.fromhex("1fd82106f0100001e1c760f91bf87f00")
 
-# 3. Live RSA-1024 Verification Probe (92 bytes -> calls 0x010033FC on 0xFF*128, stores status at 0xFEDE9000)
+# 3. Live RSA-1024 Verification Probe (92 bytes -> calls 0x010033FC / 0x01003416 on 0xFF*128, stores status at 0xFEDE9000)
 RSA_PROBE_PAYLOAD = bytes.fromhex(
     "26060092defe003a2806000100001fd8210696100001e1c760f926068092defe2706ff000000"
     "280680000000210696100001e1c760f926068000000027068092defe2106fc330001e1c760f9"
     "1bf80a3826060090defe663f01007f00"
 )
+RSA_PROBE_FN_IMM_OFFSET = 68  # `21 06 <fn_vaddr_le32>` (`mov 0x010033fc, r1`)
 EXPECTED_RSA_PROBE_SHA256 = "c9ccaf4d657ccfcf8671e9a565af041da2c02b2b6a6b769e6334b2848edf4b3b"
 
-# 4. One-Shot FACI Extended User Area (Uflash) Writer Stub (656 bytes RH850 machine code, built in hw_applets.py)
-#    Enables FLMDCNT=1 and polls FPMON.FWE, loads 128-bit SELFID from Cflash+0xAB00, polls FENTRYR==0x0001,
-#    unlocks FPROTR/FAREASELC=0x3B02, erases 0x01000000..0x01007FFF, programs `r22` 256-byte pages while kicking
-#    WDTA0/WDTA1, exits P/E mode, flushes CFCNT, restores FLMDCNT=0, and records diagnostics at 0xFEDE9000.
+# 4. One-Shot FACI Extended User Area (Uflash) Writer Stub (660 bytes RH850 machine code, built in hw_applets.py)
+#    Enables FLMDCNT=1 and polls FPMON.FWE, loads 128-bit SELFID from Cflash+0xAB00 with IDST (0xFFA08010) check &
+#    0xFFFFFFFF*4 fallback, polls FENTRYR==0x0001, unlocks FPROTR/FAREASELC=0x3B02, erases 0x01000000..0x01007FFF,
+#    programs `r22` 256-byte pages while kicking WDTA0/WDTA1, exits P/E mode, flushes CFCNT, restores FLMDCNT=0,
+#    and records diagnostics (including IDST) at 0xFEDE9000.
 EXPECTED_ENGINEERING_UFLASH_SHA256 = "2a48df13ae14250928b3fc1ea0a2696751db877380422311e56536dad89ed8cd"
-EXPECTED_ONE_SHOT_PAYLOAD_SHA256 = "fe22e4beee81b8239499d6f7ddd36b4b49ff6d9083005f4473877eb2c33d8b13"
+EXPECTED_ONE_SHOT_PAYLOAD_SHA256 = "f1d1b7579bba0128c312d471bbd26013c70c8e3651256ba165aaf58f777a3a6a"
 
 # 5. Parameterized FACI DataFlash (0xFF200000..0xFF20FFFF) Writer Stub (784 bytes RH850 machine code)
 #    Saves r20..r29/ep/lp on stack, kicks WDTA0/WDTA1, loads 128-bit FLID, enters DataFlash P/E mode
@@ -84,7 +86,7 @@ DFLASH_BLOCK_SIZE = 64
 DFLASH_ICUS_RESERVED_OFFSET = 0xF800  # Top 2 KB (0xF800..0xFFFF) hardware-guarded for ICUSB SHE keys
 MAX_DFLASH_BLOCKS_PER_PACKET = 400
 
-# 6. Parameterized FACI CodeFlash / Extended User Area Writer Stub (718 bytes RH850 machine code, built in hw_applets.py)
+# 6. Parameterized FACI CodeFlash / Extended User Area Writer Stub (724 bytes RH850 machine code, built in hw_applets.py)
 #    Supports 8 KB boot blocks (0x00000000..0x0000FFFF), 32 KB app blocks (0x00010000..0x0017FFFF),
 #    and Extended User Area (0x01000000..0x01007FFF) with FLMDCNT=1 / FPMON.FWE check and WDTA0/WDTA1 servicing.
 MAX_CFLASH_PAGES_PER_PACKET = 96
@@ -157,6 +159,19 @@ def build_loader_packet(payload: bytes) -> bytes:
     packet[0x118 : 0x118 + len(payload)] = payload
     packet[-1] = reduce(lambda a, b: a ^ b, packet[:-1], 0)
     return bytes(packet)
+
+
+def build_rsa_probe_payload(rsa_fn_vaddr: int = 0x010033FC) -> bytes:
+    """Build 92-byte live RSA-1024 probe calling `rsa_fn_vaddr` (`0x010033FC` on HW 521+, `0x01003416` on HW 517/518)."""
+    if not (0x01000000 <= rsa_fn_vaddr < 0x01008000) or (rsa_fn_vaddr & 1) != 0:
+        raise ValueError(f"Invalid FBL RSA verification address: 0x{rsa_fn_vaddr:08X}")
+    if rsa_fn_vaddr == 0x010033FC:
+        return RSA_PROBE_PAYLOAD
+    buf = bytearray(RSA_PROBE_PAYLOAD)
+    if buf[RSA_PROBE_FN_IMM_OFFSET - 2 : RSA_PROBE_FN_IMM_OFFSET] != b"\x21\x06":
+        raise RuntimeError("Corrupted RSA_PROBE_PAYLOAD call target instruction")
+    struct.pack_into("<I", buf, RSA_PROBE_FN_IMM_OFFSET, rsa_fn_vaddr)
+    return bytes(buf)
 
 
 def build_reader_payload(address: int, length: int) -> bytes:
@@ -347,7 +362,8 @@ def build_cflash_faci_block_payloads(
     max_pages_per_packet: int = MAX_CFLASH_PAGES_PER_PACKET,
 ) -> list[bytes]:
     """Build 1 or 2 FACI erase+program payloads for one physical CodeFlash (or Extended User Area) block."""
-    if not 1 <= max_pages_per_packet <= MAX_CFLASH_PAGES_PER_PACKET:
+    upper_cap = 120 if extended else MAX_CFLASH_PAGES_PER_PACKET
+    if not 1 <= max_pages_per_packet <= upper_cap:
         raise ValueError(f"Invalid max_pages_per_packet={max_pages_per_packet}")
     flid = _normalize_flid(flid_16b)
     if extended:
@@ -417,7 +433,8 @@ def build_uflash_faci_payloads(
         raise ValueError(f"Expected 32,768-byte Uflash image, got {len(uflash_32k)}")
     trimmed_len = len(uflash_32k.rstrip(b"\xff"))
     pages = max(1, (trimmed_len + 255) // 256)
-    if pages > 122 or flid_16b is not None:
+    max_one_shot_pages = 120 if flid_16b is not None else 122
+    if pages > max_one_shot_pages:
         raise ValueError(
             tr(
                 f"Образ Uflash занимает {pages} страниц — больше 122, его нельзя записать одним пакетом. "
@@ -428,6 +445,16 @@ def build_uflash_faci_payloads(
                 "Check that this is this ECU's own bootloader (usually 99 pages).",
             )
         )
+    if flid_16b is not None:
+        pkts = build_cflash_faci_block_payloads(
+            0x01000000,
+            uflash_32k,
+            extended=True,
+            flid_16b=flid_16b,
+            max_pages_per_packet=120,
+        )
+        assert len(pkts) == 1
+        return pkts, pages
     one_shot, count = build_uflash_one_shot_payload(uflash_32k)
     return [one_shot], count
 
@@ -493,13 +520,15 @@ def verify_payload_self_tests() -> None:
         raise RuntimeError("Embedded BEACON_PAYLOAD SHA-256 self-test failed")
     if hashlib.sha256(RSA_PROBE_PAYLOAD).hexdigest() != EXPECTED_RSA_PROBE_SHA256:
         raise RuntimeError("Embedded RSA_PROBE_PAYLOAD SHA-256 self-test failed")
-    if len(UFLASH_FACI_STUB) != 656 or hashlib.sha256(UFLASH_FACI_STUB).hexdigest() != EXPECTED_UFLASH_FACI_STUB_SHA256:
+    if build_rsa_probe_payload(0x01003416)[RSA_PROBE_FN_IMM_OFFSET : RSA_PROBE_FN_IMM_OFFSET + 4] != b"\x16\x34\x00\x01":
+        raise RuntimeError("build_rsa_probe_payload(0x01003416) self-test failed")
+    if len(UFLASH_FACI_STUB) != 660 or len(UFLASH_FACI_STUB) % 4 != 0 or hashlib.sha256(UFLASH_FACI_STUB).hexdigest() != EXPECTED_UFLASH_FACI_STUB_SHA256:
         raise RuntimeError("Embedded UFLASH_FACI_STUB SHA-256 self-test failed")
-    if len(DFLASH_FACI_STUB) != 784 or hashlib.sha256(DFLASH_FACI_STUB).hexdigest() != EXPECTED_DFLASH_FACI_STUB_SHA256:
+    if len(DFLASH_FACI_STUB) != 784 or len(DFLASH_FACI_STUB) % 4 != 0 or hashlib.sha256(DFLASH_FACI_STUB).hexdigest() != EXPECTED_DFLASH_FACI_STUB_SHA256:
         raise RuntimeError("Embedded DFLASH_FACI_STUB SHA-256 self-test failed")
-    if len(CFLASH_FACI_STUB) != 718 or hashlib.sha256(CFLASH_FACI_STUB).hexdigest() != EXPECTED_CFLASH_FACI_STUB_SHA256:
+    if len(CFLASH_FACI_STUB) != 724 or len(CFLASH_FACI_STUB) % 4 != 0 or hashlib.sha256(CFLASH_FACI_STUB).hexdigest() != EXPECTED_CFLASH_FACI_STUB_SHA256:
         raise RuntimeError("Embedded CFLASH_FACI_STUB SHA-256 self-test failed")
-    if len(DFLASH_READER_STUB) != 652 or hashlib.sha256(DFLASH_READER_STUB).hexdigest() != EXPECTED_DFLASH_READER_STUB_SHA256:
+    if len(DFLASH_READER_STUB) != 652 or len(DFLASH_READER_STUB) % 4 != 0 or hashlib.sha256(DFLASH_READER_STUB).hexdigest() != EXPECTED_DFLASH_READER_STUB_SHA256:
         raise RuntimeError("Embedded DFLASH_READER_STUB SHA-256 self-test failed")
     if build_fed_reader_payload(0x11223344, 0x1000, 2) != _FED_READER_ASSEMBLED_2X:
         raise RuntimeError("Fed reader builder differs from its assembled template")

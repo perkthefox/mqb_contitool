@@ -107,6 +107,7 @@ class SimulatedRh850FaciMcu:
         self.flmd_history: list[int] = []
         self.hw527_flmd0_low = True  # Vitesco HW 527 PCB keeps FLMD0 Low unless FLMDCNT == 1
         self.flmd0_stuck_low = False
+        self.uflash_erase_locked = False  # Simulate silicon lock on 0x01000000 returning ILGLERR on Block Erase
         self.fpckar = 0x0028
         self.fentryr = 0x0000
         self._fentryr_pending_mode: int | None = None
@@ -216,6 +217,10 @@ class SimulatedRh850FaciMcu:
             if idx == 3:
                 self.flid3_dummy_read = True
             return struct.pack("<I", self.flid[idx])
+        if addr == 0xFFA08010 and length in (1, 4):
+            expected_flid = list(struct.unpack("<4I", self.extra_area[0x50:0x60]))
+            idst = 0 if (self.flid3_dummy_read and self.flid == expected_flid) else 1
+            return bytes([idst]) if length == 1 else struct.pack("<I", idst)
         if addr == 0xFFA10000 and length == 1:
             fwe = (not self.flmd0_stuck_low) and (self.flmdcnt == 1 or not self.hw527_flmd0_low)
             return bytes([0x80 if fwe else 0x00])
@@ -315,6 +320,7 @@ class SimulatedRh850FaciMcu:
             assert self.fentryr == 0x0000, "FLID must be loaded in Read mode before P/E entry!"
             idx = (addr - 0xFFA08000) // 4
             self.flid[idx] = int.from_bytes(data, "little")
+            self.flid3_dummy_read = False
             return
         if addr == 0xFFA10084 and ln == 2:
             val = int.from_bytes(data, "little")
@@ -328,14 +334,17 @@ class SimulatedRh850FaciMcu:
                 self._fentryr_pending_mode = None
                 self._fentryr_pending_polls = 0
             elif mode == 0x80:
-                expected_flid = list(struct.unpack("<4I", self.cflash[0xAB00:0xAB10]))
-                assert self.flid == expected_flid, f"FLID mismatch on P/E entry: {self.flid} != {expected_flid}"
+                expected_flid = list(struct.unpack("<4I", self.extra_area[0x50:0x60]))
+                cflash_flid = list(struct.unpack("<4I", self.cflash[0xAB00:0xAB10]))
+                assert self.flid in (expected_flid, cflash_flid), (
+                    f"FLID mismatch on DataFlash P/E entry: {self.flid} not in ({expected_flid}, {cflash_flid})"
+                )
                 self._fentryr_pending_mode = 0x0080
                 self._fentryr_pending_polls = 1
             elif mode == 0x01:
-                expected_flid = list(struct.unpack("<4I", self.cflash[0xAB00:0xAB10]))
+                expected_flid = list(struct.unpack("<4I", self.extra_area[0x50:0x60]))
                 fwe = (not self.flmd0_stuck_low) and (self.flmdcnt == 1 or not self.hw527_flmd0_low)
-                if self.flid == expected_flid and fwe:
+                if self.flid3_dummy_read and self.flid == expected_flid and fwe:
                     self._fentryr_pending_mode = 0x0001
                     self._fentryr_pending_polls = 1
                 else:
@@ -491,6 +500,12 @@ class SimulatedRh850FaciMcu:
                 assert self.fprotr == 1
                 if self.fareaselc == 0x3B02:
                     assert self.fsaddr == 0x01000000 and self.feaddr == 0x01007FFF
+                    otp_eua = int.from_bytes(self.extra_area[0x48:0x4C], "little")
+                    sec_flags = int.from_bytes(self.extra_area[0x60:0x64], "little")
+                    if self.uflash_erase_locked or (otp_eua & 1) == 0 or ((sec_flags >> 30) & 1) == 0:
+                        self.fstatr = 0x0000C000
+                        self.fcstatr |= 0x10
+                        return
                     self.uflash[:] = b"\xff" * UFLASH_SIZE
                 else:
                     assert self.fareaselc == 0x3B00
@@ -812,14 +827,20 @@ class SimulatedRh850FaciMcu:
                 pc += 4
                 continue
 
-            # Format VII loads/stores (32-bit)
+            # Format VII loads/stores (32-bit) — enforce RH850/F1L MCTL.MA=0 hardware alignment (MAE vector 0x00C0)
             hw1 = struct.unpack_from("<H", self.ram, ram_off + 2)[0]
             if op6 == 0b111001:  # ld.h / ld.w disp16[reg1], reg2
                 disp = _sext(hw1 & 0xFFFE, 16)
                 addr = (regs[reg1] + disp) & 0xFFFFFFFF
                 if hw1 & 1:
+                    assert (addr & 3) == 0, (
+                        f"RH850 MAE (vector 0x00C0): unaligned ld.w @ 0x{addr:08X} from PC=0x{pc:08X}"
+                    )
                     val = int.from_bytes(self.read_phys(addr, 4), "little")
                 else:
+                    assert (addr & 1) == 0, (
+                        f"RH850 MAE (vector 0x00C0): unaligned ld.h @ 0x{addr:08X} from PC=0x{pc:08X}"
+                    )
                     val = _sext(int.from_bytes(self.read_phys(addr, 2), "little"), 16) & 0xFFFFFFFF
                 if reg2 != 0:
                     regs[reg2] = val
@@ -828,6 +849,9 @@ class SimulatedRh850FaciMcu:
             if op6 == 0b111111 and (hw1 & 1):  # ld.hu disp16[reg1], reg2
                 disp = _sext(hw1 & 0xFFFE, 16)
                 addr = (regs[reg1] + disp) & 0xFFFFFFFF
+                assert (addr & 1) == 0, (
+                    f"RH850 MAE (vector 0x00C0): unaligned ld.hu @ 0x{addr:08X} from PC=0x{pc:08X}"
+                )
                 val = int.from_bytes(self.read_phys(addr, 2), "little")
                 if reg2 != 0:
                     regs[reg2] = val
@@ -845,8 +869,14 @@ class SimulatedRh850FaciMcu:
                 disp = _sext(hw1 & 0xFFFE, 16)
                 addr = (regs[reg1] + disp) & 0xFFFFFFFF
                 if hw1 & 1:
+                    assert (addr & 3) == 0, (
+                        f"RH850 MAE (vector 0x00C0): unaligned st.w @ 0x{addr:08X} from PC=0x{pc:08X}"
+                    )
                     self.write_phys(addr, struct.pack("<I", regs[reg2] & 0xFFFFFFFF))
                 else:
+                    assert (addr & 1) == 0, (
+                        f"RH850 MAE (vector 0x00C0): unaligned st.h @ 0x{addr:08X} from PC=0x{pc:08X}"
+                    )
                     self.write_phys(addr, struct.pack("<H", regs[reg2] & 0xFFFF))
                 pc += 4
                 continue
@@ -889,6 +919,8 @@ class SimulatedJ533CanBus:
         self._dl_offset = 0
         self._dl_buf = bytearray()
         self._seed = 0x2468ACE1
+        self.fbl_erase_fail: str | None = None  # None | "fast" | "partial"
+        self.uds_erase_calls = 0
 
     def recv(self, timeout: float = 0.0):
         return self.rx_queue.pop(0) if self.rx_queue else None
@@ -958,9 +990,18 @@ class SimulatedJ533CanBus:
                 self._reply(0x6F1, blob[off : off + 8])
             self._reply(0x6F1, b"\x00\x00")
             return
-        if code.startswith(RSA_PROBE_PAYLOAD):
-            eng = analyze_uflash(bytes(self.mcu.uflash)).rsa_bypassed
-            rsa_status = 0 if eng else 2
+        if (
+            len(code) >= len(RSA_PROBE_PAYLOAD)
+            and code[:68] == RSA_PROBE_PAYLOAD[:68]
+            and code[72 : len(RSA_PROBE_PAYLOAD)] == RSA_PROBE_PAYLOAD[72:]
+        ):
+            called_fn = int.from_bytes(code[68:72], "little")
+            uinfo = analyze_uflash(bytes(self.mcu.uflash))
+            if uinfo.rsa_probe_vaddr is not None:
+                assert called_fn == uinfo.rsa_probe_vaddr, (
+                    f"RSA probe called 0x{called_fn:08X} instead of Uflash RSA fn 0x{uinfo.rsa_probe_vaddr:08X}!"
+                )
+            rsa_status = 0 if uinfo.rsa_bypassed else 2
             self.mcu.write_phys(0xFEDE9000, struct.pack("<I", rsa_status))
             self._reply(0x6F1, b"\x00\x00")
             return
@@ -1008,8 +1049,20 @@ class SimulatedJ533CanBus:
         elif req.startswith(b"\x2e\xf1\x5a"):
             self._reply_uds(b"\x6e\xf1\x5a")
         elif req == bytes.fromhex("3101ff000101"):
-            self.mcu.cflash[0xC000:CFLASH_SIZE] = b"\xff" * (CFLASH_SIZE - 0xC000)
-            self._reply_uds(b"\x71\x01\xff\x00\x00")
+            self.uds_erase_calls += 1
+            # Real FBL R_FCL (Uflash 0x0100147A / 0x01004EE0) only loads Cflash+0xAB00 into FLID0..3:
+            # if Extra Area IDCODE (@ 0xFF300050) differs, R_FCL fails with R_FCL_ERR_PROTECTION -> 71 01 FF 00 01.
+            cflash_id = bytes(self.mcu.cflash[0xAB00:0xAB10])
+            extra_id = bytes(self.mcu.extra_area[0x50:0x60])
+            if self.fbl_erase_fail == "fast" or cflash_id != extra_id:
+                self._reply_uds(b"\x71\x01\xff\x00\x01")
+            elif self.fbl_erase_fail == "partial":
+                self.mcu.cflash[0x8023] = 0xFF
+                self.mcu.cflash[0xC000:0x10000] = b"\xff" * 0x4000  # erases Block 6 + unchanged Block 7
+                self._reply_uds(b"\x71\x01\xff\x00\x01")
+            else:
+                self.mcu.cflash[0xC000:CFLASH_SIZE] = b"\xff" * (CFLASH_SIZE - 0xC000)
+                self._reply_uds(b"\x71\x01\xff\x00\x00")
         elif req.startswith(b"\x34\x00\x44"):
             self._dl_offset = int.from_bytes(req[3:7], "big")
             dl_size = int.from_bytes(req[7:11], "big")
@@ -1550,3 +1603,369 @@ def test_hw527_flmd_enable_and_faci_diagnostics(
     assert st_bad["marker"] == 2
     assert mcu.flmdcnt == 0
     assert mcu.flmd_history == [1, 0]
+
+
+def _make_hw518_uflash(synth_uflash: bytes) -> bytes:
+    """Build a realistic HW 517/518 Uflash image where the RSA check lives at +0x3444 (fn @ 0x01003416)."""
+    uf = bytearray(b"\xff" * UFLASH_SIZE)
+    uf[:0x3000] = synth_uflash[:0x3000]
+    # Shifted jarl disp22, lp (0xFF80, 0x1476 -> target 0x48B4) + cmp r0, r10 + cmov + tail @ +0x3444
+    uf[0x3444 - 6 : 0x3444] = bytes.fromhex("80ff76148051")
+    uf[0x3444 : 0x3448] = bytes.fromhex("e25714eb")
+    uf[0x3448 : 0x3448 + 6] = bytes.fromhex("1d504006ff00")
+    uf[0x6100:0x6112] = b"SH850T01xxxxxxV210"
+    return bytes(uf)
+
+
+def test_hw517_hw518_uflash_0x3444_patch_probe_and_restore(
+    synth_cflash: bytes,
+    synth_uflash: bytes,
+    synth_dflash: bytes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issues #36 & #37: HW 517/518 bootloaders place the RSA check at +0x3444 (fn @ 0x01003416) instead of +0x342A."""
+    import time
+
+    from contitool.can import can_restore_backup, can_verify
+    from contitool.core import apply_uflash_rsa_patch, detect_dump_file, validate_uflash_bytes
+    from contitool.i18n import set_lang
+
+    set_lang("en")
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+
+    uf_518 = _make_hw518_uflash(synth_uflash)
+    validate_uflash_bytes(uf_518)
+    uinfo = analyze_uflash(uf_518)
+    assert uinfo.signature_found is True
+    assert uinfo.rsa_bypassed is False
+    assert uinfo.rsa_cmp_offset == 0x3444
+    assert uinfo.rsa_probe_vaddr == 0x01003416
+
+    uf_518_path = tmp_path / "Uflash_hw518.bin"
+    uf_518_path.write_bytes(uf_518)
+    det = detect_dump_file(uf_518_path)
+    assert det.valid and det.kind == "uflash" and "Stock RSA" in det.summary_text
+
+    uf_eng, desc = apply_uflash_rsa_patch(uf_518)
+    assert "0x01003444" in desc
+    assert analyze_uflash(uf_eng).rsa_bypassed is True
+    uf_back, _ = apply_uflash_rsa_patch(uf_eng, restore_stock=True)
+    assert uf_back == uf_518
+
+    # End-to-end CAN verify, engineering Uflash unlock, CodeFlash write, and full backup restore (#37)
+    mcu = SimulatedRh850FaciMcu(synth_cflash, uf_518, synth_dflash)
+    sim_bus = SimulatedJ533CanBus(mcu)
+    sim_bus._handle_uds_orig = sim_bus._handle_uds
+
+    def _uds_with_fazit(req: bytes) -> None:
+        if req == b"\x22\xf1\x7c":
+            sim_bus._reply_uds(b"\x62\xf1\x7c" + bytes(mcu.cflash[0xA240:0xA257]))
+            return
+        sim_bus._handle_uds_orig(req)
+
+    sim_bus._handle_uds = _uds_with_fazit  # type: ignore[method-assign]
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: sim_bus)
+
+    ver = can_verify("mock0", session_dir=tmp_path / "s_ver")
+    assert ver["rsa_probe"]["rsa_fn_vaddr"] == "0x01003416"
+    assert ver["rsa_status"] == 2
+
+    bkp_dir = tmp_path / "bkp"
+    bkp_dir.mkdir()
+    patched_cf, _, _ = apply_engineering_patch(bytes(mcu.cflash))
+    files = {
+        "cflash": bkp_dir / "Cflash.bin",
+        "dflash": bkp_dir / "Dflash.bin",
+        "uflash": bkp_dir / "Uflash.bin",
+    }
+    files["cflash"].write_bytes(patched_cf)
+    files["dflash"].write_bytes(synth_dflash)
+    files["uflash"].write_bytes(uf_518)
+
+    rest = can_restore_backup(
+        "mock0",
+        files,
+        ["cflash", "dflash", "uflash"],
+        session_dir=tmp_path / "s_restore",
+    )
+    assert rest["uflash_engineering"]["complete"] is True
+    assert rest["cflash"]["complete"] is True
+    assert bytes(mcu.cflash) == patched_cf
+    assert bytes(mcu.uflash) == uf_518
+
+
+def test_blank_or_mismatched_extra_area_idcode_and_otp_uflash_fallback(
+    synth_cflash: bytes,
+    synth_uflash: bytes,
+    synth_dflash: bytes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issues #31 & #34:
+    1) Gateways with blank (0xFF*16) or distinct Extra Area IDCODE (@ 0xFF300050 != Cflash+0xAB00) unlock IDST==0.
+    2) Gateways with OTP-protected Uflash (OTPEUA bit 0 == 0 or FACI marker=3 ILGLERR @ 0x01000000) automatically
+       fall back to direct FACI CodeFlash block programming (`raw_faci=True`) without touching Uflash!"""
+    import time
+
+    from contitool.can import UflashProtectedError, can_restore_backup
+    from contitool.i18n import set_lang
+
+    set_lang("en")
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+
+    # Case 1A: Extra Area IDCODE is blank (0xFF*16) while Cflash+0xAB00 holds random bytes
+    cflash_rand_id = bytes.fromhex("41BAECDB34DCB7247FA5BF707155AE42")
+    mcu_blank_id = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash, selfid=cflash_rand_id)
+    mcu_blank_id.extra_area[0x50:0x60] = b"\xff" * 16
+    sim_blank = SimulatedJ533CanBus(mcu_blank_id)
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: sim_blank)
+
+    uf_ok = can_write_uflash("mock0", session_dir=tmp_path / "s_blank_id_uf", skip_full_backup=True)
+    assert uf_ok["complete"] is True and analyze_uflash(bytes(mcu_blank_id.uflash)).rsa_bypassed
+
+    # Case 1B: Extra Area IDCODE is non-blank and differs from Cflash+0xAB00
+    mcu_diff_id = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash, selfid=cflash_rand_id)
+    mcu_diff_id.extra_area[0x50:0x60] = bytes.fromhex("9A83F5A00E684E56AF52DF6CFE4705A9")
+    sim_diff = SimulatedJ533CanBus(mcu_diff_id)
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: sim_diff)
+
+    tk_diff = can_turnkey_read_patch_flash(
+        "mock0",
+        cp_updates=[(parse_slot_selector("5F"), parse_hex_key("A1B2C3D4E5F60718293A4B5C6D7E8F90"))],
+        session_dir=tmp_path / "s_diff_id_tk",
+    )
+    assert tk_diff["complete"] is True
+    assert analyze_cflash(bytes(mcu_diff_id.cflash)).hook_mode == "HYBRID"
+
+    # Case 2A: Hardware OTPEUA bit 0 == 0 in Extra Area (@ 0xFF300048)
+    mcu_otp = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash, selfid=cflash_rand_id)
+    struct.pack_into("<I", mcu_otp.extra_area, 0x48, 0xFFFFFFFE)
+    sim_otp = SimulatedJ533CanBus(mcu_otp)
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: sim_otp)
+
+    with pytest.raises(UflashProtectedError, match="OTP"):
+        can_write_uflash("mock0", session_dir=tmp_path / "s_otp_standalone", skip_full_backup=True)
+    assert bytes(mcu_otp.uflash) == synth_uflash
+
+    # Turnkey IKA/CP adaptation succeeds automatically via direct FACI CodeFlash fallback!
+    tk_otp = can_turnkey_read_patch_flash(
+        "mock0",
+        cp_updates=[(parse_slot_selector("17"), parse_hex_key("112233445566778899AABBCCDDEEFF00"))],
+        session_dir=tmp_path / "s_otp_tk",
+    )
+    assert tk_otp["complete"] is True
+    assert "uflash_unlock_skipped" in tk_otp
+    assert tk_otp["cflash_flash"]["raw_faci"] is True
+    assert bytes(mcu_otp.uflash) == synth_uflash  # stock Uflash untouched!
+    assert analyze_cflash(bytes(mcu_otp.cflash)).hook_mode == "HYBRID"
+
+    # Case 2B: Extra Area OTP reads clear (0xFFFFFFFF), but FACI rejects 0x01000000 Block Erase with marker=3 ILGLERR
+    mcu_faci_lock = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash, selfid=cflash_rand_id)
+    mcu_faci_lock.uflash_erase_locked = True
+    sim_lock = SimulatedJ533CanBus(mcu_faci_lock)
+    orig_uds = sim_lock._handle_uds
+
+    def _uds_fazit(req: bytes) -> None:
+        if req == b"\x22\xf1\x7c":
+            sim_lock._reply_uds(b"\x62\xf1\x7c" + bytes(mcu_faci_lock.cflash[0xA240:0xA257]))
+            return
+        orig_uds(req)
+
+    sim_lock._handle_uds = _uds_fazit  # type: ignore[method-assign]
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: sim_lock)
+
+    with pytest.raises(UflashProtectedError, match="marker=3.*0x0000C000"):
+        can_write_uflash("mock0", session_dir=tmp_path / "s_faci_lock_uf", skip_full_backup=True)
+    assert bytes(mcu_faci_lock.uflash) == synth_uflash
+
+    patched_cf, _, _ = apply_engineering_patch(bytes(mcu_faci_lock.cflash))
+    bkp = tmp_path / "bkp_lock"
+    bkp.mkdir()
+    bkp_files = {
+        "cflash": bkp / "Cflash.bin",
+        "dflash": bkp / "Dflash.bin",
+        "uflash": bkp / "Uflash.bin",
+    }
+    bkp_files["cflash"].write_bytes(patched_cf)
+    bkp_files["dflash"].write_bytes(synth_dflash)
+    bkp_files["uflash"].write_bytes(synth_uflash)
+
+    rest_lock = can_restore_backup(
+        "mock0",
+        bkp_files,
+        ["cflash", "dflash", "uflash"],
+        session_dir=tmp_path / "s_faci_lock_restore",
+    )
+    assert "uflash_engineering_skipped" in rest_lock
+    assert rest_lock["cflash"]["raw_faci"] is True
+    assert rest_lock["uflash"]["already_matching"] is True
+    assert bytes(mcu_faci_lock.cflash) == patched_cf
+    assert bytes(mcu_faci_lock.uflash) == synth_uflash
+
+
+def test_cflash_faci_stub_word_aligned_and_no_mae(
+    synth_cflash: bytes, synth_uflash: bytes, synth_dflash: bytes
+) -> None:
+    """Issues #38, #40, #42: RH850/F1L raises MAE (vector 0x00C0) on unaligned `ld.w` reads when `CFLASH_FACI_STUB`
+    is not 4-byte aligned (722 B -> PAYLOAD_DATA @ 0xFEDF840A). Verify every stub is word-aligned, executes with
+    strict MAE checks, and that the emulator genuinely catches a 2-byte misaligned `ld.w`."""
+    from contitool.can.hw_applets import (
+        EEPROM_M95640_READER_STUB,
+        OPBT_READER_STUB,
+        PAYLOAD_ENTRY_ADDR,
+        UFLASH_FACI_STUB,
+        _Rh850Builder,
+    )
+    from contitool.can.payloads import (
+        DFLASH_FACI_STUB,
+        DFLASH_READER_STUB,
+        RSA_PROBE_PAYLOAD,
+        build_uflash_faci_payloads,
+    )
+    from contitool.core import apply_uflash_rsa_patch
+
+    for name, stub in [
+        ("CFLASH_FACI_STUB", CFLASH_FACI_STUB),
+        ("UFLASH_FACI_STUB", UFLASH_FACI_STUB),
+        ("DFLASH_FACI_STUB", DFLASH_FACI_STUB),
+        ("DFLASH_READER_STUB", DFLASH_READER_STUB),
+        ("OPBT_READER_STUB", OPBT_READER_STUB),
+        ("EEPROM_M95640_READER_STUB", EEPROM_M95640_READER_STUB),
+        ("RSA_PROBE_PAYLOAD", RSA_PROBE_PAYLOAD),
+    ]:
+        assert len(stub) % 4 == 0, f"{name} length {len(stub)} is not 4-byte aligned!"
+        assert (PAYLOAD_ENTRY_ADDR + len(stub)) % 4 == 0, f"{name} PAYLOAD_DATA is not 4-byte aligned!"
+
+    # Verify the RH850 emulator really raises MAE on a 2-byte misaligned ld.w (like v2.1.3's 0xFEDF840A)
+    bad = _Rh850Builder()
+    bad.mov_imm(PAYLOAD_ENTRY_ADDR + 0x2D2, 23)
+    bad.ld_w(0, 23, 12)
+    bad.jmp_lp()
+    mcu_bad = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash)
+    with pytest.raises(AssertionError, match="RH850 MAE"):
+        mcu_bad.execute_loader_payload(bad.build())
+
+    # Execute CFLASH_FACI_STUB on Boot Block #4 (Issue #42), Boot Block #5 (Issues #38/#40), and custom-FLID Uflash
+    selfid = bytes.fromhex("A2A874A31E1E5EB3C44983B1F870F765")
+    mcu = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash, selfid=selfid)
+
+    b4_new = bytearray(mcu.cflash[0x8000:0xA000])
+    b4_new[0x0023] = 0x00
+    b4_new[0x0100:0x0104] = b"NIGB"
+    for pkt in build_cflash_faci_block_payloads(0x00008000, bytes(b4_new), flid_16b=selfid):
+        res = mcu.execute_loader_payload(pkt)
+        assert res["marker"] == 1 and res["fstatr"] == 0x8000
+    assert bytes(mcu.cflash[0x8000:0xA000]) == bytes(b4_new)
+
+    b5_new = bytearray(mcu.cflash[0xA000:0xC000])
+    b5_new[0x0167] = 0x00  # Engineering Mode OTP byte @ 0xA167 (Issue #38)
+    for pkt in build_cflash_faci_block_payloads(0x0000A000, bytes(b5_new), flid_16b=selfid):
+        res = mcu.execute_loader_payload(pkt)
+        assert res["marker"] == 1 and res["fstatr"] == 0x8000
+    assert bytes(mcu.cflash[0xA000:0xC000]) == bytes(b5_new)
+
+    uf_eng, _ = apply_uflash_rsa_patch(synth_uflash)
+    uf_pkts, _ = build_uflash_faci_payloads(uf_eng, flid_16b=selfid)
+    assert len(uf_pkts) == 1 and uf_pkts[0].startswith(CFLASH_FACI_STUB)
+    res_uf = mcu.execute_loader_payload(uf_pkts[0])
+    assert res_uf["marker"] == 1 and res_uf["fstatr"] == 0x8000
+    assert bytes(mcu.uflash) == uf_eng
+
+
+def test_issue41_idcode_mismatch_and_fbl_erase_7101ff0001_fallback(
+    synth_cflash: bytes,
+    synth_uflash: bytes,
+    synth_dflash: bytes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #41: When FBL `31 01 FF 00` cannot erase CodeFlash (`71 01 FF 00 01`), either because Extra Area IDCODE
+    differs from `Cflash+0xAB00` (e.g. blank `0xFF*16`) or because FBL rejects EraseMemory at runtime (fast fail or
+    partial erase), `can_write_cflash` falls back cleanly to direct FACI programming in RAM-Loader."""
+    import time
+
+    from contitool.core import apply_uflash_rsa_patch
+    from contitool.i18n import set_lang
+
+    set_lang("en")
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+
+    selfid_41 = bytes.fromhex("41BAECDB34DCB7247FA5BF707155AE42")
+    spec_5f = parse_slot_selector("5F")
+    ika_5f = parse_hex_key("112233445566778899AABBCCDDEEFF00")
+
+    # Case A: Blank Extra Area IDCODE (0xFF*16) != Cflash+0xAB00 (exact strtgs #31/#41 ECU state).
+    # Uflash + Dflash succeed via FACI, and can_write_cflash proactively switches to direct FACI without hitting 7101ff0001.
+    mcu_a = SimulatedRh850FaciMcu(synth_cflash, synth_uflash, synth_dflash, selfid=selfid_41)
+    mcu_a.extra_area[0x50:0x60] = b"\xff" * 16
+    bus_a = SimulatedJ533CanBus(mcu_a)
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: bus_a)
+
+    mod_cf_a, mod_df_a, _ = bind_cp_turnkey(bytes(mcu_a.cflash), synth_dflash, [(spec_5f, ika_5f)])
+    uf_a = can_write_uflash("mock0", session_dir=tmp_path / "a_uf", skip_full_backup=True, return_to_app=False)
+    assert uf_a["complete"] is True
+    df_a = can_write_dflash("mock0", mod_df_a, session_dir=tmp_path / "a_df", skip_full_backup=True, return_to_app=False)
+    assert df_a["complete"] is True
+    cf_a = can_write_cflash("mock0", mod_cf_a, session_dir=tmp_path / "a_cf", skip_backup=True)
+    assert cf_a["complete"] is True
+    assert cf_a["raw_faci"] is True
+    assert cf_a["raw_faci_reason"] == "idcode_mismatch"
+    assert bus_a.uds_erase_calls == 0
+    assert bytes(mcu_a.cflash) == mod_cf_a
+    assert bytes(mcu_a.cflash[0xAB00:0xAB10]) == selfid_41
+
+    # Case B: Extra Area IDCODE matches Cflash+0xAB00, but FBL EraseMemory (31 01 FF 00) returns 7101ff0001 immediately
+    # without erasing any flash -> reactive fallback re-enters RAM-Loader and programs only changed app blocks via FACI.
+    uf_eng, _ = apply_uflash_rsa_patch(synth_uflash)
+    mcu_b = SimulatedRh850FaciMcu(synth_cflash, uf_eng, synth_dflash, selfid=selfid_41)
+    bus_b = SimulatedJ533CanBus(mcu_b)
+    bus_b.fbl_erase_fail = "fast"
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: bus_b)
+
+    mod_cf_b, _, _ = bind_cp_turnkey(bytes(mcu_b.cflash), synth_dflash, [(spec_5f, ika_5f)])
+    cf_b = can_write_cflash("mock0", mod_cf_b, session_dir=tmp_path / "b_cf", skip_backup=True)
+    assert cf_b["complete"] is True
+    assert bus_b.uds_erase_calls == 1
+    assert cf_b["uds_fallback_faci"] is True
+    assert "7101ff0001" in cf_b["uds_erase_failed"]
+    assert cf_b["faci_fallback_blocks"] == cf_b["changed_app_blocks"]
+    assert bytes(mcu_b.cflash) == mod_cf_b
+
+    # Case C: FBL EraseMemory corrupts Block 4 (0x8023 = 0xFF) & erases Block 6 + unchanged Block 7 before returning
+    # 7101ff0001 -> reactive fallback detects the partial erase via live readback and restores Blocks 4, 6, 7 + edits!
+    from contitool.core import app_crc
+
+    cf_c_base = bytearray(synth_cflash)
+    cf_c_base[0x8023] = 0x00  # realistic finished NIGB record
+    cf_c_base[0xE000:0xE010] = b"UNMODIFIED_BLK07"
+    _, base_crc = app_crc(cf_c_base[APP_BASE:])
+    struct.pack_into("<H", cf_c_base, 0xC21C, base_crc)
+    mcu_c = SimulatedRh850FaciMcu(bytes(cf_c_base), uf_eng, synth_dflash, selfid=selfid_41)
+    bus_c = SimulatedJ533CanBus(mcu_c)
+    bus_c.fbl_erase_fail = "partial"
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: bus_c)
+
+    mod_cf_c, _, _ = bind_cp_turnkey(bytes(mcu_c.cflash), synth_dflash, [(spec_5f, ika_5f)])
+    cf_c = can_write_cflash("mock0", mod_cf_c, session_dir=tmp_path / "c_cf", skip_backup=True)
+    assert cf_c["complete"] is True
+    assert cf_c["uds_fallback_faci"] is True
+    assert {4, 6, 7}.issubset(set(cf_c["faci_fallback_blocks"]))
+    assert mcu_c.cflash[0x8023] == 0x00
+    assert bytes(mcu_c.cflash[0xE000:0xE010]) == b"UNMODIFIED_BLK07"
+    assert bytes(mcu_c.cflash) == mod_cf_c
+
+    # Case D: ECU already stuck in FBL (invalid 0xC000) and FBL EraseMemory fails with 7101ff0001 ->
+    # can_write_cflash catches FblEraseFailedError from _restore_app_over_uds and recovers via raw_faci=True.
+    mcu_d = SimulatedRh850FaciMcu(synth_cflash, uf_eng, synth_dflash, selfid=selfid_41)
+    mod_cf_d, _, _ = bind_cp_turnkey(bytes(mcu_d.cflash), synth_dflash, [(spec_5f, ika_5f)])
+    mcu_d.cflash[0xC000:0xC004] = b"\xff\xff\xff\xff"  # ECU stuck in FBL (no running app)
+    bus_d = SimulatedJ533CanBus(mcu_d)
+    bus_d.fbl_erase_fail = "fast"
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: bus_d)
+
+    cf_d = can_write_cflash("mock0", mod_cf_d, session_dir=tmp_path / "d_cf", skip_backup=True)
+    assert cf_d["complete"] is True
+    assert cf_d["raw_faci"] is True
+    assert "7101ff0001" in cf_d["uds_first_erase_failed"]
+    assert bytes(mcu_d.cflash) == mod_cf_d

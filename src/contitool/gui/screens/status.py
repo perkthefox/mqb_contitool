@@ -173,6 +173,16 @@ def active_features_detailed(ws: Workspace) -> list[tuple[int, str, str, bool, b
     return rows
 
 
+def foreign_features_detailed(ws: Workspace) -> list[tuple[int, str, str, str, str]]:
+    """(fec_int, code_hex, feature_name, donor_vcrn_hex, donor_vin) for FSC slots whose VCRN != this gateway."""
+    inf = ws.info("dflash")
+    sw = inf.dflash_swap if inf else None
+    rows: list[tuple[int, str, str, str, str]] = []
+    for f in sw.foreign_fscs if sw else []:
+        rows.append((f.fec_code, f"{f.fec_code:08X}", fec_name(f.fec_code), f.vcrn_hex.upper(), f.vin))
+    return rows
+
+
 # Status bits of one feature in UDS 22 3C 00 (VW SWaP): 0xFF = active, 0xB0 = supported but no certificate
 _SWAP_CHECKS = (
     (0x02, "сторнирована", "cancelled"),
@@ -320,6 +330,19 @@ def swap_features(ws: Workspace) -> State:
         )
     active = len(sw.active_fscs)
     if not active:
+        if sw.foreign_fscs:
+            n = len(sw.foreign_fscs)
+            return State(
+                tr(f"чужой VCRN: {n}", f"foreign VCRN: {n}"),
+                "warn",
+                tr(
+                    f"В DataFlash осталось {n} сертификат(ов) от другого блока (чужой VCRN) — шлюз их не принимает. "
+                    "Откройте «Настроить функции SWaP…», чтобы пересобрать нужные функции под текущий VCRN.",
+                    f"DataFlash contains {n} certificate(s) issued for another ECU (foreign VCRN) — the gateway rejects them. "
+                    "Open “Configure SWaP features…” to rebuild the needed features for this ECU's VCRN.",
+                ),
+                key="warn",
+            )
         return State(
             tr("нет активных", "none active"),
             "muted",

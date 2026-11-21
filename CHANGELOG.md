@@ -1,5 +1,59 @@
 # Changelog / История изменений
 
+## 2.2.0 — 2026-11-20
+
+### 🇷🇺 Исправлено
+- **VAS 6154 / VNCI (D-PDU): чтение и запись памяти на адаптерах, у которых RawMode «молчит» без предварительного запуска CAN1 (#29, #30, PR #39 — спасибо `@pokucis`):** у части адаптеров VAS6154A канал CAN1 в RawMode не выходит на шину (возвращая только собственное TX-эхо), пока на нём хотя бы раз не запущен протокольный канал, а после запуска принимает только идентификатор ответа этого канала. ContiTool раньше считал, что такой адаптер не даёт канал заводского RAM-Loader. Теперь, если RawMode не получил ответа, ContiTool запускает CAN1 коротким аппаратным каналом `ISO_15765` (~35 мс; VCI при старте шлёт функциональный `0x700 02 3E 80`) и остаётся на raw CAN. Переключение фильтра приёма повторяется на паре `0x6F0/0x6F1` перед обменом с RAM-Loader и на `0x710/0x77A` перед UDS, поэтому ответы RAM-Loader на `0x6F1` штатно доходят при чтении и записи памяти. Адаптеры, у которых RawMode работает сразу, это не затрагивает.
+- **Диагностика D-PDU и потокобезопасность трассировки эха:** в `can.jsonl` добавлены строки `tx_echo` (эхо VCI для коротких кадров синхронизации и кадров, отправленных самим VCI), обеспечена потокобезопасная очистка `echo_trace` при закрытии сессии, сброс флагов запуска CAN1 при переборе модулей D-PDU и сохранение накопленных ошибок приёма (`FrameError`) при переключении фильтра CAN1.
+
+### 🇬🇧 Fixed
+- **VAS 6154 / VNCI (D-PDU): memory reads and writes on adapters whose RawMode stays silent until CAN1 is started (#29, #30, PR #39 — thanks to `@pokucis`):** some VAS6154A units keep CAN1 off the bus in RawMode (returning only local TX echoes) until a protocol link has been started on it once, and afterwards filter reception to that link's response ID. ContiTool previously treated such adapters as lacking the factory RAM-Loader channel. Now, when RawMode gets no answer, ContiTool starts CAN1 with a short hardware `ISO_15765` link (~35 ms; the VCI sends a functional `0x700 02 3E 80` on start) and stays on raw CAN. Reception filtering is switched to `0x6F0/0x6F1` before RAM-Loader traffic and back to `0x710/0x77A` before UDS, so RAM-Loader replies on `0x6F1` arrive cleanly for both memory reads and writes. Adapters whose RawMode works straight away are unaffected.
+- **D-PDU diagnostics & receive-path hardening:** `can.jsonl` now records `tx_echo` entries (the VCI's echo of short frames such as loader sync and of frames sent autonomously by the VCI), with thread-safe `echo_trace` teardown on link close, per-module priming-flag reset across D-PDU candidates, and preservation of pending `FrameError` events across CAN1 filter switches.
+
+## 2.1.5 — 2026-11-20
+
+### 🇷🇺 Исправлено
+- **Запись блоков `CodeFlash` через `FACI` в RAM-Loader (`No CAN frame from 0x6F1 within 60.0s`, #38, #40, #42):** исправлено невыровненное смещение заголовка `PAYLOAD_DATA` в стабе `CFLASH_FACI_STUB` (722 Б → `0xFEDF840A`, `mod 4 == 2`), которое приводило к аппаратному исключению RH850/F1L `MAE` (`0x00C0`) на первой инструкции `ld.w` и немедленному перезапуску процессора при записи загрузочных блоков `#4`/`#5` (Engineering Mode OTP `0xA167`, восстановление записи FBL после UDS), прямой записи `--raw-faci` и записи `Uflash` с явным `IDCODE`. Стаб `CFLASH_FACI_STUB` выровнен до 724 Б (`0xFEDF840C`, `% 4 == 0`), в самопроверки `verify_payload_self_tests()` и RH850-эмулятор добавлена строгая проверка 4-байтового выравнивания.
+- **Автоматический переход на прямую запись `CodeFlash` через `FACI` при отказе `EraseMemory` (`7101ff0001`, #41):**
+  - В `can_write_cflash()` добавлена предварительная проверка совпадения `IDCODE` из `Extra Area` (`0xFF300050`) с `SELFID` в `CodeFlash+0xAB00`: при расхождении (например, чистый `0xFF*16` в `Extra Area`) встроенный в FBL драйвер `R_FCL` не проходит проверку `IDST` и отклоняет `31 01 FF 00` с кодом `7101ff0001`, поэтому ContiTool сразу записывает изменённые блоки напрямую через `FACI` в активном RAM-Loader.
+  - Если загрузчик FBL всё же вернул ошибку на `EraseMemory (31 01 FF 00)` (`FblEraseFailedError`), выполняется автоматический fallback на прямую запись через `FACI` с проверкой целостности блоков `#4` и `#6` (и восстановлением любых частично стёртых блоков) и полной побайтовой сверкой всех 1.5 МБ `CodeFlash`.
+
+### 🇬🇧 Fixed
+- **FACI `CodeFlash` block programming in RAM-Loader (`No CAN frame from 0x6F1 within 60.0s`, #38, #40, #42):** fixed 2-byte misaligned `PAYLOAD_DATA` in `CFLASH_FACI_STUB` (722 B → `0xFEDF840A`, `mod 4 == 2`), which triggered an RH850/F1L hardware Misaligned Access Exception (`MAE`, vector `0x00C0`) on the first `ld.w` header read and immediately reset the MCU during boot block `#4`/`#5` writes (Engineering Mode OTP `0xA167`, post-UDS FBL record restore), `--raw-faci` writes, and custom-`IDCODE` `Uflash` writes. `CFLASH_FACI_STUB` is now 4-byte aligned to 724 B (`0xFEDF840C`), and both `verify_payload_self_tests()` and the RH850 test emulator strictly enforce word alignment.
+- **Automatic direct `FACI` fallback when FBL `EraseMemory` fails (`7101ff0001`, #41):**
+  - `can_write_cflash()` now checks whether the MCU's `Extra Area` `IDCODE` (`0xFF300050`) differs from `CodeFlash+0xAB00` `SELFID` (e.g. blank `0xFF*16`): because the stock FBL's `R_FCL` only authenticates with `CodeFlash+0xAB00` and rejects `31 01 FF 00` with `7101ff0001`, ContiTool now proactively switches to direct `FACI` programming of the modified blocks in the active RAM-Loader.
+  - If FBL still rejects `EraseMemory (31 01 FF 00)` (`FblEraseFailedError`), `can_write_cflash()` automatically recovers via direct `FACI` programming in RAM-Loader, checking blocks `#4` and `#6` (and restoring any partially erased blocks) followed by full 1.5 MB byte-for-byte readback verification.
+
+## 2.1.4 — 2026-11-20
+
+### 🇷🇺 Исправлено
+- **Корректная обработка старых SWaP-сертификатов с чужим `VCRN` на б/у шлюзах после онлайн-перепривязки CP:**
+  - Анализатор `analyze_dflash_swap()` теперь сверяет 5-байтовый `VCRN` внутри каждого слота `FSC` (`0xDD00..0xE780`) с актуальным `VCRN` шлюза в `NvM 0x7C` (`0xDC0C`): отклонённые донорские сертификаты с чужим `VCRN` выносятся в отдельный список `foreign_fscs`, больше не подставляют чужой `VIN` автомобиля-донора в паспорт блока / диалоги SWaP и не считаются активными функциями.
+  - В `apply_dflash_swap_fecs()` добавлена проверка совпадения `VCRN` перед сохранением существующего слота: сертификаты с чужим `VCRN` теперь гарантированно пересобираются в `Multi-FSC` под текущий `VCRN` шлюза (как при настройке SWaP в GUI/CLI, так и при автоактивации `can_activate_swap` во время загрузки параметрии ZDC), а невыбранные донорские слоты очищаются при замене списка функций.
+  - В GUI (раздел «SWaP / FEC» и диалог настройки SWaP) и в CLI (`inspect --dflash`) донорские слоты с чужим `VCRN` отображаются отдельно с понятным предупреждением.
+- **Уточнение идентификатора `VCRN`:** в отчёте CLI и документации исправлен UDS DID для 5-байтового `VCRN` шлюза с `0x3C03` на **`0x3C0A`**.
+
+### 🇬🇧 Fixed
+- **Proper handling of leftover foreign-`VCRN` SWaP certificates on used gateways after online CP adaptation:**
+  - `analyze_dflash_swap()` now compares each `FSC` slot's 5-byte `VCRN` (`0xDD00..0xE780`) against the gateway's current `VCRN` in `NvM 0x7C` (`0xDC0C`): rejected donor certificates with a mismatched `VCRN` are separated into `foreign_fscs`, no longer leak the donor vehicle's `VIN` into the ECU passport or SWaP dialogs, and are not reported as active features.
+  - `apply_dflash_swap_fecs()` now requires a matching `VCRN` before preserving an existing slot byte-for-byte: foreign-`VCRN` donor slots are always rebuilt as `Multi-FSC` records bound to the gateway's current `VCRN` (both in GUI/CLI SWaP configuration and in `can_activate_swap` during ZDC dataset upload), and unselected donor slots are erased when replacing the feature set.
+  - The GUI SWaP screen, SWaP activation dialog, and CLI `inspect --dflash` report now display foreign-`VCRN` donor slots separately with an explicit warning.
+- **Corrected `VCRN` UDS DID label:** updated the gateway 5-byte `VCRN` DID reference from `0x3C03` to **`0x3C0A`** in CLI output and documentation.
+
+## 2.1.3 — 2026-11-18
+
+### 🇷🇺 Исправлено
+- **Поддержка загрузчиков `HW 517` и `HW 518` (`3Q0907530B` / `3Q0907530C`, #36, #37):** анализатор `Uflash.bin`, патчер инженерного загрузчика и живой CAN-пробник `RSA_PROBE_PAYLOAD` теперь автоматически определяют фактический адрес процедуры проверки RSA-1024 в сборке FBL — как стандартный `+0x342A` (`0x010033FC`, `HW 521+`), так и смещённый `+0x3444` (`0x01003416`, `HW 517` / `HW 518`). Устранены ошибки распознавания загрузчика и сбои при полном восстановлении бэкапа (`CodeFlash + DataFlash + Uflash`).
+- **Аутентификация `SELFID` (`IDCODE`) из `Extra Area` и автоматический переход на прямую запись `CodeFlash` при OTP-защите `Uflash` (#31, #34):**
+  - Перед записью через `FACI` считывается окно `Extra Area` (`0xFF300000..0xFF3000FF`): проверяются аппаратные регистры защиты `OTPEUA` (`0xFF300048`), `OTPCFL0`/`OTPCFL1` и флаги безопасности (`0xFF300060`), а для регистра `SELFID` (`0xFFA08000`) используется актуальный 128-битный `IDCODE` из `0xFF300050` с контролем статуса `IDST` (`0xFFA08010`) и автоматическим перебором `0xFFFFFFFF * 4` на чистых процессорах.
+  - Если область `Extended User Area` (`Uflash`) закрыта заводским OTP-замком (`OTPEUA` бит 0 == `0` или `FACI` возвращает `marker=3, FSTATR=0x0000C000` на `0x01000000`), операции **«Запись в блок»**, адаптация ключей под ключ (`turnkey`) и восстановление бэкапа автоматически переключаются на прямую поблочную запись `CodeFlash` через `FACI` в `RAM-Loader` (`raw_faci=True`) без модификации заводского `Uflash`, а при одиночной записи `Uflash` шлюз штатно выводится обратно в режим приложения.
+
+### 🇬🇧 Fixed
+- **`HW 517` and `HW 518` bootloader support (`3Q0907530B` / `3Q0907530C`, #36, #37):** `Uflash.bin` analysis, engineering bootloader patching, and the live CAN `RSA_PROBE_PAYLOAD` now dynamically locate the FBL RSA-1024 verification routine across both `+0x342A` (`0x010033FC`, `HW 521+`) and `+0x3444` (`0x01003416`, `HW 517` / `HW 518`), resolving unrecognised bootloader errors and full backup restore failures (`CodeFlash + DataFlash + Uflash`).
+- **`Extra Area` `SELFID` (`IDCODE`) authentication and automatic direct `CodeFlash` `FACI` fallback on OTP-locked `Uflash` (#31, #34):**
+  - Before `FACI` programming, ContiTool now inspects `Extra Area` (`0xFF300000..0xFF3000FF`) for `OTPEUA` (`0xFF300048`), `OTPCFL0`/`OTPCFL1`, and security flags (`0xFF300060`), authenticates `SELFID` (`0xFFA08000`) using the authoritative 128-bit `IDCODE` at `0xFF300050`, verifies `IDST` (`0xFFA08010`), and automatically retries `0xFFFFFFFF * 4` when `Extra Area` `IDCODE` is blank.
+  - When `Extended User Area` (`Uflash`) is permanently factory OTP-locked (`OTPEUA` bit 0 == `0` or `FACI` returns `marker=3, FSTATR=0x0000C000` at `0x01000000`), **“Write to ECU”**, turnkey key adaptation, and backup restore automatically fall back to direct in-RAM `FACI` `CodeFlash` block programming (`raw_faci=True`) while leaving stock `Uflash` untouched, and standalone `Uflash` writes cleanly return the gateway to Application mode.
+
 ## 2.1.2 — 2026-11-15
 
 ### 🇷🇺 Исправлено
