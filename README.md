@@ -1,6 +1,6 @@
 <div align="center">
 
-# ContiTool v2.1 — Continental VAG MQB Gateway J533 (`3Q0 907 530`)
+# ContiTool — Continental VAG MQB Gateway J533 (`3Q0 907 530`)
 ### Renesas RH850/F1L — Diagnosis CAN Studio, Component Protection (`KSCHUTZ`), Engineering Mode & `SWaP / RSA-1024`
 
 [![English README](https://img.shields.io/badge/lang-English-2563EB?style=for-the-badge)](README.en.md)
