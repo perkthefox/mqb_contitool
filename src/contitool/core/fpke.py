@@ -89,6 +89,42 @@ FPKE_IMMO_PARTNERS: tuple[tuple[int, str, int, int, int, int, str, str, str], ..
     (7, "VTS",   0x12, 9, 0x01E, 0x01F, "A", "VTS (Охранная система)", "VTS (Vehicle tracking)"),
 )
 
+# ────────────────── FPK_E Bootloader (BOLO) & DataFlash .FBL_RSAKEY Constants ──────────────────
+
+FPKE_DFLASH_FBL_RSAKEY_OFFSET = 0xED00          # 0xFF20ED00: 128-byte little-endian RSA-1024 modulus N (e = 3)
+FPKE_DFLASH_FBL_RSAKEY_SIZE = 128
+FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET = 0xED80      # 0xFF20ED80: 2-byte LE key version (stock 0x0023 -> 23 00)
+FPKE_DFLASH_FBL_FDSPROJECTDATA_OFFSET = 0xED82  # 0xFF20ED82: 8-byte FDS project ID (01 00 00 05 81 00 00 FF)
+
+FPKE_STOCK_FBL_RSA_MODULUS_LE = bytes.fromhex(
+    "55c69a485d103b92eae1a934d72dc56c5bd471b66cb06d61b967848c9ae430f4"
+    "b8ccd38b5f5f0256e87490c5648d7a15218e318b4ee3e5fec82b0ef42d0cb561"
+    "ea49b892f495877f9cafd096a3d615646cc83548dbf83b9782080f5114e1c7ad"
+    "4466df5acc81905140760a08efe36460df16441e5322b1354e005d0f009be4d0"
+)
+FPKE_STOCK_FBL_RSA_MODULUS_BE = FPKE_STOCK_FBL_RSA_MODULUS_LE[::-1]
+FPKE_STOCK_FBL_RSAKEYVERS = b"\x23\x00"
+FPKE_STOCK_FBL_FDSPROJECTDATA = bytes.fromhex("01000005810000ff")
+
+FPKE_CFLASH_BOLO_VERSION_OFFSET = 0x0002FB00
+FPKE_CFLASH_FBL_AESKEY_OFFSET = 0x0002FBE0
+FPKE_STOCK_FBL_AES_KEY = bytes.fromhex("07002e21b483331f9d6e498ac36f2ca8")
+FPKE_CFLASH_MEMCHECK_APP_OFFSET = 0x00031380
+FPKE_CFLASH_MEMCHECK_APP_ENTRIES = 6
+FPKE_LOADER_RAM_CODE_ADDR = 0xFEDD4D08
+
+# 38-byte comparison loop inside BOLO `.LOADER_RAM_CODE` `rsa_verify` (0xFEDE9124 on 83A, 0xFEDE909C on 1703/1711)
+_FPKE_BOLO_RSA_LOOP_BODY = bytes.fromhex(
+    "23f688000a08caf1c309a10f07006010e111ba0541ea9d0041528a000a0680ff89f51d0680ff"
+)
+_FPKE_BOLO_RSA_PREFIX = bytes.fromhex("e051")          # cmp r0, r10
+_FPKE_BOLO_RSA_EPILOGUE = bytes.fromhex("00001c50031e")  # [cmov/nop hi16=0000], mov r28, r10; dispose ...
+_FPKE_BOLO_RSA_STOCK_BNE = bytes.fromhex("ea15")       # bne +0x2A (EXIT)
+_FPKE_BOLO_RSA_STOCK_CMOV = bytes.fromhex("e2e7")      # cmov z, 1, r28, r28 (low 16 bits)
+_FPKE_BOLO_RSA_PATCH_BNE = bytes.fromhex("0052")       # mov 0, r10
+_FPKE_BOLO_RSA_PATCH_CMOV = bytes.fromhex("01e2")      # mov 1, r28; nop (with trailing 00 00)
+
+
 
 # ────────────────────────────── Pure-Python AES-128-CBC ──────────────────────────────
 
@@ -865,6 +901,14 @@ def eel_faci_word_mask(lay: dict[str, Any], df: bytes) -> bytearray:
     for off in range(pool_end, FPKE_DFLASH_SIZE, 4):
         if word(off) != 0xFFFFFFFF:
             put(off)
+    # On RV40F DataFlash an unprogrammed word raises ECC error rather than reading 0xFFFFFFFF.
+    # If .FBL_RSAKEY (0xED00..0xED7F) holds a valid 1024-bit modulus, all 32 words must remain marked programmed.
+    rsa_end = FPKE_DFLASH_FBL_RSAKEY_OFFSET + FPKE_DFLASH_FBL_RSAKEY_SIZE
+    if pool_end <= FPKE_DFLASH_FBL_RSAKEY_OFFSET and rsa_end <= len(df):
+        fbl_mod_le = df[FPKE_DFLASH_FBL_RSAKEY_OFFSET:rsa_end]
+        if fbl_mod_le != b"\xff" * FPKE_DFLASH_FBL_RSAKEY_SIZE and (fbl_mod_le[-1] & 0x80) != 0 and (fbl_mod_le[0] & 1) == 1:
+            for off in range(FPKE_DFLASH_FBL_RSAKEY_OFFSET, rsa_end, 4):
+                put(off)
     return mask
 
 
@@ -1538,7 +1582,440 @@ def analyze_fpke_dflash(dflash: bytes, cflash: bytes | None = None) -> dict[str,
         "slot_secrets": slot_secrets,
         "component_protection_state": cp_state,
         "transponder_records": parse_fpke_transponders(records.get(0x67), records.get(0x6A)),
+        "fbl_rsa_key": analyze_fpke_dflash_fbl_key(dflash),
     }
+
+
+# ─────────────── FPK_E Bootloader (BOLO) & DataFlash .FBL_RSAKEY Analysis / Patching ───────────────
+
+
+def analyze_fpke_dflash_fbl_key(dflash: bytes) -> dict[str, Any]:
+    """Inspect `.FBL_RSAKEY` (`0xFF20ED00`, `Dflash.bin[0xED00:0xED80]`, 128 B LE RSA-1024 modulus, `e = 3`)."""
+    end_off = FPKE_DFLASH_FBL_RSAKEY_OFFSET + FPKE_DFLASH_FBL_RSAKEY_SIZE
+    if len(dflash) < end_off + 10:
+        return {
+            "present": False,
+            "state": "missing",
+            "offset": FPKE_DFLASH_FBL_RSAKEY_OFFSET,
+            "ecu_addr": f"0x{FPKE_DFLASH_ADDR + FPKE_DFLASH_FBL_RSAKEY_OFFSET:08X}",
+            "exponent": 3,
+            "modulus_le_hex": "",
+            "modulus_be_hex": "",
+            "key_version_hex": "",
+            "fds_project_data_hex": "",
+            "sha256": "",
+        }
+    mod_le = bytes(dflash[FPKE_DFLASH_FBL_RSAKEY_OFFSET:end_off])
+    mod_be = mod_le[::-1]
+    vers = bytes(dflash[FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET : FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET + 2])
+    fds_proj = bytes(dflash[FPKE_DFLASH_FBL_FDSPROJECTDATA_OFFSET : FPKE_DFLASH_FBL_FDSPROJECTDATA_OFFSET + 8])
+    if mod_le == b"\xff" * FPKE_DFLASH_FBL_RSAKEY_SIZE or mod_le == b"\x00" * FPKE_DFLASH_FBL_RSAKEY_SIZE:
+        state = "blank"
+        present = False
+    elif mod_le == FPKE_STOCK_FBL_RSA_MODULUS_LE:
+        state = "stock"
+        present = True
+    elif (mod_be[0] & 0x80) != 0 and (mod_be[-1] & 1) == 1:
+        state = "custom"
+        present = True
+    else:
+        state = "invalid"
+        present = True
+    return {
+        "present": present,
+        "state": state,
+        "offset": FPKE_DFLASH_FBL_RSAKEY_OFFSET,
+        "ecu_addr": f"0x{FPKE_DFLASH_ADDR + FPKE_DFLASH_FBL_RSAKEY_OFFSET:08X}",
+        "exponent": 3,
+        "modulus_le_hex": mod_le.hex().upper(),
+        "modulus_be_hex": mod_be.hex().upper(),
+        "key_version_hex": vers.hex().upper(),
+        "fds_project_data_hex": fds_proj.hex().upper(),
+        "sha256": hashlib.sha256(mod_le).hexdigest(),
+    }
+
+
+def apply_fpke_dflash_fbl_rsa_key(
+    dflash: bytes,
+    modulus: bytes | str | None = None,
+    *,
+    input_little_endian: bool = False,
+    restore_stock: bool = False,
+    populate_metadata: bool = False,
+) -> bytes:
+    """Embed a custom 128-byte RSA-1024 modulus (`e = 3`) or restore the stock VAG modulus in `Dflash.bin[0xED00:0xED80]`.
+
+    By default only two 64-byte DataFlash blocks (`0xED00` and `0xED40`, outside the EEL T01 pool `0x0000..0xDFFF`) are
+    modified, allowing `can_fpke_write_dflash` to program the key over CAN in 2 block jobs (< 1 s). Pass
+    `populate_metadata=True` to also fill blank/zero `0xED80..0xED89` (`RSAKEYVERS` / `FDSPROJECTDATA`).
+    """
+    if len(dflash) != FPKE_DFLASH_SIZE:
+        raise ValueError(f"Expected 65,536-byte FPK_E DataFlash, got {len(dflash)} bytes")
+    if restore_stock:
+        mod_le = FPKE_STOCK_FBL_RSA_MODULUS_LE
+    else:
+        if modulus is None:
+            raise ValueError("RSA-1024 modulus is required when restore_stock=False")
+        if isinstance(modulus, str):
+            raw = _parse_exact_hex(modulus, FPKE_DFLASH_FBL_RSAKEY_SIZE, "FBL RSA-1024 modulus", allow_empty=False)
+        else:
+            raw = bytes(modulus)
+        if len(raw) != FPKE_DFLASH_FBL_RSAKEY_SIZE:
+            raise ValueError(f"FBL RSA-1024 modulus must be 128 bytes, got {len(raw)} bytes")
+        mod_be = raw[::-1] if input_little_endian else raw
+        if (mod_be[0] & 0x80) == 0 or (mod_be[-1] & 1) == 0:
+            raise ValueError(
+                tr(
+                    "Некорректный модуль RSA-1024: старший бит должен быть равен 1 (1024 бита), а младший бит — нечётным.",
+                    "Invalid RSA-1024 modulus: MSB must have bit 7 set (1024-bit) and LSB must be odd.",
+                )
+            )
+        mod_le = mod_be[::-1]
+
+    out = bytearray(dflash)
+    end_off = FPKE_DFLASH_FBL_RSAKEY_OFFSET + FPKE_DFLASH_FBL_RSAKEY_SIZE
+    out[FPKE_DFLASH_FBL_RSAKEY_OFFSET:end_off] = mod_le
+    if populate_metadata:
+        if out[FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET : FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET + 2] in (b"\xff\xff", b"\x00\x00"):
+            out[FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET : FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET + 2] = FPKE_STOCK_FBL_RSAKEYVERS
+        if out[FPKE_DFLASH_FBL_FDSPROJECTDATA_OFFSET : FPKE_DFLASH_FBL_FDSPROJECTDATA_OFFSET + 8] in (
+            b"\xff" * 8,
+            b"\x00" * 8,
+        ):
+            out[FPKE_DFLASH_FBL_FDSPROJECTDATA_OFFSET : FPKE_DFLASH_FBL_FDSPROJECTDATA_OFFSET + 8] = (
+                FPKE_STOCK_FBL_FDSPROJECTDATA
+            )
+    return bytes(out)
+
+
+def fpke_crc32_app(data: bytes) -> int:
+    """Compute the Continental FPK_E `.MemCheckCrcTblApp` inverted CRC-32 (`~zlib.crc32(data, 0xFFFFFFFF)`)."""
+    return (~zlib.crc32(data, 0xFFFFFFFF)) & 0xFFFFFFFF
+
+
+def okumura_lzss_decompress_with_map(comp: bytes) -> tuple[bytes, list[int | None]]:
+    """Decompress FPK_E `BOLO` `.LoaderRAMCOPY` Okumura LZSS stream and map each output byte to its literal source index."""
+    win = bytearray(4096)
+    r = 4096 - 18
+    out = bytearray()
+    src_map: list[int | None] = []
+    i = 0
+    n = len(comp)
+    while i < n:
+        flags = comp[i]
+        i += 1
+        for bit in range(8):
+            if i >= n:
+                break
+            if (flags >> bit) & 1:
+                c_pos = i
+                c = comp[i]
+                i += 1
+                out.append(c)
+                src_map.append(c_pos)
+                win[r] = c
+                r = (r + 1) & 0xFFF
+            else:
+                if i + 1 >= n:
+                    i = n
+                    break
+                b1 = comp[i]
+                b2 = comp[i + 1]
+                i += 2
+                pos = b1 | ((b2 & 0xF0) << 4)
+                length = (b2 & 0x0F) + 3
+                for k in range(length):
+                    c = win[(pos + k) & 0xFFF]
+                    out.append(c)
+                    src_map.append(None)
+                    win[r] = c
+                    r = (r + 1) & 0xFFF
+    return bytes(out), src_map
+
+
+def _find_fpke_bolo_loader_secinfo(cflash: bytes) -> tuple[int, int, int, int] | None:
+    """Locate 4-byte aligned `.secinfo` entry `(sec_off, dst=0xFEDD4D08, src_off, comp_len)` in `BOLO` (`0x000000..0x010000`)."""
+    if len(cflash) < 0x00030000:
+        return None
+    target_dst = struct.pack("<I", FPKE_LOADER_RAM_CODE_ADDR)
+    pos = 0
+    limit = min(len(cflash) - 12, 0x00010000)
+    while pos <= limit:
+        idx = cflash.find(target_dst, pos, limit)
+        if idx == -1:
+            break
+        if (idx & 3) == 0:
+            dst, src, comp_len = struct.unpack_from("<3I", cflash, idx)
+            if 0x00010000 <= src <= 0x00028000 and 0x00008000 <= comp_len <= 0x0001C000 and src + comp_len <= 0x00030000:
+                return idx, dst, src, comp_len
+        pos = idx + 1
+    return None
+
+
+def _analyze_fpke_cflash_bootloader_with_dec(
+    cflash: bytes,
+) -> tuple[dict[str, Any], tuple[int, int, int, int], bytes, tuple[int, int, int, int]]:
+    """Internal implementation returning `(info, secinfo_tuple, decompressed_loader, patch_ram_offsets)`."""
+    if len(cflash) < 0x00032000:
+        raise ValueError(
+            tr(
+                f"Образ CodeFlash FPK_E слишком мал ({len(cflash)} Б, требуется не менее 0x32000 Б).",
+                f"FPK_E CodeFlash image is too small ({len(cflash)} B, minimum 0x32000 B required).",
+            )
+        )
+
+    bolo_ver_raw = cflash[FPKE_CFLASH_BOLO_VERSION_OFFSET : FPKE_CFLASH_BOLO_VERSION_OFFSET + 4]
+    bolo_version = _clean_ascii(bolo_ver_raw) or bolo_ver_raw.hex().upper()
+    aes_key = bytes(cflash[FPKE_CFLASH_FBL_AESKEY_OFFSET : FPKE_CFLASH_FBL_AESKEY_OFFSET + 16])
+
+    sec = _find_fpke_bolo_loader_secinfo(cflash)
+    if sec is None:
+        raise ValueError(
+            tr(
+                "В образе CodeFlash не найден дескриптор .LoaderRAMCOPY (0xFEDD4D08) загрузчика BOLO.",
+                "BOLO .LoaderRAMCOPY descriptor (0xFEDD4D08) not found in CodeFlash image.",
+            )
+        )
+    sec_off, dst_ram, src_off, comp_len = sec
+    dec, src_map = okumura_lzss_decompress_with_map(cflash[src_off : src_off + comp_len])
+
+    loop_idx = dec.find(_FPKE_BOLO_RSA_LOOP_BODY)
+    if loop_idx < 4 or loop_idx + len(_FPKE_BOLO_RSA_LOOP_BODY) + 8 > len(dec):
+        raise ValueError(
+            tr(
+                "В распакованном .LOADER_RAM_CODE не найден блок проверки подписи RSA-1024.",
+                "RSA-1024 signature check routine not found in decompressed .LOADER_RAM_CODE.",
+            )
+        )
+    if dec.find(_FPKE_BOLO_RSA_LOOP_BODY, loop_idx + 1) != -1:
+        raise ValueError(
+            tr(
+                "В распакованном .LOADER_RAM_CODE найдено несколько совпадений сигнатуры проверки RSA-1024.",
+                "Multiple RSA-1024 verification loop matches found in decompressed .LOADER_RAM_CODE.",
+            )
+        )
+    prefix_off = loop_idx - 4
+    bne_off = loop_idx - 2
+    cmov_off = loop_idx + len(_FPKE_BOLO_RSA_LOOP_BODY)
+    epilogue_off = cmov_off + 2
+    if dec[prefix_off:bne_off] != _FPKE_BOLO_RSA_PREFIX or dec[epilogue_off : epilogue_off + 6] != _FPKE_BOLO_RSA_EPILOGUE:
+        raise ValueError(
+            tr(
+                "Неожиданные инструкции вокруг цикла проверки подписи RSA-1024 в загрузчике BOLO.",
+                "Unexpected instructions surrounding the BOLO RSA-1024 verification loop.",
+            )
+        )
+
+    bne_bytes = dec[bne_off : bne_off + 2]
+    cmov_bytes = dec[cmov_off : cmov_off + 2]
+    patch_ram_offsets = (bne_off, bne_off + 1, cmov_off, cmov_off + 1)
+    patch_cflash_offsets: list[int] = []
+    for r_off in patch_ram_offsets:
+        rel_c = src_map[r_off]
+        if rel_c is None:
+            raise ValueError(
+                tr(
+                    f"Байт патча BOLO RSA по смещению в ОЗУ 0x{r_off:X} не является литералом LZSS (ссылка назад).",
+                    f"BOLO RSA patch byte at RAM offset 0x{r_off:X} is not an LZSS literal token (back-reference).",
+                )
+            )
+        patch_cflash_offsets.append(src_off + rel_c)
+
+    if bne_bytes == _FPKE_BOLO_RSA_STOCK_BNE and cmov_bytes == _FPKE_BOLO_RSA_STOCK_CMOV:
+        state = "stock"
+    elif bne_bytes == _FPKE_BOLO_RSA_PATCH_BNE and cmov_bytes == _FPKE_BOLO_RSA_PATCH_CMOV:
+        state = "engineering"
+    else:
+        state = "custom"
+
+    # Parse and verify .MemCheckCrcTblApp (6 entries @ 0x00031380)
+    crc_entries: list[dict[str, Any]] = []
+    all_crc_valid = True
+    for idx in range(FPKE_CFLASH_MEMCHECK_APP_ENTRIES):
+        e_off = FPKE_CFLASH_MEMCHECK_APP_OFFSET + idx * 20
+        s1, s2, length, stored_crc, flag = struct.unpack_from("<5I", cflash, e_off)
+        if s1 == s2 and 0 < length <= len(cflash) and s1 + length <= len(cflash) and flag == 0x55:
+            calc_crc = fpke_crc32_app(cflash[s1 : s1 + length])
+            valid = calc_crc == stored_crc
+        else:
+            calc_crc = 0
+            valid = False
+        if not valid:
+            all_crc_valid = False
+        crc_entries.append(
+            {
+                "index": idx,
+                "table_offset": f"0x{e_off:06X}",
+                "crc_offset": f"0x{e_off + 12:06X}",
+                "start": f"0x{s1:06X}",
+                "length": f"0x{length:06X}",
+                "stored_crc": f"0x{stored_crc:08X}",
+                "calculated_crc": f"0x{calc_crc:08X}",
+                "valid": valid,
+            }
+        )
+
+    rsa_fn_ram = dst_ram + (prefix_off - 0x82 if prefix_off >= 0x82 else prefix_off)
+    info = {
+        "bolo_version": bolo_version,
+        "state": state,
+        "secinfo_offset": f"0x{sec_off:06X}",
+        "loader_ram_addr": f"0x{dst_ram:08X}",
+        "loader_rom_offset": f"0x{src_off:06X}",
+        "loader_compressed_size": comp_len,
+        "loader_decompressed_size": len(dec),
+        "rsa_verify_ram_addr": f"0x{rsa_fn_ram:08X}",
+        "rsa_bne_ram_addr": f"0x{dst_ram + bne_off:08X}",
+        "rsa_cmov_ram_addr": f"0x{dst_ram + cmov_off:08X}",
+        "patch_cflash_offsets": [f"0x{o:06X}" for o in patch_cflash_offsets],
+        "patch_cflash_offsets_int": patch_cflash_offsets,
+        "patch_ram_offsets_int": list(patch_ram_offsets),
+        "bne_hex": bne_bytes.hex().upper(),
+        "cmov_hex": cmov_bytes.hex().upper(),
+        "fbl_aes_key_hex": aes_key.hex().upper(),
+        "fbl_aes_key_is_stock": aes_key == FPKE_STOCK_FBL_AES_KEY,
+        "memcheck_crc_valid": all_crc_valid,
+        "memcheck_bolo_entry": crc_entries[0],
+        "memcheck_entries": crc_entries,
+        "sha256": hashlib.sha256(cflash).hexdigest(),
+    }
+    return info, sec, dec, patch_ram_offsets
+
+
+def analyze_fpke_cflash_bootloader(cflash: bytes) -> dict[str, Any]:
+    """Analyze FPK_E `BOLO` (`0x00000000..0x0002FFFF`) LZSS `.LOADER_RAM_CODE` RSA check and `.MemCheckCrcTblApp`."""
+    info, _sec, _dec, _ram_offs = _analyze_fpke_cflash_bootloader_with_dec(cflash)
+    return info
+
+
+def apply_fpke_cflash_rsa_patch(
+    cflash: bytes,
+    *,
+    restore_stock: bool = False,
+) -> tuple[bytes, dict[str, Any]]:
+    """Patch (or restore) `BOLO` `.LoaderRAMCOPY` RSA-1024 signature check in `Cflash.bin` and update `.MemCheckCrcTblApp[0]`.
+
+    - Replaces the 4 raw LZSS literal bytes of `rsa_verify` (`bne +0x2A` -> `mov 0, r10` and `cmov z, 1, r28, r28` -> `mov 1, r28; nop`).
+    - Verifies that Okumura LZSS decompression into `.LOADER_RAM_CODE` (`0xFEDD4D08`) changes only positions within those 4 bytes
+      (guaranteeing zero perturbed LZSS back-references anywhere in `.LOADER_RAM_CODE`).
+    - Updates `.MemCheckCrcTblApp[0]` at `0x0003138C` (`fpke_crc32_app(cflash[s1:s1+length])`) and verifies entry `[0]`.
+    """
+    before, _sec, dec_before, patch_ram_offsets = _analyze_fpke_cflash_bootloader_with_dec(cflash)
+    c_offs = before["patch_cflash_offsets_int"]
+    target_bytes = (
+        (_FPKE_BOLO_RSA_STOCK_BNE + _FPKE_BOLO_RSA_STOCK_CMOV)
+        if restore_stock
+        else (_FPKE_BOLO_RSA_PATCH_BNE + _FPKE_BOLO_RSA_PATCH_CMOV)
+    )
+
+    out = bytearray(cflash)
+    # Validate .MemCheckCrcTblApp[0] header and confirm all patch bytes lie within its covered range
+    s1, s2, length, _old_crc, flag = struct.unpack_from("<5I", out, FPKE_CFLASH_MEMCHECK_APP_OFFSET)
+    if (
+        s1 != 0
+        or s2 != 0
+        or flag != 0x55
+        or length <= 0
+        or s1 + length > len(out)
+        or not all(s1 <= c_off < s1 + length for c_off in c_offs)
+    ):
+        raise RuntimeError(
+            tr(
+                "Некорректный заголовок .MemCheckCrcTblApp[0] (0x00031380) или точки патча вне проверяемого диапазона BOLO.",
+                "Invalid .MemCheckCrcTblApp[0] header at 0x00031380 or patch offsets fall outside the BOLO CRC range.",
+            )
+        )
+
+    for c_off, val in zip(c_offs, target_bytes, strict=True):
+        out[c_off] = val
+
+    new_bolo_crc = fpke_crc32_app(bytes(out[s1 : s1 + length]))
+    struct.pack_into("<I", out, FPKE_CFLASH_MEMCHECK_APP_OFFSET + 12, new_bolo_crc)
+
+    out_bytes = bytes(out)
+    after, _sec2, dec_after, _ram_offs2 = _analyze_fpke_cflash_bootloader_with_dec(out_bytes)
+    if len(dec_after) != len(dec_before):
+        raise RuntimeError(
+            tr(
+                "Размер распакованного потока LZSS изменился после патча загрузчика BOLO.",
+                "LZSS decompressed length changed after BOLO RSA patch.",
+            )
+        )
+    expected_ram_set = set(patch_ram_offsets)
+    diff_ram_positions = [i for i in range(len(dec_before)) if dec_before[i] != dec_after[i]]
+    if not set(diff_ram_positions).issubset(expected_ram_set):
+        extra = sorted(set(diff_ram_positions) - expected_ram_set)
+        raise RuntimeError(
+            tr(
+                f"Патч затронул посторонние байты LZSS (back-reference) в .LOADER_RAM_CODE: {[f'0x{p:X}' for p in extra[:4]]}.",
+                f"Patch perturbed unexpected LZSS back-reference bytes in .LOADER_RAM_CODE: {[f'0x{p:X}' for p in extra[:4]]}.",
+            )
+        )
+
+    expected_state = "stock" if restore_stock else "engineering"
+    if after["state"] != expected_state or not after["memcheck_bolo_entry"]["valid"]:
+        raise RuntimeError(
+            tr(
+                "Контрольная проверка загрузчика BOLO или .MemCheckCrcTblApp[0] после патча не пройдена.",
+                "Post-patch BOLO state or .MemCheckCrcTblApp[0] verification failed.",
+            )
+        )
+    return out_bytes, after
+
+
+def sign_fpke_odx_datablock(
+    flashdata: bytes,
+    *,
+    source_start_address: int,
+    uncompressed_size: int,
+    n_bytes: bytes,
+    d_int: int,
+    input_modulus_little_endian: bool = False,
+) -> bytes:
+    """Sign an FPK_E ODX `<FLASHDATA>` block (`SHA-1(BE32(source_start_address) || BE32(uncompressed_size) || flashdata)`) with RSA-1024 (`e = 3`)."""
+    from contitool.core.crypto import rsassa_pkcs1_v15_sign, rsassa_pkcs1_v15_verify
+
+    if not (0 <= source_start_address <= 0xFFFFFFFF):
+        raise ValueError(
+            tr(
+                f"Некорректный SOURCE-START-ADDRESS (ожидается uint32): 0x{source_start_address:X}",
+                f"Invalid SOURCE-START-ADDRESS (expected uint32): 0x{source_start_address:X}",
+            )
+        )
+    if not (0 < uncompressed_size <= 0xFFFFFFFF):
+        raise ValueError(
+            tr(
+                f"Некорректный UNCOMPRESSED-SIZE (ожидается 1..0xFFFFFFFF): {uncompressed_size}",
+                f"Invalid UNCOMPRESSED-SIZE (expected 1..0xFFFFFFFF): {uncompressed_size}",
+            )
+        )
+    if len(n_bytes) != FPKE_DFLASH_FBL_RSAKEY_SIZE:
+        raise ValueError(
+            tr(
+                f"Модуль RSA-1024 должен иметь длину 128 байт (получено {len(n_bytes)} Б).",
+                f"RSA-1024 modulus must be 128 bytes (got {len(n_bytes)} B).",
+            )
+        )
+    mod_be = n_bytes[::-1] if input_modulus_little_endian else bytes(n_bytes)
+    if (mod_be[0] & 0x80) == 0 or (mod_be[-1] & 1) == 0:
+        raise ValueError(
+            tr(
+                "Некорректный модуль RSA-1024: старший бит должен быть равен 1 (1024 бита), а младший бит — нечётным.",
+                "Invalid RSA-1024 modulus: MSB must have bit 7 set (1024-bit) and LSB must be odd.",
+            )
+        )
+    n_int = int.from_bytes(mod_be, "big")
+    msg = struct.pack(">II", source_start_address, uncompressed_size) + bytes(flashdata)
+    sig = rsassa_pkcs1_v15_sign(msg, n_int, d_int, "sha1")
+    if not rsassa_pkcs1_v15_verify(msg, sig, mod_be, 3, "sha1"):
+        raise RuntimeError(
+            tr(
+                "Самопроверка подписи RSA-1024 (e=3) для блока ODX FPK_E не пройдена.",
+                "FPK_E ODX RSA-1024 (e=3) signature self-verification failed.",
+            )
+        )
+    return sig
+
 
 
 # ─────────────── Read-Only Immo 4.0 Exporter, Comparator & A->B Planner ───────────────
@@ -2314,6 +2791,7 @@ def summarize_fpke_dflash_changes(
     updates = extract_fpke_eel_updates(norm_before, norm_after, cflash)
 
     is_pure_eel_update = False
+    eel_pool_append_only = False
     if updates:
         with contextlib.suppress(Exception):
             lay_chk = fpke_eel_layout(cflash, norm_after)
@@ -2322,16 +2800,18 @@ def summarize_fpke_dflash_changes(
                 eel_append_records(norm_before, updates, cflash),
                 cflash,
             )
-            if (norm_after == replayed) and (mask_after == mask_replayed):
-                is_pure_eel_update = True
-            elif (
-                norm_before[pool_end:] == norm_after[pool_end:]
+            if (norm_after[:pool_end] == replayed[:pool_end]) and (mask_after[:pool_end] == mask_replayed[:pool_end]):
+                eel_pool_append_only = True
+            elif all(
+                any(mask_after[off : off + 4]) and norm_before[off : off + 4] == norm_after[off : off + 4]
+                for off in range(0, pool_end, 4)
+                if any(mask_before[off : off + 4])
+            ):
+                eel_pool_append_only = True
+            if (
+                eel_pool_append_only
+                and norm_before[pool_end:] == norm_after[pool_end:]
                 and mask_before[pool_end:] == mask_after[pool_end:]
-                and all(
-                    any(mask_after[off : off + 4]) and norm_before[off : off + 4] == norm_after[off : off + 4]
-                    for off in range(0, pool_end, 4)
-                    if any(mask_before[off : off + 4])
-                )
             ):
                 is_pure_eel_update = True
 
@@ -2346,6 +2826,7 @@ def summarize_fpke_dflash_changes(
         return {
             "changed": False,
             "is_pure_eel_update": False,
+            "eel_pool_append_only": False,
             "changed_eel_ids": [],
             "raw_diff_blocks": 0,
             "lines": [],
@@ -2440,6 +2921,26 @@ def summarize_fpke_dflash_changes(
         )
         short_tags.append(tr("кодировка", "coding"))
 
+    fbl1 = analyze_fpke_dflash_fbl_key(norm_before)
+    fbl2 = analyze_fpke_dflash_fbl_key(norm_after)
+    if fbl1.get("modulus_le_hex") != fbl2.get("modulus_le_hex"):
+        st_lbl_map = {
+            "stock": tr("заводской VAG", "factory VAG"),
+            "custom": tr("свой RSA-1024", "custom RSA-1024"),
+            "blank": tr("пусто (FF)", "blank (FF)"),
+            "invalid": tr("некорректный", "invalid"),
+        }
+        s1_txt = st_lbl_map.get(str(fbl1.get("state")), str(fbl1.get("state")))
+        s2_txt = st_lbl_map.get(str(fbl2.get("state")), str(fbl2.get("state")))
+        lines.append(
+            tr(
+                f"Ключ FBL RSA-1024 (0xFF20ED00): {s1_txt} → {s2_txt} ({(fbl2.get('modulus_be_hex') or '—')[:12]}…)",
+                f"FBL RSA-1024 key (0xFF20ED00): {s1_txt} → {s2_txt} ({(fbl2.get('modulus_be_hex') or '—')[:12]}…)",
+            )
+        )
+        short_tags.append(tr("ключ FBL RSA", "FBL RSA key"))
+
+
     covered_ids = {0x68, 0x69, 0x66, 0x67, 0x60, 0x35, 0x6B, 0x6D, 0x30}
     extra_ids = [f"0x{i:02X}" for i in sorted(updates) if i not in covered_ids]
     if extra_ids or not lines:
@@ -2467,6 +2968,7 @@ def summarize_fpke_dflash_changes(
     return {
         "changed": True,
         "is_pure_eel_update": is_pure_eel_update,
+        "eel_pool_append_only": eel_pool_append_only,
         "changed_eel_ids": [f"0x{i:02X}" for i in sorted(updates)],
         "raw_diff_blocks": raw_diff_blocks,
         "lines": lines,
@@ -2619,6 +3121,7 @@ def format_fpke_report(
     extra_info: dict[str, Any] | None = None,
     ident: list[dict[str, str]] | None = None,
     idauth_info: dict[str, Any] | None = None,
+    bolo_info: dict[str, Any] | None = None,
 ) -> str:
     """Format a human-readable RU/EN report for FPK_E DataFlash EEL secrets and Extra Area."""
     lines: list[str] = []
@@ -2773,5 +3276,39 @@ def format_fpke_report(
                     tag = tr("обучен", "learned") if k["within_learned_count"] else tr("вне счётчика", "outside learned count")
                     disp = k.get("display_id") or k["hex"].upper()
                     lines.append(f"    Key {k['slot'] + 1}: {disp}  (raw: {k['hex'].upper()}, {tag})")
+
+        fbl_key = dflash_info.get("fbl_rsa_key") or {}
+        if fbl_key.get("state"):
+            lines.append("")
+            lines.append(tr("── Ключ загрузчика FBL RSA-1024 (0xFF20ED00) ──", "── FBL Bootloader RSA-1024 Key (0xFF20ED00) ──"))
+            lines.append(f"  {'State':<28} : {fbl_key['state']} (e={fbl_key.get('exponent', 3)}, ver={fbl_key.get('key_version_hex') or '—'})")
+            if fbl_key.get("fds_project_data_hex"):
+                lines.append(f"  {'FDS Project Data (0xED82)':<28} : {fbl_key['fds_project_data_hex']}")
+            if fbl_key.get("modulus_be_hex"):
+                lines.append(f"  {'Modulus N (BE, 128 B)':<28} : {fbl_key['modulus_be_hex'][:32]}…{fbl_key['modulus_be_hex'][-16:]}")
+
+    if bolo_info:
+        b_entry = bolo_info.get("memcheck_bolo_entry") or {}
+        lines.append("")
+        lines.append(tr("── Загрузчик BOLO в CodeFlash (0x000000..0x02FFFF) ──", "── BOLO Bootloader in CodeFlash (0x000000..0x02FFFF) ──"))
+        lines.append(f"  {'BOLO Version (0x02FB00)':<28} : {bolo_info.get('bolo_version', '—')} ({bolo_info.get('state', '—')})")
+        lines.append(
+            f"  {'Loader .secinfo -> RAM':<28} : {bolo_info.get('secinfo_offset', '—')} -> {bolo_info.get('loader_ram_addr', '—')} "
+            f"(ROM {bolo_info.get('loader_rom_offset', '—')}, {bolo_info.get('loader_compressed_size', 0)} -> {bolo_info.get('loader_decompressed_size', 0)} B)"
+        )
+        lines.append(
+            f"  {'rsa_verify check bytes':<28} : bne @ {bolo_info.get('rsa_bne_ram_addr', '—')} = {bolo_info.get('bne_hex', '—')}, "
+            f"cmov @ {bolo_info.get('rsa_cmov_ram_addr', '—')} = {bolo_info.get('cmov_hex', '—')}"
+        )
+        if bolo_info.get("patch_cflash_offsets"):
+            lines.append(f"  {'Cflash LZSS patch offsets':<28} : {', '.join(bolo_info['patch_cflash_offsets'])}")
+        if b_entry:
+            lines.append(
+                f"  {'.MemCheckCrcTblApp[0]':<28} : {b_entry.get('start', '—')}..+{b_entry.get('length', '—')} "
+                f"CRC={b_entry.get('stored_crc', '—')} ({'OK' if b_entry.get('valid') else 'FAIL'}; "
+                f"all6={'OK' if bolo_info.get('memcheck_crc_valid') else 'MODIFIED'})"
+            )
+        if bolo_info.get("fbl_aes_key_hex"):
+            lines.append(f"  {'.FBL_AESKEY (0x02FBE0)':<28} : {bolo_info['fbl_aes_key_hex']}")
 
     return "\n".join(lines)

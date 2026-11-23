@@ -1112,16 +1112,22 @@ class MainWindow(QMainWindow):
         if self._is_fpke_active():
             dumps: dict[str, Path] = {}
             orig_df = self.fpke_screen._orig_dflash_path
+            orig_cf = self.fpke_screen._orig_cflash_path
             if orig_df is not None and orig_df.is_file():
                 dumps[f"loaded/{orig_df.name}"] = orig_df
+            if orig_cf is not None and orig_cf.is_file():
+                dumps[f"loaded/{orig_cf.name}"] = orig_cf
             for kind, p in self.fpke_screen.files.items():
-                if kind == "dflash" and orig_df is not None:
+                if (kind == "dflash" and orig_df is not None) or (kind == "cflash" and orig_cf is not None):
                     continue
                 if p is not None and p.is_file():
                     dumps[f"loaded/{p.name}"] = p
             work_df = self.fpke_screen._working_dflash_path
             if self.fpke_screen.is_dflash_modified and work_df is not None and work_df.is_file():
                 dumps[f"edited/{work_df.name}"] = work_df
+            work_cf = self.fpke_screen._working_cflash_path
+            if self.fpke_screen.is_cflash_modified and work_cf is not None and work_cf.is_file():
+                dumps[f"edited/{work_cf.name}"] = work_cf
         else:
             dumps = {f"loaded/{p.name}": p for p in self.ws.original.values()}
             dumps.update({f"edited/{p.name}": p for k, p in self.ws.current.items() if self.ws.modified(k)})

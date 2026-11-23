@@ -370,8 +370,8 @@ def load_rsa1024_key_material(raw_spec: str | Path) -> tuple[bytes, int | None]:
             if int(obj.get("e", 3)) != 3:
                 raise ValueError(
                     tr(
-                        "Экспонента e в прошивке Continental J533 должна быть равна 3!",
-                        "Public exponent e for Continental J533 must be 3!",
+                        "Экспонента e загрузчика должна быть равна 3!",
+                        "Bootloader public exponent e must be 3!",
                     )
                 )
             n_bytes = bytes.fromhex(n_hex)
@@ -394,8 +394,8 @@ def load_rsa1024_key_material(raw_spec: str | Path) -> tuple[bytes, int | None]:
             if 3 not in ints:
                 raise ValueError(
                     tr(
-                        "Экспонента e в PEM-файле не равна 3 (J533 требует e=3)!",
-                        "PEM public exponent e is not 3 (J533 requires e=3)!",
+                        "Экспонента e в PEM-файле не равна 3 (загрузчик требует e=3)!",
+                        "PEM public exponent e is not 3 (bootloader requires e=3)!",
                     )
                 )
             n_val = mods[0]

@@ -2318,3 +2318,416 @@ def test_fpke_k_ffb_derivation_and_gui_calculator(tmp_path: Path) -> None:
         win.close()
 
 
+def build_synthetic_fpke_cflash(
+    bolo_version: bytes = b"4094",
+    *,
+    include_lzss_backrefs: bool = True,
+    backref_to_patch_byte: bool = False,
+) -> bytes:
+    """Build a synthetic 256 KiB FPK_E CodeFlash prefix containing BOLO `.secinfo`, `.LoaderRAMCOPY` (Okumura LZSS), and `.MemCheckCrcTblApp`."""
+    from contitool.fpke import (
+        FPKE_CFLASH_BOLO_VERSION_OFFSET,
+        FPKE_CFLASH_FBL_AESKEY_OFFSET,
+        FPKE_CFLASH_MEMCHECK_APP_ENTRIES,
+        FPKE_CFLASH_MEMCHECK_APP_OFFSET,
+        FPKE_LOADER_RAM_CODE_ADDR,
+        FPKE_STOCK_FBL_AES_KEY,
+        fpke_crc32_app,
+    )
+
+    cf = bytearray(b"\xff" * 0x040000)
+    cf[FPKE_CFLASH_BOLO_VERSION_OFFSET : FPKE_CFLASH_BOLO_VERSION_OFFSET + 4] = bolo_version
+    cf[FPKE_CFLASH_FBL_AESKEY_OFFSET : FPKE_CFLASH_FBL_AESKEY_OFFSET + 16] = FPKE_STOCK_FBL_AES_KEY
+
+    # Construct a valid Okumura LZSS stream containing the rsa_verify tail plus real back-reference tokens
+    # Pad raw_ram_code to a multiple of 8 bytes (130 + 50 + 68 = 248) so the next byte is a fresh LZSS flag byte.
+    raw_ram_code = (
+        b"\x00" * 0x82
+        + bytes.fromhex(
+            "e051ea1523f688000a08caf1c309a10f07006010e111ba0541ea9d0041528a000a0680ff89f51d0680ffe2e700001c50031e"
+        )
+        + b"\x00" * 68
+    )
+    assert len(raw_ram_code) % 8 == 0
+    comp = bytearray()
+    for i in range(0, len(raw_ram_code), 8):
+        chunk = raw_ram_code[i : i + 8]
+        comp.append((1 << len(chunk)) - 1)
+        comp.extend(chunk)
+
+    if include_lzss_backrefs:
+        # Emit an Okumura LZSS back-reference token (flag bit 0 = backref, bits 1..7 = 7 literal zeros):
+        # either referencing harmless prologue bytes (offset 0) or deliberately referencing the patched bne byte (0x84).
+        ref_ram_off = 0x84 if backref_to_patch_byte else 0x00
+        ring_pos = (4096 - 18 + ref_ram_off) & 0xFFF
+        ref_len = 4
+        comp.append(0xFE)  # bit 0 = backref, bits 1..7 = literals
+        comp.append(ring_pos & 0xFF)
+        comp.append(((ring_pos >> 4) & 0xF0) | ((ref_len - 3) & 0x0F))
+        comp.extend(b"\x00" * 7)
+
+    # Pad compressed stream into realistic BOLO range (>= 0x8000 bytes)
+    while len(comp) < 0x8100:
+        comp.append(0xFF)
+        comp.extend(b"\x00" * 8)
+
+    src_off = 0x0103D4
+    cf[src_off : src_off + len(comp)] = comp
+    struct.pack_into("<3I", cf, 0x007F5C, FPKE_LOADER_RAM_CODE_ADDR, src_off, len(comp))
+
+    # Populate 6 .MemCheckCrcTblApp entries @ 0x00031380 (entry 0 covers BOLO 0x000000..0x02EEE0)
+    ranges = (
+        (0x000000, 0x02EEE0),
+        (0x030000, 0x001373),
+        (0x031500, 0x002B00),
+        (0x034000, 0x004000),
+        (0x038000, 0x004000),
+        (0x03C000, 0x004000),
+    )
+    assert len(ranges) == FPKE_CFLASH_MEMCHECK_APP_ENTRIES
+    for idx, (s_addr, length) in enumerate(ranges):
+        crc = fpke_crc32_app(bytes(cf[s_addr : s_addr + length]))
+        struct.pack_into(
+            "<5I",
+            cf,
+            FPKE_CFLASH_MEMCHECK_APP_OFFSET + idx * 20,
+            s_addr,
+            s_addr,
+            length,
+            crc,
+            0x55,
+        )
+    return bytes(cf)
+
+
+def test_fpke_engineering_bootloader_and_fbl_rsa_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from PySide6.QtWidgets import QApplication, QFileDialog
+
+    from contitool.core.crypto import _is_probable_prime, rsassa_pkcs1_v15_verify
+    from contitool.fpke import (
+        FPKE_DFLASH_FBL_RSAKEY_OFFSET,
+        FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET,
+        FPKE_STOCK_FBL_RSA_MODULUS_BE,
+        FPKE_STOCK_FBL_RSA_MODULUS_LE,
+        analyze_fpke_cflash_bootloader,
+        analyze_fpke_dflash,
+        analyze_fpke_dflash_fbl_key,
+        apply_fpke_cflash_rsa_patch,
+        apply_fpke_dflash_edits,
+        apply_fpke_dflash_fbl_rsa_key,
+        format_fpke_report,
+        okumura_lzss_decompress_with_map,
+        sign_fpke_odx_datablock,
+    )
+    from contitool.gui.main_window import MainWindow
+    from contitool.gui.screens.fpke import _FpkeOdxSignDialog
+    from contitool.report import Failure
+
+    # 1. Verify stock VAG ODX signature from FL_83A920700E_6181___S.odx (FD_01ERASEPROGRROUTI: addr=0xF0, usize=16)
+    stock_odx_sig = bytes.fromhex(
+        "490c445a407ef66918f5dd3821879cb86d64329fbd3793ae4a92588ded0cb6f6"
+        "eb54fa4d4c275768f7adbf18dfdc808a51f6ded39a13dd835f922518c7d305e0"
+        "959019f2d4f3070da1440adca89b52d1f147c33fbdffb2ec54eefbb1a8ca5dfe"
+        "442cd8cc2a1c2d4a03d70afe2b14a22a78d21c1aa0967f8a5526f0784653a0ec"
+    )
+    fd_01 = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+    msg_01 = struct.pack(">II", 0x000000F0, 16) + fd_01
+    assert rsassa_pkcs1_v15_verify(msg_01, stock_odx_sig, FPKE_STOCK_FBL_RSA_MODULUS_BE, 3, "sha1")
+
+    # 2. Verify DataFlash .FBL_RSAKEY strict 2-block isolation (0xED00/0xED40 only by default, opt-in metadata),
+    #    invalid modulus rejection, and ODX signing validation
+    df_blank_tail = build_synthetic_fpke_dflash()
+    df_stock_only = apply_fpke_dflash_fbl_rsa_key(df_blank_tail, restore_stock=True)
+    # Default populate_metadata=False must NOT touch block 0xED80
+    assert df_stock_only[FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET : FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET + 10] == b"\xff" * 10
+    df_base = apply_fpke_dflash_fbl_rsa_key(df_blank_tail, restore_stock=True, populate_metadata=True)
+    assert df_base[FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET : FPKE_DFLASH_FBL_RSAKEYVERS_OFFSET + 2] == b"\x23\x00"
+
+    fbl_st = analyze_fpke_dflash_fbl_key(df_base)
+    assert fbl_st["state"] == "stock"
+    assert fbl_st["modulus_le_hex"] == FPKE_STOCK_FBL_RSA_MODULUS_LE.hex().upper()
+    assert fbl_st["modulus_be_hex"] == FPKE_STOCK_FBL_RSA_MODULUS_BE.hex().upper()
+
+    # Invalid RSA moduli must be rejected
+    with pytest.raises(ValueError):
+        apply_fpke_dflash_fbl_rsa_key(df_base, b"\x7f" + b"\x11" * 126 + b"\x01")  # MSB bit 7 == 0
+    with pytest.raises(ValueError):
+        apply_fpke_dflash_fbl_rsa_key(df_base, b"\x80" + b"\x11" * 126 + b"\x02")  # even LSB
+
+    # Deterministic 1024-bit RSA test keypair (e = 3)
+    p_test = 0xD5BBB96D30086EC484EBA3D7F9CAEB0753D1F4452B986324F15C6C775E5B130B2C8497E153D9668F7C6B985E290F7B41E519A67F0252E8C7D29F456B03D6A44B
+    q_test = 0xC97FB1F027F453F6341233EAAAD1D9353F6C42D08866B1D05A0F2035028B9D869840B41666B42E92EA0DA3B43204B5CFCE3352524D0416A5A441E700AF46128B
+    while not (p_test.bit_length() == 512 and p_test % 3 == 2 and _is_probable_prime(p_test)):
+        p_test += 2
+    while not (q_test.bit_length() == 512 and q_test % 3 == 2 and _is_probable_prime(q_test)):
+        q_test += 2
+    n_test = p_test * q_test
+    d_test = pow(3, -1, (p_test - 1) * (q_test - 1))
+    n_test_be = n_test.to_bytes(128, "big")
+
+    custom_sig = sign_fpke_odx_datablock(
+        fd_01,
+        source_start_address=0x000000F0,
+        uncompressed_size=16,
+        n_bytes=n_test_be,
+        d_int=d_test,
+    )
+    assert rsassa_pkcs1_v15_verify(msg_01, custom_sig, n_test_be, 3, "sha1")
+    with pytest.raises(ValueError):
+        sign_fpke_odx_datablock(fd_01, source_start_address=-1, uncompressed_size=16, n_bytes=n_test_be, d_int=d_test)
+    with pytest.raises(ValueError):
+        sign_fpke_odx_datablock(fd_01, source_start_address=0xF0, uncompressed_size=0, n_bytes=n_test_be, d_int=d_test)
+
+    df_custom = apply_fpke_dflash_fbl_rsa_key(df_base, n_test_be)
+    fbl_cu = analyze_fpke_dflash_fbl_key(df_custom)
+    assert fbl_cu["state"] == "custom"
+    assert fbl_cu["modulus_be_hex"] == n_test_be.hex().upper()
+    assert df_custom[FPKE_DFLASH_FBL_RSAKEY_OFFSET : FPKE_DFLASH_FBL_RSAKEY_OFFSET + 128] == n_test_be[::-1]
+
+    chg = summarize_fpke_dflash_changes(df_base, df_custom)
+    assert chg["changed"] is True
+    assert chg["raw_diff_blocks"] == 2
+    assert any("0xFF20ED00" in ln for ln in chg["lines"])
+
+    # 3. Verify can_fpke_write_dflash: smart_tail_update, 0xFFFFFFFF word programming, floating-gate noise preservation,
+    #    atomic key replacement over colliding words, and combined smart_eel_and_tail mode
+    bus = FakeFpkeBus()
+    bus.dflash = df_base
+    bus.faci_mask = eel_faci_word_mask(fpke_eel_layout(None, bus.dflash), bus.dflash)
+    wr_res = can_fpke_write_dflash(
+        "fake",
+        df_custom,
+        base_dflash=df_base,
+        session_dir=tmp_path / "write_fbl_key",
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        keep_open=False,
+        bus=bus,
+    )
+    assert wr_res["ok"] is True
+    assert wr_res["mode"] == "smart_tail_update"
+    assert wr_res["blocks_written"] == 2
+    assert analyze_fpke_dflash_fbl_key(bus.dflash)["modulus_be_hex"] == n_test_be.hex().upper()
+
+    # 3a. Custom modulus containing a literal 0xFFFFFFFF 32-bit word must be programmed (faci_mask == 1 on all 32 words)
+    mod_with_ff = bytearray(n_test_be)
+    mod_with_ff[16:20] = b"\xff\xff\xff\xff"
+    df_ff_mod = apply_fpke_dflash_fbl_rsa_key(df_base, bytes(mod_with_ff))
+    ff_mask = eel_faci_word_mask(fpke_eel_layout(None, df_ff_mod), df_ff_mod)
+    assert all(ff_mask[FPKE_DFLASH_FBL_RSAKEY_OFFSET : FPKE_DFLASH_FBL_RSAKEY_OFFSET + 128])
+    wr_ff = can_fpke_write_dflash(
+        "fake",
+        df_ff_mod,
+        base_dflash=df_custom,
+        session_dir=tmp_path / "write_ff_word_key",
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        keep_open=False,
+        bus=bus,
+    )
+    assert wr_ff["ok"] is True
+    assert wr_ff["mode"] == "smart_tail_update"
+    assert all(bus.faci_mask[FPKE_DFLASH_FBL_RSAKEY_OFFSET : FPKE_DFLASH_FBL_RSAKEY_OFFSET + 128])
+    assert analyze_fpke_dflash_fbl_key(bus.dflash)["modulus_be_hex"] == bytes(mod_with_ff).hex().upper()
+
+    # 3b. Atomic key replacement: live ECU has mod_with_ff, ref_base has stock key, cand has Key B sharing a 32-bit word with stock
+    mod_b = bytearray(n_test_be)
+    mod_b[0:4] = FPKE_STOCK_FBL_RSA_MODULUS_BE[0:4]  # collides with ref_base (stock) while differing from live bus (mod_with_ff)
+    mod_b[16:20] = b"\x12\x34\x56\x78"
+    df_mod_b = apply_fpke_dflash_fbl_rsa_key(df_base, bytes(mod_b))
+    wr_atom = can_fpke_write_dflash(
+        "fake",
+        df_mod_b,
+        base_dflash=df_base,
+        session_dir=tmp_path / "write_atomic_key",
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        keep_open=False,
+        bus=bus,
+    )
+    assert wr_atom["ok"] is True
+    assert wr_atom["mode"] == "smart_tail_update"
+    assert analyze_fpke_dflash_fbl_key(bus.dflash)["modulus_be_hex"] == bytes(mod_b).hex().upper()
+
+    # 3c. Floating-gate noise in erased cells 0xED8C..0xEDFF must NOT be programmed during smart_tail_update
+    noisy_raw = bytearray(df_stock_only)
+    noisy_raw[0xED8C:0xEE00] = bytes((i * 37 + 13) & 0xFF for i in range(0xEE00 - 0xED8C))
+    bus_noise = FakeFpkeBus()
+    bus_noise.dflash = bytes(noisy_raw)
+    bus_noise.faci_mask = eel_faci_word_mask(fpke_eel_layout(None, df_stock_only), df_stock_only)
+    # Mark 0xED80..0xEDFF truly blank in hardware BCST (erased cells with CPU-read floating-gate noise)
+    bus_noise.faci_mask[0xED80:0xEE00] = b"\x00" * 0x80
+    cand_meta = apply_fpke_dflash_fbl_rsa_key(bytes(noisy_raw), n_test_be, populate_metadata=True)
+    wr_noise = can_fpke_write_dflash(
+        "fake",
+        cand_meta,
+        base_dflash=bytes(noisy_raw),
+        session_dir=tmp_path / "write_tail_noise",
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        keep_open=False,
+        bus=bus_noise,
+    )
+    assert wr_noise["ok"] is True
+    assert wr_noise["mode"] == "smart_tail_update"
+    assert wr_noise["blocks_written"] == 3  # 0xED00, 0xED40, 0xED80 only (NOT 0xEDC0)
+    assert not any(bus_noise.faci_mask[0xED8C:0xEE00])  # erased cells remain unprogrammed
+
+    # 3d. Combined EEL + .FBL_RSAKEY edits use smart_eel_and_tail (not 64 KB full_blank_checked_diff)
+    bus_comb = FakeFpkeBus()
+    bus_comb.dflash = df_base
+    bus_comb.faci_mask = eel_faci_word_mask(fpke_eel_layout(None, df_base), df_base)
+    df_comb = apply_fpke_dflash_edits(df_base, vin="WAUZZZ8V0LA123456")
+    df_comb = apply_fpke_dflash_fbl_rsa_key(df_comb, n_test_be)
+    wr_comb = can_fpke_write_dflash(
+        "fake",
+        df_comb,
+        base_dflash=df_base,
+        session_dir=tmp_path / "write_eel_and_tail",
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        keep_open=False,
+        bus=bus_comb,
+    )
+    assert wr_comb["ok"] is True
+    assert wr_comb["mode"] == "smart_eel_and_tail"
+    rb_comb = analyze_fpke_dflash(bus_comb.dflash)
+    assert rb_comb["metadata"]["vin"] == "WAUZZZ8V0LA123456"
+    assert rb_comb["fbl_rsa_key"]["modulus_be_hex"] == n_test_be.hex().upper()
+
+    # 4. Verify CodeFlash BOLO RSA-Free patch, LZSS back-ref protection, modified App [1..5] tolerance, and roundtrip restore
+    cf_stock = build_synthetic_fpke_cflash(b"4094", include_lzss_backrefs=True)
+    b_stock = analyze_fpke_cflash_bootloader(cf_stock)
+    assert b_stock["bolo_version"] == "4094"
+    assert b_stock["state"] == "stock"
+    assert b_stock["memcheck_crc_valid"] is True
+
+    # Confirm synthetic LZSS stream really includes non-literal back-reference tokens
+    src_off = int(b_stock["loader_rom_offset"], 16)
+    comp_len = int(b_stock["loader_compressed_size"])
+    dec_stock, src_map_stock = okumura_lzss_decompress_with_map(cf_stock[src_off : src_off + comp_len])
+    assert any(m is None for m in src_map_stock)
+
+    cf_eng, b_eng = apply_fpke_cflash_rsa_patch(cf_stock, restore_stock=False)
+    assert b_eng["state"] == "engineering"
+    assert b_eng["bne_hex"] == "0052"
+    assert b_eng["cmov_hex"] == "01E2"
+    assert b_eng["memcheck_crc_valid"] is True
+    assert b_eng["memcheck_bolo_entry"]["stored_crc"] != b_stock["memcheck_bolo_entry"]["stored_crc"]
+
+    dec_eng, _ = okumura_lzss_decompress_with_map(cf_eng[src_off : src_off + comp_len])
+    diff_offs = [i for i in range(len(dec_stock)) if dec_stock[i] != dec_eng[i]]
+    assert set(diff_offs) == set(b_stock["patch_ram_offsets_int"])
+
+    # If an LZSS back-reference copies from a patched byte, apply_fpke_cflash_rsa_patch MUST reject it
+    cf_bad_backref = build_synthetic_fpke_cflash(b"4094", include_lzss_backrefs=True, backref_to_patch_byte=True)
+    with pytest.raises(RuntimeError):
+        apply_fpke_cflash_rsa_patch(cf_bad_backref, restore_stock=False)
+
+    # If Application ranges [1..5] are already modified (memcheck_crc_valid=False), BOLO patching must STILL succeed
+    cf_mod_app = bytearray(cf_stock)
+    cf_mod_app[0x030010] ^= 0x5A
+    b_mod_before = analyze_fpke_cflash_bootloader(bytes(cf_mod_app))
+    assert b_mod_before["memcheck_bolo_entry"]["valid"] is True
+    assert b_mod_before["memcheck_crc_valid"] is False
+    _cf_mod_eng, b_mod_eng = apply_fpke_cflash_rsa_patch(bytes(cf_mod_app), restore_stock=False)
+    assert b_mod_eng["state"] == "engineering"
+    assert b_mod_eng["memcheck_bolo_entry"]["valid"] is True
+    assert b_mod_eng["memcheck_crc_valid"] is False
+
+    cf_restored, b_restored = apply_fpke_cflash_rsa_patch(cf_eng, restore_stock=True)
+    assert b_restored["state"] == "stock"
+    assert b_restored["memcheck_crc_valid"] is True
+    assert cf_restored == cf_stock
+
+    # Report formatting includes BOLO section when bolo_info is passed
+    rep_txt = format_fpke_report(dflash_info=analyze_fpke_dflash(df_custom), bolo_info=b_eng)
+    assert "BOLO" in rep_txt and b_eng["memcheck_bolo_entry"]["stored_crc"] in rep_txt
+
+    # 5. Verify GUI 'boot' tab, orig Cflash preservation, cleanup on restore, and _FpkeOdxSignDialog
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    try:
+        df_file = tmp_path / "Dflash.bin"
+        cf_file = tmp_path / "Cflash.bin"
+        df_file.write_bytes(df_base)
+        cf_file.write_bytes(cf_stock)
+        key_file = tmp_path / "test_key.json"
+        key_file.write_text(
+            f'{{"n_hex": "{n_test_be.hex()}", "e": 3, "d_hex": "{d_test.to_bytes(128, "big").hex()}"}}\n',
+            encoding="utf-8",
+        )
+
+        win.fpke_screen.open_from_files(
+            {"dflash": df_file, "cflash": cf_file},
+            folder=tmp_path,
+            source="disk",
+        )
+        win.fpke_screen.select("boot")
+        app.processEvents()
+        assert win.fpke_screen.is_cflash_modified is False
+        assert win.fpke_screen._orig_cflash_path == cf_file
+
+        win.fpke_screen.embed_fbl_rsa_key_from_file(key_file)
+        app.processEvents()
+        assert win.fpke_screen.is_dflash_modified is True
+        assert win.fpke_screen.dflash_info["fbl_rsa_key"]["state"] == "custom"
+        assert win.fpke_screen._fbl_key_file == key_file
+
+        win.fpke_screen.apply_cflash_engineering_bootloader(restore_stock=False)
+        app.processEvents()
+        edited_cf = tmp_path / "ContiTool_edited" / "Cflash.bin"
+        assert win.fpke_screen.is_cflash_modified is True
+        assert win.fpke_screen._orig_cflash_path == cf_file
+        assert win.fpke_screen._working_cflash_path == edited_cf
+        assert edited_cf.is_file()
+        assert cf_file.read_bytes() == cf_stock  # original untouched
+        assert win.fpke_screen._cflash_boot_info["state"] == "engineering"
+
+        # export_backup MUST export the unmodified original Cflash.bin (and Dflash.bin), not ContiTool_edited/
+        backup_dir = tmp_path / "exported_backup"
+        backup_dir.mkdir()
+        monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *_a, **_kw: str(backup_dir))
+        win.fpke_screen.export_backup()
+        assert (backup_dir / "Cflash.bin").read_bytes() == cf_stock
+        assert (backup_dir / "Dflash.bin").read_bytes() == df_base
+
+        # MainWindow.offer_problem_report MUST include loaded/Cflash.bin (orig) and edited/Cflash.bin (patched)
+        win.stack.setCurrentWidget(win.fpke_screen)
+        win.offer_problem_report(Failure("Test", "trace", started=0.0))
+        assert win._report_dlg is not None
+        assert win._report_dlg.dumps["loaded/Cflash.bin"] == cf_file
+        assert win._report_dlg.dumps["edited/Cflash.bin"] == edited_cf
+        win._report_dlg.close()
+
+        # Restoring stock must remove ContiTool_edited/Cflash.bin and clear is_cflash_modified
+        win.fpke_screen.apply_cflash_engineering_bootloader(restore_stock=True)
+        win.fpke_screen.restore_stock_fbl_rsa_key()
+        app.processEvents()
+        assert win.fpke_screen.is_cflash_modified is False
+        assert not edited_cf.exists()
+        assert win.fpke_screen.files["cflash"] == cf_file
+        assert win.fpke_screen._cflash_boot_info["state"] == "stock"
+        assert win.fpke_screen.dflash_info["fbl_rsa_key"]["state"] == "stock"
+
+        # Verify _FpkeOdxSignDialog validation & field parsing
+        block_file = tmp_path / "fd01.bin"
+        block_file.write_bytes(fd_01)
+        dlg = _FpkeOdxSignDialog(key_path=key_file, default_dir=tmp_path, parent=win)
+        try:
+            assert dlg.btn_ok.isEnabled() is False
+            dlg._data_path = block_file
+            dlg.ed_data.setText(str(block_file))
+            dlg.ed_addr.setText("0x000000F0")
+            dlg.ed_usize.setText("16")
+            dlg._sync()
+            assert dlg.btn_ok.isEnabled() is True
+            assert dlg.source_start_address == 0xF0
+            assert dlg.uncompressed_size == 16
+        finally:
+            dlg.close()
+    finally:
+        win.close()
+
+
+

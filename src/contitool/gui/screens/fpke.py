@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import secrets as _py_secrets
 import shutil
+import time
 from typing import Any
 
 from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
@@ -39,6 +40,7 @@ from contitool.can.fpke import (
     FPKE_CAN_PRESETS,
     FPKE_MFL_BUTTONS,
     FPKE_NATIVE_INTERFACES,
+    atomic_write,
     can_fpke_full_read,
     can_fpke_read_region,
     can_fpke_run_level8_action,
@@ -54,10 +56,19 @@ from contitool.can.fpke import (
     get_active_fpke_link,
     open_or_reuse_fpke_link,
 )
+from contitool.core.crypto import (
+    generate_rsa1024_e3_keypair,
+    load_rsa1024_key_material,
+    save_rsa1024_keypair_bundle,
+)
 from contitool.core.fpke import (
+    analyze_fpke_cflash_bootloader,
     analyze_fpke_dflash,
+    analyze_fpke_dflash_fbl_key,
     analyze_fpke_extra_area,
+    apply_fpke_cflash_rsa_patch,
     apply_fpke_dflash_edits,
+    apply_fpke_dflash_fbl_rsa_key,
     compare_fpke_immo_passports,
     detect_fpke_files,
     extract_fpke_immo_passport,
@@ -70,12 +81,14 @@ from contitool.core.fpke import (
     fpke_verify_s0_s1,
     is_fpke_dflash,
     plan_fpke_a_to_b_transfer,
+    sign_fpke_odx_datablock,
     summarize_fpke_dflash_changes,
     transfer_fpke_donor_to_target,
 )
 from contitool.gui import theme
 from contitool.gui.can_session import parse_hex, parse_id
 from contitool.gui.connection import CanConnection, PathLabel, ensure_ready
+from contitool.gui.dialogs.crypto import key_selector
 from contitool.gui.theme import mono_font, set_tone
 from contitool.gui.widgets.page import (
     Callout,
@@ -99,7 +112,7 @@ from contitool.storage import new_session, unit_of_ident
 
 FPKE_GROUPS = (
     ("analysis", ("secrets", "cp", "keys", "transfer")),
-    ("can", ("read", "can_ctrl", "extra")),
+    ("can", ("read", "can_ctrl", "boot", "extra")),
 )
 
 REQUIRED_DUMPS = (
@@ -122,6 +135,7 @@ def _fpke_nav_title(key: str) -> str:
         "transfer": tr("Перенос из донора", "Donor transfer"),
         "read": tr("Чтение памяти", "Memory read"),
         "can_ctrl": tr("Управление по CAN", "CAN control"),
+        "boot": tr("Инженерный загрузчик", "Engineering bootloader"),
         "extra": tr("Процессор и FD11", "MCU & FD11 access"),
     }[key]
 
@@ -152,6 +166,151 @@ class _FpkeNavRow(QWidget):
         f.setWeight(f.Weight.DemiBold if active else f.Weight.Normal)
         self.lbl_name.setFont(f)
         self.lbl_name.setStyleSheet(f"color: {'#FFFFFF' if active else theme.TEXT};")
+
+
+class _FpkeOdxSignDialog(Dialog):
+    """Dialog for signing an FPK_E ODX `<FLASHDATA>` block (`SHA-1(BE32(addr) || BE32(usize) || data)`, RSA-1024 `e = 3`)."""
+
+    _ADDR_PRESETS: tuple[tuple[str, str, int | None], ...] = (
+        ("RH850 Application SW_2 (0x00070000)", "RH850 Application SW_2 (0x00070000)", 0x00070000),
+        ("FD_01 Erase/Prog Routine (0x000000F0)", "FD_01 Erase/Prog Routine (0x000000F0)", 0x000000F0),
+        ("Произвольный адрес (ввести вручную)", "Custom address (manual input)", None),
+    )
+
+    def __init__(
+        self,
+        key_path: Path | None = None,
+        default_dir: Path | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(
+            parent,
+            tr("Подписать блок прошивки FPK_E для ODX", "Sign FPK_E firmware block for ODX"),
+            tr(
+                "Вычисляет <FW-SIGNATURE> (RSA-1024, e = 3, SHA-1) для блока данных <FLASHDATA> процессора AC (RH850), "
+                "чтобы заводской загрузчик BOLO принял прошивку с вшитым ключом .FBL_RSAKEY.",
+                "Computes <FW-SIGNATURE> (RSA-1024, e = 3, SHA-1) for an AC (RH850) <FLASHDATA> block so the stock BOLO "
+                "bootloader accepts firmware signed with your embedded .FBL_RSAKEY.",
+            ),
+            width=640,
+        )
+        self._default_dir = default_dir or Path.home()
+        self._data_path: Path | None = None
+
+        self.sel_key = key_selector(private=True, path=key_path)
+        self.body.addWidget(self.sel_key)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+
+        lbl_data = QLabel(tr("Блок <FLASHDATA> (.bin)", "<FLASHDATA> block (.bin)"))
+        lbl_data.setObjectName("FieldKey")
+        self.ed_data = QLineEdit()
+        self.ed_data.setReadOnly(True)
+        self.ed_data.setPlaceholderText(tr("Выберите бинарный файл блока данных…", "Select binary datablock file…"))
+        self.ed_data.setFont(mono_font(11))
+        btn_browse = button(tr("Выбрать…", "Browse…"), slot=self._pick_data)
+        grid.addWidget(lbl_data, 0, 0)
+        grid.addWidget(self.ed_data, 0, 1)
+        grid.addWidget(btn_browse, 0, 2)
+
+        lbl_preset = QLabel(tr("Пресет адреса", "Address preset"))
+        lbl_preset.setObjectName("FieldKey")
+        self.cmb_preset = QComboBox()
+        for ru_lbl, en_lbl, addr in self._ADDR_PRESETS:
+            self.cmb_preset.addItem(tr(ru_lbl, en_lbl), addr)
+        self.cmb_preset.currentIndexChanged.connect(self._on_preset)
+        grid.addWidget(lbl_preset, 1, 0)
+        grid.addWidget(self.cmb_preset, 1, 1, 1, 2)
+
+        lbl_addr = QLabel("SOURCE-START-ADDRESS")
+        lbl_addr.setObjectName("FieldKey")
+        self.ed_addr = QLineEdit("0x00070000")
+        self.ed_addr.setFont(mono_font(11))
+        self.ed_addr.textChanged.connect(self._sync)
+        grid.addWidget(lbl_addr, 2, 0)
+        grid.addWidget(self.ed_addr, 2, 1, 1, 2)
+
+        lbl_usize = QLabel("UNCOMPRESSED-SIZE")
+        lbl_usize.setObjectName("FieldKey")
+        self.ed_usize = QLineEdit()
+        self.ed_usize.setFont(mono_font(11))
+        self.ed_usize.setPlaceholderText(tr("Автоматически из размера файла (dec или 0xHEX)", "Auto-filled from file size (dec or 0xHEX)"))
+        self.ed_usize.textChanged.connect(self._sync)
+        grid.addWidget(lbl_usize, 3, 0)
+        grid.addWidget(self.ed_usize, 3, 1, 1, 2)
+
+        grid.setColumnStretch(1, 1)
+        self.body.addLayout(grid)
+
+        self.btn_ok = button(tr("Подписать", "Sign"), "PrimaryBtn", slot=self.accept)
+        self.finish(ok=self.btn_ok)
+        self.sel_key.file_changed.connect(lambda _d: self._sync())
+        self._sync()
+
+    def _pick_data(self) -> None:
+        picked, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("Выберите бинарный файл блока <FLASHDATA>", "Select <FLASHDATA> binary file"),
+            str(self._default_dir),
+            "Binary (*.bin);;All files (*)",
+        )
+        if not picked:
+            return
+        p = Path(picked)
+        self._data_path = p
+        self._default_dir = p.parent
+        self.ed_data.setText(str(p))
+        with contextlib.suppress(OSError):
+            sz = p.stat().st_size
+            if sz > 0:
+                self.ed_usize.setText(f"0x{sz:X}")
+        self._sync()
+
+    def _on_preset(self, idx: int) -> None:
+        val = self.cmb_preset.itemData(idx)
+        if isinstance(val, int):
+            self.ed_addr.setText(f"0x{val:08X}")
+        self._sync()
+
+    @staticmethod
+    def _parse_u32(text: str, *, allow_zero: bool) -> int | None:
+        s = text.strip()
+        if not s:
+            return None
+        try:
+            v = int(s, 0)
+        except ValueError:
+            return None
+        low = 0 if allow_zero else 1
+        return v if low <= v <= 0xFFFFFFFF else None
+
+    def _sync(self) -> None:
+        ok = (
+            self.sel_key.is_valid_selection()
+            and self._data_path is not None
+            and self._data_path.is_file()
+            and self.source_start_address is not None
+            and self.uncompressed_size is not None
+        )
+        self.btn_ok.setEnabled(ok)
+
+    @property
+    def key_path(self) -> Path | None:
+        return self.sel_key.current_path
+
+    @property
+    def data_path(self) -> Path | None:
+        return self._data_path
+
+    @property
+    def source_start_address(self) -> int | None:
+        return self._parse_u32(self.ed_addr.text(), allow_zero=True)
+
+    @property
+    def uncompressed_size(self) -> int | None:
+        return self._parse_u32(self.ed_usize.text(), allow_zero=False)
 
 
 class FpkeScreen(QWidget):
@@ -198,7 +357,14 @@ class FpkeScreen(QWidget):
         self._orig_dflash_bytes: bytes | None = None
         self._working_dflash_path: Path | None = None
         self._working_dflash_bytes: bytes | None = None
+        self._orig_cflash_path: Path | None = None
+        self._orig_cflash_bytes: bytes | None = None
+        self._working_cflash_path: Path | None = None
         self._cflash_bytes: bytes | None = None
+        self._cflash_boot_info: dict[str, Any] | None = None
+        self._cflash_boot_err: str | None = None
+        self._fbl_key_file: Path | None = None
+        self._session_gen: int = 0
         self._page_commit_fn: Callable[[bool], bool] | None = None
 
         self._donor_path: Path | None = None
@@ -307,6 +473,36 @@ class FpkeScreen(QWidget):
             and self._working_dflash_bytes != self._orig_dflash_bytes
         )
 
+    @property
+    def is_cflash_modified(self) -> bool:
+        return (
+            self._orig_cflash_bytes is not None
+            and self._cflash_bytes is not None
+            and self._cflash_bytes != self._orig_cflash_bytes
+        )
+
+    def _set_cflash_bytes(
+        self,
+        raw: bytes | None,
+        *,
+        precomputed_info: dict[str, Any] | None = None,
+    ) -> None:
+        self._cflash_bytes = raw
+        if raw is None:
+            self._cflash_boot_info = None
+            self._cflash_boot_err = None
+            return
+        if precomputed_info is not None:
+            self._cflash_boot_info = precomputed_info
+            self._cflash_boot_err = None
+            return
+        try:
+            self._cflash_boot_info = analyze_fpke_cflash_bootloader(raw)
+            self._cflash_boot_err = None
+        except Exception as exc:
+            self._cflash_boot_info = None
+            self._cflash_boot_err = str(exc)
+
     def open_from_ident(self, ident: dict[str, Any]) -> None:
         self.is_open = True
         self.source = "can"
@@ -345,6 +541,7 @@ class FpkeScreen(QWidget):
             self.gateway_channel = int(gateway_channel)
         elif source != "can":
             self.gateway_channel = 0
+        self._session_gen += 1
         self.folder = folder or next((p.parent for p in detected.values()), None)
         self.files = dict(detected)
         self.dflash_info = None
@@ -354,7 +551,11 @@ class FpkeScreen(QWidget):
         self._orig_dflash_bytes = None
         self._working_dflash_path = None
         self._working_dflash_bytes = None
-        self._cflash_bytes = None
+        self._orig_cflash_path = None
+        self._orig_cflash_bytes = None
+        self._working_cflash_path = None
+        self._fbl_key_file = None
+        self._set_cflash_bytes(None)
         if source != "can":
             self.ident_items = []
             self.idauth_info = None
@@ -363,9 +564,26 @@ class FpkeScreen(QWidget):
 
         if "cflash" in detected and detected["cflash"].is_file():
             try:
-                self._cflash_bytes = detected["cflash"].read_bytes()
+                orig_cf_path = detected["cflash"]
+                orig_cf_raw = orig_cf_path.read_bytes()
+                self._orig_cflash_path = orig_cf_path
+                self._orig_cflash_bytes = orig_cf_raw
+                self._working_cflash_path = orig_cf_path
+                cf_raw = orig_cf_raw
+                edit_cf = orig_cf_path.parent / "ContiTool_edited" / orig_cf_path.name
+                if edit_cf.is_file():
+                    with contextlib.suppress(OSError):
+                        edit_raw = edit_cf.read_bytes()
+                        if len(edit_raw) >= 0x00032000 and len(edit_raw) == len(orig_cf_raw) and edit_raw != orig_cf_raw:
+                            self._working_cflash_path = edit_cf
+                            self.files["cflash"] = edit_cf
+                            cf_raw = edit_raw
+                self._set_cflash_bytes(cf_raw)
             except OSError:
-                self._cflash_bytes = None
+                self._orig_cflash_path = None
+                self._orig_cflash_bytes = None
+                self._working_cflash_path = None
+                self._set_cflash_bytes(None)
 
         if "report" in detected and detected["report"].is_file():
             try:
@@ -427,6 +645,7 @@ class FpkeScreen(QWidget):
 
     def close_kombi(self) -> None:
         close_active_fpke_link()
+        self._session_gen += 1
         self.is_open = False
         self.source = ""
         self.via_gateway = False
@@ -443,7 +662,11 @@ class FpkeScreen(QWidget):
         self._orig_dflash_bytes = None
         self._working_dflash_path = None
         self._working_dflash_bytes = None
-        self._cflash_bytes = None
+        self._orig_cflash_path = None
+        self._orig_cflash_bytes = None
+        self._working_cflash_path = None
+        self._fbl_key_file = None
+        self._set_cflash_bytes(None)
         self._donor_path = None
         self._donor_dflash = None
         self._donor_cflash = None
@@ -554,7 +777,12 @@ class FpkeScreen(QWidget):
         target_dir = Path(dest)
         copied = 0
         for kind in ("dflash", "extra", "cflash", "uflash", "bflash", "report"):
-            src = self._orig_dflash_path if (kind == "dflash" and self._orig_dflash_path) else self.files.get(kind)
+            if kind == "dflash" and self._orig_dflash_path:
+                src = self._orig_dflash_path
+            elif kind == "cflash" and self._orig_cflash_path:
+                src = self._orig_cflash_path
+            else:
+                src = self.files.get(kind)
             if src is not None and src.is_file():
                 shutil.copy2(src, target_dir / src.name)
                 copied += 1
@@ -815,6 +1043,7 @@ class FpkeScreen(QWidget):
             extra_info=self.extra_info,
             ident=self.ident_items,
             idauth_info=self.idauth_info,
+            bolo_info=self._cflash_boot_info,
         )
         run_dialog(
             TextResultDialog(
@@ -1104,7 +1333,7 @@ class FpkeScreen(QWidget):
         )
         self.btn_export.setEnabled(bool(self.files))
         self.btn_report.setText(tr("Подробный отчёт", "Full report"))
-        self.btn_report.setEnabled(bool(self.dflash_info or self.extra_info or self.ident_items))
+        self.btn_report.setEnabled(bool(self.dflash_info or self.extra_info or self.ident_items or self._cflash_boot_info))
         self.btn_close.setText(tr("Закрыть", "Close"))
 
         clear_layout(self.grid_id)
@@ -1237,6 +1466,17 @@ class FpkeScreen(QWidget):
             "ok" if kl15_on else ("info" if active_link else "muted"),
         )
 
+        boot_state = str((self._cflash_boot_info or {}).get("state") or "")
+        fbl_key_state = str(((self.dflash_info or {}).get("fbl_rsa_key") or {}).get("state") or "")
+        if boot_state == "engineering":
+            set_pill(self.nav_rows["boot"].pill, tr("RSA ОТКЛ", "RSA OFF"), "ok")
+        elif fbl_key_state == "custom":
+            set_pill(self.nav_rows["boot"].pill, tr("свой RSA", "custom RSA"), "ok")
+        elif boot_state == "stock" or fbl_key_state == "stock":
+            set_pill(self.nav_rows["boot"].pill, tr("заводской", "factory"), "muted")
+        else:
+            set_pill(self.nav_rows["boot"].pill, "—", "muted")
+
         self.lbl_dumps_hdr.setText(tr("ФАЙЛЫ ПАМЯТИ", "MEMORY DUMPS"))
         clear_layout(self.dumps_list)
         for kind, label in REQUIRED_DUMPS:
@@ -1255,7 +1495,12 @@ class FpkeScreen(QWidget):
         for kind, label in OPTIONAL_DUMPS:
             p = self.files.get(kind)
             if p is not None and p.is_file():
-                self.dumps_list.addWidget(self._dump_ledger_row(label, self._fmt_dump_size(p), "muted", str(p)))
+                sz_txt = self._fmt_dump_size(p)
+                if kind == "cflash" and self.is_cflash_modified:
+                    sz_txt = f"{sz_txt} • {tr('изм.', 'mod.')}"
+                    self.dumps_list.addWidget(self._dump_ledger_row(label, sz_txt, "info", str(p)))
+                else:
+                    self.dumps_list.addWidget(self._dump_ledger_row(label, sz_txt, "muted", str(p)))
 
     def _render_page(self) -> None:
         self._active_can_panel = None
@@ -1334,6 +1579,8 @@ class FpkeScreen(QWidget):
             self._build_transfer_page(lay)
         elif self._key == "extra":
             self._build_extra_page(lay)
+        elif self._key == "boot":
+            self._build_boot_page(lay)
         elif self._key == "read":
             self._build_read_page(lay)
         elif self._key == "can_ctrl":
@@ -2609,6 +2856,552 @@ class FpkeScreen(QWidget):
             fd_grid.setColumnStretch(2, 1)
             sec_fd.body.addLayout(fd_grid)
             lay.addWidget(sec_fd)
+
+    # ────────────────────────── Page 6: Engineering Bootloader (BOLO & .FBL_RSAKEY) ──────────────────────────
+
+    def _build_boot_page(self, lay: QVBoxLayout) -> None:
+        busy = self.runner.is_busy
+        df_bytes, _cf_bytes = self._own_dflash_and_cflash()
+
+        # ── Card 1: Custom FBL RSA-1024 Public Key in DataFlash (.FBL_RSAKEY @ 0xFF20ED00) ──
+        sec_key = _FpkeCanControlPanel._compact_section(Section())
+        sec_key.set_text(
+            tr(
+                "Свой ключ FBL RSA-1024 в DataFlash (.FBL_RSAKEY @ 0xFF20ED00) — запись по CAN",
+                "Custom FBL RSA-1024 key in DataFlash (.FBL_RSAKEY @ 0xFF20ED00) — write over CAN",
+            ),
+            tr(
+                "Открытый модуль RSA-1024 (128 Б, e = 3) загрузчика BOLO хранится в DataFlash по адресу 0xFF20ED00 "
+                "(Dflash.bin + 0xED00..0xED7F) вне пула EEL T01. Замена ключа затрагивает строго два 64-байтных блока "
+                "(0xED00 и 0xED40) и записывается в приборную панель по CAN кнопкой «Записать в блок» за < 1 с без правки CodeFlash. "
+                "Применяется к блокам процессора AC (RH850: 0xF0, Dataset, ПО RH850 SW_2); графические разделы GC (R-Car) "
+                "дополнительно проверяются загрузчиком GC по отдельному ключу в GC NOR (0x9002E000).",
+                "The BOLO bootloader's 128-byte RSA-1024 public modulus (e = 3) resides in DataFlash at 0xFF20ED00 "
+                "(Dflash.bin + 0xED00..0xED7F) outside the EEL T01 pool. Replacing it touches strictly two 64-byte blocks "
+                "(0xED00 and 0xED40) and writes over CAN via “Write to ECU” in < 1 s without touching CodeFlash. "
+                "Covers AC (RH850) blocks (0xF0, Dataset, RH850 SW_2); GC (R-Car) graphic blocks are also verified by GC "
+                "loaderKernel against a separate key in GC NOR (0x9002E000).",
+            ),
+        )
+        fbl_key = analyze_fpke_dflash_fbl_key(df_bytes) if df_bytes is not None else {"state": "missing"}
+        k_state = str(fbl_key.get("state") or "missing")
+        k_badge_map = {
+            "stock": (tr("Заводской ключ VAG", "Factory VAG key"), "info"),
+            "custom": (tr("Свой ключ RSA-1024", "Custom RSA-1024 key"), "ok"),
+            "blank": (tr("Пусто (FF×128)", "Blank (FF×128)"), "warn"),
+            "invalid": (tr("Некорректный модуль", "Invalid modulus"), "err"),
+            "missing": (tr("DataFlash не загружен", "DataFlash not loaded"), "muted"),
+        }
+        k_txt, k_tone = k_badge_map.get(k_state, (k_state, "muted"))
+        sec_key.head.addWidget(status_readout(k_txt, k_tone), 0, Qt.AlignmentFlag.AlignVCenter)
+
+        if df_bytes is not None:
+            mod_be = str(fbl_key.get("modulus_be_hex") or "")
+            mod_le = str(fbl_key.get("modulus_le_hex") or "")
+            ver_hex = str(fbl_key.get("key_version_hex") or "—")
+            fds_hex = str(fbl_key.get("fds_project_data_hex") or "—")
+
+            row_meta = QHBoxLayout()
+            row_meta.setSpacing(10)
+            ed_addr = QLineEdit("0xFF20ED00 (Dflash + 0xED00, 128 B LE, e = 3)")
+            ed_addr.setReadOnly(True)
+            ed_addr.setFont(mono_font(11))
+            c_addr, _ = self._field_box(tr("АДРЕС В DATAFLASH", "DATAFLASH ADDRESS"), ed_addr)
+
+            ed_ver = QLineEdit(f"ver={ver_hex} • FDS={fds_hex}")
+            ed_ver.setReadOnly(True)
+            ed_ver.setFont(mono_font(11))
+            c_ver, _ = self._field_box(tr("ВЕРСИЯ КЛЮЧА И ПРОЕКТ FDS (0xED80)", "KEY VERSION & FDS PROJECT (0xED80)"), ed_ver)
+
+            row_meta.addWidget(c_addr, 1)
+            row_meta.addWidget(c_ver, 1)
+            sec_key.body.addLayout(row_meta)
+
+            ed_mod_be = QLineEdit(mod_be)
+            ed_mod_be.setReadOnly(True)
+            ed_mod_be.setFont(mono_font(11))
+            btn_cp_be = button(
+                tr("Копировать BE", "Copy BE"),
+                "GhostBtn",
+                slot=lambda: self._copy_hex(mod_be, "FBL RSA-1024 N (BE)"),
+            )
+            btn_cp_le = button(
+                tr("Копировать LE", "Copy LE"),
+                "GhostBtn",
+                slot=lambda: self._copy_hex(mod_le, "FBL RSA-1024 N (LE)"),
+            )
+            c_mod, _ = self._field_box(
+                tr("МОДУЛЬ RSA-1024 N (128 БАЙТ, BIG-ENDIAN)", "RSA-1024 MODULUS N (128 BYTES, BIG-ENDIAN)"),
+                ed_mod_be,
+                badge_text="128 B",
+                badge_tone="ok" if k_state in ("stock", "custom") else "warn",
+                trailing=(btn_cp_be, btn_cp_le),
+            )
+            sec_key.body.addWidget(c_mod)
+
+        btn_gen_key = button(
+            tr("Сгенерировать и вшить свой ключ", "Generate & embed keypair"),
+            "PrimaryBtn" if k_state == "stock" else "",
+            slot=self.generate_and_embed_fbl_rsa_key,
+        )
+        btn_gen_key.setEnabled(not busy and df_bytes is not None)
+        btn_load_key = button(
+            tr("Вшить ключ из файла…", "Embed key from file…"),
+            slot=lambda: self.embed_fbl_rsa_key_from_file(),
+        )
+        btn_load_key.setEnabled(not busy and df_bytes is not None)
+        btn_sign_odx = button(
+            tr("Подписать блок ODX…", "Sign ODX datablock…"),
+            slot=self.sign_odx_datablock,
+        )
+        btn_sign_odx.setEnabled(not busy)
+        key_btns: list[QWidget] = [btn_gen_key, btn_load_key, btn_sign_odx]
+        if k_state != "stock" and df_bytes is not None:
+            btn_rest_key = button(
+                tr("Вернуть заводской ключ VAG", "Restore factory VAG key"),
+                "GhostBtn",
+                slot=self.restore_stock_fbl_rsa_key,
+            )
+            btn_rest_key.setEnabled(not busy)
+            key_btns.append(btn_rest_key)
+        sec_key.add_footer(*key_btns)
+        lay.addWidget(sec_key)
+
+        # ── Card 2: Offline Engineering Bootloader BOLO Patch in CodeFlash (.LoaderRAMCOPY + .MemCheckCrcTblApp[0]) ──
+        sec_bolo = _FpkeCanControlPanel._compact_section(Section())
+        sec_bolo.set_text(
+            tr(
+                "Офлайн-патч загрузчика BOLO без проверки RSA (Cflash.bin, 0x000000..0x02FFFF)",
+                "Offline RSA-Free BOLO bootloader patch (Cflash.bin, 0x000000..0x02FFFF)",
+            ),
+            tr(
+                "На FPK_E область Uflash (0x01000000) пуста; загрузчик BOLO находится в CodeFlash (0x000000..0x02FFFF) "
+                "и распаковывает .LoaderRAMCOPY (Okumura LZSS) в ОЗУ 0xFEDD4D08. Операция ниже патчит локальный файл "
+                "Cflash.bin (4 литеральных байта rsa_verify в потоке LZSS + пересчёт .MemCheckCrcTblApp[0] @ 0x0003138C) "
+                "для последующей записи программатором (по CAN CodeFlash не записывается). Отключает проверку RSA на AC (RH850); "
+                "проверка графических разделов на GC (R-Car) остаётся отдельной.",
+                "On FPK_E, Uflash (0x01000000) is blank; the BOLO bootloader lives in CodeFlash (0x000000..0x02FFFF) and "
+                "decompresses .LoaderRAMCOPY (Okumura LZSS) into SRAM at 0xFEDD4D08. This patches the local Cflash.bin file "
+                "(4 LZSS literal bytes in rsa_verify + updated .MemCheckCrcTblApp[0] CRC-32 @ 0x0003138C) for flashing via "
+                "external programmer (CodeFlash is not written over CAN). Disables RSA on AC (RH850); GC (R-Car) verification "
+                "for graphic blocks remains separate.",
+            ),
+        )
+
+        bolo_info = self._cflash_boot_info
+        bolo_err = self._cflash_boot_err
+
+        if bolo_info is not None:
+            b_state = str(bolo_info.get("state") or "")
+            bolo_crc_ok = bool((bolo_info.get("memcheck_bolo_entry") or {}).get("valid"))
+            if b_state == "engineering":
+                b_lbl, b_tone = tr("Инженерный (RSA ОТКЛ)", "Engineering (RSA OFF)"), ("ok" if bolo_crc_ok else "warn")
+            elif b_state == "stock":
+                b_lbl, b_tone = tr("Заводской (RSA ВКЛ)", "Factory (RSA ON)"), ("info" if bolo_crc_ok else "warn")
+            else:
+                b_lbl, b_tone = tr("Нестандартный BOLO", "Modified BOLO"), "warn"
+        elif bolo_err:
+            b_lbl, b_tone = tr("Ошибка разбора CodeFlash", "CodeFlash parse error"), "err"
+        else:
+            b_lbl, b_tone = tr("CodeFlash не загружен", "CodeFlash not loaded"), "muted"
+        sec_bolo.head.addWidget(status_readout(b_lbl, b_tone), 0, Qt.AlignmentFlag.AlignVCenter)
+
+        if bolo_info is not None:
+            b_entry = bolo_info["memcheck_bolo_entry"]
+            bolo_crc_ok = bool(b_entry.get("valid"))
+            all_crc_ok = bool(bolo_info.get("memcheck_crc_valid"))
+            if bolo_crc_ok and all_crc_ok:
+                crc_status_txt = tr("BOLO [0] ОК • все 6 диапазонов ОК", "BOLO [0] OK • all 6 ranges OK")
+                crc_tone = "ok"
+            elif bolo_crc_ok:
+                crc_status_txt = tr("BOLO [0] ОК • App [1..5] изменены", "BOLO [0] OK • App [1..5] modified")
+                crc_tone = "warn"
+            else:
+                crc_status_txt = tr("ошибка CRC BOLO [0]", "BOLO [0] CRC mismatch")
+                crc_tone = "err"
+
+            offs_str = ", ".join(bolo_info["patch_cflash_offsets"])
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(18)
+            grid.setVerticalSpacing(4)
+            rows_b = [
+                (
+                    tr("Версия загрузчика BOLO (0x02FB00)", "BOLO bootloader version (0x02FB00)"),
+                    f"BOLO {bolo_info['bolo_version']}   •   .secinfo @ {bolo_info['secinfo_offset']} → {bolo_info['loader_ram_addr']}",
+                    "",
+                ),
+                (
+                    tr("Проверка rsa_verify в .LOADER_RAM_CODE", "rsa_verify check in .LOADER_RAM_CODE"),
+                    f"bne @ {bolo_info['rsa_bne_ram_addr']} = {bolo_info['bne_hex']}, "
+                    f"cmov @ {bolo_info['rsa_cmov_ram_addr']} = {bolo_info['cmov_hex']}",
+                    "ok" if bolo_info["state"] == "engineering" else "",
+                ),
+                (
+                    tr("Точки патча в Cflash.bin (литералы LZSS)", "Patch offsets in Cflash.bin (LZSS literals)"),
+                    offs_str,
+                    "",
+                ),
+                (
+                    tr("Самотестирование .MemCheckCrcTblApp[0]", "Self-test .MemCheckCrcTblApp[0]"),
+                    f"{b_entry['start']}..+{b_entry['length']} → CRC-32 @ {b_entry['crc_offset']} = {b_entry['stored_crc']} "
+                    f"({crc_status_txt})",
+                    crc_tone,
+                ),
+                (
+                    tr("Ключ шифрования .FBL_AESKEY (0x02FBE0)", "Encryption key .FBL_AESKEY (0x02FBE0)"),
+                    str(bolo_info["fbl_aes_key_hex"]),
+                    "",
+                ),
+            ]
+            for r, (k, v, tone) in enumerate(rows_b):
+                lk = QLabel(k)
+                lk.setObjectName("FieldKey")
+                lv = QLabel(v)
+                lv.setFont(mono_font(11, bold=(r in (1, 3))))
+                lv.setWordWrap(True)
+                lv.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                if tone:
+                    set_tone(lv, tone)
+                grid.addWidget(lk, r, 0)
+                grid.addWidget(lv, r, 1)
+            grid.setColumnStretch(1, 1)
+            sec_bolo.body.addLayout(grid)
+        elif bolo_err:
+            err_call = Callout("err")
+            err_call.label.setText(bolo_err)
+            sec_bolo.body.addWidget(err_call)
+        else:
+            info_call = Callout("info")
+            info_call.label.setText(
+                tr(
+                    "Дамп <b>Cflash.bin</b> (2 МБ) ещё не загружен. Считайте CodeFlash во вкладке <b>«Чтение памяти»</b> "
+                    "или выберите готовый файл <b>Cflash.bin</b> кнопкой ниже.",
+                    "No <b>Cflash.bin</b> (2 MB) dump is loaded yet. Read CodeFlash in the <b>“Memory read”</b> tab "
+                    "or load an existing <b>Cflash.bin</b> file below.",
+                )
+            )
+            sec_bolo.body.addWidget(info_call)
+
+        bolo_btns: list[QWidget] = []
+        if bolo_info is not None:
+            if bolo_info["state"] != "engineering":
+                btn_act_bolo = button(
+                    tr("Пропатчить Cflash.bin (RSA-Free)", "Patch Cflash.bin (RSA-Free)"),
+                    "PrimaryBtn",
+                    slot=lambda: self.apply_cflash_engineering_bootloader(restore_stock=False),
+                )
+                btn_act_bolo.setEnabled(not busy)
+                bolo_btns.append(btn_act_bolo)
+            if bolo_info["state"] != "stock":
+                btn_rest_bolo = button(
+                    tr("Вернуть заводской BOLO в Cflash.bin", "Restore factory BOLO in Cflash.bin"),
+                    "GhostBtn",
+                    slot=lambda: self.apply_cflash_engineering_bootloader(restore_stock=True),
+                )
+                btn_rest_bolo.setEnabled(not busy)
+                bolo_btns.append(btn_rest_bolo)
+            btn_save_cf = button(
+                tr("Сохранить Cflash.bin…", "Save Cflash.bin…"),
+                slot=self.save_cflash_as,
+            )
+            btn_save_cf.setEnabled(not busy)
+            bolo_btns.append(btn_save_cf)
+
+        btn_pick_cf = button(
+            tr("Открыть Cflash.bin…", "Open Cflash.bin…"),
+            "GhostBtn" if bolo_info is not None else "PrimaryBtn",
+            slot=lambda: self.load_cflash_from_file(),
+        )
+        btn_pick_cf.setEnabled(not busy)
+        bolo_btns.append(btn_pick_cf)
+        sec_bolo.add_footer(*bolo_btns)
+        lay.addWidget(sec_bolo)
+
+    def generate_and_embed_fbl_rsa_key(self) -> None:
+        """Generate a new RSA-1024 (e=3) keypair, save key bundle, and embed its public modulus into DataFlash 0xFF20ED00."""
+        df_bytes, _ = self._own_dflash_and_cflash()
+        if df_bytes is None or self.runner.is_busy:
+            return
+        gen = self._session_gen
+        bundle_dir = (self.folder or Path.cwd()) / "ContiTool_keys"
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        bundle_path = bundle_dir / f"fpke_fbl_{stamp}.json"
+        idx = 1
+        while bundle_path.exists():
+            bundle_path = bundle_dir / f"fpke_fbl_{stamp}_{idx}.json"
+            idx += 1
+
+        def task(rep: Any) -> tuple[bytes, Path, str]:
+            kp = generate_rsa1024_e3_keypair(reporter=rep)
+            for p in save_rsa1024_keypair_bundle(bundle_path, kp):
+                rep.success(tr(f"Ключ сохранён: {p}", f"Key saved: {p}"))
+            modulus = bytes.fromhex(kp["n_hex"])
+            patched_df = apply_fpke_dflash_fbl_rsa_key(df_bytes, modulus, input_little_endian=False)
+            return patched_df, bundle_path, modulus.hex().upper()
+
+        def done(res: tuple[bytes, Path, str]) -> None:
+            if not (_qt_valid(self) and self.is_open and self._session_gen == gen):
+                return
+            patched_df, saved_path, mod_be_hex = res
+            self._fbl_key_file = saved_path
+            self._commit_dflash_bytes(
+                patched_df,
+                tr(
+                    f"Свой ключ FBL RSA-1024 вшит в DataFlash (0xFF20ED00, N={mod_be_hex[:12]}…). Пара ключей: {saved_path}",
+                    f"Custom FBL RSA-1024 key embedded in DataFlash (0xFF20ED00, N={mod_be_hex[:12]}…). Keypair: {saved_path}",
+                ),
+            )
+
+        self.runner.run_task(
+            tr("Генерация и вшивание ключа FBL RSA-1024 (e=3)", "Generating & embedding FBL RSA-1024 (e=3) key"),
+            task,
+            on_success=done,
+        )
+
+    def embed_fbl_rsa_key_from_file(self, path: Path | str | None = None) -> None:
+        """Load an RSA-1024 (e=3) key from `.json`, `.pem`, `.bin`, or hex string and embed it into DataFlash `0xFF20ED00`."""
+        df_bytes, _ = self._own_dflash_and_cflash()
+        if df_bytes is None:
+            return
+        if path is None:
+            default_dir = (self.folder / "ContiTool_keys") if (self.folder and (self.folder / "ContiTool_keys").is_dir()) else (self.folder or Path.home())
+            picked, _ = QFileDialog.getOpenFileName(
+                self,
+                tr("Выберите файл ключа RSA-1024 (e = 3)", "Select RSA-1024 (e = 3) key file"),
+                str(default_dir),
+                "RSA-1024 Key (*.json *.pem *.bin);;All files (*)",
+            )
+            if not picked:
+                return
+            path = Path(picked)
+        try:
+            modulus, d_int = load_rsa1024_key_material(path)
+            patched_df = apply_fpke_dflash_fbl_rsa_key(df_bytes, modulus, input_little_endian=False)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                tr("Ошибка загрузки ключа RSA-1024", "RSA-1024 key load error"),
+                str(exc),
+            )
+            return
+        if d_int is not None and isinstance(path, (Path, str)) and Path(path).is_file():
+            self._fbl_key_file = Path(path)
+        self._commit_dflash_bytes(
+            patched_df,
+            tr(
+                f"Ключ FBL RSA-1024 вшит в DataFlash (0xFF20ED00, N={modulus.hex().upper()[:12]}…).",
+                f"FBL RSA-1024 key embedded into DataFlash (0xFF20ED00, N={modulus.hex().upper()[:12]}…).",
+            ),
+        )
+
+    def sign_odx_datablock(self) -> None:
+        """Open a dialog to sign an FPK_E ODX `<FLASHDATA>` block with a private RSA-1024 (`e = 3`) key."""
+        if self.runner.is_busy:
+            return
+        gen = self._session_gen
+        dlg = _FpkeOdxSignDialog(
+            key_path=self._fbl_key_file,
+            default_dir=self.folder or Path.home(),
+            parent=self,
+        )
+        if not run_dialog(dlg):
+            return
+        key_path = dlg.key_path
+        data_path = dlg.data_path
+        start_addr = dlg.source_start_address
+        usize = dlg.uncompressed_size
+        if key_path is None or data_path is None or start_addr is None or usize is None:
+            return
+
+        def task(_rep: Any) -> bytes:
+            modulus, d_int = load_rsa1024_key_material(key_path)
+            if d_int is None:
+                raise ValueError(
+                    tr(
+                        "В выбранном файле нет приватной части ключа RSA-1024 — подписать блок невозможно.",
+                        "The selected key file has no private RSA-1024 component — cannot sign.",
+                    )
+                )
+            return sign_fpke_odx_datablock(
+                data_path.read_bytes(),
+                source_start_address=start_addr,
+                uncompressed_size=usize,
+                n_bytes=modulus,
+                d_int=d_int,
+            )
+
+        def done(sig: bytes) -> None:
+            if not (_qt_valid(self) and self.is_open and self._session_gen == gen):
+                return
+            self._fbl_key_file = key_path
+            run_dialog(
+                TextResultDialog(
+                    self,
+                    tr("Подпись блока ODX FPK_E", "FPK_E ODX datablock signature"),
+                    f'<FW-SIGNATURE TYPE="A_BYTEFIELD">{sig.hex().upper()}</FW-SIGNATURE>',
+                    tr(
+                        f"Блок {data_path.name} (addr=0x{start_addr:08X}, usize=0x{usize:X}) — вставьте строку в .odx.",
+                        f"Block {data_path.name} (addr=0x{start_addr:08X}, usize=0x{usize:X}) — paste into .odx.",
+                    ),
+                )
+            )
+
+        self.runner.run_task(
+            tr("Подпись блока ODX FPK_E (RSA-1024, e=3)", "Signing FPK_E ODX datablock (RSA-1024, e=3)"),
+            task,
+            on_success=done,
+        )
+
+    def restore_stock_fbl_rsa_key(self) -> None:
+        """Restore the stock VAG FBL RSA-1024 public modulus in DataFlash `0xFF20ED00`."""
+        df_bytes, _ = self._own_dflash_and_cflash()
+        if df_bytes is None:
+            return
+        patched_df = apply_fpke_dflash_fbl_rsa_key(df_bytes, restore_stock=True)
+        self._commit_dflash_bytes(
+            patched_df,
+            tr(
+                "Возвращён заводской ключ VAG FBL RSA-1024 в DataFlash (0xFF20ED00).",
+                "Restored factory VAG FBL RSA-1024 key in DataFlash (0xFF20ED00).",
+            ),
+        )
+
+    def load_cflash_from_file(self, path: Path | None = None) -> None:
+        """Load a 2 MB `Cflash.bin` image from disk for `BOLO` bootloader analysis and patching."""
+        if path is None:
+            picked, _ = QFileDialog.getOpenFileName(
+                self,
+                tr("Выберите дамп CodeFlash (Cflash.bin, 2 МБ)", "Select CodeFlash dump (Cflash.bin, 2 MB)"),
+                str(self.folder or Path.home()),
+                "CodeFlash (*.bin);;All files (*)",
+            )
+            if not picked:
+                return
+            path = Path(picked)
+        try:
+            raw = path.read_bytes()
+            b_info = analyze_fpke_cflash_bootloader(raw)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                tr("Некорректный файл CodeFlash", "Invalid CodeFlash file"),
+                str(exc),
+            )
+            return
+        self._orig_cflash_path = path
+        self._orig_cflash_bytes = raw
+        self._working_cflash_path = path
+        self._set_cflash_bytes(raw, precomputed_info=b_info)
+        self.files["cflash"] = path
+        if self._working_dflash_bytes is not None:
+            self.dflash_info = analyze_fpke_dflash(self._working_dflash_bytes, self._cflash_bytes)
+        self.refresh()
+        self.changed.emit()
+        self.note.emit(
+            tr(
+                f"Загружен CodeFlash: BOLO {b_info['bolo_version']} ({path.name})",
+                f"Loaded CodeFlash: BOLO {b_info['bolo_version']} ({path.name})",
+            )
+        )
+
+    def apply_cflash_engineering_bootloader(self, *, restore_stock: bool = False) -> None:
+        """Patch (or restore) `BOLO` `.LoaderRAMCOPY` RSA verification in `Cflash.bin` and update `.MemCheckCrcTblApp[0]`."""
+        if self._cflash_bytes is None:
+            return
+        try:
+            patched_cf, after_info = apply_fpke_cflash_rsa_patch(self._cflash_bytes, restore_stock=restore_stock)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                tr("Ошибка патча загрузчика BOLO", "BOLO bootloader patch error"),
+                str(exc),
+            )
+            return
+
+        out_path: Path | None = None
+        reverted_to_orig = self._orig_cflash_bytes is not None and patched_cf == self._orig_cflash_bytes
+        if reverted_to_orig:
+            old_work = self._working_cflash_path
+            if (
+                old_work is not None
+                and old_work != self._orig_cflash_path
+                and old_work.parent.name == "ContiTool_edited"
+            ):
+                with contextlib.suppress(OSError):
+                    old_work.unlink()
+            self._working_cflash_path = self._orig_cflash_path
+            if self._orig_cflash_path is not None:
+                self.files["cflash"] = self._orig_cflash_path
+                out_path = self._orig_cflash_path
+        elif self.folder is not None and self.folder.is_dir():
+            edit_dir = self.folder / "ContiTool_edited"
+            base_cf = self._orig_cflash_path or self.files.get("cflash")
+            out_name = base_cf.name if base_cf is not None else "Cflash.bin"
+            out_path = edit_dir / out_name
+            try:
+                atomic_write(out_path, patched_cf)
+            except OSError as exc:
+                QMessageBox.warning(
+                    self,
+                    tr("Ошибка сохранения Cflash.bin", "Failed to save Cflash.bin"),
+                    str(exc),
+                )
+                return
+            self._working_cflash_path = out_path
+            self.files["cflash"] = out_path
+
+        self._set_cflash_bytes(patched_cf, precomputed_info=after_info)
+        self.refresh()
+        self.changed.emit()
+        crc_str = after_info["memcheck_bolo_entry"]["stored_crc"]
+        offs_str = ", ".join(after_info["patch_cflash_offsets"])
+        if restore_stock:
+            msg = tr(
+                f"Заводской загрузчик BOLO {after_info['bolo_version']} восстановлен ({offs_str}; CRC-32 @ 0x03138C = {crc_str})"
+                + (f": {out_path}" if out_path else ""),
+                f"Factory bootloader BOLO {after_info['bolo_version']} restored ({offs_str}; CRC-32 @ 0x03138C = {crc_str})"
+                + (f": {out_path}" if out_path else ""),
+            )
+        else:
+            msg = tr(
+                f"Инженерный загрузчик BOLO {after_info['bolo_version']} (RSA-Free) пропатчен ({offs_str}; CRC-32 @ 0x03138C = {crc_str})"
+                + (f": {out_path}" if out_path else ""),
+                f"Engineering bootloader BOLO {after_info['bolo_version']} (RSA-Free) patched ({offs_str}; CRC-32 @ 0x03138C = {crc_str})"
+                + (f": {out_path}" if out_path else ""),
+            )
+        self.note.emit(msg)
+
+    def save_cflash_as(self) -> None:
+        """Export the current working `Cflash.bin` image to a user-chosen file."""
+        if self._cflash_bytes is None:
+            return
+        default_dir = self.folder or Path.home()
+        state = (self._cflash_boot_info or {}).get("state")
+        if state == "engineering":
+            suffix = "Cflash_engineering.bin"
+        elif state == "stock":
+            suffix = "Cflash_stock.bin"
+        else:
+            suffix = "Cflash_opened.bin"
+        dest, _ = QFileDialog.getSaveFileName(
+            self,
+            tr("Сохранить дамп CodeFlash (2 МБ)", "Save CodeFlash dump (2 MB)"),
+            str(default_dir / f"{self.part_number}_{suffix}"),
+            "CodeFlash 2 MB (*.bin);;All files (*)",
+        )
+        if not dest:
+            return
+        out_path = Path(dest)
+        try:
+            atomic_write(out_path, self._cflash_bytes)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                tr("Ошибка сохранения Cflash.bin", "Failed to save Cflash.bin"),
+                str(exc),
+            )
+            return
+        self.note.emit(tr(f"Дамп CodeFlash сохранён: {out_path}", f"CodeFlash dump saved: {out_path}"))
 
     # ────────────────────────────── Page 4: Memory Read ──────────────────────────────
 

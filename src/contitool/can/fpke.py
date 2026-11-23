@@ -46,6 +46,8 @@ from contitool.core.fpke import (
     FPKE_CFLASH_CONTROL_PREFIX,
     FPKE_CFLASH_SIZE,
     FPKE_DFLASH_ADDR,
+    FPKE_DFLASH_FBL_RSAKEY_OFFSET,
+    FPKE_DFLASH_FBL_RSAKEY_SIZE,
     FPKE_DFLASH_SIZE,
     FPKE_EXTRA_ADDR,
     FPKE_EXTRA_SIZE,
@@ -4103,59 +4105,128 @@ def can_fpke_write_dflash(
             ref_base = base_bytes if base_bytes is not None else dflash_before
             change_summary = summarize_fpke_dflash_changes(ref_base, cand_bytes, cflash_bytes)
             eel_updates = extract_fpke_eel_updates(ref_base, cand_bytes, cflash_bytes)
-            use_smart_eel = (not full_rewrite) and bool(eel_updates) and bool(change_summary.get("is_pure_eel_update"))
+            ref_clean_df, ref_mask = normalize_fpke_dflash_for_faci(ref_base, cflash_bytes)
+            cand_clean_df, cand_mask = normalize_fpke_dflash_for_faci(cand_bytes, cflash_bytes)
+            has_eel_append = (
+                (not full_rewrite)
+                and bool(eel_updates)
+                and bool(change_summary.get("eel_pool_append_only") or change_summary.get("is_pure_eel_update"))
+            )
+            eel_pool_unchanged = (
+                (not full_rewrite)
+                and (not eel_updates)
+                and ref_clean_df[:pool_end] == cand_clean_df[:pool_end]
+                and ref_mask[:pool_end] == cand_mask[:pool_end]
+            )
+            tail_diff_128_offsets = [
+                off
+                for off in range(pool_end, FPKE_DFLASH_SIZE, 128)
+                if ref_clean_df[off : off + 128] != cand_clean_df[off : off + 128]
+                or ref_mask[off : off + 128] != cand_mask[off : off + 128]
+            ]
+            use_smart_eel = has_eel_append and not tail_diff_128_offsets
+            use_smart_tail = eel_pool_unchanged and bool(tail_diff_128_offsets)
+            use_smart_both = has_eel_append and bool(tail_diff_128_offsets)
 
-            if use_smart_eel:
-                write_mode = "smart_eel_append"
+            if use_smart_eel or use_smart_tail or use_smart_both:
+                if use_smart_both:
+                    write_mode = "smart_eel_and_tail"
+                elif use_smart_eel:
+                    write_mode = "smart_eel_append"
+                else:
+                    write_mode = "smart_tail_update"
+
                 live_clean_df, live_mask = normalize_fpke_dflash_for_faci(dflash_before, cflash_bytes)
-                blocks_live, _ = eel_parse_pool(lay, live_clean_df, live_mask)
-                active_nums = {b["vb"] for b in blocks_live if b["state"] == "active"}
-                ring_start = 0
-                if 0 in active_nums and (n_vb - 1) in active_nums and len(active_nums) < n_vb:
-                    for c_vb in sorted(active_nums):
-                        if ((c_vb - 1) % n_vb) not in active_nums:
-                            ring_start = c_vb
-                            break
-                active_sorted = sorted(
-                    (b for b in blocks_live if b["state"] == "active"),
-                    key=lambda blk: (blk["ec"] or 0, (blk["vb"] - ring_start) % n_vb),
-                )
-                head_vb = active_sorted[-1]["vb"]
-                scan_vbs = [head_vb, (head_vb + 1) % n_vb, (head_vb + 2) % n_vb]
                 live_clean_mut = bytearray(live_clean_df)
                 live_mask_mut = bytearray(live_mask)
-                scanned_blk_offsets: set[int] = set()
-                for v_idx in scan_vbs:
-                    vb_off = lay["base"] + v_idx * vb_sz
-                    bc_slice, bc_mask = fpke_read_dflash_blank_checked(
-                        link,
-                        offset=vb_off,
-                        length=vb_sz,
-                        cpu_dflash=dflash_before,
-                        reporter=reporter,
+                scanned_eel_offsets: set[int] = set()
+                scanned_tail_offsets: set[int] = set()
+
+                if use_smart_eel or use_smart_both:
+                    blocks_live, _ = eel_parse_pool(lay, live_clean_df, live_mask)
+                    active_nums = {b["vb"] for b in blocks_live if b["state"] == "active"}
+                    ring_start = 0
+                    if 0 in active_nums and (n_vb - 1) in active_nums and len(active_nums) < n_vb:
+                        for c_vb in sorted(active_nums):
+                            if ((c_vb - 1) % n_vb) not in active_nums:
+                                ring_start = c_vb
+                                break
+                    active_sorted = sorted(
+                        (b for b in blocks_live if b["state"] == "active"),
+                        key=lambda blk: (blk["ec"] or 0, (blk["vb"] - ring_start) % n_vb),
                     )
-                    live_clean_mut[vb_off : vb_off + vb_sz] = bc_slice
-                    live_mask_mut[vb_off : vb_off + vb_sz] = bc_mask
-                    for bo in range(vb_off, vb_off + vb_sz, 64):
-                        scanned_blk_offsets.add(bo)
+                    head_vb = active_sorted[-1]["vb"]
+                    scan_vbs = [head_vb, (head_vb + 1) % n_vb, (head_vb + 2) % n_vb]
+                    for v_idx in scan_vbs:
+                        vb_off = lay["base"] + v_idx * vb_sz
+                        bc_slice, bc_mask = fpke_read_dflash_blank_checked(
+                            link,
+                            offset=vb_off,
+                            length=vb_sz,
+                            cpu_dflash=dflash_before,
+                            reporter=reporter,
+                        )
+                        live_clean_mut[vb_off : vb_off + vb_sz] = bc_slice
+                        live_mask_mut[vb_off : vb_off + vb_sz] = bc_mask
+                        for bo in range(vb_off, vb_off + vb_sz, 64):
+                            scanned_eel_offsets.add(bo)
+
+                if use_smart_tail or use_smart_both:
+                    for t_off in tail_diff_128_offsets:
+                        bc_slice, bc_mask = fpke_read_dflash_blank_checked(
+                            link,
+                            offset=t_off,
+                            length=128,
+                            cpu_dflash=dflash_before,
+                            reporter=reporter,
+                        )
+                        live_clean_mut[t_off : t_off + 128] = bc_slice
+                        live_mask_mut[t_off : t_off + 128] = bc_mask
+                        scanned_tail_offsets.add(t_off)
+                        scanned_tail_offsets.add(t_off + 64)
 
                 live_clean_df = bytes(live_clean_mut)
                 live_mask = live_mask_mut
-                synth_before_mask = eel_faci_word_mask(lay, live_clean_df)
-                appended_df = eel_append_records(live_clean_df, eel_updates, cflash_bytes)
-                target_clean_df, target_mask = normalize_fpke_dflash_for_faci(appended_df, cflash_bytes)
-                # Preserve exact hardware BCST on untouched words inside scanned VBs so only newly appended EEL words are programmed
-                target_clean_mut = bytearray(target_clean_df)
-                target_mask_mut = bytearray(target_mask)
-                for bo in scanned_blk_offsets:
-                    for w in range(16):
-                        pos = bo + w * 4
-                        newly_added = (not any(synth_before_mask[pos : pos + 4])) and any(target_mask_mut[pos : pos + 4])
-                        if not newly_added:
-                            target_mask_mut[pos : pos + 4] = live_mask[pos : pos + 4]
-                            target_clean_mut[pos : pos + 4] = live_clean_df[pos : pos + 4]
+                target_clean_mut = bytearray(live_clean_df)
+                target_mask_mut = bytearray(live_mask)
+
+                if use_smart_eel or use_smart_both:
+                    synth_before_mask = eel_faci_word_mask(lay, live_clean_df)
+                    appended_df = eel_append_records(live_clean_df, eel_updates, cflash_bytes)
+                    eel_target_clean, eel_target_mask = normalize_fpke_dflash_for_faci(appended_df, cflash_bytes)
+                    # Preserve exact hardware BCST on untouched words inside scanned VBs so only newly appended EEL words are programmed
+                    for bo in scanned_eel_offsets:
+                        for w in range(16):
+                            pos = bo + w * 4
+                            newly_added = (not any(synth_before_mask[pos : pos + 4])) and any(eel_target_mask[pos : pos + 4])
+                            if newly_added:
+                                target_mask_mut[pos : pos + 4] = eel_target_mask[pos : pos + 4]
+                                target_clean_mut[pos : pos + 4] = eel_target_clean[pos : pos + 4]
+
+                if use_smart_tail or use_smart_both:
+                    # Treat .FBL_RSAKEY (0xED00..0xED7F) as an atomic 128-byte logical field if any byte in it changed,
+                    # while preserving exact hardware BCST on untouched words elsewhere in scanned tail slices so
+                    # CPU-read floating-gate noise in erased cells is never programmed.
+                    rsa_off = FPKE_DFLASH_FBL_RSAKEY_OFFSET
+                    rsa_end = rsa_off + FPKE_DFLASH_FBL_RSAKEY_SIZE
+                    rsa_changed = (
+                        ref_clean_df[rsa_off:rsa_end] != cand_clean_df[rsa_off:rsa_end]
+                        or ref_mask[rsa_off:rsa_end] != cand_mask[rsa_off:rsa_end]
+                    )
+                    for t_off in tail_diff_128_offsets:
+                        for pos in range(t_off, t_off + 128, 4):
+                            in_changed_rsa = rsa_changed and (rsa_off <= pos < rsa_end)
+                            word_changed = (
+                                ref_clean_df[pos : pos + 4] != cand_clean_df[pos : pos + 4]
+                                or ref_mask[pos : pos + 4] != cand_mask[pos : pos + 4]
+                            )
+                            if in_changed_rsa or word_changed:
+                                target_clean_mut[pos : pos + 4] = cand_clean_df[pos : pos + 4]
+                                target_mask_mut[pos : pos + 4] = cand_mask[pos : pos + 4]
+
                 target_clean_df = bytes(target_clean_mut)
                 target_mask = target_mask_mut
+                scanned_blk_offsets = scanned_eel_offsets | scanned_tail_offsets
                 block_jobs = _build_faci_block_jobs(
                     live_clean_df,
                     live_mask,
