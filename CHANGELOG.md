@@ -1,5 +1,25 @@
 # Changelog / История изменений
 
+## 2.2.1 — 2026-11-23
+
+### 🇷🇺 Исправлено
+- **D-PDU на локализованных Windows (`'NoneType' object has no attribute 'splitlines'`, #47):** в `vci_programs_running()` добавлен `errors="replace"` для декодирования вывода `tasklist` (который на турецкой и других не-UTF-8 локалях Windows выводит байты OEM-кодировки, обрушавшие поток чтения `subprocess` с `stdout=None`) и защита от пустого вывода.
+- **Чтение памяти через J2534 (`PassThruReadMsgs: J2534 error 0x12 / ERR_BUFFER_OVERFLOW`, #45):** для адаптеров J2534 (в том числе Scanmatik SM2 USB) размер пакета чтения по умолчанию снижен до 16 КБ (`4 × 4 КБ`), увеличен пакетный буфер приёма `_RX_BATCH` до 256 кадров, добавлена очистка буфера `PassThruIoctl(CLEAR_RX_BUFFER = 0x08)`, обработка `ERR_BUFFER_OVERFLOW` в `drain_rx` / `drain_until_quiet` и защита очистки при повторах в `read_memory_area()` с автоматическим уменьшением пакета до 4 КБ.
+- **Заводской RAM-Loader на медленных VNCI 6154A (`0300020001` / `0300050006`, #49, #51):**
+  - В `DPduBus` добавлено адаптивное окно отправки RawMode: при стабильной задержке TX-примитива ≥ 50–80 мс (на отдельных VNCI задержка достигает 130–200 мс и превышает ~150 мс межкадровый таймаут RAM-Loader) окно автоматически расширяется с 1 до 4 кадров с немедленным возвратом к 1 при `ERR_TX_QUEUE_FULL`.
+  - В `send_loader_payload()` добавлена повторная синхронизация `84 00 00 00 00` после ответа `0300020001` / `0300050006` (закрывающего предыдущий оборванный пакет), добавлена расшифровка этих кодов ошибки в `_probe_beacon_in_loader()`, а `_loader_reset_command()` теперь повторяет сброс `FE FF` до 3 раз при потере кадра синхронизации.
+- **Устойчивость прошивки приложения по UDS `0x36 TransferData` (`PDU_ERR_EVT_PROT_ERR 0x105` / `No CAN frame from 0x77A`, #44):** при разовом сбое протокола на аппаратном ISO-TP (`0x105` при живом канале VCI) идемпотентный блок `0x36` теперь повторяется до 2 раз на том же аппаратном канале `ISO_15765` вместо немедленного и необратимого сброса на программный RawMode для всех оставшихся блоков; на программном ISO-TP также добавлен однократный повтор блока `0x36` при разовом таймауте.
+- **Диагностика отказа входа в сессию программирования (`10 02 -> 7F 10 22`, #52):** анализируются и выводятся коды невыполненных предусловий из ответа `31 01 02 03`, при `7F 10 22` (`conditionsNotCorrect`) сразу выдаётся понятное сообщение с проверкой питания на столе (`+12 В` на контактах `1 KL30` и `14 KL15`, `12.5–13.5 В`) без лишнего опроса `0x6F0` и холостых сбросов.
+
+### 🇬🇧 Fixed
+- **D-PDU on localized Windows (`'NoneType' object has no attribute 'splitlines'`, #47):** `vci_programs_running()` now passes `errors="replace"` when decoding `tasklist` output (whose OEM-codepage bytes on Turkish and other non-UTF-8 Windows locales killed Python's `subprocess` reader thread and left `.stdout` as `None`) and safely guards empty output.
+- **Memory reads over J2534 (`PassThruReadMsgs: J2534 error 0x12 / ERR_BUFFER_OVERFLOW`, #45):** J2534 adapters (including Scanmatik SM2 USB) now start with 16 KB bursts (`4 × 4 KB`), use a larger `_RX_BATCH = 256`, flush the RX queue via `PassThruIoctl(CLEAR_RX_BUFFER = 0x08)`, handle `ERR_BUFFER_OVERFLOW` inside `drain_rx` / `drain_until_quiet`, and guard retry cleanup in `read_memory_area()` while stepping bursts down to 4 KB on overflow.
+- **Factory RAM-Loader on high-latency VNCI 6154A units (`0300020001` / `0300050006`, #49, #51):**
+  - `DPduBus` now uses an adaptive RawMode TX pipeline window: when waited TX primitive latency reaches ≥ 50–80 ms (some VNCI units take 130–200 ms per frame, exceeding the RAM-Loader's ~150 ms inter-frame timeout), the window expands from 1 to 4 in-flight frames and immediately drops back to 1 if `ERR_TX_QUEUE_FULL` is ever seen.
+  - `send_loader_payload()` now retries `84 00 00 00 00` sync once after `0300020001` / `0300050006` (which aborts a prior broken packet), `_probe_beacon_in_loader()` explains those loader abort codes, and `_loader_reset_command()` retries `FE FF` reset sync up to 3 times on dropped frames.
+- **UDS `0x36 TransferData` flash resilience (`PDU_ERR_EVT_PROT_ERR 0x105` / `No CAN frame from 0x77A`, #44):** transient hardware ISO-TP glitches (such as D-PDU `0x105` while the VCI link remains online) now retry the idempotent `0x36` block up to 2 times on the live hardware `ISO_15765` link instead of permanently falling back to slow RawMode software ISO-TP for the remaining blocks; software ISO-TP also retries a `0x36` block once on transient timeout.
+- **Programming Session refusal diagnostics (`10 02 -> 7F 10 22`, #52):** ContiTool now inspects and logs non-zero precondition failure bytes from `31 01 02 03` and raises a clear bilingual `ProgrammingConditionsError` on `7F 10 22` (`conditionsNotCorrect`) with bench power guidance (`+12 V` on both Pin `1 KL30` and Pin `14 KL15`, `12.5–13.5 V`), skipping redundant `0x6F0` probes and blind reset loops.
+
 ## 2.2.0 — 2026-11-20
 
 ### 🇷🇺 Исправлено

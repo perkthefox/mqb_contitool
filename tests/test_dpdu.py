@@ -1940,3 +1940,148 @@ def test_closing_link_while_echoes_arrive_never_races_echo_trace(tmp_path) -> No
             link.send_frame(0x6F0, LOADER_SYNC)
     assert not bus.spent and bus._rx_error is None and bus.echo_trace is None
     bus.shutdown()
+
+
+def test_vci_programs_running_survives_non_utf8_and_none_stdout(monkeypatch) -> None:
+    """Issue #47: Turkish Windows `tasklist` writes OEM codepage bytes that killed subprocess's reader thread
+    and left `.stdout` as None, crashing Link check with `'NoneType' object has no attribute 'splitlines'`."""
+    seen_kwargs: list[dict] = []
+
+    def fake_run(*_args, **kwargs):
+        seen_kwargs.append(kwargs)
+        return type("R", (), {"stdout": None})()
+
+    monkeypatch.setattr(dpdu.sys, "platform", "win32")
+    monkeypatch.setattr(dpdu.subprocess, "run", fake_run)
+    assert dpdu.vci_programs_running() == []
+    dpdu.check_vci_free()
+    assert seen_kwargs and seen_kwargs[0].get("errors") == "replace"
+
+    # Also survives bytes containing non-UTF-8 OEM sequences and UnicodeDecodeError
+    raw_oem = b'"sistem\x8d.exe","4","Services","0","12 K"\r\n"VCTool.exe","778","Console","1","1 K"\r\n'
+    monkeypatch.setattr(dpdu.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": raw_oem})())
+    assert dpdu.vci_programs_running() == ["VCTool.exe"]
+
+    def bad_decode(*_a, **_k):
+        raise UnicodeDecodeError("cp1254", b"\x8d", 0, 1, "invalid")
+
+    monkeypatch.setattr(dpdu.subprocess, "run", bad_decode)
+    assert dpdu.vci_programs_running() == []
+
+
+def test_slow_rawmode_vci_raises_tx_window_and_drops_back_on_queue_full(monkeypatch) -> None:
+    """Issue #49: a VNCI whose RawMode TX primitives take ~150 ms exceeds the RAM-Loader's inter-frame timeout at
+    window=1; DPduBus pipelines up to SLOW_TX_IN_FLIGHT once waited TX RTT is slow, ignores idle caller pauses,
+    and drops immediately back to MAX_TX_IN_FLIGHT on ERR_TX_QUEUE_FULL."""
+    clock = [100.0]
+
+    class SlowRawApi(FakePduApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pending_due: list[tuple[int, float]] = []
+            self.delay = 0.0
+            self.queue_full_once = False
+
+        def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+            if hcll != self.monitor and cop == COPT_SENDRECV and self.queue_full_once:
+                self.queue_full_once = False
+                return dpdu.ERR_TX_QUEUE_FULL
+            rc = super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+            if rc == 0 and hcll != self.monitor and cop == COPT_SENDRECV and self.tx_open:
+                self.pending_due.append((self.tx_open.pop(), clock[0] + self.delay))
+                self.max_open = max(self.max_open, len(self.pending_due))
+            return rc
+
+        def _get_event(self, hmod, hcll, out) -> int:
+            if hcll != self.monitor:
+                ready = [item for item in self.pending_due if item[1] <= clock[0]]
+                if ready:
+                    cop, _ = ready[0]
+                    self.pending_due.remove(ready[0])
+                    st = C.c_uint32(0x8012)
+                    self.keep.append(st)
+                    self.events[hcll].append(EventItem(IT_STATUS, cop, None, 0, C.cast(C.pointer(st), C.c_void_p)))
+            return super()._get_event(hmod, hcll, out)
+
+    api = SlowRawApi()
+    bus = DPduBus(dll=api)
+    monkeypatch.setattr(dpdu.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(dpdu.time, "sleep", lambda dt: clock.__setitem__(0, clock[0] + max(dt, 0.02)))
+
+    # 1. Idle gap between fast frames must NOT falsely expand the TX window
+    api.delay = 0.002
+    bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False))
+    clock[0] += 0.25  # caller paused between requests; primitive already finished at +2 ms
+    bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False))
+    assert bus._tx_window == MAX_TX_IN_FLIGHT
+
+    # 2. Genuine 140 ms RawMode TX RTT during a back-to-back burst expands window to SLOW_TX_IN_FLIGHT
+    clock[0] += 0.1
+    api.delay = 0.14
+    api.max_open = 0
+    for _ in range(6):
+        bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False))
+    assert bus._tx_window == dpdu.SLOW_TX_IN_FLIGHT
+    assert api.max_open == dpdu.SLOW_TX_IN_FLIGHT
+
+    # 3. ERR_TX_QUEUE_FULL immediately clamps window back to MAX_TX_IN_FLIGHT
+    clock[0] += 0.2
+    api.queue_full_once = True
+    bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False))
+    assert bus._tx_window == MAX_TX_IN_FLIGHT
+    bus.shutdown()
+
+
+def test_transient_hw_isotp_0x105_on_transfer_data_retries_without_dropping_hw_uds(monkeypatch) -> None:
+    """Issue #44: a single PDU_ERR_EVT_PROT_ERR (0x105) on `36 2F` leaves the D-PDU ISO_15765 link ONLINE.
+    ContiTool must retry the idempotent `36` block on hardware ISO-TP instead of permanently dropping to RawMode."""
+    from contitool.can import J533CanLink, transport, workflows
+    from contitool.core.constants import APP_SIZE
+    from contitool.progress import OperationReporter
+
+    class GlitchOnceUdsApi(UdsCapablePduApi):
+        def __init__(self) -> None:
+            super().__init__(require_resource_lookup=True, finish_on_78=True)
+            self.glitched = False
+
+        def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+            if (
+                hcll in self.uds_links
+                and cop == COPT_SENDRECV
+                and size > 2
+                and data[0] == 0x36
+                and data[1] == 0x2F
+                and not self.glitched
+            ):
+                self.glitched = True
+                cid = self.next_cop
+                self.next_cop += 1
+                hcop._obj.value = cid
+                err = dpdu.ErrorData(0x105, 0x208)  # PDU_ERR_EVT_PROT_ERR, ExtraError=520
+                ev = EventItem(IT_ERROR, cid, None, 0, C.cast(C.pointer(err), C.c_void_p))
+                self.keep += [err, ev]
+                self.events[hcll].append(ev)
+                self._queue_uds_done(hcll, cid)
+                return 0
+            return super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+
+    set_lang("en")
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(transport.time, "sleep", lambda _s: None)
+    warnings: list[str] = []
+
+    class Rep(OperationReporter):
+        def warning(self, message: str) -> None:
+            warnings.append(message)
+
+    api = GlitchOnceUdsApi()
+    bus = DPduBus(dll=api)
+    app_image = bytes(((i * 53) ^ (i >> 7)) & 0xFF for i in range(APP_SIZE))
+    with J533CanLink("", bus=bus) as link:
+        res = workflows._program_application_uds(link, app_image, reporter=Rep())
+    assert api.glitched is True
+    assert res["hardware_isotp"] is True
+    assert "hardware_isotp_fell_back_at" not in res
+    assert not any("software path" in w for w in warnings)
+    assert bytes(api.flashed_app) == app_image
+    bus.shutdown()

@@ -26,6 +26,33 @@ P2_STAR_WAIT = 6.0  # P2*server 5.0 s + 1 s for adapter latency
 FRAME_SEND_TIMEOUT = 1.0
 BLOCK_SEND_TIMEOUT = 5.0  # a whole ISO-TP block in one adapter call, so up to 0x20 frames at once
 TRANSPORT_ERRORS = (TimeoutError, can.CanError)  # the link failed — as opposed to the ECU answering "no"
+# Transient hardware ISO-TP retries for idempotent 0x36 TransferData before giving up on hardware ISO-TP (#44).
+HW_TRANSFER_DATA_RETRIES = 2
+# Factory RAM-Loader (0x0100120E) 5-byte error frames on 0x6F1 (4-byte status + XOR checksum):
+#   03 00 02 00 01 — packet receive timeout / framing abort (inter-frame gap > ~150 ms or dropped TX frame)
+#   03 00 05 00 06 — unexpected frame / protocol desync (frame arrived while loader waited for 84 00 00 00 00)
+LOADER_ERR_TIMEOUT = bytes.fromhex("0300020001")
+LOADER_ERR_UNSYNC = bytes.fromhex("0300050006")
+LOADER_ERR_FRAMES = (LOADER_ERR_TIMEOUT, LOADER_ERR_UNSYNC)
+
+
+def describe_loader_error(raw: bytes) -> str | None:
+    """Explain known 0x6F1 factory RAM-Loader abort frames (`0300020001` / `0300050006`), or None if unknown."""
+    if not raw:
+        return None
+    if raw.startswith(LOADER_ERR_TIMEOUT) or LOADER_ERR_TIMEOUT in raw:
+        return tr(
+            "заводской RAM-Loader прервал приём пакета по таймауту между кадрами (~150 мс) или из-за потери кадра "
+            "адаптером; проверьте USB-кабель / задержки VCI или попробуйте другой порт / адаптер",
+            "factory RAM-Loader aborted the packet due to inter-frame timeout (~150 ms) or a dropped TX frame; "
+            "check USB cable / VCI latency or try another port / adapter",
+        )
+    if raw.startswith(LOADER_ERR_UNSYNC) or LOADER_ERR_UNSYNC in raw:
+        return tr(
+            "заводской RAM-Loader потерял синхронизацию пакета (пропущен кадр отправки адаптером)",
+            "factory RAM-Loader lost packet sync (a TX frame was dropped by the adapter)",
+        )
+    return None
 
 
 class UdsNegativeResponse(RuntimeError):
@@ -370,6 +397,7 @@ class J533CanLink:
         raw_buf = getattr(self.bus, "_buffer", None)
         drained = 0
         polls = 0
+        overflows = 0
         max_polls = max_frames * 4 + 256
         while drained < max_frames and polls < max_polls:
             polls += 1
@@ -380,9 +408,19 @@ class J533CanLink:
                 msg = self.bus.recv(timeout=0.0)
             except can.CanOperationError as exc:
                 from contitool.can.dpdu import FrameError
+                from contitool.can.j2534 import J2534BufferOverflowError
 
-                if not isinstance(exc, FrameError):
+                if not isinstance(exc, (FrameError, J2534BufferOverflowError)):
                     raise
+                if isinstance(exc, J2534BufferOverflowError):
+                    clear_rx = getattr(self.bus, "clear_rx_buffer", None)
+                    if callable(clear_rx):
+                        clear_rx()
+                    overflows += 1
+                    drained += 1
+                    if overflows >= 8:
+                        break
+                    continue
                 drained += 1
                 continue  # a result of the stale stream the bus could not interpret: thrown away with the rest
             if msg is None:
@@ -421,9 +459,15 @@ class J533CanLink:
                 msg = self.bus.recv(timeout=wait)
             except can.CanOperationError as exc:
                 from contitool.can.dpdu import FrameError
+                from contitool.can.j2534 import J2534BufferOverflowError
 
-                if not isinstance(exc, FrameError):
+                if not isinstance(exc, (FrameError, J2534BufferOverflowError)):
                     raise
+                if isinstance(exc, J2534BufferOverflowError):
+                    clear_rx = getattr(self.bus, "clear_rx_buffer", None)
+                    if callable(clear_rx):
+                        clear_rx()
+                    time.sleep(0.01)
                 discarded += 1
                 quiet_since = time.monotonic()
                 continue
@@ -622,50 +666,65 @@ class J533CanLink:
         req_sid = req[0]
         uds_only = bool(getattr(self.bus, "uds_only", False)) and (self.UDS_TX_ID, self.UDS_RX_ID) == (0x710, 0x77A)
         if self._hw_uds or uds_only:
-            self._write_trace("uds_tx", self.UDS_TX_ID, len(req), req[:16])
-            self.tx_frames += 1
-            try:
-                resp = self.bus.request_uds(req, timeout=timeout, allow_pending=allow_pending)
-            except TRANSPORT_ERRORS as exc:
-                if not resend:
-                    raise
-                # The adapter's ISO-TP failed. Mid-flash the application may already be erased, so this request
-                # goes again on the verified software path instead of ending the operation. The ECU refusing
-                # (a 7F answer) is not caught here: that is its answer, and no transport would change it.
-                self.drop_hw_uds()
-                if not uds_only:
-                    self._write_trace("uds_hw_fallback", self.UDS_TX_ID, len(req), req[:16])
-                if getattr(self.bus, "spent", False):
-                    # The VCI itself is gone (it reboots, #19-#22): the software path would only fail on the next
-                    # frame with "this link no longer works", after promising to carry on.
-                    from contitool.can.dpdu import driver_unstable
+            # TransferData (0x36) with the same sequence counter is idempotent per ISO 14229: on a single-block
+            # ISO-TP glitch (e.g. D-PDU 0x105 / N_Bs timeout, #44) the hardware link is still ONLINE, so retry it
+            # before abandoning hardware ISO-TP for the rest of a 2,975-block flash.
+            hw_attempts = (1 + HW_TRANSFER_DATA_RETRIES) if (req_sid == 0x36 and resend) else 1
+            last_hw_exc: BaseException | None = None
+            for hw_try in range(hw_attempts):
+                self._write_trace("uds_tx", self.UDS_TX_ID, len(req), req[:16])
+                self.tx_frames += 1
+                try:
+                    resp = self.bus.request_uds(req, timeout=timeout, allow_pending=allow_pending)
+                except TRANSPORT_ERRORS as exc:
+                    last_hw_exc = exc
+                    if not resend:
+                        raise
+                    if getattr(self.bus, "spent", False):
+                        break  # the VCI itself is gone: do not retry on a dead link
+                    if hw_try + 1 < hw_attempts:
+                        self._write_trace("uds_hw_retry", self.UDS_TX_ID, len(req), req[:16])
+                        time.sleep(0.2)
+                        continue
+                else:
+                    self._write_trace("uds_rx", self.UDS_RX_ID, len(resp), resp[:16])
+                    self.rx_frames += 1
+                    return _checked_response(req_sid, resp, expected_sid)
+            assert last_hw_exc is not None
+            exc = last_hw_exc
+            # The adapter's ISO-TP failed. Mid-flash the application may already be erased, so this request
+            # goes again on the verified software path instead of ending the operation. The ECU refusing
+            # (a 7F answer) is not caught here: that is its answer, and no transport would change it.
+            self.drop_hw_uds()
+            if not uds_only:
+                self._write_trace("uds_hw_fallback", self.UDS_TX_ID, len(req), req[:16])
+            if getattr(self.bus, "spent", False):
+                # The VCI itself is gone (it reboots, #19-#22): the software path would only fail on the next
+                # frame with "this link no longer works", after promising to carry on.
+                from contitool.can.dpdu import driver_unstable
 
-                    # On a 30+ driver the same flash stops at the same place again: the way out is the 27.2 one.
-                    again = tr(
-                        "затем подключитесь через драйвер D-PDU 27.2 (идёт вместе с ContiTool) и запустите ту же "
-                        "прошивку заново: на драйверах 30 и новее обрыв повторится.",
-                        "then connect through D-PDU driver 27.2 (it comes with ContiTool) and run the same flash "
-                        "again: on drivers 30 and newer it breaks off again.",
-                    ) if driver_unstable(getattr(self.bus, "driver_version", "")) else tr(
-                        "затем запустите ту же прошивку заново.", "then run the same flash again.")
-                    raise can.CanOperationError(tr(
-                        f"Связь с VCI потеряна посреди передачи ({req[:3].hex(' ').upper()}: {exc}): адаптер "
-                        "перезагрузился или отключился, продолжить на этом соединении нельзя. Если шла прошивка, блок "
-                        "остался в загрузчике FBL без приложения — это поправимо: выключите и включите питание блока и "
-                        f"VCI, {again}",
-                        f"Lost the VCI mid-transfer ({req[:3].hex(' ').upper()}: {exc}): the adapter rebooted or "
-                        "disconnected, and this connection cannot go on. If a flash was running, the ECU stays in its "
-                        "FBL bootloader without an application — which can be fixed: power-cycle the ECU and the VCI, "
-                        f"{again}",
-                    )) from exc
-                if uds_only:
-                    raise
-                if self.on_hw_fallback is not None:
-                    self.on_hw_fallback(f"{req[:3].hex(' ').upper()}: {exc}")
-            else:
-                self._write_trace("uds_rx", self.UDS_RX_ID, len(resp), resp[:16])
-                self.rx_frames += 1
-                return _checked_response(req_sid, resp, expected_sid)
+                # On a 30+ driver the same flash stops at the same place again: the way out is the 27.2 one.
+                again = tr(
+                    "затем подключитесь через драйвер D-PDU 27.2 (идёт вместе с ContiTool) и запустите ту же "
+                    "прошивку заново: на драйверах 30 и новее обрыв повторится.",
+                    "then connect through D-PDU driver 27.2 (it comes with ContiTool) and run the same flash "
+                    "again: on drivers 30 and newer it breaks off again.",
+                ) if driver_unstable(getattr(self.bus, "driver_version", "")) else tr(
+                    "затем запустите ту же прошивку заново.", "then run the same flash again.")
+                raise can.CanOperationError(tr(
+                    f"Связь с VCI потеряна посреди передачи ({req[:3].hex(' ').upper()}: {exc}): адаптер "
+                    "перезагрузился или отключился, продолжить на этом соединении нельзя. Если шла прошивка, блок "
+                    "остался в загрузчике FBL без приложения — это поправимо: выключите и включите питание блока и "
+                    f"VCI, {again}",
+                    f"Lost the VCI mid-transfer ({req[:3].hex(' ').upper()}: {exc}): the adapter rebooted or "
+                    "disconnected, and this connection cannot go on. If a flash was running, the ECU stays in its "
+                    "FBL bootloader without an application — which can be fixed: power-cycle the ECU and the VCI, "
+                    f"{again}",
+                )) from exc
+            if uds_only:
+                raise exc
+            if self.on_hw_fallback is not None:
+                self.on_hw_fallback(f"{req[:3].hex(' ').upper()}: {exc}")
         try:
             self.drain_rx(quick=True)  # a late answer to an earlier request must not be read as the answer to this one
             self.send_uds(req)
@@ -717,18 +776,30 @@ class J533CanLink:
         self._maybe_recycle_tx()
         if self.drain_rx(max_frames=16_384):
             self.drain_until_quiet(self.LOADER_RX_ID, quiet_window=0.06, max_wait=2.0)
-        self.send_frame(self.LOADER_TX_ID, LOADER_SYNC)
-        sync_deadline = time.monotonic() + 2.0
-        sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=2.0).data)
-        while sync_rx != LOADER_SYNC:
-            rem = min(0.15, sync_deadline - time.monotonic())
-            if rem <= 0:
+        sync_rx = b""
+        for sync_attempt in range(2):
+            self.send_frame(self.LOADER_TX_ID, LOADER_SYNC)
+            sync_deadline = time.monotonic() + 2.0
+            sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=2.0).data)
+            while sync_rx != LOADER_SYNC:
+                if sync_rx in LOADER_ERR_FRAMES:
+                    break  # loader aborted an earlier incomplete packet and returned to idle sync state (#51)
+                rem = min(0.15, sync_deadline - time.monotonic())
+                if rem <= 0:
+                    break
+                try:
+                    sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=rem).data)
+                except TimeoutError:
+                    break
+            if sync_rx == LOADER_SYNC:
                 break
-            try:
-                sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=rem).data)
-            except TimeoutError:
+            if sync_rx not in LOADER_ERR_FRAMES or sync_attempt == 1:
                 break
+            self.drain_until_quiet(self.LOADER_RX_ID, quiet_window=0.05, max_wait=0.5)
         if sync_rx != LOADER_SYNC:
+            detail = describe_loader_error(sync_rx)
+            if detail:
+                raise RuntimeError(f"Factory loader sync failed: got {sync_rx.hex()} ({detail})")
             raise RuntimeError(f"Factory loader sync failed: got {sync_rx.hex()}")
         total = len(packet)
         for idx, offset in enumerate(range(0, total, 8)):

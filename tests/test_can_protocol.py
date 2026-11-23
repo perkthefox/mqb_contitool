@@ -857,3 +857,179 @@ def test_slcan_bulk_read_and_win32_buffer_tuning_prevent_64kb_stream_frame_loss(
         # Also verify `drain_rx(quick=True)` clears a buffered frame sitting behind a `z\r` SLCAN TX ack
         link.bus._buffer.extend(b"z\rt77A37F2278\r")
         assert link.drain_rx(quick=True) == 1
+
+
+def test_loader_sync_recovers_from_0300020001_and_reset_retries_dropped_sync(monkeypatch) -> None:
+    """Issues #49 & #51: when a previous transfer dropped a frame, the RAM-Loader answers `84 00 00 00 00` with
+    `03 00 02 00 01` and returns to idle sync; send_loader_payload must re-sync once, _probe_beacon_in_loader
+    must explain 0300020001/0300050006, and _loader_reset_command must retry a single dropped sync."""
+    import pytest
+
+    from contitool.can import transport, workflows
+    from contitool.can.payloads import LOADER_SYNC
+    from contitool.i18n import set_lang
+    from contitool.progress import NULL_REPORTER
+
+    set_lang("en")
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(transport.time, "sleep", lambda _s: None)
+
+    class RecoveringLoaderBus:
+        def __init__(self, sync_replies: list[bytes | None], post_replies: list[bytes] | None = None) -> None:
+            self.sync_replies = list(sync_replies)
+            self.post_replies = list(post_replies or [])
+            self.rx: list[can.Message] = []
+            self.syncs = 0
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            data = bytes(msg.data)
+            if msg.arbitration_id == 0x6F0 and data == LOADER_SYNC:
+                self.syncs += 1
+                reply = self.sync_replies.pop(0) if self.sync_replies else LOADER_SYNC
+                if reply is not None:
+                    self.rx.append(can.Message(arbitration_id=0x6F1, data=reply, is_extended_id=False))
+            elif msg.arbitration_id == 0x6F0 and self.post_replies:
+                while self.post_replies:
+                    self.rx.append(can.Message(arbitration_id=0x6F1, data=self.post_replies.pop(0), is_extended_id=False))
+
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            return self.rx.pop(0) if self.rx else None
+
+        def shutdown(self) -> None:
+            pass
+
+    # 1. First sync returns 0300020001 (closing stale broken packet), second returns 8400000000 -> succeeds
+    bus1 = RecoveringLoaderBus([bytes.fromhex("0300020001"), LOADER_SYNC])
+    with J533CanLink("mock", bus=bus1) as link:
+        assert link.send_loader_payload(b"\xfe\xff", inter_frame_delay=0.0) > 0
+    assert bus1.syncs == 2
+
+    # 2. Beacon receiving 0300020001 explains the ~150 ms inter-frame timeout while keeping the raw hex
+    bus2 = RecoveringLoaderBus([LOADER_SYNC], post_replies=[bytes.fromhex("0300020001")])
+    with J533CanLink("mock", bus=bus2) as link:
+        with pytest.raises(RuntimeError, match="0300020001.*inter-frame timeout"):
+            workflows._probe_beacon_in_loader(link, NULL_REPORTER)
+
+    # 3. _loader_reset_command retries when the first sync frame was dropped (None -> TimeoutError)
+    bus3 = RecoveringLoaderBus([None, LOADER_SYNC], post_replies=[b"\x00\x00"])
+    with J533CanLink("mock", bus=bus3) as link:
+        # Shorten sync receive timeout via monkeypatch on receive_frame for a fast test
+        real_recv = link.receive_frame
+        monkeypatch.setattr(link, "receive_frame", lambda ident=None, timeout=2.0: real_recv(ident, timeout=0.02))
+        assert workflows._loader_reset_command(link) == "0000"
+    assert bus3.syncs == 2
+
+
+def test_transfer_data_software_isotp_retries_once_on_transient_timeout(monkeypatch) -> None:
+    """Issue #44: if a single software ISO-TP `36` block loses a ConsecutiveFrame and times out,
+    `_program_application_uds` retries that idempotent block once instead of aborting mid-flash."""
+    from contitool.can import workflows
+    from contitool.can.payloads import fbl_sa2
+    from contitool.core.constants import APP_SIZE
+
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    glitched = {"done": False}
+    received = bytearray()
+
+    class GlitchySwLink:
+        interface = "slcan"
+        bus = None
+        on_hw_fallback = None
+
+        def drain_rx(self, **_kw) -> int:
+            return 0
+
+        def request_uds(self, req: bytes, expected_sid=None, *, timeout=2.0, allow_pending=True, resend=True) -> bytes:
+            if req == b"\x10\x03":
+                return b"\x50\x03\x00\x32\x01\xf4"
+            if req == b"\x27\x03":
+                return b"\x67\x03\x01\x02\x03\x04"
+            if req.startswith(b"\x27\x04"):
+                return b"\x67\x04"
+            if req == bytes.fromhex("31010203"):
+                return bytes.fromhex("71010203")
+            if req == b"\x10\x02":
+                return b"\x50\x02\x00\x32\x01\xf4"
+            if req == b"\x27\x11":
+                return bytes.fromhex("671112345678")
+            if req.startswith(b"\x27\x12"):
+                assert int.from_bytes(req[2:6], "big") == fbl_sa2(0x12345678)
+                return b"\x67\x12"
+            if req.startswith(b"\x2e\xf1\x5a"):
+                return b"\x6e\xf1\x5a"
+            if req == bytes.fromhex("3101ff000101"):
+                return bytes.fromhex("7101ff0000")
+            if req.startswith(b"\x34\x00\x44"):
+                return bytes.fromhex("74200f02")
+            if req[0] == 0x36:
+                if req[1] == 0x2F and not glitched["done"]:
+                    glitched["done"] = True
+                    raise TimeoutError("No CAN frame from 0x77A within 2.0s")
+                received.extend(req[2:])
+                return bytes([0x76, req[1]])
+            if req == b"\x37":
+                return b"\x77"
+            if req.startswith(b"\x31\x01\x02\x02"):
+                return bytes.fromhex("7101020200")
+            if req == bytes.fromhex("3101ff01"):
+                return bytes.fromhex("7101ff0100")
+            if req == b"\x11\x01":
+                return b"\x51\x01"
+            raise AssertionError(req.hex())
+
+    app_image = bytes(((i * 29) ^ (i >> 6)) & 0xFF for i in range(APP_SIZE))
+    res = workflows._program_application_uds(GlitchySwLink(), app_image)
+    assert glitched["done"] is True
+    assert res["bytes_transferred"] == APP_SIZE
+    assert bytes(received) == app_image
+
+
+def test_programming_session_7f1022_reports_precondition_codes_and_does_not_probe_loader(monkeypatch) -> None:
+    """Issue #52: when `10 02` answers `7F 10 22` (`conditionsNotCorrect`), ContiTool must surface any non-zero
+    `31 01 02 03` precondition codes plus bench KL30/KL15 power guidance, and skip probing 0x6F0 / reset-retry."""
+    import pytest
+
+    from contitool.can import workflows
+    from contitool.can.transport import UdsNegativeResponse
+    from contitool.i18n import set_lang
+
+    class Refuses1002Bus(_MockGatewayBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.saw_loader_tx = False
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            if msg.arbitration_id == 0x6F0:
+                self.saw_loader_tx = True
+            super().send(msg, timeout)
+
+        def _handle_uds(self, req: bytes) -> None:
+            if req == bytes.fromhex("31010203"):
+                # Non-zero precondition failure byte 0x0A
+                self._reply(0x77A, b"\x05\x71\x01\x02\x03\x0a\xaa\xaa")
+                return
+            if req == b"\x10\x02":
+                self._reply(0x77A, b"\x03\x7f\x10\x22\xaa\xaa\xaa\xaa")
+                return
+            if req.startswith(b"\x22\xf1"):
+                # Supported 3Q0 gateway so _abort_if_unsupported_ecu does not fire
+                part = b"3Q0907530AR"
+                resp = b"\x62" + req[1:3] + part
+                self._reply(0x77A, bytes([0x10, len(resp)]) + resp[:6])
+                self._reply(0x77A, b"\x21" + resp[6:13].ljust(7, b"\xaa"))
+                self._reply(0x77A, b"\x22" + resp[13:].ljust(7, b"\xaa"))
+                return
+            super()._handle_uds(req)
+
+    monkeypatch.setattr(workflows, "_reset_to_application", lambda *_a, **_k: pytest.fail("must not reset-retry 7F 10 22"))
+    for lang, needle in (("en", "Pin 14 (KL15"), ("ru", "контакт 14 (KL15")):
+        set_lang(lang)
+        bus = Refuses1002Bus()
+        with J533CanLink("mock", bus=bus) as link:
+            with pytest.raises(workflows.ProgrammingConditionsError) as exc_info:
+                enter_ram_loader(link)
+        err = exc_info.value
+        assert isinstance(err, UdsNegativeResponse) and (err.sid, err.nrc) == (0x10, 0x22)
+        assert err.precondition_codes == b"\x0a"
+        assert "7F 10 22" in str(err) and "0A" in str(err) and needle in str(err)
+        assert not bus.saw_loader_tx

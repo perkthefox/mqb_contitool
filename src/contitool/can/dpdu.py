@@ -66,6 +66,12 @@ COPST_DONE = (0x8012, 0x8013)  # FINISHED, CANCELLED
 # payload and the ECU reset. Waiting for each FINISHED keeps the order; it costs ~10 % on a read.
 # Raise to 2-4 only after reads at that setting give byte-identical dumps.
 MAX_TX_IN_FLIGHT = 1
+# A few VNCI 6154A units take 130-200 ms per RawMode TX primitive (#49). With MAX_TX_IN_FLIGHT = 1 that puts a
+# >150 ms gap between frames on CAN, triggering the J533 factory RAM-Loader's receive timeout (`03 00 02 00 01`).
+# When measured RawMode TX RTT repeatedly exceeds SLOW_TX_RTT_THRESHOLD, pipeline up to SLOW_TX_IN_FLIGHT frames
+# (well under the ~14-frame firmware queue limit) and drop straight back to 1 if ERR_TX_QUEUE_FULL is ever seen.
+SLOW_TX_RTT_THRESHOLD = 0.05
+SLOW_TX_IN_FLIGHT = 4
 MODULE_READY = (0x8060, 0x8063)  # MODST_READY, MODST_AVAIL
 # Monitor ComParams (id, class, value) exactly as PDUAPI_VW.dll's CMonitor2Logfile sets them, except the collect time:
 # 1000 ms suits a log file; 10 ms hands every frame over right away (the gateway answers ~0.6 ms after a request).
@@ -291,10 +297,23 @@ def vci_programs_running() -> list[str]:
     if sys.platform != "win32":
         return []
     try:
-        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=10,
-                             creationflags=0x08000000).stdout  # CREATE_NO_WINDOW: no console flashes up in the GUI
-    except (OSError, subprocess.SubprocessError):
+        # `tasklist` writes in the console OEM codepage (e.g. cp857 on Turkish Windows) while Python's text=True
+        # decodes with the ANSI codepage (cp1254); strict decoding kills subprocess's reader thread with
+        # UnicodeDecodeError and leaves `.stdout` as None (#47). errors="replace" keeps every ASCII process name.
+        out = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW: no console flashes up in the GUI
+        ).stdout
+    except (OSError, subprocess.SubprocessError, UnicodeError):
         return []
+    if not out:
+        return []
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", errors="replace")
     names = {line.split('","')[0].strip('"') for line in out.splitlines() if line.strip()}
     return sorted(n for n in names if any(key in n.lower() for key in VCI_PROGRAMS))
 
@@ -395,6 +414,9 @@ class DPduBus(can.BusABC):
         # cop -> the logical link it was started on: a fixed-id adapter has one link per CAN id, and a stuck
         # primitive can only be cancelled on its own link
         self._tx_in_flight: dict[int, int] = {}
+        self._tx_started_at: dict[int, float] = {}
+        self._tx_slow_streak = 0
+        self._tx_window = MAX_TX_IN_FLIGHT
         self._tx_cop_count = 0
         self.hmod = self.h_rx = self.h_tx = self._mon_cop = self._uds_link = 0
         self.uds_refusal = ""  # why the last uds_session() stayed on RawMode: goes into the flash result
@@ -679,6 +701,7 @@ class DPduBus(can.BusABC):
         self.nonraw.clear()
         self._rx_id.clear()
         self._tx_in_flight.clear()
+        self._tx_started_at.clear()
 
     # ------------------------------------------------------------------ hardware ISO-TP / UDS link for fast flashing
     def _set_named_u32(self, hcll: int, name: str, value: int, cls: int = 2, *, supported_only: bool = False) -> bool:
@@ -1461,7 +1484,7 @@ class DPduBus(can.BusABC):
         wake.wait(cap)
         wake.clear()
 
-    def _drain(self, hcll: int) -> bool:
+    def _drain(self, hcll: int, *, measure_rtt: bool = False) -> bool:
         """Take every queued event of one link; results of the monitor link become messages. True if any arrived."""
         got = False
         while True:
@@ -1481,9 +1504,23 @@ class DPduBus(can.BusABC):
                     if C.cast(ev.pData, C.POINTER(U32)).contents.value in COPST_DONE:
                         self._tx_in_flight.pop(ev.hCop, None)
                         self._cop_keep.pop(ev.hCop, None)
+                        started = self._tx_started_at.pop(ev.hCop, None)
+                        # Only measure RTT when send() actually had to wait for this primitive: a drain after an
+                        # idle gap between requests includes the caller's idle time, not VCI latency.
+                        if measure_rtt and started is not None and not self.nonraw:
+                            rtt = time.monotonic() - started
+                            if rtt >= SLOW_TX_RTT_THRESHOLD:
+                                self._tx_slow_streak += 1
+                                if (self._tx_slow_streak >= 2 or rtt >= 0.08) and self._tx_window < SLOW_TX_IN_FLIGHT:
+                                    self._tx_window = SLOW_TX_IN_FLIGHT
+                            elif rtt < SLOW_TX_RTT_THRESHOLD * 0.5:
+                                self._tx_slow_streak = 0
+                                if self._tx_window > MAX_TX_IN_FLIGHT:
+                                    self._tx_window = MAX_TX_IN_FLIGHT
                 elif ev.ItemType == IT_ERROR and hcll != self.h_rx:
                     # a frame the VCI could not send (e.g. its queue overflowed): fail now, not by a later timeout
                     self._tx_in_flight.pop(ev.hCop, None)
+                    self._tx_started_at.pop(ev.hCop, None)
                     self._cop_keep.pop(ev.hCop, None)
                     self.spent = True
                     raise can.CanOperationError(tr("VCI не смог отправить кадр", "The VCI could not send a frame"))
@@ -1599,17 +1636,25 @@ class DPduBus(can.BusABC):
             flag = (0, 0, 1 if msg.is_extended_id else 0, 0)
         end = time.monotonic() + (5.0 if timeout is None else timeout)
         saw_queue_full = False
+        waited = False
         while True:
             self._check_rx()
-            self._drain(tx_link)
-            if len(self._tx_in_flight) < MAX_TX_IN_FLIGHT:
+            self._drain(tx_link, measure_rtt=waited)
+            window = MAX_TX_IN_FLIGHT if self.nonraw else self._tx_window
+            if len(self._tx_in_flight) < window:
+                started_at = time.monotonic()
                 rc, hcop = self._start(tx_link, COPT_SENDRECV, payload, 1, 0, tx_flag=flag,
                                        also_ok=(ERR_TX_QUEUE_FULL,))
                 if rc == 0:
                     self._tx_in_flight[hcop] = tx_link
+                    if hcop:
+                        self._tx_started_at[hcop] = started_at
                     self._tx_cop_count += 1
                     return
                 saw_queue_full = True
+                self._tx_slow_streak = 0
+                self._tx_window = MAX_TX_IN_FLIGHT
+            waited = True
             if time.monotonic() > end:
                 # Mark the link unusable first: _check_rx re-raises whatever killed the receive thread, and if it
                 # does, `spent` must already be set or the kept-open session hands this dead bus out again.
@@ -1655,6 +1700,7 @@ class DPduBus(can.BusABC):
             self.spent = spent or (self._rx_error is not None and not isinstance(self._rx_error, FrameError))
         for cop in [c for c, owner in self._tx_in_flight.items() if owner == link]:
             del self._tx_in_flight[cop]
+            self._tx_started_at.pop(cop, None)
 
     def _stop_links(self) -> None:
         """STOPCOMM on the send link (waiting for it like ODIS does), then cancel the monitor primitive."""

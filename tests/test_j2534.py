@@ -306,3 +306,68 @@ def test_j2534_fallback_and_send_batch_with_partial_driver_writes() -> None:
     # 1 FirstFrame + four 15-frame blocks (split 8+7) + final 13-frame block (split 8+5) = 11 calls instead of 74!
     assert dll.batch_sizes == [1, 8, 7, 8, 7, 8, 7, 8, 7, 8, 5]
     bus.shutdown()
+
+
+def test_j2534_buffer_overflow_clears_rx_and_steps_down_read_burst(monkeypatch, tmp_path) -> None:
+    """Issue #45: Scanmatik SM2 USB returned ERR_BUFFER_OVERFLOW (0x12) during 64 KB bursts and again inside
+    `read_memory_area`'s retry `drain_rx`. J2534 must default to 16 KB bursts, clear the RX queue via
+    CLEAR_RX_BUFFER on 0x12, survive 0x12 during retry drain, and step down to 4 KB bursts to finish cleanly."""
+    from contitool.can import J533CanLink, transport, workflows
+    from contitool.can.j2534 import ERR_BUFFER_OVERFLOW, IOCTL_CLEAR_RX_BUFFER, J2534BufferOverflowError
+
+    class OverflowPassThru(FakePassThru):
+        def __init__(self) -> None:
+            super().__init__(FakeGateway())
+            self.ioctls: list[tuple[int, int]] = []
+            self.overflow_reads = 0
+
+        def PassThruIoctl(self, chan, ioctl_id, _p_in, _p_out) -> int:  # noqa: N802
+            self.ioctls.append((chan, ioctl_id))
+            if ioctl_id == IOCTL_CLEAR_RX_BUFFER:
+                self.rx.clear()
+            return 0
+
+        def PassThruReadMsgs(self, chan, buf, n, timeout) -> int:  # noqa: N802
+            if self.overflow_reads > 0:
+                self.overflow_reads -= 1
+                n._obj.value = 0
+                return ERR_BUFFER_OVERFLOW
+            return super().PassThruReadMsgs(chan, buf, n, timeout)
+
+    set_lang("en")
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(transport.time, "sleep", lambda _s: None)
+    dll = OverflowPassThru()
+    bus = J2534Bus("fake.dll", dll=dll)
+
+    # 1. Direct read raises J2534BufferOverflowError (keeps message & error code); drain_rx clears and recovers
+    dll.overflow_reads = 1
+    with pytest.raises(J2534BufferOverflowError, match="PassThruReadMsgs: J2534 error 0x12"):
+        bus.recv(0)
+    dll.overflow_reads = 2
+    with J533CanLink("fake.dll", interface="j2534", bus=bus) as link:
+        assert link.drain_rx(max_frames=32) == 2
+        assert (7, IOCTL_CLEAR_RX_BUFFER) in dll.ioctls
+
+        # 2. read_memory_area starts at 16 KB on J2534, survives 0x12 inside retry drain, and steps down to 4 KB
+        expected = bytes((i * 73 + 5) & 0xFF for i in range(65_536))
+        seen_sizes: list[int] = []
+        dll.ioctls.clear()
+
+        def fake_stream(_link, _payload, addr, size, **_kw) -> bytes:
+            seen_sizes.append(size)
+            if len(seen_sizes) == 1:
+                dll.overflow_reads = 2  # retry cleanup's drain_rx also hits 0x12 — must not abort retry
+                raise J2534BufferOverflowError("PassThruReadMsgs: J2534 error 0x12", error_code=ERR_BUFFER_OVERFLOW)
+            return expected[addr : addr + size]
+
+        monkeypatch.setattr(workflows, "_stream_loader_read_payload", fake_stream)
+        out = tmp_path / "Cflash.bin"
+        res = workflows.read_memory_area(link, 0, 65_536, out, label="Cflash.bin")
+
+    assert res["complete"] is True
+    assert out.read_bytes() == expected
+    assert seen_sizes[0] == workflows.J2534_FED_READS_PER_PAYLOAD * workflows.READ_CHUNK_BYTES  # 16 KB initial burst
+    assert seen_sizes[1:] == [4096] * 16  # stepped down to 4 KB after 0x12
+    assert (7, IOCTL_CLEAR_RX_BUFFER) in dll.ioctls
+    bus.shutdown()

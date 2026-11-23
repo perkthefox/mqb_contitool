@@ -48,7 +48,13 @@ from contitool.can.payloads import (
     fbl_sa2,
     verify_payload_self_tests,
 )
-from contitool.can.transport import TRANSPORT_ERRORS, J533CanLink, UdsNegativeResponse
+from contitool.can.transport import (
+    LOADER_ERR_FRAMES,
+    TRANSPORT_ERRORS,
+    J533CanLink,
+    UdsNegativeResponse,
+    describe_loader_error,
+)
 from contitool.core.analyzer import (
     FBL_LIBRARY_ID,
     UnrecognisedUflashError,
@@ -141,6 +147,9 @@ FED_READS_PER_PAYLOAD = 16  # 64 KB per upload outside DataFlash; verified: full
 # On D-PDU VCIs (VAS 6154A / VNCI over TCP, #28) an unpaused 8,192-frame (2.6 s) burst lets PDUAPI_VW.dll's monitor
 # queue fall seconds behind past ~1 MB; 4 x 4 KB (16 KB = 2,048 frames, ~0.65 s) drains the queue cleanly between bursts.
 DPDU_FED_READS_PER_PAYLOAD = 4
+# J2534 drivers (e.g. Scanmatik SM2 USB, #45) often have a finite RX ring buffer that overflows (ERR_BUFFER_OVERFLOW
+# 0x12) on an unpaused 8,192-frame (64 KB) burst; 16 KB (2,048 frames) drains cleanly and steps down to 4 KB on 0x12.
+J2534_FED_READS_PER_PAYLOAD = 4
 AREA_READ_RETRIES = 2
 SELFID_OFFSET = CFLASH_IDCODE_OFFSET
 SELFID_SIZE = IDCODE_SIZE
@@ -204,9 +213,15 @@ def _probe_beacon_in_loader(link: J533CanLink, reporter: OperationReporter) -> s
     deadline = time.monotonic() + 5.0
     while len(received) < len(BEACON_ASCII) and time.monotonic() < deadline:
         frame = link.receive_frame(link.LOADER_RX_ID, timeout=1.0)
-        received.extend(bytes(frame.data))
+        chunk = bytes(frame.data)
+        received.extend(chunk)
+        if not received.startswith(BEACON_ASCII[: len(received)]) and chunk in LOADER_ERR_FRAMES:
+            break
     beacon_bytes = bytes(received[: len(BEACON_ASCII)])
     if beacon_bytes != BEACON_ASCII:
+        detail = describe_loader_error(bytes(received))
+        if detail:
+            raise RuntimeError(f"Unexpected RAM-loader beacon reply: {received.hex()} ({detail})")
         raise RuntimeError(f"Unexpected RAM-loader beacon reply: {received.hex()}")
     _consume_loader_end_frame(link, timeout=1.5, label="beacon")
     return beacon_bytes.decode("ascii")
@@ -312,6 +327,50 @@ class Stage1SilentError(TimeoutError):
     A retry would be just as silent; can_cure_fbl_fingerprint is the cure."""
 
 
+class ProgrammingConditionsError(UdsNegativeResponse):
+    """The ECU refused `10 02` (Programming Session) with NRC 0x22 (`conditionsNotCorrect`, #52)."""
+
+    def __init__(self, exc: UdsNegativeResponse, precondition_codes: bytes = b"") -> None:
+        self.precondition_codes = bytes(precondition_codes)
+        codes_ru = (
+            f" Коды предусловий 31 01 02 03: {self.precondition_codes.hex(' ').upper()}."
+            if self.precondition_codes
+            else ""
+        )
+        codes_en = (
+            f" Precondition codes from 31 01 02 03: {self.precondition_codes.hex(' ').upper()}."
+            if self.precondition_codes
+            else ""
+        )
+        msg = tr(
+            f"Шлюз отклонил вход в сессию программирования (10 02 -> 7F 10 22, conditionsNotCorrect).{codes_ru} "
+            "Проверьте питание на столе: +12 В должно быть подано и на контакт 1 (KL30), и на контакт 14 (KL15, "
+            "зажигание), напряжение стабильно 12.5–13.5 В; если блок подключён в автомобиле — зажигание должно "
+            "быть включено, двигатель заглушен, а лучше выполнять работы на снятом блоке на столе. Если условия "
+            "выполнены, а ошибка повторяется — приложите отчёт о проблеме.",
+            f"The gateway refused Programming Session (10 02 -> 7F 10 22, conditionsNotCorrect).{codes_en} "
+            "Check bench power: +12 V must be supplied to both Pin 1 (KL30) and Pin 14 (KL15, ignition) at a "
+            "stable 12.5–13.5 V; if connected in a vehicle, switch ignition ON with the engine stopped (working "
+            "on the bench is strongly recommended). If all conditions are met and this repeats, attach a problem report.",
+        )
+        RuntimeError.__init__(self, msg)
+        self.sid, self.nrc, self.resp = exc.sid, exc.nrc, exc.resp
+
+
+def _precondition_codes(resp: bytes) -> bytes:
+    """Return non-zero precondition failure bytes from a `31 01 02 03` (`71 01 02 03 ...`) reply, or b'' if clear."""
+    if len(resp) <= 4 or resp[:4] != bytes.fromhex("71010203"):
+        return b""
+    tail = resp[4:]
+    return b"" if all(b == 0 for b in tail) else tail
+
+
+def _is_rx_overflow(exc: BaseException) -> bool:
+    from contitool.can.j2534 import J2534BufferOverflowError
+
+    return isinstance(exc, J2534BufferOverflowError)
+
+
 def _is_sa_delay_nrc(exc: BaseException) -> bool:
     """True when SecurityAccess answered NRC 0x37 `requiredTimeDelayNotExpired`."""
     return isinstance(exc, UdsNegativeResponse) and exc.sid == 0x27 and exc.nrc == 0x37
@@ -383,6 +442,7 @@ def _enter_ram_loader_once(link: J533CanLink, reporter: OperationReporter) -> di
         "payload_sha256": EXPECTED_BEACON_SHA256,
         "flash_commands_sent": False,
     }
+    precond_codes = b""
     reporter.can_log(tr("UDS 10 03 -> Расширенная диагностическая сессия", "UDS 10 03 -> Extended Diagnostic Session"))
     try:
         info["session_1003"] = link.request_uds(b"\x10\x03", 0x50, timeout=2.0).hex()
@@ -412,10 +472,23 @@ def _enter_ram_loader_once(link: J533CanLink, reporter: OperationReporter) -> di
             )
         else:
             info["security_2704"] = link.request_uds(bytes.fromhex("2704caffe012"), 0x67, timeout=2.0).hex()
-            info["preconditions"] = link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0).hex()
+            precond_resp = link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0)
+            info["preconditions"] = precond_resp.hex()
+            precond_codes = _precondition_codes(precond_resp)
+            if precond_codes:
+                info["precondition_codes"] = precond_codes.hex(" ").upper()
+                reporter.warning(tr(
+                    f"Шлюз сообщил невыполненные предусловия программирования (31 01 02 03): {info['precondition_codes']}",
+                    f"Gateway reported unmet programming preconditions (31 01 02 03): {info['precondition_codes']}",
+                ))
 
     reporter.can_log(tr("UDS 10 02 -> Переход в загрузчик FBL (Programming Session)", "UDS 10 02 -> Entering FBL Programming Session"))
-    info["session_1002"] = link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True).hex()
+    try:
+        info["session_1002"] = link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True).hex()
+    except UdsNegativeResponse as exc:
+        if exc.sid == 0x10 and exc.nrc == 0x22:
+            raise ProgrammingConditionsError(exc, precond_codes) from exc
+        raise
     time.sleep(1.0)
 
     reporter.can_log(tr("UDS 27 11 + multi-DID 0x22 Stage 1/2 -> Подготовка дескриптора 0x0100120E", "UDS 27 11 + multi-DID 0x22 Stage 1/2 -> Staging descriptor 0x0100120E"))
@@ -582,6 +655,8 @@ def enter_ram_loader(
             raise  # a retry would only stage another entry: another key attempt, or the same silence
         if isinstance(first_err, UdsNegativeResponse):
             _abort_if_unsupported_ecu(link)
+        if isinstance(first_err, ProgrammingConditionsError):
+            raise  # ECU explicitly refused 10 02 (conditionsNotCorrect): probing 0x6F0 or resetting will not cure it
         if allow_already_active:
             try:
                 reporter.info(
@@ -613,7 +688,7 @@ def enter_ram_loader(
             )
         )
         try:
-            _reset_to_application(link, reporter=reporter, allow_fbl=True)
+            _reset_to_application(link, reporter=reporter, allow_fbl=True, loader_reset_attempts=1)
         except LINK_ERRORS as recovery_err:
             # Keep the entry failure in the GUI and manifest: the recovery timeout alone hides which step failed.
             raise RuntimeError(tr(
@@ -769,13 +844,21 @@ def read_memory_area(
         and type(bus_obj).__name__ == "DPduBus"
         and not getattr(bus_obj, "nonraw", None)
     )
-    max_reads = DPDU_FED_READS_PER_PAYLOAD if is_dpdu_raw else FED_READS_PER_PAYLOAD
+    is_j2534 = getattr(link, "interface", "") == "j2534" or type(bus_obj).__name__ == "J2534Bus"
+    if is_dpdu_raw:
+        max_reads = DPDU_FED_READS_PER_PAYLOAD
+    elif is_j2534:
+        max_reads = J2534_FED_READS_PER_PAYLOAD
+    else:
+        max_reads = FED_READS_PER_PAYLOAD
     while offset < total:
         reporter.check_cancelled()
         addr = start + offset
-        reads = 1 if in_dflash else min(max_reads, (total - offset) // READ_CHUNK_BYTES)
-        size = reads * READ_CHUNK_BYTES
+        chunk = b""
+        size = 0
         for attempt in range(AREA_READ_RETRIES + 1):
+            reads = 1 if in_dflash else min(max_reads, (total - offset) // READ_CHUNK_BYTES)
+            size = reads * READ_CHUNK_BYTES
             try:
                 if in_dflash:  # FACI blank-check reader: erased words come back as FF
                     chunk = read_memory_bytes(link, addr, size)
@@ -791,17 +874,35 @@ def read_memory_area(
                         elif getattr(getattr(link, "bus", None), "nonraw", None):
                             reporter.error(tr(*NONRAW_ADAPTER_HINT))
                     raise
-                reporter.warning(
-                    tr(
-                        f"{label}: сбой чтения @ 0x{addr:08X} ({exc}) — повтор {attempt + 1}/{AREA_READ_RETRIES}",
-                        f"{label}: read failed @ 0x{addr:08X} ({exc}) — retry {attempt + 1}/{AREA_READ_RETRIES}",
+                if not in_dflash and max_reads > 1 and _is_rx_overflow(exc):
+                    next_reads = max(1, max_reads // 4)
+                    reporter.warning(
+                        tr(
+                            f"{label}: переполнение буфера приёма @ 0x{addr:08X} ({exc}) — уменьшаем пакет с "
+                            f"{max_reads * 4} до {next_reads * 4} КБ, повтор {attempt + 1}/{AREA_READ_RETRIES}",
+                            f"{label}: RX buffer overflow @ 0x{addr:08X} ({exc}) — reducing burst from "
+                            f"{max_reads * 4} to {next_reads * 4} KB, retry {attempt + 1}/{AREA_READ_RETRIES}",
+                        )
                     )
-                )
+                    max_reads = next_reads
+                else:
+                    reporter.warning(
+                        tr(
+                            f"{label}: сбой чтения @ 0x{addr:08X} ({exc}) — повтор {attempt + 1}/{AREA_READ_RETRIES}",
+                            f"{label}: read failed @ 0x{addr:08X} ({exc}) — retry {attempt + 1}/{AREA_READ_RETRIES}",
+                        )
+                    )
                 time.sleep(2.5)  # a 64 KB stream lasts ~2.1 s: let a broken one run out before the next sync
-                link.drain_rx(max_frames=100_000)
+                clear_rx = getattr(getattr(link, "bus", None), "clear_rx_buffer", None)
+                if callable(clear_rx):
+                    with contextlib.suppress(*LINK_ERRORS):
+                        clear_rx()
+                with contextlib.suppress(*LINK_ERRORS):
+                    link.drain_rx(max_frames=100_000)
                 drain_quiet = getattr(link, "drain_until_quiet", None)
                 if callable(drain_quiet):
-                    drain_quiet(link.LOADER_RX_ID, quiet_window=0.15, max_wait=2.0)
+                    with contextlib.suppress(*LINK_ERRORS):
+                        drain_quiet(link.LOADER_RX_ID, quiet_window=0.15, max_wait=2.0)
         if len(chunk) != size:
             raise RuntimeError(f"Short chunk at 0x{addr:08X}: {len(chunk)}")
         with output_path.open("ab") as fh:
@@ -888,11 +989,25 @@ def run_rsa_probe(
     }
 
 
-def _loader_reset_command(link: J533CanLink) -> str:
-    try:
-        link.send_loader_payload(LOADER_RESET_PAYLOAD)
-    except LINK_ERRORS as exc:
-        return f"sync-error:{exc}"
+def _loader_reset_command(link: J533CanLink, *, attempts: int = 3) -> str:
+    last_exc: BaseException | None = None
+    tries = max(1, attempts)
+    for attempt in range(tries):
+        try:
+            link.send_loader_payload(LOADER_RESET_PAYLOAD)
+            last_exc = None
+            break
+        except LINK_ERRORS as exc:
+            last_exc = exc
+            if attempt + 1 >= tries or getattr(getattr(link, "bus", None), "spent", False):
+                break
+            drain_quiet = getattr(link, "drain_until_quiet", None)
+            if callable(drain_quiet):
+                with contextlib.suppress(*LINK_ERRORS):
+                    drain_quiet(link.LOADER_RX_ID, quiet_window=0.05, max_wait=0.5)
+            time.sleep(0.1)
+    if last_exc is not None:
+        return f"sync-error:{last_exc}"
     try:
         return bytes(link.receive_frame(link.LOADER_RX_ID, timeout=1.0).data).hex()
     except TimeoutError:
@@ -989,6 +1104,7 @@ def _reset_to_application(
     *,
     reporter: OperationReporter = NULL_REPORTER,
     allow_fbl: bool = False,
+    loader_reset_attempts: int = 3,
 ) -> dict[str, Any]:
     info: dict[str, Any] = {}
     try:
@@ -1007,7 +1123,7 @@ def _reset_to_application(
                 "Trying FE FF MCU reset via factory RAM-Loader (0x6F0)…",
             )
         )
-        info["loader_reset"] = _loader_reset_command(link)
+        info["loader_reset"] = _loader_reset_command(link, attempts=loader_reset_attempts)
         if info["loader_reset"].startswith("sync-error:"):
             reporter.warning(tr(
                 f"Не удалось передать сброс через заводской RAM-Loader: {info['loader_reset']}",
@@ -2711,11 +2827,18 @@ def _enter_fbl_uds_programming(link: J533CanLink, reporter: OperationReporter, *
     `resend=False` while the ECU may be switched off: a request it does not answer must not move the link off the
     adapter's hardware ISO-TP (see J533CanLink.request_uds)."""
     kw = {} if resend else {"resend": False}
+    precond_codes = b""
     try:
         link.request_uds(b"\x10\x03", 0x50, timeout=1.5, **kw)
         link.request_uds(b"\x27\x03", 0x67, timeout=2.0, **kw)
         link.request_uds(bytes.fromhex("2704caffe012"), 0x67, timeout=2.0, **kw)
-        link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0, **kw)
+        precond_resp = link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0, **kw)
+        precond_codes = _precondition_codes(precond_resp)
+        if precond_codes:
+            reporter.warning(tr(
+                f"Шлюз сообщил невыполненные предусловия программирования (31 01 02 03): {precond_codes.hex(' ').upper()}",
+                f"Gateway reported unmet programming preconditions (31 01 02 03): {precond_codes.hex(' ').upper()}",
+            ))
     except RuntimeError as exc:
         # The preconditions are best effort, as in the hardware-verified 2.0.1c: in FBL they are refused by design
         # (7F 10 7E, 7F 27 7F/12), and in the application a 27 03 delay (7F 27 37) or a refused 31 01 0203 does not
@@ -2723,7 +2846,12 @@ def _enter_fbl_uds_programming(link: J533CanLink, reporter: OperationReporter, *
         # are not RuntimeError and still end the operation.
         if not (_is_fbl_session_nrc(exc) or _is_fbl_precondition_nrc(exc)):
             reporter.can_log(tr(f"Предусловие отклонено ({exc}) — пробуем 10 02", f"Precondition refused ({exc}) — trying 10 02"))
-    link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True, **kw)
+    try:
+        link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True, **kw)
+    except UdsNegativeResponse as exc:
+        if exc.sid == 0x10 and exc.nrc == 0x22:
+            raise ProgrammingConditionsError(exc, precond_codes) from exc
+        raise
     time.sleep(1.0)
 
 
@@ -2864,7 +2992,21 @@ def _program_application_uds(
             reporter.check_cancelled()
             chunk = app_bytes[offset : offset + chunk_size]
             seq = (blk_idx + 1) & 0xFF
-            link.request_uds(bytes([0x36, seq]) + chunk, 0x76, timeout=30.0, allow_pending=True)
+            block_req = bytes([0x36, seq]) + chunk
+            for td_try in range(2):
+                try:
+                    link.request_uds(block_req, 0x76, timeout=30.0, allow_pending=True)
+                    break
+                except TimeoutError as exc:
+                    if td_try == 1 or getattr(getattr(link, "bus", None), "spent", False):
+                        raise
+                    reporter.warning(tr(
+                        f"TransferData: таймаут на блоке {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X}: {exc}) — повтор блока…",
+                        f"TransferData: timeout on block {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X}: {exc}) — retrying block…",
+                    ))
+                    time.sleep(0.25)
+                    with contextlib.suppress(*LINK_ERRORS):
+                        link.drain_rx(max_frames=256, quick=True)
             done = offset + len(chunk)
             info["bytes_transferred"] = done
             if blk_idx % 8 == 0 or done == APP_SIZE:
