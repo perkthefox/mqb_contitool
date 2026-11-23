@@ -14,7 +14,7 @@ import contextlib
 import dataclasses
 from typing import Any
 
-from contitool.can.bridge import BRIDGE_NATIVE_INTERFACES, bridge_bus_label
+from contitool.can.bridge import BRIDGE_NATIVE_INTERFACES, bridge_bus_label, bridge_bus_ok
 from contitool.can.transport import J533CanLink
 from contitool.i18n import tr
 from contitool.progress import NULL_REPORTER, OperationReporter
@@ -386,22 +386,25 @@ def _build_slave_ecu(
     interface: str,
     bus_injected: bool,
     in_fbl: bool,
+    bridge_adapter_ok: bool = False,
 ) -> DiscoveredEcu:
+    """`bridge_adapter_ok`: the scan found the adapter able to carry the J533 bridge (`bridge_bus_ok`)."""
     native_ok = bus_injected or (interface in BRIDGE_NATIVE_INTERFACES)
     if spec.kind == "fpke":
         if via_gateway:
             if gateway_bridge_capable:
                 caps: tuple[str, ...] = ("uds", "memory", "bridge_memory")
                 mem_err: str | None = None
-            elif not native_ok:
+            elif not bridge_adapter_ok:
                 caps = ("uds",)
                 mem_err = tr(
-                    "Чтение и запись памяти приборной панели FPK_E через шлюз требуют нативный CAN-адаптер "
-                    "(CANable / SLCAN / candleLight) для прозрачного RAM-моста. UDS-диагностика, DTC, опрос "
-                    "катушки и обучение ключей доступны через текущий адаптер.",
-                    "Reading/writing FPK_E memory through a gateway requires a native CAN adapter "
-                    "(CANable / SLCAN / candleLight) for the transparent RAM bridge. UDS diagnostics, DTC, LF coil "
-                    "polling, and key learning work over the current adapter.",
+                    "Чтение и запись памяти приборной панели FPK_E через шлюз требуют для прозрачного RAM-моста "
+                    "адаптер с произвольным raw CAN (CANable / SLCAN / candleLight или VNCI, принимающий в RawMode "
+                    "все идентификаторы). UDS-диагностика, DTC, опрос катушки и обучение ключей доступны через "
+                    "текущий адаптер.",
+                    "Reading/writing FPK_E memory through a gateway requires an adapter with arbitrary raw CAN for the "
+                    "transparent RAM bridge (CANable / SLCAN / candleLight, or a VNCI whose RawMode receives every "
+                    "identifier). UDS diagnostics, DTC, LF coil polling, and key learning work over the current adapter.",
                 )
             else:
                 caps = ("uds",)
@@ -472,10 +475,12 @@ def _build_slave_ecu(
                 bcm_caps = ("uds", "dtc", "terminal")
                 bcm_mem_err = tr(
                     "Чтение IKA/GFA по XCP и адаптация FFB (29-бит XCP / WFS канал 3) через шлюз требуют "
-                    "шлюз Continental 3Q0 907 530 и нативный CAN-адаптер для прозрачного RAM-моста ch3 ↔ ch0. "
+                    "шлюз Continental 3Q0 907 530 и адаптер с произвольным raw CAN (нативный или VNCI, принимающий "
+                    "в RawMode все идентификаторы) для прозрачного RAM-моста ch3 ↔ ch0. "
                     "Статус KS/FFB и запись ключей (2E 00BE / 00BD) по UDS доступны.",
                     "Reading IKA/GFA via XCP and FFB adaptation (29-bit XCP / WFS Channel 3) through a gateway require "
-                    "a Continental 3Q0 907 530 gateway and a native CAN adapter for the ch3 ↔ ch0 RAM bridge. "
+                    "a Continental 3Q0 907 530 gateway and an adapter with arbitrary raw CAN (native, or a VNCI whose "
+                    "RawMode receives every identifier) for the ch3 ↔ ch0 RAM bridge. "
                     "UDS KS/FFB status and key writing (2E 00BE / 00BD) are available.",
                 )
             return DiscoveredEcu(
@@ -589,6 +594,7 @@ def can_scan_bus(
     gateway: DiscoveredEcu | None = None
     topology = "none"
     gw_bridge_capable = False
+    bridge_adapter_ok = False
     adapter_warning: str | None = None
     scan_notes: list[str] = []
     keep_direct_fpke_alive = False
@@ -617,8 +623,8 @@ def can_scan_bus(
                 topology = "gateway"
                 gateway = _build_gateway_ecu(link, gw_fbl, reporter)
                 ecus.append(gateway)
-                native_ok = bus is not None or (interface in BRIDGE_NATIVE_INTERFACES)
-                gw_bridge_capable = (gateway.unsupported is None) and (not gateway.in_fbl) and native_ok
+                bridge_adapter_ok = bus is not None or bridge_bus_ok(interface, link.bus)
+                gw_bridge_capable = (gateway.unsupported is None) and (not gateway.in_fbl) and bridge_adapter_ok
                 reporter.info(
                     tr(
                         f"Найден шлюз [19] {gateway.part_number}"
@@ -687,6 +693,7 @@ def can_scan_bus(
                         interface=interface,
                         bus_injected=(bus is not None),
                         in_fbl=fbl_s,
+                        bridge_adapter_ok=bridge_adapter_ok,
                     )
                     ecus.append(ecu)
                     reporter.info(

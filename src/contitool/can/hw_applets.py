@@ -1362,6 +1362,18 @@ J533_BRIDGE_STOP_ID = 0x6F0
 J533_BRIDGE_STOP_DATA = b"STOPBRDG"
 J533_BRIDGE_END_ID = 0x6F1
 J533_BRIDGE_END_DATA = b"BRDG-END"
+# Burst variant only: `0x6F0 BURST-GO` makes the gateway itself send its preloaded frame table on the target channel,
+# then answer on 0x6F1 (`BURST-OK`, or `BURST-NA` when a frame found no ACK and the rest were dropped).
+J533_BRIDGE_BURST_ID = 0x6F0
+J533_BRIDGE_BURST_DATA = b"BURST-GO"
+J533_BRIDGE_BURST_OK = b"BURST-OK"
+J533_BRIDGE_BURST_FAIL = b"BURST-NA"
+# ponytail: a busy loop, not a timer; ~60 us at 80 MHz, more on a slower clock (frames only get further apart).
+# Measure the frame spacing on the sub-bus and tune if a target needs an exact pace.
+J533_BRIDGE_BURST_GAP_LOOPS = 2400
+# The gap loop does not kick the watchdog: 100k loops ~2.5 ms at 80 MHz, still ~25 ms at a tenth of that clock,
+# far inside the WDTA window (~0.273 s)
+J533_BRIDGE_BURST_GAP_MAX_LOOPS = 100_000
 
 # Port registers for CAN0..CAN5 TX/RX alternate functions and active-low transceiver STB pins (3Q0 907 530 Port_Config)
 _P0 = 0xFFC10000
@@ -1388,7 +1400,13 @@ _PM11 = 0xFFC1032C
 _PMC11 = 0xFFC1042C
 
 
-def build_j533_can_bridge_applet(target_channel: int = 0, *, idle_limit: int = 40_000_000) -> bytes:
+def build_j533_can_bridge_applet(
+    target_channel: int = 0,
+    *,
+    idle_limit: int = 40_000_000,
+    burst_frames: list[tuple[int, bytes]] | None = None,
+    burst_gap_loops: int = J533_BRIDGE_BURST_GAP_LOOPS,
+) -> bytes:
     """Build RH850/F1L RAM-loader applet that transparently bridges Diagnosis CAN (`ch3`) <-> `target_channel`.
 
     Verified against Continental 3Q0 907 530 (`R7F7010543` / `R7F7010563`) `Uflash` + `Cflash`:
@@ -1404,6 +1422,11 @@ def build_j533_can_bridge_applet(target_channel: int = 0, *, idle_limit: int = 4
         unplugged bus never blocks `STOPBRDG`; auto-exits after `idle_limit` idle iterations with no `ch3` traffic.
       - On `0x6F0: STOPBRDG` (or idle timeout), replies `0x6F1: BRDG-END` and triggers `SWRESA` (`0xFFF80A04`)
         with WDTA reset fallback so the gateway boots cleanly back into its normal Application firmware.
+
+    `burst_frames` (opt-in; without it the applet is byte-identical to the verified one) appends a table of
+    `(29-bit can_id, 8 data bytes)` that `0x6F0: BURST-GO` sends on the target channel back to back as extended
+    frames (as the host sends the level-8 stream), each frame waited out and followed by `burst_gap_loops` idle
+    loops — the pace a slow host adapter (VAS 6154 RawMode) cannot reach.
     """
     if target_channel not in J533_BUS_CHANNELS:
         raise ValueError(
@@ -1411,6 +1434,20 @@ def build_j533_can_bridge_applet(target_channel: int = 0, *, idle_limit: int = 4
         )
     if idle_limit <= 0:
         raise ValueError(f"idle_limit must be positive, got {idle_limit}")
+    burst_table = b""
+    if burst_frames is not None:
+        if not burst_frames:
+            raise ValueError("burst_frames must be non-empty")
+        if not 0 < burst_gap_loops <= J533_BRIDGE_BURST_GAP_MAX_LOOPS:
+            raise ValueError(
+                f"burst_gap_loops must be 1..{J533_BRIDGE_BURST_GAP_MAX_LOOPS} (the gap does not kick the watchdog), "
+                f"got {burst_gap_loops}"
+            )
+        for can_id, data in burst_frames:
+            if len(data) != 8 or not 0 <= can_id <= 0x1FFFFFFF:
+                raise ValueError(f"Burst frame 0x{can_id:X} needs 8 data bytes and a 29-bit id")
+            # TMID with IDE (bit 31) always set + TMDF0/TMDF1 exactly as the RX FIFO hands them over
+            burst_table += struct.pack("<I", can_id | 0x80000000) + bytes(data)
 
     diag_ch = J533_BRIDGE_DIAG_CHANNEL
     tgt_ctr_off = 0x0004 + 0x10 * target_channel
@@ -1620,11 +1657,23 @@ def build_j533_can_bridge_applet(target_channel: int = 0, *, idle_limit: int = 4
     b.cmp_reg(15, 6)       # id == 0x6F0 (standard, IDE=0)?
     b.bne("FWD_TO_TGT")
     b.cmp_reg(16, 8)       # df0 == "STOP"?
-    b.bne("FWD_TO_TGT")
+    b.bne("CHECK_BURST" if burst_table else "FWD_TO_TGT")
     b.cmp_reg(17, 9)       # df1 == "BRDG"?
     b.bne("FWD_TO_TGT")
     b.st_w(19, 0x00F8, 14)  # RFPCTR0 = 0xFF
     b.jr("EXIT_BRIDGE")
+
+    if burst_table:
+        burst_d0, burst_d1 = struct.unpack("<II", J533_BRIDGE_BURST_DATA)
+        b.label("CHECK_BURST")  # id == 0x6F0 already matched; r10 / r23 are free here
+        b.mov_imm(burst_d0, 10)
+        b.cmp_reg(10, 8)
+        b.bne("FWD_TO_TGT")
+        b.mov_imm(burst_d1, 10)
+        b.cmp_reg(10, 9)
+        b.bne("FWD_TO_TGT")
+        b.st_w(19, 0x00F8, 14)  # RFPCTR0 = 0xFF (the trigger is consumed, never forwarded)
+        b.jr("BURST")
 
     b.label("FWD_TO_TGT")
     b.mov_imm5(0, 21)      # reset idle counter on live ch3 activity
@@ -1759,5 +1808,132 @@ def build_j533_can_bridge_applet(target_channel: int = 0, *, idle_limit: int = 4
     b.label("BRIDGE_RST_SPIN")
     b.br_short("BRIDGE_RST_SPIN")
 
+    if burst_table:
+        _emit_bridge_burst(b, len(burst_frames or ()), burst_gap_loops)
+
     _emit_wdt_subroutine(b, "SUB_WDT")
+    if burst_table:
+        b.align(4)
+        b.label("BURST_TABLE")
+        b._emit(burst_table)
     return b.build()
+
+
+def _emit_bridge_burst(b: _Rh850Builder, count: int, gap_loops: int) -> None:
+    """`BURST`: send the `BURST_TABLE` frames on the target TX buffer, then answer on ch3 and rejoin `BRIDGE_LOOP`.
+
+    Uses only r6..r10 and r23 (the bridge keeps its constants in r14..r29; SUB_WDT clobbers r11..r13).
+    r24/r26/r27 = target TMID/TMC/TMSTS, r25/r28/r29 = ch3 TM48 TMID/TMC/TMSTS (set up by the bridge)."""
+    ok_d0, ok_d1 = struct.unpack("<II", J533_BRIDGE_BURST_OK)
+    na_d0, na_d1 = struct.unpack("<II", J533_BRIDGE_BURST_FAIL)
+    b.label("BURST")
+    b.mov_label_addr("BURST_TABLE", 8)
+    b.mov_imm(count, 9)
+
+    b.label("BURST_NEXT")
+    # Previous frame (or the bridge's last forward) must be off the buffer: TMTSTS == 0
+    b.mov_imm(60_000, 10)
+    b.label("BURST_WAIT_FREE")
+    b.jarl("SUB_WDT")
+    b.ld_bu_0(27, 23)
+    b.andi(0x0001, 23, 23)
+    b.cmp_imm5(0, 23)
+    b.be("BURST_FREE")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("BURST_WAIT_FREE")
+    b.jr("BURST_STALL")
+
+    b.label("BURST_FREE")
+    b.st_b(0, 0, 27)       # clear TMSTStgt
+    b.ld_w(0, 8, 6)
+    b.st_w(6, 0x00, 24)    # TMIDtgt (IDE bit from the table)
+    b.mov_imm(0x80000000, 6)
+    b.st_w(6, 0x04, 24)    # TMPTRtgt: DLC = 8
+    b.ld_w(4, 8, 6)
+    b.st_w(6, 0x08, 24)    # TMDF0tgt
+    b.ld_w(8, 8, 6)
+    b.st_w(6, 0x0C, 24)    # TMDF1tgt
+    b.mov_imm5(1, 23)
+    b.st_b(23, 0, 26)      # TMCtgt = 1 (TMTR)
+
+    # Wait for this frame to be on the wire and ACKed (TMTRF != 0), so the next one never queues behind it
+    b.mov_imm(60_000, 10)
+    b.label("BURST_WAIT_DONE")
+    b.jarl("SUB_WDT")
+    b.ld_bu_0(27, 23)
+    b.andi(0x0006, 23, 23)
+    b.cmp_imm5(0, 23)
+    b.bne("BURST_SENT")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("BURST_WAIT_DONE")
+    b.jr("BURST_STALL")
+
+    b.label("BURST_SENT")
+    b.mov_imm(gap_loops, 10)
+    b.label("BURST_GAP")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne_short("BURST_GAP")
+    b.addi(12, 8, 8)
+    b.add_imm5(-1, 9)
+    b.cmp_imm5(0, 9)
+    b.bne("BURST_NEXT")
+    b.mov_imm(ok_d0, 7)
+    b.mov_imm(ok_d1, 9)
+    b.jr("BURST_REPLY")
+
+    # No ACK on the sub-bus: abort the pending frame, drop the rest of the table (a partial stream is never resumed)
+    b.label("BURST_STALL")
+    b.mov_imm5(2, 23)
+    b.st_b(23, 0, 26)      # TMCtgt = 2 (TMTAR abort)
+    b.mov_u16(2000, 10)
+    b.label("BURST_WAIT_ABT")
+    b.jarl("SUB_WDT")
+    b.ld_bu_0(27, 23)
+    b.andi(0x0001, 23, 23)
+    b.cmp_imm5(0, 23)
+    b.be("BURST_ABORTED")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("BURST_WAIT_ABT")
+    b.label("BURST_ABORTED")
+    b.mov_imm(na_d0, 7)
+    b.mov_imm(na_d1, 9)
+
+    # Answer on ch3 TM48 (0x6F1), then back to the bridge loop with a fresh idle counter
+    b.label("BURST_REPLY")
+    b.mov_imm(60_000, 10)
+    b.label("BURST_WAIT_TM48")
+    b.jarl("SUB_WDT")
+    b.ld_bu_0(29, 23)
+    b.andi(0x0001, 23, 23)
+    b.cmp_imm5(0, 23)
+    b.be("BURST_TM48_FREE")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("BURST_WAIT_TM48")
+    b.mov_imm5(2, 23)
+    b.st_b(23, 0, 28)      # TMC48 = 2: abort the stuck ch3 frame before overwriting it, as EXIT_BRIDGE does
+    b.mov_u16(1000, 10)
+    b.label("BURST_WAIT_TM48_ABT")
+    b.ld_bu_0(29, 23)
+    b.andi(0x0001, 23, 23)
+    b.cmp_imm5(0, 23)
+    b.be("BURST_TM48_FREE")
+    b.add_imm5(-1, 10)
+    b.cmp_imm5(0, 10)
+    b.bne("BURST_WAIT_TM48_ABT")
+    b.label("BURST_TM48_FREE")
+    b.st_b(0, 0, 29)       # clear TMSTS48
+    b.mov_u16(J533_BRIDGE_END_ID, 6)
+    b.st_w(6, 0x00, 25)    # TMID48 = 0x6F1
+    b.mov_imm(0x80000000, 6)
+    b.st_w(6, 0x04, 25)    # DLC = 8
+    b.st_w(7, 0x08, 25)
+    b.st_w(9, 0x0C, 25)
+    b.mov_imm5(1, 23)
+    b.st_b(23, 0, 28)      # TMC48 = 1
+    b.mov_imm5(0, 21)      # idle counter restarts after the burst
+    b.jr("BRIDGE_LOOP")

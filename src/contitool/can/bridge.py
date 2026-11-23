@@ -16,6 +16,10 @@ from typing import Any
 import can
 
 from contitool.can.hw_applets import (
+    J533_BRIDGE_BURST_DATA,
+    J533_BRIDGE_BURST_FAIL,
+    J533_BRIDGE_BURST_ID,
+    J533_BRIDGE_BURST_OK,
     J533_BRIDGE_END_DATA,
     J533_BRIDGE_END_ID,
     J533_BRIDGE_READY_DATA,
@@ -32,6 +36,11 @@ from contitool.progress import NULL_REPORTER, OperationReporter
 BRIDGE_NATIVE_INTERFACES: tuple[str, ...] = ("slcan", "gs_usb", "socketcan", "pcan", "kvaser", "vector")
 
 
+def bridge_bus_ok(interface: str, bus: Any = None) -> bool:
+    """The adapter can carry the bridge: a native one, or a VAS 6154 / VNCI whose RawMode passes every CAN id."""
+    return interface in BRIDGE_NATIVE_INTERFACES or bool(getattr(bus, "every_id_raw", False))
+
+
 def bridge_bus_label(channel: int) -> str:
     """Localized human-readable label for a J533 RSCAN0 sub-bus channel."""
     spec = J533_BUS_CHANNELS.get(channel)
@@ -39,6 +48,21 @@ def bridge_bus_label(channel: int) -> str:
         return f"ch{channel}"
     _, ru, en = spec
     return f"ch{channel} — {tr(ru, en)}"
+
+
+def _no_bridge_adapter(interface: str) -> RuntimeError:
+    return RuntimeError(
+        tr(
+            f"Прозрачный CAN-мост через шлюз J533 требует адаптер с произвольным raw CAN (11 и 29 бит): "
+            f"CANable / SLCAN / candleLight / SocketCAN / PCAN / Kvaser / Vector или VAS 6154 / VNCI, "
+            f"принимающий в RawMode все идентификаторы. Интерфейс «{interface}» так не может (VNCI без RawMode, "
+            f"VNCI, которому нужен запуск CAN1 каналом ISO-TP, или J2534 через драйвер VW).",
+            f"The J533 transparent CAN bridge needs an adapter with arbitrary raw CAN (11- and 29-bit): "
+            f"CANable / SLCAN / candleLight / SocketCAN / PCAN / Kvaser / Vector, or a VAS 6154 / VNCI whose RawMode "
+            f"receives every identifier. Interface “{interface}” cannot (a VNCI without RawMode, a VNCI that needs "
+            f"CAN1 started by an ISO-TP link, or J2534 through the VW driver).",
+        )
+    )
 
 
 class J533CanBridge:
@@ -56,23 +80,15 @@ class J533CanBridge:
         ready_timeout: float = 4.0,
         reset_wait: float | None = None,
         verify_app_return: bool = True,
+        burst_frames: list[tuple[int, bytes]] | None = None,
         reporter: OperationReporter = NULL_REPORTER,
     ) -> None:
         if target_channel not in J533_BUS_CHANNELS:
             raise ValueError(
                 f"Unsupported J533 bridge target_channel={target_channel} (expected one of {tuple(J533_BUS_CHANNELS)})"
             )
-        if bus is None and interface not in BRIDGE_NATIVE_INTERFACES:
-            raise RuntimeError(
-                tr(
-                    f"Прозрачный CAN-мост через шлюз J533 требует нативный CAN-адаптер "
-                    f"(CANable / SLCAN / candleLight / SocketCAN / PCAN / Kvaser / Vector). "
-                    f"Интерфейс «{interface}» не поддерживает произвольный 29-битный raw CAN.",
-                    f"J533 transparent CAN bridge requires a native CAN adapter "
-                    f"(CANable / SLCAN / candleLight / SocketCAN / PCAN / Kvaser / Vector). "
-                    f"Interface “{interface}” does not support arbitrary 29-bit raw CAN.",
-                )
-            )
+        if bus is None and interface not in BRIDGE_NATIVE_INTERFACES and interface != "dpdu":
+            raise _no_bridge_adapter(interface)
         self.port = port
         self.interface = interface
         self.target_channel = target_channel
@@ -82,6 +98,7 @@ class J533CanBridge:
         self.ready_timeout = ready_timeout
         self.reset_wait = (0.05 if bus is not None else 1.4) if reset_wait is None else reset_wait
         self.verify_app_return = verify_app_return
+        self.burst_frames = list(burst_frames) if burst_frames else None
         self.reporter = reporter
 
         self._link: J533CanLink | None = None
@@ -136,8 +153,15 @@ class J533CanBridge:
         )
         self._link = link
         try:
+            if self._injected_bus is None and not bridge_bus_ok(self.interface, link.bus):
+                raise _no_bridge_adapter(self.interface)
             self.loader_info = enter_ram_loader(link, reporter=self.reporter)
-            applet = build_j533_can_bridge_applet(self.target_channel, idle_limit=self.idle_limit)
+            # A VNCI may first turn out to need CAN1 primed while entering the loader (its monitor then filters ids)
+            if self._injected_bus is None and not bridge_bus_ok(self.interface, link.bus):
+                raise _no_bridge_adapter(self.interface)
+            applet = build_j533_can_bridge_applet(
+                self.target_channel, idle_limit=self.idle_limit, burst_frames=self.burst_frames
+            )
             self.reporter.can_log(
                 tr(
                     f"Загрузка RAM-апплета CAN-моста ({len(applet)} Б, ch3 ↔ ch{self.target_channel})…",
@@ -171,6 +195,44 @@ class J533CanBridge:
 
     def stop(self) -> dict[str, Any]:
         return self._close_safely(had_error=False)
+
+    def fire_burst(self, frames: list[tuple[int, bytes]], *, timeout: float = 5.0) -> None:
+        """Have the gateway send its preloaded frames on the sub-bus itself, at CAN pace (`0x6F0 BURST-GO`).
+
+        The gateway can only send the table uploaded with the applet, so `frames` must equal it: the caller asks for
+        exactly the stream that will go out. Whether that stream suits the ECU is the caller's check."""
+        if not self.active:
+            raise RuntimeError(tr(
+                "CAN-мост в шлюзе J533 не запущен — поток не отправлен.",
+                "The J533 CAN bridge is not running — the stream was not sent.",
+            ))
+        if self.burst_frames is None or list(frames) != self.burst_frames:
+            raise RuntimeError(tr(
+                "Поток не отправлен: он не совпадает с таблицей кадров, загруженной в шлюз J533 вместе с мостом "
+                "(или таблица не загружалась).",
+                "The stream was not sent: it differs from the frame table uploaded to the J533 gateway with the "
+                "bridge (or no table was uploaded).",
+            ))
+        self.link.send_frame(J533_BRIDGE_BURST_ID, J533_BRIDGE_BURST_DATA)
+        end = time.monotonic() + timeout
+        while (rem := end - time.monotonic()) > 0:
+            try:
+                data = bytes(self.link.receive_frame(J533_BRIDGE_END_ID, timeout=rem).data)
+            except TimeoutError:
+                break
+            if data == J533_BRIDGE_BURST_OK:
+                return
+            if data == J533_BRIDGE_BURST_FAIL:
+                raise RuntimeError(tr(
+                    f"Шлюз J533 не смог отправить поток в {bridge_bus_label(self.target_channel)}: кадр не получил "
+                    f"подтверждения (ACK), остаток потока отброшен. Проверьте питание блока и провода шины.",
+                    f"The J533 gateway could not send the stream on {bridge_bus_label(self.target_channel)}: a frame "
+                    f"got no ACK and the rest was dropped. Check the ECU power and the bus wiring.",
+                ))
+        raise TimeoutError(tr(
+            f"Шлюз J533 не подтвердил отправку потока (ожидался 0x{J533_BRIDGE_END_ID:03X} BURST-OK).",
+            f"The J533 gateway did not confirm the stream (expected 0x{J533_BRIDGE_END_ID:03X} BURST-OK).",
+        ))
 
     def _close_safely(self, *, had_error: bool) -> dict[str, Any]:
         from contitool.can.workflows import LINK_ERRORS, _probe_app_or_fbl, _reset_to_application
@@ -248,6 +310,7 @@ def j533_can_bridge(
     ready_timeout: float = 4.0,
     reset_wait: float | None = None,
     verify_app_return: bool = True,
+    burst_frames: list[tuple[int, bytes]] | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> J533CanBridge:
     """Create a `J533CanBridge` context manager bridging Diagnosis CAN (`ch3`) <-> `target_channel`."""
@@ -261,5 +324,6 @@ def j533_can_bridge(
         ready_timeout=ready_timeout,
         reset_wait=reset_wait,
         verify_app_return=verify_app_return,
+        burst_frames=burst_frames,
         reporter=reporter,
     )

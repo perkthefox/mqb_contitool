@@ -253,6 +253,52 @@ class FpkeScreen(QWidget):
             return vals["F191"]
         return "83A920700E"
 
+    def _memory_blocker(self) -> str | None:
+        """What stops level-8 memory work here: `"adapter"`, `"gateway"` or None.
+
+        Direct CAN needs a native adapter. Through a gateway the selected adapter must carry the J533 bridge (native,
+        or a VAS 6154 / VNCI: the gateway then sends the level-8 stream for it), and the scan must have found the
+        gateway able to run it."""
+        usable = (*FPKE_NATIVE_INTERFACES, "dpdu") if self.via_gateway else FPKE_NATIVE_INTERFACES
+        if (self.conn.interface or "slcan") not in usable:
+            return "adapter"
+        if self.via_gateway and not self.gateway_bridge:
+            return "gateway"
+        return None
+
+    def _write_blocked(self) -> bool:
+        """Tell the user why a DataFlash write cannot run on this connection; True when it cannot."""
+        blocker = self._memory_blocker()
+        iface = self.conn.interface or "slcan"
+        if blocker == "adapter":
+            QMessageBox.warning(
+                self,
+                tr("Неподдерживаемый адаптер", "Unsupported adapter"),
+                tr(
+                    f"Выбран адаптер «{iface}». Для записи приборной панели FPK через шлюз J533 нужен адаптер с "
+                    "произвольным raw CAN (CANable / SLCAN / candleLight или VAS 6154 / VNCI).",
+                    f"Adapter “{iface}” is selected. Writing to an FPK cluster through the J533 gateway requires an "
+                    "adapter with arbitrary raw CAN (CANable / SLCAN / candleLight, or a VAS 6154 / VNCI).",
+                )
+                if self.via_gateway
+                else tr(
+                    f"Выбран адаптер «{iface}». Для записи приборной панели FPK требуется нативный CAN-адаптер (CANable / SLCAN / candleLight).",
+                    f"Adapter “{iface}” is selected. Writing to an FPK cluster requires a native CAN adapter (CANable / SLCAN / candleLight).",
+                ),
+            )
+        elif blocker == "gateway":
+            QMessageBox.warning(
+                self,
+                tr("RAM-мост недоступен", "RAM bridge unavailable"),
+                tr(
+                    "Запись DataFlash приборной панели через шлюз требует шлюз Continental 3Q0 907 530 с поддержкой "
+                    "прозрачного RAM-моста, либо прямое подключение к CAN приборной панели (T18).",
+                    "Writing cluster DataFlash through a gateway requires a Continental 3Q0 907 530 gateway with "
+                    "transparent RAM-bridging, or a direct connection to the cluster CAN bus (T18).",
+                ),
+            )
+        return blocker is not None
+
     @property
     def is_dflash_modified(self) -> bool:
         return (
@@ -1175,11 +1221,13 @@ class FpkeScreen(QWidget):
         else:
             set_pill(self.nav_rows["extra"].pill, "—", "muted")
 
-        native_ok = not self.conn.interface or self.conn.interface in FPKE_NATIVE_INTERFACES
+        blocker = self._memory_blocker() if self.conn.interface else None
         set_pill(
             self.nav_rows["read"].pill,
-            "" if native_ok else tr("нужен SLCAN", "SLCAN needed"),
-            "warn" if not native_ok else "muted",
+            {"adapter": tr("нужен SLCAN", "SLCAN needed"), "gateway": tr("нет RAM-моста", "no RAM bridge")}.get(
+                blocker or "", ""
+            ),
+            "warn" if blocker else "muted",
         )
         active_link = get_active_fpke_link()
         kl15_on = bool(active_link and active_link.is_keepalive_running())
@@ -2567,19 +2615,31 @@ class FpkeScreen(QWidget):
     def _build_read_page(self, lay: QVBoxLayout) -> None:
         busy = self.runner.is_busy
         iface = self.conn.interface or "slcan"
-        native_ok = iface in FPKE_NATIVE_INTERFACES and (not self.via_gateway or self.gateway_bridge)
+        blocker = self._memory_blocker()
+        native_ok = blocker is None
 
-        if not native_ok:
+        if blocker:
             warn = Callout("err")
-            if self.via_gateway and not self.gateway_bridge:
+            if blocker == "gateway":
                 warn.label.setText(
                     tr(
                         "<b>Чтение памяти уровня 8 через этот шлюз недоступно.</b> "
-                        "Для прозрачного RAM-моста требуется шлюз Continental 3Q0 907 530 и нативный CAN-адаптер "
-                        "(CANable / SLCAN / candleLight), либо прямое подключение к CAN приборной панели (T18).",
+                        "Для прозрачного RAM-моста требуется шлюз Continental 3Q0 907 530 и адаптер с произвольным "
+                        "raw CAN (CANable / SLCAN / candleLight или VNCI, принимающий в RawMode все идентификаторы), "
+                        "либо прямое подключение к CAN приборной панели (T18).",
                         "<b>Level-8 memory access is unavailable through this gateway.</b> "
-                        "Transparent RAM-bridging requires a Continental 3Q0 907 530 gateway and a native CAN adapter "
-                        "(CANable / SLCAN / candleLight), or a direct connection to the cluster CAN bus (T18).",
+                        "Transparent RAM-bridging requires a Continental 3Q0 907 530 gateway and an adapter with "
+                        "arbitrary raw CAN (CANable / SLCAN / candleLight, or a VNCI whose RawMode receives every "
+                        "identifier), or a direct connection to the cluster CAN bus (T18).",
+                    )
+                )
+            elif self.via_gateway:
+                warn.label.setText(
+                    tr(
+                        f"<b>Выбран адаптер «{iface}».</b> Для чтения приборной панели через шлюз J533 нужен адаптер "
+                        "с произвольным raw CAN (CANable / SLCAN / candleLight или VAS 6154 / VNCI).",
+                        f"<b>Adapter “{iface}” is selected.</b> Reading this instrument cluster through the J533 gateway "
+                        "requires an adapter with arbitrary raw CAN (CANable / SLCAN / candleLight, or a VAS 6154 / VNCI).",
                     )
                 )
             else:
@@ -2601,7 +2661,7 @@ class FpkeScreen(QWidget):
                 "Reads DataFlash (64 KB) and the MCU configuration Extra Area (256 B). Nothing is written to flash.",
             ),
         )
-        if self.via_gateway and self.gateway_bridge and iface in FPKE_NATIVE_INTERFACES:
+        if self.via_gateway and native_ok:
             gw_badge = status_readout(
                 tr(
                     f"Через шлюз J533 (RAM-мост ch{self.gateway_channel})",
@@ -2895,29 +2955,9 @@ class FpkeScreen(QWidget):
 
         if not ensure_ready(self.conn, self):
             return
+        if self._write_blocked():
+            return
         iface = self.conn.interface or "slcan"
-        if iface not in FPKE_NATIVE_INTERFACES:
-            QMessageBox.warning(
-                self,
-                tr("Неподдерживаемый адаптер", "Unsupported adapter"),
-                tr(
-                    f"Выбран адаптер «{iface}». Для записи приборной панели FPK требуется нативный CAN-адаптер (CANable / SLCAN / candleLight).",
-                    f"Adapter “{iface}” is selected. Writing to an FPK cluster requires a native CAN adapter (CANable / SLCAN / candleLight).",
-                ),
-            )
-            return
-        if self.via_gateway and not self.gateway_bridge:
-            QMessageBox.warning(
-                self,
-                tr("RAM-мост недоступен", "RAM bridge unavailable"),
-                tr(
-                    "Запись DataFlash приборной панели через шлюз требует шлюз Continental 3Q0 907 530 с поддержкой "
-                    "прозрачного RAM-моста, либо прямое подключение к CAN приборной панели (T18).",
-                    "Writing cluster DataFlash through a gateway requires a Continental 3Q0 907 530 gateway with "
-                    "transparent RAM-bridging, or a direct connection to the cluster CAN bus (T18).",
-                ),
-            )
-            return
 
         if confirm:
             bullets = "\n".join(f"  • {line}" for line in (chg.get("lines") or []))
@@ -3017,29 +3057,9 @@ class FpkeScreen(QWidget):
 
         if not ensure_ready(self.conn, self):
             return
+        if self._write_blocked():
+            return
         iface = self.conn.interface or "slcan"
-        if iface not in FPKE_NATIVE_INTERFACES:
-            QMessageBox.warning(
-                self,
-                tr("Неподдерживаемый адаптер", "Unsupported adapter"),
-                tr(
-                    f"Выбран адаптер «{iface}». Для записи приборной панели FPK требуется нативный CAN-адаптер (CANable / SLCAN / candleLight).",
-                    f"Adapter “{iface}” is selected. Writing to an FPK cluster requires a native CAN adapter (CANable / SLCAN / candleLight).",
-                ),
-            )
-            return
-        if self.via_gateway and not self.gateway_bridge:
-            QMessageBox.warning(
-                self,
-                tr("RAM-мост недоступен", "RAM bridge unavailable"),
-                tr(
-                    "Запись DataFlash приборной панели через шлюз требует шлюз Continental 3Q0 907 530 с поддержкой "
-                    "прозрачного RAM-моста, либо прямое подключение к CAN приборной панели (T18).",
-                    "Writing cluster DataFlash through a gateway requires a Continental 3Q0 907 530 gateway with "
-                    "transparent RAM-bridging, or a direct connection to the cluster CAN bus (T18).",
-                ),
-            )
-            return
 
         _, cf_bytes = self._own_dflash_and_cflash()
         if confirm:

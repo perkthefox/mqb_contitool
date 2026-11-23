@@ -1283,6 +1283,15 @@ class DPduBus(can.BusABC):
         #17 (OpenVCX32 this way) it refused raw CAN and passed on only every fifth frame of a memory stream."""
         return bool(self.hmod) and not self.module_is_vci
 
+    @property
+    def every_id_raw(self) -> bool:
+        """RawMode that sends and receives any CAN id, as the J533 RAM bridge needs. A primed CAN1 passes only the
+        priming link's response id to the monitor, and a J2534 wrapper drops most frames of a stream (#17)."""
+        return bool(self.h_tx) and not (
+            self.spent or self.nonraw or self.uds_only or self.j2534_wrapper
+            or self._raw_needs_prime or self._raw_prime_unproven
+        )
+
     def describe(self) -> str:
         """The module actually connected, for the log and the problem report."""
         kind = tr("VCI VW", "VW VCI") if self.module_is_vci else tr("J2534 через драйвер VW", "J2534 through the VW driver")
@@ -1595,7 +1604,9 @@ class DPduBus(can.BusABC):
         else:
             self._prime_for(msg.arbitration_id)
             payload, tx_link = msg.arbitration_id.to_bytes(4, "big") + bytes(msg.data), self.h_tx
-            # 29-bit sending mirrors the RxFlag layout (byte 2 bit 0); only 11-bit sending is verified on hardware
+            # 29-bit: TxFlag 0x100 (byte 2 bit 0). Static RE of 27.2: the DLL (fcn.180031820) turns that bit alone into
+            # the CoP header's ext bit, and the PC protocol layer (RawCan_ubDataReq 0x429cd0) takes ext only from it.
+            # The VCI firmware itself is encrypted; only 11-bit sending is verified on hardware.
             flag = (0, 0, 1 if msg.is_extended_id else 0, 0)
         end = time.monotonic() + (5.0 if timeout is None else timeout)
         saw_queue_full = False

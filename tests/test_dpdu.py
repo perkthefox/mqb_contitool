@@ -299,6 +299,50 @@ def test_monitor_frames_keep_their_29_bit_flag_and_own_echoes_are_dropped() -> N
     bus.shutdown()
 
 
+def test_only_a_rawmode_vci_that_hears_every_id_can_carry_the_j533_bridge() -> None:
+    from contitool.can.bridge import bridge_bus_ok
+
+    bus = DPduBus(dll=FakePduApi())
+    assert bridge_bus_ok("dpdu", bus)
+    bus._raw_needs_prime = True  # its monitor now passes only the priming link's response id
+    assert not bridge_bus_ok("dpdu", bus)
+    bus.shutdown()
+    api = FakePduApi()
+    api.rawmode_ok = False
+    bus = DPduBus(dll=api)
+    assert bus.nonraw and not bridge_bus_ok("dpdu", bus)
+    bus.shutdown()
+    assert bridge_bus_ok("slcan") and not bridge_bus_ok("dpdu") and not bridge_bus_ok("j2534")
+
+
+def test_a_vnci_found_to_need_can1_primed_in_the_loader_does_not_start_the_bridge(monkeypatch) -> None:
+    from contitool.can import workflows
+    from contitool.can.bridge import j533_can_bridge
+
+    set_lang("en")
+    api = FakePduApi()
+    sent: list[can.Message] = []
+    gw_send = api.gw.send
+    api.gw.send = lambda msg, timeout=None: (sent.append(msg), gw_send(msg, timeout))  # type: ignore[method-assign]
+    bus = DPduBus(dll=api)
+    monkeypatch.setattr(dpdu, "open_session", lambda *a, **k: bus)
+    monkeypatch.setattr(dpdu, "release_session", lambda *a, **k: None)
+    resets: list[object] = []
+
+    def enter_loader(link, **kw):
+        bus._raw_needs_prime = True  # entering the loader showed CAN1 must be started by an ISO-TP link
+        return {"loader_ready": True}
+
+    monkeypatch.setattr(workflows, "enter_ram_loader", enter_loader)
+    monkeypatch.setattr(workflows, "_reset_to_application", lambda link, **kw: resets.append(link))
+    bridge = j533_can_bridge("VAS6154", interface="dpdu")
+    with pytest.raises(RuntimeError, match="arbitrary raw CAN"):
+        bridge.start()
+    assert not bridge.active and len(resets) == 1  # the gateway sat in the RAM loader: sent back to its application
+    assert not [m for m in sent if m.arbitration_id == 0x6F0]  # no applet byte went out
+    bus.shutdown()
+
+
 def test_full_send_queue_is_waited_out() -> None:
     api = FakePduApi()
     bus = DPduBus(dll=api)

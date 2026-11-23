@@ -30,6 +30,7 @@ from contitool.can import (  # noqa: E402
     can_uds_read_dtc,
     j533_can_bridge,
 )
+from contitool.can.hw_applets import J533_BRIDGE_BURST_DATA, J533_BRIDGE_BURST_FAIL, J533_BRIDGE_BURST_OK  # noqa: E402
 from contitool.i18n import set_lang  # noqa: E402
 
 
@@ -101,6 +102,8 @@ class FakeMultiEcuBus:
         self.bridge_stops = 0
         self.cleared_tx_ids: list[int] = []
         self._loader_bytes_remaining = 0
+        self.bursts = 0
+        self.burst_reply: bytes | None = None  # what the bridge applet answers to BURST-GO (None: silence)
 
     def _enqueue_isotp(self, rx_id: int, payload: bytes) -> None:
         if len(payload) <= 7:
@@ -120,6 +123,11 @@ class FakeMultiEcuBus:
                 self.bridge_active = False
                 self.bridge_stops += 1
                 self.rx.append((J533_BRIDGE_END_ID, False, J533_BRIDGE_END_DATA))
+                return
+            if data == J533_BRIDGE_BURST_DATA and self.bridge_active:
+                self.bursts += 1
+                if self.burst_reply is not None:
+                    self.rx.append((J533_BRIDGE_END_ID, False, self.burst_reply))
                 return
             if data == b"\x84\x00\x00\x00\x00":
                 self.rx.append((0x6F1, False, b"\x84\x00\x00\x00\x00"))
@@ -205,10 +213,253 @@ def test_j533_can_bridge_lifecycle_starts_and_stops_cleanly(monkeypatch) -> None
     assert bridge.stop_info.get("returned_to_app") is True
 
 
-def test_j533_can_bridge_rejects_non_native_interface_without_bus() -> None:
+def test_fire_burst_reports_what_the_gateway_answered(monkeypatch) -> None:
+    from contitool.can import workflows
+
     set_lang("en")
-    with pytest.raises(RuntimeError, match="native CAN adapter"):
-        j533_can_bridge("VAS6154", interface="dpdu")
+    monkeypatch.setattr(workflows, "enter_ram_loader", lambda link, **kw: {"loader_ready": True})
+    frames = [(0x1BFCA2ED, bytes(range(8))), (0x17FA0E14, bytes(8))]
+    fake = FakeMultiEcuBus()
+    with j533_can_bridge("fake", interface="slcan", bus=fake, burst_frames=frames) as bridge:
+        with pytest.raises(RuntimeError, match="differs from the frame table"):
+            bridge.fire_burst(frames[:1])
+        assert fake.bursts == 0  # nothing triggered for a stream the gateway does not hold
+        fake.burst_reply = J533_BRIDGE_BURST_OK
+        bridge.fire_burst(frames)
+        fake.burst_reply = J533_BRIDGE_BURST_FAIL
+        with pytest.raises(RuntimeError, match="got no ACK"):
+            bridge.fire_burst(frames)
+        fake.burst_reply = None
+        with pytest.raises(TimeoutError, match="BURST-OK"):
+            bridge.fire_burst(frames, timeout=0.2)
+        assert fake.bursts == 3
+    with pytest.raises(RuntimeError, match="not running"):
+        bridge.fire_burst(frames)
+
+    with j533_can_bridge("fake", interface="slcan", bus=FakeMultiEcuBus()) as plain:
+        with pytest.raises(RuntimeError, match="no table was uploaded"):
+            plain.fire_burst(frames)
+
+
+def test_j533_can_bridge_rejects_an_adapter_without_raw_can() -> None:
+    set_lang("en")
+    with pytest.raises(RuntimeError, match="arbitrary raw CAN"):
+        j533_can_bridge("PassThru", interface="j2534")
+
+
+def test_a_vnci_bridge_serves_the_bcm_and_the_fpke() -> None:
+    from contitool.can.ecus import ECU_SPEC_BY_KIND, _build_slave_ecu
+
+    def build(kind: str):
+        return _build_slave_ecu(ECU_SPEC_BY_KIND[kind], [], via_gateway=True, gateway_bridge_capable=True,
+                                interface="dpdu", bus_injected=False, in_fbl=False)
+
+    for ecu in (build("bcm"), build("fpke")):
+        assert ecu.bridge_available and "memory" in ecu.capabilities
+
+
+def test_a_vnci_that_can_carry_the_bridge_blames_the_gateway_when_memory_is_unavailable() -> None:
+    from contitool.can.ecus import ECU_SPEC_BY_KIND, _build_slave_ecu
+
+    set_lang("en")
+
+    def reason(adapter_ok: bool) -> str:
+        ecu = _build_slave_ecu(ECU_SPEC_BY_KIND["fpke"], [], via_gateway=True, gateway_bridge_capable=False,
+                               interface="dpdu", bus_injected=False, in_fbl=False, bridge_adapter_ok=adapter_ok)
+        return str(ecu.memory_unavailable_reason)
+
+    assert "gateway on the bus does not support" in reason(True)
+    assert "arbitrary raw CAN" in reason(False)
+
+
+def test_fpke_memory_pages_check_the_selected_adapter_and_the_gateway_separately() -> None:
+    from types import SimpleNamespace
+
+    from contitool.gui.screens.fpke import FpkeScreen
+
+    def blocker(iface: str, via_gateway: bool, gateway_bridge: bool = True) -> str | None:
+        screen = SimpleNamespace(conn=SimpleNamespace(interface=iface), via_gateway=via_gateway,
+                                 gateway_bridge=gateway_bridge)
+        return FpkeScreen._memory_blocker(screen)  # type: ignore[arg-type]
+
+    assert blocker("slcan", False) is None and blocker("dpdu", False) == "adapter"
+    assert blocker("dpdu", True) is None and blocker("slcan", True) is None
+    assert blocker("j2534", True) == "adapter"  # scanned with a VNCI, then J2534 selected
+    assert blocker("slcan", True, gateway_bridge=False) == "gateway"  # SLCAN is fine, the gateway is not
+
+
+# sha256 of the hardware-verified bridge applet per target channel: the burst variant must never change these
+VERIFIED_BRIDGE_APPLETS = {
+    0: "2bb48ea7960dde4fc080beac4476cbdc144049063e91143caec726a840c8cfdf",
+    1: "c4228e2fde3bb5258fa161790146f2054e6c1ea00ae0b529512ebed03ffa0b0a",
+    2: "60154c7c2ba0d9d974be16dc7bacd05cdba9f0a310e764ca7c53f71ad50c4a64",
+    4: "d568e5f438a99d24aae07e0bf51b3a352d937e4efe5270a2a285079bb8e49ef1",
+    5: "bf579a82525f6b66c694c2f421e3ec0ce6c97ab80bb97a930b4c7bbc3277903c",
+}
+
+
+def test_the_bridge_applet_without_a_burst_stays_byte_identical() -> None:
+    import hashlib
+
+    for ch, digest in VERIFIED_BRIDGE_APPLETS.items():
+        assert hashlib.sha256(build_j533_can_bridge_applet(ch)).hexdigest() == digest
+
+
+def test_the_burst_table_rides_at_the_end_of_the_applet_as_tmid_plus_data() -> None:
+    import struct
+
+    from contitool.can.hw_applets import J533_BRIDGE_BURST_DATA, J533_BRIDGE_BURST_GAP_MAX_LOOPS
+
+    frames = [(0x1BFCA2ED, bytes(range(8))), (0x17FA0E14, bytes.fromhex("1022800300000000")), (0x6F0, b"ABCDEFGH")]
+    blob = build_j533_can_bridge_applet(0, burst_frames=frames)
+    table = blob[-12 * len(frames):]
+    for i, (can_id, data) in enumerate(frames):
+        tmid, = struct.unpack_from("<I", table, 12 * i)
+        assert tmid == can_id | 0x80000000  # every burst frame goes out 29-bit, a low id included
+        assert table[12 * i + 4 : 12 * i + 12] == data
+    for magic in struct.unpack("<II", J533_BRIDGE_BURST_DATA):
+        assert struct.pack("<I", magic) in blob  # the trigger compare is compiled in
+    assert len(blob) > len(build_j533_can_bridge_applet(0)) + 12 * len(frames)
+    for bad in ([], [(0x1BFCA2ED, b"short")], [(0x20000000, bytes(8))]):
+        with pytest.raises(ValueError):
+            build_j533_can_bridge_applet(0, burst_frames=bad)
+    build_j533_can_bridge_applet(0, burst_frames=frames, burst_gap_loops=J533_BRIDGE_BURST_GAP_MAX_LOOPS)
+    for gap in (0, J533_BRIDGE_BURST_GAP_MAX_LOOPS + 1):  # the gap loop never kicks the watchdog
+        with pytest.raises(ValueError, match="burst_gap_loops"):
+            build_j533_can_bridge_applet(0, burst_frames=frames, burst_gap_loops=gap)
+
+
+def _vnci_behind_a_gateway(monkeypatch, fake, *, on_bridge_start=None) -> dict[str, Any]:
+    """A VAS 6154 (`dpdu`) reaching `fake` through a J533 whose bridge is faked; its burst goes out as the applet
+    sends it. Returns what the bridge saw: `table` (uploaded with it) and `fired`."""
+    from contitool.can import dpdu
+
+    monkeypatch.setattr(dpdu, "open_session", lambda *a, **k: fake)
+    monkeypatch.setattr(dpdu, "release_session", lambda *a, **k: None)
+    seen: dict[str, Any] = {}
+
+    class GatewayBridge:
+        def __init__(self, *a: Any, burst_frames=None, **kw: Any) -> None:
+            self.bus = fake
+            seen["table"] = burst_frames
+
+        def __enter__(self):
+            if on_bridge_start is not None:
+                on_bridge_start()
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            pass
+
+        def fire_burst(self, frames) -> None:
+            assert frames == seen["table"]
+            seen["fired"] = True
+            for can_id, data in frames:  # what the applet puts on ch0
+                fake.send(can.Message(arbitration_id=can_id, data=data, is_extended_id=True))
+
+    monkeypatch.setattr("contitool.can.bridge.j533_can_bridge", lambda *a, **kw: GatewayBridge(*a, **kw))
+    return seen
+
+
+def test_fpke_level8_stream_sent_from_the_gateway_when_the_adapter_is_a_vnci(monkeypatch, tmp_path: Path) -> None:
+    """Over a VAS 6154 the gateway gets the level-8 stream with the bridge applet and sends it itself; the host only
+    triggers it, and the table matches the profile the cluster reported before the bridge started."""
+    from contitool.can import fpke as fpke_can
+    from test_fpke import FakeFpkeBus
+
+    fake = FakeFpkeBus()
+    seen = _vnci_behind_a_gateway(monkeypatch, fake)
+    res = fpke_can.can_fpke_full_read(
+        "VAS6154", interface="dpdu", session_dir=tmp_path / "vci", wake_seconds=0.0,
+        via_gateway=True, gateway_bridge=True, gateway_channel=0,
+    )
+    assert seen.get("fired") and res["gateway_bridged"] is True
+    assert seen["table"] == fpke_can.fpke_level8_frames(fpke_can.fpke_detect_sw_profile(
+        f189=fake.ident_map[0xF189].decode("latin1"), f187=fake.ident_map[0xF187].decode("latin1")))
+    assert (tmp_path / "vci" / "Dflash.bin").read_bytes() == bytes(fake.dflash)
+
+
+def test_no_level8_stream_goes_to_the_gateway_for_a_cluster_that_does_not_identify_itself(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A sleeping cluster answers neither F189 nor F187: its profile would only be a guess, so no bridge starts."""
+    from contitool.can import fpke as fpke_can
+    from test_fpke import FakeFpkeBus
+
+    set_lang("en")
+    fake = FakeFpkeBus()
+    del fake.ident_map[0xF189], fake.ident_map[0xF187]
+    seen = _vnci_behind_a_gateway(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="did not report its software version"):
+        fpke_can.can_fpke_full_read(
+            "VAS6154", interface="dpdu", session_dir=tmp_path / "s", wake_seconds=0.0,
+            via_gateway=True, gateway_bridge=True, gateway_channel=0,
+        )
+    assert "table" not in seen and fake.ed_count == 0
+
+
+def test_the_gateway_stream_is_not_fired_when_the_cluster_reports_another_profile_after_10_03(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from contitool.can import fpke as fpke_can
+    from test_fpke import FakeFpkeBus
+
+    set_lang("en")
+    fake = FakeFpkeBus()  # identifies as 83a to the probe before the bridge
+
+    def now_a_1703() -> None:
+        fake.ident_map.update({0xF189: b"1703", 0xF187: b"5E0920790A "})
+
+    seen = _vnci_behind_a_gateway(monkeypatch, fake, on_bridge_start=now_a_1703)
+    with pytest.raises(RuntimeError, match=r"holds the stream for cluster software 83A.*1703"):
+        fpke_can.can_fpke_full_read(
+            "VAS6154", interface="dpdu", session_dir=tmp_path / "s", wake_seconds=0.0,
+            via_gateway=True, gateway_bridge=True, gateway_channel=0,
+        )
+    assert seen["table"] == fpke_can.fpke_level8_frames("83a")
+    assert "fired" not in seen and fake.ed_count == 0 and fake.vendor_level == 0
+
+
+def test_a_large_dataflash_rewrite_through_a_vnci_is_refused_before_anything_is_written(monkeypatch, tmp_path: Path) -> None:
+    from contitool.can import fpke as fpke_can
+    from test_fpke import FakeFpkeBus
+
+    fake = FakeFpkeBus()
+    before = bytes(fake.dflash)
+    _vnci_behind_a_gateway(monkeypatch, fake)
+    blank_checks: list[Any] = []
+    monkeypatch.setattr(fpke_can, "fpke_read_dflash_blank_checked", lambda *a, **k: blank_checks.append(k))
+    monkeypatch.setattr(fpke_can, "FPKE_SLOW_ADAPTER_MAX_BLOCKS", 8)  # this diff makes 34 block jobs
+    cand = bytearray(before)
+    for off in range(0x8000, 0x8000 + 64 * 136, 64):
+        cand[off] ^= 0x01
+    with pytest.raises(RuntimeError, match="VAS 6154"):
+        fpke_can.can_fpke_write_dflash(
+            "VAS6154", bytes(cand), interface="dpdu", session_dir=tmp_path / "w", wake_seconds=0.0,
+            full_rewrite=True, allow_foreign=True, reset_after=False,
+            via_gateway=True, gateway_bridge=True, gateway_channel=0,
+        )
+    assert bytes(fake.dflash) == before
+    assert not blank_checks  # refused from the backup read alone, before the 64 KB blank-check
+    set_lang("en")
+    with pytest.raises(RuntimeError, match="through adapter “j2534”") as other:
+        fpke_can._refuse_slow_adapter_write("j2534", 9)
+    assert "VAS 6154" not in str(other.value)
+    fpke_can._refuse_slow_adapter_write("j2534", 8)
+    fpke_can._refuse_slow_adapter_write("slcan", 10_000)
+
+
+def test_the_level8_frame_list_is_the_stream_the_host_has_always_sent() -> None:
+    from contitool.can import fpke as f
+
+    for profile in ("83a", "1703", "1711"):
+        ptr = int(f.fpke_get_profile(profile)["pointer_frame"])
+        old = [(f.FPKE_BLOCK_ID, f.flood_payload(i, profile=profile)) for i in range(ptr)]
+        old += [(f.FPKE_CF_CH9_ID, bytes.fromhex("1022800300000000")),
+                (f.FPKE_BLOCK_ID, f.flood_payload(ptr, profile=profile)),
+                (f.FPKE_CF_CH9_ID, bytes([0x21, 8, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]))]
+        assert f.fpke_level8_frames(profile) == old and len(old) == ptr + 3
+        build_loader_packet(build_j533_can_bridge_applet(0, burst_frames=old))  # raises past the FBL buffer limit
 
 
 def test_can_scan_bus_discovers_gateway_and_connected_slaves() -> None:

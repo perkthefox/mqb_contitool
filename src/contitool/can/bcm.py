@@ -403,11 +403,13 @@ def _managed_bcm_session(
         raise RuntimeError(
             tr(
                 "Для работы с 29-битными протоколами BCM (XCP / WFS канал 3) через шлюз требуется шлюз "
-                "Continental 3Q0 907 530 и нативный CAN-адаптер (CANable / SLCAN / candleLight) для запуска "
-                "прозрачного RAM-моста ch3 ↔ ch0 — либо прямое подключение к шине CAN Komfort.",
+                "Continental 3Q0 907 530 и адаптер с произвольным raw CAN (CANable / SLCAN / candleLight или "
+                "VAS 6154 / VNCI, принимающий в RawMode все идентификаторы) для запуска прозрачного RAM-моста "
+                "ch3 ↔ ch0 — либо прямое подключение к шине CAN Komfort.",
                 "Working with 29-bit BCM protocols (XCP / WFS Channel 3) through a gateway requires a Continental "
-                "3Q0 907 530 gateway and a native CAN adapter (CANable / SLCAN / candleLight) for the transparent "
-                "ch3 ↔ ch0 RAM bridge — or a direct connection to the Komfort CAN bus.",
+                "3Q0 907 530 gateway and an adapter with arbitrary raw CAN (CANable / SLCAN / candleLight, or a "
+                "VAS 6154 / VNCI whose RawMode receives every identifier) for the transparent ch3 ↔ ch0 RAM bridge "
+                "— or a direct connection to the Komfort CAN bus.",
             )
         )
 
