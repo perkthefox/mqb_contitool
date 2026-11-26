@@ -125,12 +125,10 @@ GROUPS = (("main", ("cp", "eng", "swap", "zdc", "dtc")), ("service", ("boot", "h
 def _restart_note() -> str:
     """After a dataset change: the gateway restarts itself, the other modules (the head unit above all) do not."""
     return tr(
-        "Чтобы изменения датасета вступили в силу во всех блоках, перезапустите их: на автомобиле выключите и снова "
-        "включите зажигание, на столе отключите питание на несколько секунд. Если магнитола продолжает показывать "
-        "старый список режимов движения, перезагрузите её: удерживайте кнопку питания около 10 секунд.",
-        "For the dataset changes to take effect in every module, restart them: in a car switch the ignition off and "
-        "on again; on the bench cut the power for a few seconds. If the head unit still shows the old list of driving "
-        "modes, restart it by holding its power button for about 10 seconds.",
+        "Перезапустите блоки (выкл/вкл зажигание в авто или питание на стенде). "
+        "Если магнитола показывает старые режимы, перезагрузите её удержанием кнопки питания ~10 с.",
+        "Cycle power/ignition so all modules reload the dataset. "
+        "If the head unit still shows old modes, reboot it by holding its power button for ~10 s.",
     )
 
 
@@ -221,14 +219,14 @@ class EcuScreen(QWidget):
         self.sec_id = QFrame()
         self.sec_id.setObjectName("IdentityBar")
         body = QVBoxLayout(self.sec_id)
-        body.setContentsMargins(24, 12, 24, 12)
-        body.setSpacing(10)
+        body.setContentsMargins(24, 10, 24, 10)
+        body.setSpacing(8)
 
         head = QHBoxLayout()
         head.setSpacing(10)
         self.lbl_pn = QLabel()
         self.lbl_pn.setObjectName("PartNumber")
-        self.lbl_pn.setFont(mono_font(20, bold=True))
+        self.lbl_pn.setFont(mono_font(18, bold=True))
         self.lbl_pn.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_sys = QLabel()
         self.lbl_sys.setObjectName("Hint")
@@ -259,13 +257,13 @@ class EcuScreen(QWidget):
         body.addWidget(divider())
 
         self.grid_id = QGridLayout()
-        self.grid_id.setHorizontalSpacing(22)
+        self.grid_id.setHorizontalSpacing(20)
         self.grid_id.setVerticalSpacing(2)
         body.addLayout(self.grid_id)
 
         self.grid_mcu_id = QGridLayout()
         self.grid_mcu_id.setContentsMargins(0, 0, 0, 0)
-        self.grid_mcu_id.setHorizontalSpacing(28)
+        self.grid_mcu_id.setHorizontalSpacing(26)
         self.grid_mcu_id.setVerticalSpacing(2)
         body.addLayout(self.grid_mcu_id)
         return self.sec_id
@@ -273,7 +271,7 @@ class EcuScreen(QWidget):
     def _build_nav(self) -> QWidget:
         pane = QFrame()
         pane.setObjectName("NavPane")
-        pane.setFixedWidth(306)
+        pane.setFixedWidth(284)
         lay = QVBoxLayout(pane)
         lay.setContentsMargins(6, 6, 6, 0)
         lay.setSpacing(0)
@@ -285,15 +283,15 @@ class EcuScreen(QWidget):
         for group, keys in GROUPS:
             head = QListWidgetItem(self.nav)
             head.setFlags(Qt.ItemFlag.NoItemFlags)
-            head.setSizeHint(QSize(0, 26))
+            head.setSizeHint(QSize(0, 24))
             lbl = group_label()
-            lbl.setContentsMargins(12, 8, 0, 0)
+            lbl.setContentsMargins(12, 7, 0, 0)
             self.nav.setItemWidget(head, lbl)
             self._group_labels[group] = lbl
             for key in keys:
                 item = QListWidgetItem(self.nav)
                 item.setData(Qt.ItemDataRole.UserRole, key)
-                item.setSizeHint(QSize(0, 33))
+                item.setSizeHint(QSize(0, 32))
                 nav_row = _NavRow()
                 self.nav.setItemWidget(item, nav_row)
                 self.nav_rows[key] = nav_row
@@ -600,7 +598,7 @@ class EcuScreen(QWidget):
         frame = QFrame()
         frame.setObjectName("Step")
         outer = QVBoxLayout(frame)
-        outer.setContentsMargins(18, 15, 18, 16)
+        outer.setContentsMargins(18, 13, 18, 14)
         outer.setSpacing(7)
 
         h = QHBoxLayout()
@@ -612,8 +610,8 @@ class EcuScreen(QWidget):
             n.setAlignment(Qt.AlignmentFlag.AlignCenter)
             h.addWidget(n, 0, Qt.AlignmentFlag.AlignVCenter)
         t = QLabel(title)
-        t.setObjectName("FieldLabel")
-        h.addWidget(t)
+        t.setObjectName("SectionTitle")
+        h.addWidget(t, 0, Qt.AlignmentFlag.AlignVCenter)
         h.addStretch(1)
         if state is not None:
             h.addWidget(status_readout(state.text, state.tone), 0, Qt.AlignmentFlag.AlignVCenter)
@@ -718,23 +716,15 @@ class EcuScreen(QWidget):
         self._text(
             lay,
             tr(
-                "Component Protection: модули (магнитола, приборная панель, усилитель и др.) сверяют через шлюз, "
-                "что установлены в своём автомобиле. Адаптация добавляет в шлюз модуль с другого автомобиля; "
-                "заводские модули не затрагиваются.",
-                "Component Protection: modules (head unit, instrument cluster, amplifier and others) check "
-                "through the gateway that they sit in their own car. Adaptation adds a module from another car to "
-                "the gateway; the factory modules are not affected.",
+                "Привязка б/у модулей (магнитола, приборка, усилитель и др.) к шлюзу без затрагивания заводских блоков.",
+                "Bind donor modules (head unit, cluster, amplifier, etc.) to this gateway without affecting factory modules.",
             ),
         )
         self._note(
             lay,
             tr(
-                "Нужен ключ IKA адаптируемого модуля (16 байт), известный заранее. Его читают из дампа памяти "
-                "самого модуля. Без ключа модуль не адаптировать. Другой вариант — сгенерировать свой ключ и записать "
-                "его и в шлюз, и в слот IKA модуля.",
-                "You need the IKA key of the module being adapted (16 bytes), known in advance. It is read from "
-                "a memory dump of the module itself. Without the key the module cannot be adapted. The alternative is to "
-                "generate your own key and write it into both the gateway and the module's IKA slot.",
+                "Требуется 16-байтный ключ IKA модуля (из его дампа), либо сгенерируйте свой ключ и запишите его в оба блока.",
+                "Requires the module's 16-byte IKA key (from its dump), or generate a key and write it to both units.",
             ),
             tone="warn",
         )
@@ -761,18 +751,16 @@ class EcuScreen(QWidget):
         self._note(
             lay,
             tr(
-                "Адаптация меняет CodeFlash и DataFlash; в блок они записываются кнопкой «Записать в блок».",
-                "Adaptation changes CodeFlash and DataFlash; they go into the ECU with “Write to ECU”.",
+                "Изменения в CodeFlash и DataFlash записываются в шлюз кнопкой «Записать в блок».",
+                "CodeFlash and DataFlash edits go into the gateway via “Write to ECU”.",
             ),
         )
 
     def _page_eng(self, lay: QVBoxLayout) -> None:
         st = self._head(lay, "eng")
         desc = tr(
-            "Включает заводские инженерные службы шлюза: функции 0x80/0x81/0x83, ASAM CCP (чтение и запись "
-            "памяти по CAN) и RAM-Loader 0x6F0.",
-            "Enables the gateway's factory engineering services: functions 0x80/0x81/0x83, ASAM CCP (memory "
-            "read and write over CAN) and the 0x6F0 RAM-Loader.",
+            "Включает заводские инженерные службы шлюза: 0x80/0x81/0x83, ASAM CCP (чтение/запись по CAN) и RAM-Loader 0x6F0.",
+            "Enables factory engineering services: 0x80/0x81/0x83, ASAM CCP (CAN memory access), and RAM-Loader 0x6F0.",
         )
         if st.key == "partial" and st.detail:
             desc = f"{desc}\n\n{st.detail}"
@@ -793,8 +781,8 @@ class EcuScreen(QWidget):
             *btns,
         )
         self._note(lay, tr(
-            "Меняется только CodeFlash; в блок он записывается кнопкой «Записать в блок».",
-            "Only CodeFlash changes; it goes into the ECU with “Write to ECU”.",
+            "Меняется только CodeFlash; запись в шлюз — кнопкой «Записать в блок».",
+            "Only CodeFlash changes; write it to the ECU with “Write to ECU”.",
         ))
 
     def _page_swap(self, lay: QVBoxLayout) -> None:
@@ -802,12 +790,8 @@ class EcuScreen(QWidget):
         self._text(
             lay,
             tr(
-                "Функции SWaP шлюза (круиз-контроль GRA, контроль усталости MKE, профили движения FPA) включаются"
-                " записью кодов FEC в слоты Multi-FSC в DataFlash. Ключ RSA, сертификаты и изменение CodeFlash "
-                "для этого не нужны.",
-                "The gateway's SWaP features (GRA cruise control, MKE fatigue detection, FPA driving profiles) "
-                "are switched on by writing FEC codes into the Multi-FSC slots in DataFlash. No RSA key, "
-                "certificate or CodeFlash change is needed.",
+                "Активация функций SWaP (GRA, MKE, профили FPA) записью кодов FEC в слоты Multi-FSC DataFlash — без правки CodeFlash и ключа RSA.",
+                "Enable SWaP features (GRA, MKE, FPA driving profiles) via Multi-FSC slots in DataFlash — no RSA key or CodeFlash edits needed.",
             ),
         )
         self._swap_live_block(lay)
@@ -837,12 +821,10 @@ class EcuScreen(QWidget):
             self._note(
                 lay,
                 tr(
-                    f"В DataFlash найдено {len(foreign)} сертификат(ов) от другого блока (чужой VCRN {vcrns}{vin_part}) — "
-                    "такое бывает на б/у шлюзе после онлайн-перепривязки CP. Шлюз их не принимает, а их VIN относится "
-                    "к автомобилю-донору. Откройте «Настроить функции SWaP…», чтобы пересобрать нужные функции под текущий VCRN.",
-                    f"DataFlash holds {len(foreign)} certificate(s) from another ECU (foreign VCRN {vcrns}{vin_part}) — "
-                    "typical on a used gateway after online CP adaptation. The gateway rejects them, and their VIN belongs "
-                    "to the donor vehicle. Open “Configure SWaP features…” to rebuild the needed features for this ECU's VCRN.",
+                    f"Найдено {len(foreign)} сертификат(ов) от другого блока (чужой VCRN {vcrns}{vin_part}) — шлюз их отклоняет. "
+                    "Пересоберите нужные функции через «Настроить функции SWaP…».",
+                    f"Found {len(foreign)} certificate(s) for another ECU (foreign VCRN {vcrns}{vin_part}) — rejected by the gateway. "
+                    "Rebuild the needed features via “Configure SWaP features…”.",
                 ),
                 tone="warn",
             )
@@ -905,10 +887,8 @@ class EcuScreen(QWidget):
             ),
             status.dataset_state(self.ws),
             tr(
-                "Записывает выбранные FEC в слоты Multi-FSC в DataFlash и проверяет, есть ли для них данные в "
-                "датасете ZDC. CodeFlash и ключ VAG не меняются.",
-                "Writes the selected FECs into the Multi-FSC slots in DataFlash and checks that the ZDC dataset "
-                "has data for them. CodeFlash and the VAG key stay as they are.",
+                "Записывает выбранные FEC в слоты Multi-FSC и проверяет наличие данных в датасете ZDC. CodeFlash не меняется.",
+                "Writes selected FECs to Multi-FSC slots and checks ZDC dataset coverage. CodeFlash stays untouched.",
             ),
             self._btn(
                 "swap_direct",
@@ -950,12 +930,8 @@ class EcuScreen(QWidget):
             tr("Свой ключ в шлюзе", "Your key in the gateway"),
             key,
             tr(
-                "Ключ RSA-1024 записывается в CodeFlash и в кэш SWaP в DataFlash. Новая пара ключей сохраняется в"
-                " папке ContiTool_keys рядом с дампами. Без приватного ключа сертификат не подписать — сохраните "
-                "его.",
-                "The RSA-1024 key is written into CodeFlash and into the SWaP cache in DataFlash. A new key pair "
-                "is saved in the ContiTool_keys folder next to the dumps. Without the private key no certificate "
-                "can be signed — keep it.",
+                "Вшивает открытый ключ RSA-1024 в CodeFlash и кэш SWaP. Приватный ключ сохраняется в ContiTool_keys — храните его.",
+                "Embeds your RSA-1024 public key in CodeFlash and SWaP cache. Keep the private key saved in ContiTool_keys.",
             ),
             *key_btns,
             num="1",
@@ -965,8 +941,8 @@ class EcuScreen(QWidget):
             tr("Сертификат функции", "Feature certificate"),
             None,
             tr(
-                "Выберите функцию — ContiTool подпишет сертификат вашим ключом для VCRN и VIN этого блока.",
-                "Pick a feature — ContiTool signs a certificate with your key for this ECU's VCRN and VIN.",
+                "Подписывает сертификат вашим ключом под VCRN и VIN этого блока.",
+                "Signs a certificate with your key for this ECU's VCRN and VIN.",
             ),
             self._btn(
                 "fsc",
@@ -983,10 +959,8 @@ class EcuScreen(QWidget):
             tr("Отправка в блок", "Sending to the ECU"),
             None,
             tr(
-                "Сертификат отправляется в шлюз (адрес 19) командой UDS 31 01 06 55 из CAN-терминала ContiTool "
-                "или тестером. Готовый сертификат открывается в CAN-терминале.",
-                "The certificate goes to the gateway (address 19) with UDS 31 01 06 55, from ContiTool's CAN "
-                "terminal or a scan tool. A signed certificate opens in the CAN terminal.",
+                "Отправьте сертификат в блок 19 командой UDS 31 01 06 55 через CAN-терминал.",
+                "Send the certificate to module 19 via UDS 31 01 06 55 in the CAN terminal.",
             ),
             num="3",
         )
@@ -1005,10 +979,8 @@ class EcuScreen(QWidget):
                 tr("Состояние в блоке", "State in the ECU"),
                 None,
                 tr(
-                    "Читает из блока статус всех FEC (UDS 22 3C 00): какие приняты, какие отклонены и почему. После "
-                    "записи области SWaP запускается сам.",
-                    "Reads the status of every FEC from the ECU (UDS 22 3C 00): which are accepted, which are "
-                    "rejected and why. Runs by itself after the SWaP area is written.",
+                    "Опрашивает реальный статус всех FEC по UDS 22 3C 00 (приняты, отклонены и причина).",
+                    "Reads live FEC status over UDS 22 3C 00 (accepted, rejected, and reason).",
                 ),
                 btn,
             )
@@ -1208,13 +1180,8 @@ class EcuScreen(QWidget):
             tr("Параметрия блока", "ECU datasets"),
             pp_st,
             tr(
-                "Запись по UDS (сессия 10 40, доступ 20103). Перед записью ContiTool читает из блока статус SWaP "
-                "и кодировку и предлагает включить недостающее. Экспорт сохраняет датасеты файлами ODIS (.xml) и "
-                "как есть (.bin); импорт загружает датасет из файла ODIS с его номером и версией.",
-                "Written over UDS (session 10 40, access 20103). Before the write ContiTool reads the ECU's SWaP "
-                "status and coding and offers to switch on what is missing. Export saves the datasets as ODIS "
-                "files (.xml) and as they are (.bin); import loads a dataset from an ODIS file with its number "
-                "and version.",
+                "Штатная запись по UDS (10 40, код 20103) с проверкой SWaP и кодировки, а также импорт/экспорт файлов ODIS (.xml / .bin).",
+                "Standard UDS upload (10 40, access 20103) with SWaP/coding sync, plus ODIS (.xml / .bin) import and export.",
             ),
             self._btn("zdc_can_upload", tr("Записать параметрию по CAN…", "Write datasets over CAN…"),
                       self._upload_zdc_over_can, "PrimaryBtn", ok_df, tip_df),
@@ -1361,20 +1328,14 @@ class EcuScreen(QWidget):
         self._text(
             lay,
             tr(
-                "Загрузчик (Uflash) записывает прошивку в блок. Заводской загрузчик принимает только CodeFlash с "
-                "подписью VAG, а любое изменение CodeFlash эту подпись нарушает. Инженерный загрузчик подпись не "
-                "проверяет — с ним изменённый CodeFlash записывается по CAN. От заводского он отличается одной "
-                f"инструкцией: 4 байта по адресу {addr_lbl}.",
-                "The bootloader (Uflash) writes firmware into the ECU. The factory bootloader accepts only CodeFlash "
-                "signed by VAG, and any change to CodeFlash breaks that signature. The engineering bootloader does not "
-                "check the signature, so a modified CodeFlash can be written over CAN. It differs from the factory one "
-                f"by a single instruction: 4 bytes at {addr_lbl}.",
+                f"Инженерный загрузчик (Uflash) отключает проверку подписи VAG (4 байта @ {addr_lbl}), позволяя записывать изменённый CodeFlash по CAN.",
+                f"The engineering bootloader (Uflash) bypasses the VAG signature check (4 bytes @ {addr_lbl}) so modified CodeFlash can be flashed over CAN.",
             ),
         )
         btns = []
         if st.key != "open":
             btns.append(
-                self._btn("boot_on", tr("Активировать инженерный…", "Activate engineering…"), lambda: self._flash_bootloader(True))
+                self._btn("boot_on", tr("Активировать инженерный…", "Activate engineering…"), lambda: self._flash_bootloader(True), "PrimaryBtn")
             )
         if st.key != "stock":
             btns.append(
@@ -1385,14 +1346,10 @@ class EcuScreen(QWidget):
             tr("Инженерный загрузчик", "Engineering bootloader"),
             st,
             tr(
-                "Uflash меняется только через FACI: в RAM блока загружается программа, которая перезаписывает "
-                "загрузчик, после записи — проверка чтением. Перед записью CodeFlash ContiTool ставит инженерный "
-                "загрузчик сам, если его нет.",
-                "Uflash is changed only through FACI: a program loaded into the ECU's RAM rewrites the "
-                "bootloader, which is then read back. Before a CodeFlash write ContiTool installs the engineering"
-                " bootloader itself if it is not there.",
+                "Перезаписывает Uflash через FACI с проверкой чтением. При записи CodeFlash устанавливается автоматически.",
+                "Rewrites Uflash via FACI with readback verification. Installed automatically before a CodeFlash write.",
             )
-            + ("" if st.known else "\n" + tr("Состояние видно по дампу Uflash.", "The state comes from the Uflash dump.")),
+            + ("" if st.known else "\n" + tr("Состояние видно по дампу Uflash.", "State is read from the Uflash dump.")),
             *btns,
         )
 
@@ -1409,12 +1366,8 @@ class EcuScreen(QWidget):
             tr("Свой ключ FBL — для ODX и ODIS", "Your FBL key — for ODX and ODIS"),
             fbl,
             tr(
-                "Вместо инженерного загрузчика можно записать свой ключ FBL и подписывать им прошивку, например "
-                "для контейнера .odx под ODIS. Ключ хранится в CodeFlash по адресу 0xA2F7 и записывается в блок "
-                "через FACI кнопкой «Записать в блок».",
-                "Instead of the engineering bootloader you can write your own FBL key and sign firmware with it, "
-                "for an .odx container for ODIS, say. The key sits in CodeFlash at 0xA2F7 and goes into the ECU "
-                "through FACI with “Write to ECU”.",
+                "Альтернатива инженерному загрузчику: вшивает ваш ключ RSA-1024 в CodeFlash (@ 0xA2F7) для подписи контейнеров .odx.",
+                "Alternative to the engineering bootloader: embeds your RSA-1024 key in CodeFlash (@ 0xA2F7) to sign .odx containers.",
             ),
             *btns,
         )
@@ -1424,25 +1377,15 @@ class EcuScreen(QWidget):
         self._text(
             lay,
             tr(
-                "Внешняя SPI EEPROM ST M95640 (8 КБ на шине CSIH1) хранит паспорт блока, VIN, кодировку 0x0600, "
-                "список оборудования 0x04A3, данные АКБ BEM и блок состояния безопасности NvM 0x5E. Опционные "
-                "байты RH850/F1L (OPBT0..OPBT8, 36 Б) задают режим отладки JTAG/LPD, сторожевые таймеры WDTA0/1, "
-                "монитор питания CVM и активацию криптомодуля ICU-S.",
-                "The external ST M95640 SPI EEPROM (8 KB on CSIH1) stores the ECU passport, VIN, coding 0x0600, "
-                "installation list 0x04A3, BEM battery data, and the NvM 0x5E security state block. The RH850/F1L "
-                "Option Bytes (OPBT0..OPBT8, 36 B) configure JTAG/LPD debug mode, WDTA0/1 watchdogs, CVM voltage "
-                "monitoring, and ICU-S cryptographic activation.",
+                "Диагностический просмотр внешней SPI EEPROM ST M95640 (8 КБ: VIN, кодировка, BEM, NvM 0x5E) и опционных байтов RH850 (OPBT0..8).",
+                "Diagnostic viewer for external ST M95640 SPI EEPROM (8 KB: VIN, coding, BEM, NvM 0x5E) and RH850 Option Bytes (OPBT0..8).",
             ),
         )
         self._note(
             lay,
             tr(
-                "Режим только для чтения и диагностики: запись в OPBT и внешнюю EEPROM намеренно не предусмотрена. "
-                "Некорректное значение OPBT необратимо блокирует запуск и отладку процессора RH850, а записи "
-                "безопасности NvM 0x5E/0x5F в M95640 защищены аппаратными тегами AES-CMAC (ICU-S).",
-                "Diagnostic read-only mode: writing to OPBT or the external EEPROM is intentionally disabled. "
-                "Invalid OPBT values can lock RH850 boot and debug access, and security records NvM 0x5E/0x5F in "
-                "M95640 are paired with hardware ICU-S AES-CMAC tags.",
+                "Только чтение: запись в OPBT и EEPROM отключена для защиты от блокировки процессора и нарушения тегов AES-CMAC.",
+                "Read-only: writing to OPBT and external EEPROM is disabled to protect MCU boot access and ICU-S AES-CMAC tags.",
             ),
         )
         if self.ws.read_warnings:
@@ -1500,10 +1443,8 @@ class EcuScreen(QWidget):
             tr("Внешняя SPI EEPROM (ST M95640, 8 КБ)", "External SPI EEPROM (ST M95640, 8 KB)"),
             ee_state,
             tr(
-                "Читается по шине SPI CSIH1 в режиме RAM-Loader (без модификации регистров и памяти) и автоматически "
-                "снимается при полном чтении блока.",
-                "Read over the CSIH1 SPI bus inside RAM-Loader (read-only, restoring all registers) and included "
-                "automatically in a full ECU backup.",
+                "Читается по шине CSIH1 через RAM-Loader и автоматически входит в полное чтение блока.",
+                "Read over CSIH1 via RAM-Loader and included automatically in a full ECU backup.",
             ),
             *ee_btns,
         )
@@ -1617,8 +1558,8 @@ class EcuScreen(QWidget):
             tr("Опционные байты RH850/F1L (OPBT0..OPBT8, 36 Б)", "RH850/F1L Option Bytes (OPBT0..OPBT8, 36 B)"),
             op_state,
             tr(
-                "Считываются через окно Extra Area (BFASELR=1 @ 0x01000070) с полным сохранением состояния кэша и буфера предвыборки.",
-                "Read via the Extra Area flash window (BFASELR=1 @ 0x01000070) while saving and restoring I-cache and prefetch state.",
+                "Читаются через окно Extra Area (BFASELR=1 @ 0x01000070) в режиме только чтение.",
+                "Read via the Extra Area flash window (BFASELR=1 @ 0x01000070) in read-only mode.",
             ),
             *op_btns,
         )
@@ -2448,7 +2389,12 @@ class EcuScreen(QWidget):
                 )
             )
 
-        self.runner.run_task(tr("Подпись прошивки для ODX", "Signing firmware for ODX"), task, on_success=done)
+        # the runner is still busy inside on_success: show the modal result once it has finished
+        self.runner.run_task(
+            tr("Подпись прошивки для ODX", "Signing firmware for ODX"),
+            task,
+            on_success=self._here(lambda sig: QTimer.singleShot(0, lambda s=sig: done(s))),
+        )
 
     # ────────────────────────────── bench ──────────────────────────────
     def _dtc_run(self, clear: bool) -> None:

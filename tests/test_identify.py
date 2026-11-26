@@ -358,3 +358,57 @@ def test_ram_loader_entry_refuses_5q0_and_lear_gateways_with_clear_reason(monkey
     with J533CanLink("fake", bus=bus_lear) as link, pytest.raises(RuntimeError, match="Lear.*PowerPC"):
         workflows.enter_ram_loader(link)
     assert bus_lear.stage1_attempts == 1 and bus_lear.resets == 1
+
+
+def test_can_identify_target_j533_does_not_fall_through_to_other_ecus() -> None:
+    """M2b: Explicitly requesting target='j533' must probe only J533 (0x710/0x77A) and fail clearly if absent,
+    never falling through to BCM (0x70E), MRR (0x757), or FPK_E (0x714)."""
+    from test_gateway_bridge_and_bus_scan import FakeMultiEcuBus
+
+    set_lang("en")
+    seen_tx_ids: list[int] = []
+
+    class TrackingSlaveOnlyBus(FakeMultiEcuBus):
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            seen_tx_ids.append(msg.arbitration_id)
+            super().send(msg, timeout=timeout)
+
+    bus = TrackingSlaveOnlyBus(has_j533=False, has_fpke=True, has_bcm=True)
+    with pytest.raises(RuntimeError, match="J533 gateway.*0x710"):
+        can_identify("fake", target="j533", bus=bus)
+    assert seen_tx_ids and set(seen_tx_ids) == {0x710}
+
+
+def test_can_identify_j533_nrc22_on_1003_falls_back_to_default_session_1001() -> None:
+    """M2c: When J533 rejects 10 03 with NRC 0x22 (e.g. KL15 off / engine running), can_identify must fall back
+    to 10 01 (default session) and still read standard identification DIDs."""
+    set_lang("en")
+
+    class Kl15OffGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.saw_1001 = False
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            data = bytes(msg.data)
+            if msg.arbitration_id == 0x710 and data[0] >> 4 == 0:
+                req = data[1 : 1 + (data[0] & 0x0F)]
+                if req == b"\x10\x03":
+                    self._reply(b"\x7f\x10\x22")
+                    return
+                if req == b"\x10\x01":
+                    self.saw_1001 = True
+                    self._reply(b"\x50\x01\x00\x32\x01\xf4")
+                    return
+            super().send(msg, timeout=timeout)
+
+    for tgt in ("j533", "auto"):
+        gw = Kl15OffGateway()
+        res = can_identify("fake", target=tgt, bus=gw)
+        vals = {i["did"]: i["value"] for i in res["ident"]}
+        assert res["responding"] is True
+        assert res["ecu_kind"] == "j533"
+        assert not res.get("in_fbl")
+        assert gw.saw_1001 is True
+        assert vals["F187"] == "3Q0907530AA"
+        assert vals["F197"] == "GW MQB High"

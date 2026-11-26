@@ -31,11 +31,19 @@ TX_MSG_TYPE = 0x01  # rx status: echo of our own frame
 START_OF_MESSAGE = 0x02  # ISO15765 rx status: FirstFrame seen; wait for the reassembled PDU
 TX_INDICATION = 0x08  # rx status: "your frame went out"
 ISO15765_FRAME_PAD = 0x40  # ISO15765 tx/filter flag: pad CAN frames to 8 bytes
+IOCTL_CLEAR_RX_BUFFER = 0x08
 ERR_TIMEOUT = 0x09
 ERR_BUFFER_EMPTY = 0x10
-_RX_BATCH = 64
+ERR_BUFFER_OVERFLOW = 0x12
+_RX_BATCH = 256
 _P2_WAIT = 2.5  # P2server before the first response byte; the FBL repeats `7F xx 78` about this often
 _P2_STAR_WAIT = 6.0  # P2*server 5.0 s + 1 s for adapter latency, matching the software ISO-TP path
+
+
+class J2534BufferOverflowError(can.CanOperationError):
+    """PassThruReadMsgs reported ERR_BUFFER_OVERFLOW (0x12): the adapter's RX queue overflowed during a burst.
+
+    The link itself stays usable: clearing/draining the RX buffer and retrying with a smaller burst recovers (#45)."""
 
 
 class PassThruMsg(ctypes.Structure):
@@ -192,8 +200,22 @@ class J2534Bus(can.BusABC):
             except Exception:
                 pass
             detail = text.value.decode("latin-1", "replace").strip()
-            raise can.CanOperationError(f"{fn}: J2534 error 0x{rc:02X}" + (f" ({detail})" if detail else ""))
+            msg = f"{fn}: J2534 error 0x{rc:02X}" + (f" ({detail})" if detail else "")
+            if rc == ERR_BUFFER_OVERFLOW:
+                raise J2534BufferOverflowError(msg, error_code=rc)
+            raise can.CanOperationError(msg, error_code=rc)
         return rc
+
+    def clear_rx_buffer(self) -> None:
+        """Flush the active PassThru channel's RX queue (`CLEAR_RX_BUFFER` ioctl) and local pending frames."""
+        self._pending.clear()
+        chan = self._uds_chan or self._chan.value
+        if not chan:
+            return
+        try:
+            self._dll.PassThruIoctl(chan, IOCTL_CLEAR_RX_BUFFER, None, None)
+        except Exception:  # noqa: BLE001 - best-effort cleanup; drain_rx follows
+            pass
 
     def _read(self, timeout_ms: int, count: int) -> None:
         n = ctypes.c_uint32(count)
@@ -366,7 +388,11 @@ class J2534Bus(can.BusABC):
         """Throw away anything already queued on the ISO15765 channel before sending a new request."""
         for _ in range(16):
             n_rx = ctypes.c_uint32(_RX_BATCH)
-            self._call("PassThruReadMsgs", self._uds_chan, ctypes.byref(self._rx_buf), ctypes.byref(n_rx), 0)
+            try:
+                self._call("PassThruReadMsgs", self._uds_chan, ctypes.byref(self._rx_buf), ctypes.byref(n_rx), 0)
+            except J2534BufferOverflowError:
+                self.clear_rx_buffer()
+                continue
             if n_rx.value == 0:
                 return
 

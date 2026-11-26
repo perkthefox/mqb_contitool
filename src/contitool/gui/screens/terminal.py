@@ -230,7 +230,7 @@ class TerminalScreen(QWidget):
         self.cmb_bitrate.currentIndexChanged.connect(
             lambda _i: QSettings().setValue("terminal/bitrate", self.cmb_bitrate.currentData())
         )
-        self.btn_settings = button("", "GhostBtn", slot=lambda: run_dialog(ConnectionDialog(self.conn, self)))
+        self.btn_settings = button("", "InlineBtn", slot=lambda: run_dialog(ConnectionDialog(self.conn, self)))
         self.lbl_state = QLabel()
         self.lbl_state.setObjectName("StatusReadout")
         sep = vdivider()
@@ -239,13 +239,13 @@ class TerminalScreen(QWidget):
         self.lbl_counts.setFont(mono_font(12))
         set_tone(self.lbl_counts, "muted")
         for w in (self.btn_connect, self.lbl_link, self.cmb_bitrate, self.btn_settings):
-            row.addWidget(w)
+            row.addWidget(w, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addStretch(1)
-        row.addWidget(self.lbl_state)
+        row.addWidget(self.lbl_state, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addSpacing(8)
         row.addWidget(sep, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addSpacing(8)
-        row.addWidget(self.lbl_counts)
+        row.addWidget(self.lbl_counts, 0, Qt.AlignmentFlag.AlignVCenter)
         sec.body.addLayout(row)
         return sec
 
@@ -328,6 +328,8 @@ class TerminalScreen(QWidget):
         self.cmb_target.addItem("", ("710", "77A"))
         self.cmb_target.addItem("", ("714", "77E"))
         self.cmb_target.addItem("", ("70E", "778"))
+        self.cmb_target.addItem("", ("757", "7C1"))
+        self.cmb_target.addItem("", ("731", "79B"))
         self.cmb_target.currentIndexChanged.connect(self._on_target_changed)
         self.ed_tx = self._id_edit("710")
         self.ed_rx = self._id_edit("77A")
@@ -359,8 +361,8 @@ class TerminalScreen(QWidget):
             self.ed_rx.setText(pair[1])
 
     def set_target_ecu(self, kind: str) -> None:
-        """Select default UDS IDs for gateway (`j533`), instrument cluster (`fpke`), or BCM (`bcm`)."""
-        idx_map = {"j533": 0, "fpke": 1, "bcm": 2}
+        """Select default UDS IDs for gateway (`j533`), instrument cluster (`fpke`), BCM (`bcm`), ACC radar (`mrr`), or ELV (`elv`)."""
+        idx_map = {"j533": 0, "fpke": 1, "bcm": 2, "mrr": 3, "elv": 4}
         idx = idx_map.get(kind.strip().lower(), 0)
         self.cmb_target.setCurrentIndex(idx)
         self._on_target_changed(idx)
@@ -428,6 +430,8 @@ class TerminalScreen(QWidget):
         self.cmb_target.setItemText(0, tr("Шлюз (710/77A)", "Gateway (710/77A)"))
         self.cmb_target.setItemText(1, tr("Панель (714/77E)", "Cluster (714/77E)"))
         self.cmb_target.setItemText(2, tr("BCM (70E/778)", "BCM (70E/778)"))
+        self.cmb_target.setItemText(3, tr("Радар 13 (757/7C1)", "Radar 13 (757/7C1)"))
+        self.cmb_target.setItemText(4, tr("ELV 2B (731/79B)", "ELV 2B (731/79B)"))
         self.lbl_id.setText("ID")
         self.lbl_data_frame.setText(tr("Данные / шаблон", "Data / preset"))
         self.lbl_tx.setText(tr("Запрос", "Request"))
@@ -472,7 +476,7 @@ class TerminalScreen(QWidget):
         self._refresh_counts()
 
     def _refresh_counts(self) -> None:
-        self.lbl_counts.setText(f"Rx {self._rx}    Tx {self._tx}")
+        self.lbl_counts.setText(f"Rx {self._rx}  ·  Tx {self._tx}")
 
     def _say(self, text: str, tone: str = "") -> None:
         self.lbl_msg.setText(text)
@@ -482,17 +486,15 @@ class TerminalScreen(QWidget):
         if self.btn_mode_uds.isChecked():
             self._say(
                 tr(
-                    "Запрос уходит по ISO-TP, ответ собирается целиком; «ожидание» (7F xx 78) обрабатывается само. "
-                    "После # можно писать комментарий.",
-                    "The request goes over ISO-TP and the reply is reassembled; “pending” (7F xx 78) is handled for you. "
-                    "Text after # is a comment.",
+                    "ISO-TP: ответ собирается целиком, ожидание 7F xx 78 обрабатывается автоматически. Комментарий — после #.",
+                    "ISO-TP: replies are reassembled and 7F xx 78 pending is handled automatically. Use # for comments.",
                 )
             )
         else:
             self._say(
                 tr(
-                    "До 8 байт данных. ID длиннее трёх знаков или больше 7FF отправляется как 29-битный.",
-                    "Up to 8 data bytes. An ID longer than three digits or above 7FF is sent as 29-bit.",
+                    "До 8 байт данных. ID длиннее 3 знаков или > 7FF отправляется как 29-битный.",
+                    "Up to 8 data bytes. IDs > 3 hex digits or > 7FF are sent as 29-bit.",
                 )
             )
 

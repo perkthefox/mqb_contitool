@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import time
 from typing import Any
 
@@ -32,11 +33,16 @@ from contitool.can import (
     can_backup,
     can_bcm_read_all,
     can_cure_fbl_fingerprint,
+    can_elv_read_dflash,
+    can_elv_status,
     can_flash_frf,
     can_fpke_full_read,
     can_identify,
+    can_mrr_read_keys,
+    can_mrr_status,
     can_restore_backup,
     can_scan_bus,
+    can_uds_read_dtc,
     close_active_fpke_link,
     unsupported_ecu_reason,
 )
@@ -62,7 +68,16 @@ from contitool.core import (
     analyze_opbt,
     analyze_uflash,
 )
+from contitool.can.bridge import BRIDGE_NATIVE_INTERFACES
+from contitool.core.elv import (
+    ELV_DFLASH_COMPACT_SIZE,
+    ELV_DFLASH_RAW64K_SIZE,
+    elv_detect_folder_files,
+    elv_is_dflash_bytes,
+    is_elv_ident,
+)
 from contitool.core.fpke import detect_fpke_files, is_fpke_ident
+from contitool.core.mrr import MRR_DFLASH_SIZE, mrr_detect_profile, mrr_parse_dflash_fee
 from contitool.gui.connection import CanConnection, ConnectionDialog, ensure_ready
 from contitool.gui.dialogs.guide import GuideDialog
 from contitool.gui.dialogs.problem_report import ProblemReportDialog
@@ -70,7 +85,9 @@ from contitool.gui.dialogs.restore import RestoreDialog
 from contitool.gui.screens.bcm import BcmScreen
 from contitool.gui.screens.bus import BusScreen
 from contitool.gui.screens.ecu import EcuScreen
+from contitool.gui.screens.elv import ElvScreen
 from contitool.gui.screens.fpke import FpkeScreen
+from contitool.gui.screens.mrr import MrrScreen
 from contitool.gui.screens.start import StartScreen
 from contitool.gui.screens.terminal import TerminalScreen
 from contitool.gui import theme
@@ -79,12 +96,12 @@ from contitool.gui.widgets.execution_panel import ExecutionPanel
 from contitool.gui.widgets.page import Callout, Dialog, TextResultDialog, button, hint, run_dialog, vdivider
 from contitool.gui.update_check import UpdateChecker
 from contitool.gui.worker import OperationRunner
-from contitool.gui.workspace import NAMES, Workspace
+from contitool.gui.workspace import NAMES, Workspace, _remember_recent
 from contitool.i18n import get_lang, set_lang, subscribe_lang_change, tr
 from contitool.core.constants import FBL_MOD_OFFSET
 from contitool.core.frf import FrfImage, frf_ident_problems, frf_signature_problem, read_flash_file
 from contitool.report import Failure
-from contitool.storage import keep_as_base, latest_area, new_session, unit_of_cflash, unit_of_ident
+from contitool.storage import keep_as_base, latest_area, new_session, unit_name, unit_of_cflash, unit_of_ident
 
 CURE_TITLE = ("Исправление отпечатка программирования", "Fixing the programming fingerprint")
 
@@ -101,7 +118,7 @@ class MainWindow(QMainWindow):
         self.runner = OperationRunner(self)
         self.ws = Workspace(self)
         self.conn = CanConnection(self)
-        self._active_screen: str = "start"  # "start" | "bus" | "j533" | "fpke"
+        self._active_screen: str = "start"  # "start" | "bus" | "j533" | "fpke" | "bcm" | "mrr" | "elv"
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -124,11 +141,23 @@ class MainWindow(QMainWindow):
             self.runner,
             cluster_provider=self._provide_fpke_cluster_material,
         )
+        self.mrr_screen = MrrScreen(
+            self.conn,
+            self.runner,
+            cluster_provider=self._provide_fpke_cluster_material,
+        )
+        self.elv_screen = ElvScreen(
+            self.conn,
+            self.runner,
+            cluster_provider=self._provide_fpke_cluster_material,
+        )
         self.stack.addWidget(self.start_screen)
         self.stack.addWidget(self.bus_screen)
         self.stack.addWidget(self.ecu_screen)
         self.stack.addWidget(self.fpke_screen)
         self.stack.addWidget(self.bcm_screen)
+        self.stack.addWidget(self.mrr_screen)
+        self.stack.addWidget(self.elv_screen)
 
         self.start_screen.scan_bus_requested.connect(self.scan_can_bus)
         self.start_screen.read_can_requested.connect(self.read_over_can)
@@ -144,6 +173,8 @@ class MainWindow(QMainWindow):
         self.bus_screen.open_j533_workspace_requested.connect(lambda: self.switch_ecu_view("j533"))
         self.bus_screen.open_fpke_workspace_requested.connect(self._on_bus_open_fpke_workspace)
         self.bus_screen.open_bcm_workspace_requested.connect(self._on_bus_open_bcm_workspace)
+        self.bus_screen.open_mrr_workspace_requested.connect(self._on_bus_open_mrr_workspace)
+        self.bus_screen.open_elv_workspace_requested.connect(self._on_bus_open_elv_workspace)
         self.bus_screen.open_terminal_requested.connect(self._on_bus_open_terminal)
         self.bus_screen.back_requested.connect(lambda: self.switch_ecu_view("start"))
         self.ecu_screen.report_requested.connect(self.show_report)
@@ -153,6 +184,10 @@ class MainWindow(QMainWindow):
         self.fpke_screen.close_requested.connect(self.close_ecu)
         self.bcm_screen.close_requested.connect(self.close_ecu)
         self.bcm_screen.open_terminal_requested.connect(self._on_bcm_open_terminal)
+        self.mrr_screen.close_requested.connect(self.close_ecu)
+        self.mrr_screen.open_terminal_requested.connect(self._on_mrr_open_terminal)
+        self.elv_screen.close_requested.connect(self.close_ecu)
+        self.elv_screen.open_terminal_requested.connect(self._on_elv_open_terminal)
 
         self.console = ExecutionPanel(self.runner)
         self.console.setMinimumHeight(120)
@@ -165,6 +200,10 @@ class MainWindow(QMainWindow):
         self.fpke_screen.note.connect(lambda _m: self._ensure_console_visible())
         self.bcm_screen.note.connect(self.console.note)
         self.bcm_screen.note.connect(lambda _m: self._ensure_console_visible())
+        self.mrr_screen.note.connect(self.console.note)
+        self.mrr_screen.note.connect(lambda _m: self._ensure_console_visible())
+        self.elv_screen.note.connect(self.console.note)
+        self.elv_screen.note.connect(lambda _m: self._ensure_console_visible())
         self.splitter.addWidget(self.stack)
         self.splitter.addWidget(self.console)
         self.splitter.setStretchFactor(0, 1)
@@ -186,6 +225,10 @@ class MainWindow(QMainWindow):
         self.fpke_screen.changed.connect(self._refresh_screen)
         self.bcm_screen.changed.connect(self._refresh_header)
         self.bcm_screen.changed.connect(self._refresh_screen)
+        self.mrr_screen.changed.connect(self._refresh_header)
+        self.mrr_screen.changed.connect(self._refresh_screen)
+        self.elv_screen.changed.connect(self._refresh_header)
+        self.elv_screen.changed.connect(self._refresh_screen)
         self.conn.changed.connect(self._refresh_header)
         self.console.btn_toggle_log.toggled.connect(self._set_console_visible)
         self.console.btn_hide.clicked.connect(lambda: self._set_console_visible(False))
@@ -205,8 +248,8 @@ class MainWindow(QMainWindow):
         bar = QFrame()
         bar.setObjectName("Header")
         lay = QHBoxLayout(bar)
-        lay.setContentsMargins(18, 0, 18, 0)
-        lay.setSpacing(10)
+        lay.setContentsMargins(14, 0, 14, 0)
+        lay.setSpacing(8)
 
         logo = QLabel()
         logo.setPixmap(build_app_icon().pixmap(QSize(20, 20)))
@@ -214,11 +257,11 @@ class MainWindow(QMainWindow):
         self.lbl_app = QLabel("ContiTool")
         self.lbl_app.setObjectName("AppName")
         lay.addWidget(self.lbl_app, 0, Qt.AlignmentFlag.AlignVCenter)
-        lay.addSpacing(4)
+        lay.addSpacing(2)
         sep = vdivider()
         sep.setFixedHeight(16)
         lay.addWidget(sep, 0, Qt.AlignmentFlag.AlignVCenter)
-        lay.addSpacing(4)
+        lay.addSpacing(2)
 
         track = QFrame()
         track.setObjectName("ModeTrack")
@@ -250,7 +293,15 @@ class MainWindow(QMainWindow):
         self.btn_sw_j533 = QPushButton()
         self.btn_sw_fpke = QPushButton()
         self.btn_sw_bcm = QPushButton()
-        for b, target in ((self.btn_sw_j533, "j533"), (self.btn_sw_fpke, "fpke"), (self.btn_sw_bcm, "bcm")):
+        self.btn_sw_mrr = QPushButton()
+        self.btn_sw_elv = QPushButton()
+        for b, target in (
+            (self.btn_sw_j533, "j533"),
+            (self.btn_sw_fpke, "fpke"),
+            (self.btn_sw_bcm, "bcm"),
+            (self.btn_sw_mrr, "mrr"),
+            (self.btn_sw_elv, "elv"),
+        ):
             b.setObjectName("TabBtn")
             b.setCheckable(True)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -296,7 +347,7 @@ class MainWindow(QMainWindow):
         self.act_read = act(self.read_over_can, "Ctrl+R")
         self.act_folder = act(self.open_folder, QKeySequence.StandardKey.Open)
         self.act_files = act(self.open_files, "Ctrl+Shift+O")
-        self.act_export = act(lambda: self.fpke_screen.export_backup() if self._is_fpke_active() else self.ecu_screen.export_backup())
+        self.act_export = act(self._export_active)
         self.act_restore = act(self.restore_backup)
         self.act_frf = act(lambda: self.flash_frf())
         self.act_report = act(self.show_report, "Ctrl+I")
@@ -334,21 +385,67 @@ class MainWindow(QMainWindow):
         self.menu_help.addAction(self.act_about)
 
     def _is_fpke_active(self) -> bool:
-        return self.fpke_screen.is_open and (self._active_screen == "fpke" or (not self.ws.is_open and not self.bcm_screen.is_open))
+        return self.fpke_screen.is_open and (
+            self._active_screen == "fpke"
+            or (not self.ws.is_open and not self.bcm_screen.is_open and not self.mrr_screen.is_open and not self.elv_screen.is_open)
+        )
 
     def _is_bcm_active(self) -> bool:
-        return self.bcm_screen.is_open and (self._active_screen == "bcm" or (not self.ws.is_open and not self.fpke_screen.is_open))
+        return self.bcm_screen.is_open and (
+            self._active_screen == "bcm"
+            or (not self.ws.is_open and not self.fpke_screen.is_open and not self.mrr_screen.is_open and not self.elv_screen.is_open)
+        )
+
+    def _is_mrr_active(self) -> bool:
+        return self.mrr_screen.is_open and (
+            self._active_screen == "mrr"
+            or (not self.ws.is_open and not self.fpke_screen.is_open and not self.bcm_screen.is_open and not self.elv_screen.is_open)
+        )
+
+    def _is_elv_active(self) -> bool:
+        return self.elv_screen.is_open and (
+            self._active_screen == "elv"
+            or (not self.ws.is_open and not self.fpke_screen.is_open and not self.bcm_screen.is_open and not self.mrr_screen.is_open)
+        )
+
+    def _export_active(self) -> None:
+        if self._is_elv_active():
+            self.elv_screen.action_export_json()
+        elif self._is_mrr_active():
+            self.mrr_screen.action_export_json()
+        elif self._is_bcm_active():
+            self.bcm_screen.action_export_keys_json()
+        elif self._is_fpke_active():
+            self.fpke_screen.export_backup()
+        else:
+            self.ecu_screen.export_backup()
 
     def _provide_fpke_cluster_material(self) -> dict[str, Any] | None:
         if not self.fpke_screen.is_open:
             return None
+        df_bytes = self.fpke_screen._working_dflash_bytes
+        cf_bytes = self.fpke_screen._cflash_bytes
+        if df_bytes is not None:
+            return {
+                "dflash_bytes": df_bytes,
+                "cflash_bytes": cf_bytes,
+                "s0_hex": str(getattr(self.fpke_screen, "_cached_s0_hex", "") or ""),
+                "s1_hex": str(getattr(self.fpke_screen, "_cached_s1_hex", "") or ""),
+            }
         df_path = self.fpke_screen._working_dflash_path or self.fpke_screen.files.get("dflash")
         if df_path is None or not df_path.is_file():
             return None
         cf_path = self.fpke_screen.files.get("cflash")
+        try:
+            df_raw = df_path.read_bytes()
+            cf_raw = cf_bytes if cf_bytes is not None else (cf_path.read_bytes() if (cf_path is not None and cf_path.is_file()) else None)
+        except OSError:
+            return None
         return {
-            "dflash_bytes": df_path.read_bytes(),
-            "cflash_bytes": cf_path.read_bytes() if (cf_path is not None and cf_path.is_file()) else None,
+            "dflash_bytes": df_raw,
+            "cflash_bytes": cf_raw,
+            "s0_hex": str(getattr(self.fpke_screen, "_cached_s0_hex", "") or ""),
+            "s1_hex": str(getattr(self.fpke_screen, "_cached_s1_hex", "") or ""),
         }
 
     def _refresh_header(self) -> None:
@@ -366,14 +463,41 @@ class MainWindow(QMainWindow):
             j533_loaded=self.ws.is_open,
             fpke_loaded=self.fpke_screen.is_open,
             bcm_loaded=self.bcm_screen.is_open,
+            mrr_loaded=self.mrr_screen.is_open,
+            elv_loaded=self.elv_screen.is_open,
         )
 
-        open_count = int(self.ws.is_open) + int(self.fpke_screen.is_open) + int(self.bcm_screen.is_open)
-        if self._is_bcm_active():
+        open_count = (
+            int(self.ws.is_open)
+            + int(self.fpke_screen.is_open)
+            + int(self.bcm_screen.is_open)
+            + int(self.mrr_screen.is_open)
+            + int(self.elv_screen.is_open)
+        )
+        if self._is_elv_active():
+            self.tab_ecu.setText(tr("Блок", "ECU") if open_count >= 2 else tr("Блок", "ECU") + f" {self.elv_screen.part_number}")
+            self.tab_term.setText(tr("CAN-терминал", "CAN terminal"))
+            self.act_report.setEnabled(False)
+            self.act_export.setEnabled(bool(self.elv_screen._dflash_parsed or self.elv_screen._passport))
+            self.act_close.setEnabled(True)
+        elif self._is_mrr_active():
+            self.tab_ecu.setText(tr("Блок", "ECU") if open_count >= 2 else tr("Блок", "ECU") + f" {self.mrr_screen.part_number}")
+            self.tab_term.setText(tr("CAN-терминал", "CAN terminal"))
+            self.act_report.setEnabled(False)
+            self.act_export.setEnabled(
+                bool(
+                    self.mrr_screen._passport
+                    or self.mrr_screen._status
+                    or self.mrr_screen._ika_hex
+                    or self.mrr_screen._gfa_hex
+                )
+            )
+            self.act_close.setEnabled(True)
+        elif self._is_bcm_active():
             self.tab_ecu.setText(tr("Блок", "ECU") if open_count >= 2 else tr("Блок", "ECU") + f" {self.bcm_screen.part_number}")
             self.tab_term.setText(tr("CAN-терминал", "CAN terminal"))
             self.act_report.setEnabled(False)
-            self.act_export.setEnabled(False)
+            self.act_export.setEnabled(bool(self.bcm_screen._ika_hex or self.bcm_screen._gfa_hex or self.bcm_screen._status))
             self.act_close.setEnabled(True)
         elif self._is_fpke_active():
             self.tab_ecu.setText(tr("Блок", "ECU") if open_count >= 2 else tr("Блок", "ECU") + f" {self.fpke_screen.part_number}")
@@ -391,41 +515,58 @@ class MainWindow(QMainWindow):
             self.tab_term.setText(tr("CAN-терминал", "CAN terminal"))
             self.act_report.setEnabled(open_ or self.fpke_screen.is_open)
             self.act_export.setEnabled(open_ or bool(self.fpke_screen.files))
-            self.act_close.setEnabled(open_ or self.fpke_screen.is_open or self.bcm_screen.is_open)
+            self.act_close.setEnabled(
+                open_ or self.fpke_screen.is_open or self.bcm_screen.is_open or self.mrr_screen.is_open or self.elv_screen.is_open
+            )
 
         self.ecu_switch_track.setVisible(open_count >= 2)
         if open_count >= 2:
             self.btn_sw_j533.setVisible(self.ws.is_open)
             self.btn_sw_fpke.setVisible(self.fpke_screen.is_open)
             self.btn_sw_bcm.setVisible(self.bcm_screen.is_open)
-            self.btn_sw_j533.setText(f"19 {self.ws.part_number or 'J533'}")
-            self.btn_sw_fpke.setText(f"17 {self.fpke_screen.part_number}")
-            self.btn_sw_bcm.setText(f"09 {self.bcm_screen.part_number}")
+            self.btn_sw_mrr.setVisible(self.mrr_screen.is_open)
+            self.btn_sw_elv.setVisible(self.elv_screen.is_open)
+            self.btn_sw_j533.setText("19 J533")
+            self.btn_sw_j533.setToolTip(f"19 J533 — {self.ws.part_number}" if self.ws.part_number else "19 J533")
+            self.btn_sw_fpke.setText("17 FPK_E")
+            self.btn_sw_fpke.setToolTip(f"17 FPK_E — {self.fpke_screen.part_number}" if self.fpke_screen.part_number else "17 FPK_E")
+            self.btn_sw_bcm.setText("09 BCM")
+            self.btn_sw_bcm.setToolTip(f"09 BCM — {self.bcm_screen.part_number}" if self.bcm_screen.part_number else "09 BCM")
+            self.btn_sw_mrr.setText("13 MRR")
+            self.btn_sw_mrr.setToolTip(f"13 MRR — {self.mrr_screen.part_number}" if self.mrr_screen.part_number else "13 MRR")
+            self.btn_sw_elv.setText("2B ELV")
+            self.btn_sw_elv.setToolTip(f"2B ELV — {self.elv_screen.part_number}" if self.elv_screen.part_number else "2B ELV")
             self.btn_sw_j533.setChecked(self._active_screen == "j533")
             self.btn_sw_fpke.setChecked(self._active_screen == "fpke")
             self.btn_sw_bcm.setChecked(self._active_screen == "bcm")
-            for b in (self.btn_sw_j533, self.btn_sw_fpke, self.btn_sw_bcm):
-                b.adjustSize()
+            self.btn_sw_mrr.setChecked(self._active_screen == "mrr")
+            self.btn_sw_elv.setChecked(self._active_screen == "elv")
+            for b in (self.btn_sw_j533, self.btn_sw_fpke, self.btn_sw_bcm, self.btn_sw_mrr, self.btn_sw_elv):
+                b.updateGeometry()
             self.ecu_switch_track.updateGeometry()
         for b in (self.tab_bus, self.tab_ecu, self.tab_term):
-            b.adjustSize()
+            b.updateGeometry()
         self._mode_track.updateGeometry()
 
         if self.conn.port or self.conn.title:
-            self.btn_conn.setText(self.conn.display())
+            full_disp = self.conn.display()
+            max_conn_px = 112 if open_count >= 2 else 165
+            short_disp = self.btn_conn.fontMetrics().elidedText(full_disp, Qt.TextElideMode.ElideMiddle, max_conn_px)
+            self.btn_conn.setText(short_disp)
             self.btn_conn.setIcon(dot_icon(theme.OK if self.conn.ready else theme.WARN, 6))
-            self.btn_conn.setToolTip(
+            status_tip = (
                 tr("Адаптер готов", "Adapter ready")
                 if self.conn.ready
                 else tr("Подтвердите схему подключения", "Confirm the bench wiring")
             )
+            self.btn_conn.setToolTip(f"{full_disp}\n{status_tip}")
         else:
             self.btn_conn.setText(tr("Подключение…", "Connection…"))
             self.btn_conn.setIcon(QIcon())
             self.btn_conn.setToolTip(tr("Настроить адаптер и подключение к блоку", "Set up the CAN adapter and ECU connection"))
 
     def switch_ecu_view(self, target: str) -> None:
-        """Switch between `'start'`, `'bus'`, `'j533'`, and `'fpke'` inside the main workspace stack."""
+        """Switch between `'start'`, `'bus'`, `'j533'`, `'fpke'`, `'bcm'`, `'mrr'`, and `'elv'` inside the main workspace stack."""
         self._active_screen = target
         if self.modes.currentWidget() is self.terminal:
             self.terminal.disconnect_bus()
@@ -442,6 +583,10 @@ class MainWindow(QMainWindow):
         term = mode == "terminal" and not self.runner.is_busy
         if not term:
             self.terminal.disconnect_bus()
+        elif self._is_elv_active():
+            self.terminal.set_target_ecu("elv")
+        elif self._is_mrr_active():
+            self.terminal.set_target_ecu("mrr")
         elif self._is_bcm_active():
             self.terminal.set_target_ecu("bcm")
         elif self._is_fpke_active():
@@ -451,7 +596,11 @@ class MainWindow(QMainWindow):
         if mode == "bus":
             self._active_screen = "bus"
         elif mode == "ecu" and self._active_screen == "bus":
-            if self.bcm_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open:
+            if self.elv_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open and not self.bcm_screen.is_open and not self.mrr_screen.is_open:
+                self._active_screen = "elv"
+            elif self.mrr_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open and not self.bcm_screen.is_open:
+                self._active_screen = "mrr"
+            elif self.bcm_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open:
                 self._active_screen = "bcm"
             elif self.fpke_screen.is_open and not self.ws.is_open:
                 self._active_screen = "fpke"
@@ -459,6 +608,10 @@ class MainWindow(QMainWindow):
                 self._active_screen = "j533"
             elif self.bcm_screen.is_open:
                 self._active_screen = "bcm"
+            elif self.mrr_screen.is_open:
+                self._active_screen = "mrr"
+            elif self.elv_screen.is_open:
+                self._active_screen = "elv"
             else:
                 self._active_screen = "start"
         self.modes.setCurrentWidget(self.terminal if term else self.splitter)
@@ -488,6 +641,12 @@ class MainWindow(QMainWindow):
         if self._active_screen == "bus":
             self.stack.setCurrentWidget(self.bus_screen)
             return
+        if self._active_screen == "elv" and self.elv_screen.is_open:
+            self.stack.setCurrentWidget(self.elv_screen)
+            return
+        if self._active_screen == "mrr" and self.mrr_screen.is_open:
+            self.stack.setCurrentWidget(self.mrr_screen)
+            return
         if self._active_screen == "bcm" and self.bcm_screen.is_open:
             self.stack.setCurrentWidget(self.bcm_screen)
             return
@@ -506,6 +665,12 @@ class MainWindow(QMainWindow):
         elif self.bcm_screen.is_open:
             self._active_screen = "bcm"
             self.stack.setCurrentWidget(self.bcm_screen)
+        elif self.mrr_screen.is_open:
+            self._active_screen = "mrr"
+            self.stack.setCurrentWidget(self.mrr_screen)
+        elif self.elv_screen.is_open:
+            self._active_screen = "elv"
+            self.stack.setCurrentWidget(self.elv_screen)
         elif self._active_screen == "bus":
             self.stack.setCurrentWidget(self.bus_screen)
         else:
@@ -529,6 +694,89 @@ class MainWindow(QMainWindow):
         self._set_console_visible(True)
 
     # ────────────────────────────── loading ──────────────────────────────
+    @staticmethod
+    def _detect_mrr_offline_file(paths: list[Path], *, json_only: bool = False) -> Path | None:
+        """Return a recognizable offline 13 ACC Radar file (mrr_keys.json, verified CodeFlash/App, or MRR Dflash)."""
+        files: list[Path] = []
+        for p in paths:
+            if p.is_dir():
+                files.extend(sorted(f for f in p.iterdir() if f.is_file()))
+            elif p.is_file():
+                files.append(p)
+        # 1. Explicit MRR JSON reports (mrr_keys.json or exported report JSON)
+        for f in files:
+            if f.suffix.lower() != ".json":
+                continue
+            try:
+                if f.stat().st_size > 2 * 1024 * 1024:
+                    continue
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict) and (
+                data.get("ecu_kind") == "mrr"
+                or ("dflash_fee" in data and ("ika_hex" in data or "cflash_cp" in data))
+            ):
+                return f
+        if json_only:
+            return None
+        # 2. Verified MRR CodeFlash / Application binary dump (skip if a J533 Uflash is present)
+        if any("uflash" in f.name.lower() for f in files):
+            return None
+        for f in files:
+            if f.suffix.lower() not in (".bin", ".raw"):
+                continue
+            try:
+                sz = f.stat().st_size
+                if sz not in (0x180000, 0x150000, 0x200000, 0x1D0000):
+                    continue
+                prof = mrr_detect_profile(image_bytes=f.read_bytes())
+                if prof.get("verified"):
+                    return f
+            except OSError:
+                continue
+        # 3. 64 KiB DFLASH0 containing verified AUTOSAR Fee KS_META or ShadowSecret
+        for f in files:
+            if f.suffix.lower() not in (".bin", ".raw"):
+                continue
+            try:
+                if f.stat().st_size != MRR_DFLASH_SIZE:
+                    continue
+                fee = mrr_parse_dflash_fee(f.read_bytes())
+                if fee.get("encryption_scheme", "unknown") != "unknown" or fee.get("shadow_secret_present"):
+                    return f
+            except (OSError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _detect_elv_report_file(paths: list[Path]) -> Path | None:
+        """Return a recognizable offline 2B ELV JSON report (`elv_report.json`, etc.)."""
+        files: list[Path] = []
+        for p in paths:
+            if p.is_dir():
+                files.extend(sorted(f for f in p.iterdir() if f.is_file()))
+            elif p.is_file():
+                files.append(p)
+        for f in files:
+            if f.suffix.lower() != ".json":
+                continue
+            try:
+                if f.stat().st_size > 2 * 1024 * 1024:
+                    continue
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict) and (
+                data.get("ecu_kind") == "elv"
+                or (
+                    f.name.lower() in ("elv_report.json", "elv_read_report.json", "elv_backup_report.json")
+                    and ("passport" in data or "status" in data)
+                )
+            ):
+                return f
+        return None
+
     def open_folder(self, folder: str = "") -> None:
         self.set_mode("ecu")
         chosen = folder or QFileDialog.getExistingDirectory(
@@ -542,6 +790,52 @@ class MainWindow(QMainWindow):
                     self.ws.close()
                 self._active_screen = "fpke"
                 self.fpke_screen.open_from_files(fpke_files, folder=folder_path, source="disk")
+                self._refresh_header()
+                self._refresh_screen()
+                return
+            mrr_file = self._detect_mrr_offline_file([folder_path], json_only=False)
+            if mrr_file is not None:
+                self._active_screen = "mrr"
+                self.mrr_screen.open_offline(mrr_file)
+                _remember_recent(folder_path)
+                self._refresh_header()
+                self._refresh_screen()
+                return
+            elv_files = elv_detect_folder_files(folder_path)
+            if "dflash" in elv_files:
+                try:
+                    self.elv_screen.open_from_dflash_file(elv_files["dflash"])
+                except (OSError, ValueError) as exc:
+                    QMessageBox.warning(
+                        self,
+                        tr("Ошибка чтения дампа 2B ELV", "2B ELV dump read error"),
+                        tr(
+                            f"Не удалось открыть дамп ELV ({elv_files['dflash'].name}):\n{exc}",
+                            f"Could not open ELV dump ({elv_files['dflash'].name}):\n{exc}",
+                        ),
+                    )
+                    return
+                self._active_screen = "elv"
+                _remember_recent(folder_path)
+                self._refresh_header()
+                self._refresh_screen()
+                return
+            elv_report = elv_files.get("report") or self._detect_elv_report_file([folder_path])
+            if elv_report is not None:
+                try:
+                    self.elv_screen.open_from_report_file(elv_report)
+                except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                    QMessageBox.warning(
+                        self,
+                        tr("Ошибка чтения отчёта 2B ELV", "2B ELV report read error"),
+                        tr(
+                            f"Не удалось открыть отчёт ELV ({elv_report.name}):\n{exc}",
+                            f"Could not open ELV report ({elv_report.name}):\n{exc}",
+                        ),
+                    )
+                    return
+                self._active_screen = "elv"
+                _remember_recent(folder_path)
                 self._refresh_header()
                 self._refresh_screen()
                 return
@@ -560,7 +854,7 @@ class MainWindow(QMainWindow):
             self,
             tr("Файлы дампов", "Dump files"),
             str(Path.cwd()),
-            "Binary (*.bin *.raw);;All Files (*)",
+            "Binary / JSON (*.bin *.raw *.json);;All Files (*)",
         )
         if chosen:
             self._load_paths([Path(c) for c in chosen])
@@ -576,6 +870,56 @@ class MainWindow(QMainWindow):
                 self.ws.close()
             self._active_screen = "fpke"
             self.fpke_screen.open_from_files(fpke_files, folder=file_list[0].parent if file_list else None, source="disk")
+            self._refresh_header()
+            self._refresh_screen()
+            return
+        mrr_file = self._detect_mrr_offline_file(file_list, json_only=False)
+        if mrr_file is not None:
+            self._active_screen = "mrr"
+            self.mrr_screen.open_offline(mrr_file)
+            self._refresh_header()
+            self._refresh_screen()
+            return
+        for cand in file_list:
+            if cand.suffix.lower() in (".bin", ".raw"):
+                try:
+                    sz = cand.stat().st_size
+                    if sz in (ELV_DFLASH_COMPACT_SIZE, ELV_DFLASH_RAW64K_SIZE):
+                        raw = cand.read_bytes()
+                        if elv_is_dflash_bytes(raw):
+                            try:
+                                self.elv_screen.open_from_dflash_file(cand, raw=raw)
+                            except (OSError, ValueError) as exc:
+                                QMessageBox.warning(
+                                    self,
+                                    tr("Ошибка чтения дампа 2B ELV", "2B ELV dump read error"),
+                                    tr(
+                                        f"Не удалось открыть дамп ELV ({cand.name}):\n{exc}",
+                                        f"Could not open ELV dump ({cand.name}):\n{exc}",
+                                    ),
+                                )
+                                return
+                            self._active_screen = "elv"
+                            self._refresh_header()
+                            self._refresh_screen()
+                            return
+                except OSError:
+                    continue
+        elv_report = self._detect_elv_report_file(file_list)
+        if elv_report is not None:
+            try:
+                self.elv_screen.open_from_report_file(elv_report)
+            except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                QMessageBox.warning(
+                    self,
+                    tr("Ошибка чтения отчёта 2B ELV", "2B ELV report read error"),
+                    tr(
+                        f"Не удалось открыть отчёт ELV ({elv_report.name}):\n{exc}",
+                        f"Could not open ELV report ({elv_report.name}):\n{exc}",
+                    ),
+                )
+                return
+            self._active_screen = "elv"
             self._refresh_header()
             self._refresh_screen()
             return
@@ -595,10 +939,10 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.warning(
             self,
-            tr("Это не дампы шлюза", "Not gateway dumps"),
+            tr("Это не дампы блока", "Not recognised ECU dumps"),
             tr(
-                "Ни один файл не опознан как CodeFlash, DataFlash, Uflash, EEPROM или OPBT этого шлюза.",
-                "None of the files is a CodeFlash, DataFlash, Uflash, EEPROM or OPBT dump of this gateway.",
+                "Ни один файл не опознан как дамп шлюза J533, приборной панели FPK_E, радара 13 ACC или защёлки руля 2B ELV.",
+                "None of the files was recognised as a J533 gateway, FPK_E cluster, 13 ACC radar, or 2B ELV dump.",
             ),
         )
 
@@ -638,6 +982,55 @@ class MainWindow(QMainWindow):
 
     def _on_bus_scanned(self, res: BusScanResult) -> None:
         self.bus_screen.set_scan_result(res)
+        for ecu in res.ecus:
+            ecu_pn = (ecu.part_number or "").replace(" ", "").upper()
+            if ecu.kind == "fpke" and self.fpke_screen.is_open:
+                has_fpke_pn = bool(
+                    any(it.get("did") in ("F187", "F191") for it in self.fpke_screen.ident_items)
+                    or (self.fpke_screen.dflash_info or {}).get("metadata", {}).get("part_number")
+                )
+                fpke_pn = self.fpke_screen.part_number.replace(" ", "").upper() if has_fpke_pn else ""
+                if not fpke_pn or not ecu_pn or fpke_pn == ecu_pn:
+                    self.fpke_screen.via_gateway = bool(ecu.via_gateway)
+                    self.fpke_screen.gateway_bridge = bool(ecu.bridge_available)
+                    self.fpke_screen.gateway_channel = 0 if ecu.gateway_channel is None else int(ecu.gateway_channel)
+                    self.fpke_screen.refresh()
+            elif ecu.kind == "bcm" and self.bcm_screen.is_open:
+                bcm_pn = (
+                    self.bcm_screen._passport.get("part_number")
+                    or self.bcm_screen._passport.get("hw_part_number")
+                    or ""
+                ).replace(" ", "").upper()
+                if not bcm_pn or not ecu_pn or bcm_pn == ecu_pn:
+                    self.bcm_screen.set_routing(
+                        via_gateway=bool(ecu.via_gateway),
+                        gateway_bridge=bool(ecu.bridge_available),
+                        gateway_channel=0 if ecu.gateway_channel is None else int(ecu.gateway_channel),
+                    )
+            elif ecu.kind == "mrr" and self.mrr_screen.is_open:
+                mrr_pn = (
+                    self.mrr_screen._passport.get("part_number")
+                    or self.mrr_screen._passport.get("hw_part_number")
+                    or ""
+                ).replace(" ", "").upper()
+                if not mrr_pn or not ecu_pn or mrr_pn == ecu_pn:
+                    self.mrr_screen.set_routing(
+                        via_gateway=bool(ecu.via_gateway),
+                        gateway_bridge=bool(ecu.bridge_available),
+                        gateway_channel=2 if ecu.gateway_channel is None else int(ecu.gateway_channel),
+                    )
+            elif ecu.kind == "elv" and self.elv_screen.is_open:
+                elv_pn = (
+                    self.elv_screen._passport.get("part_number")
+                    or self.elv_screen._passport.get("hw_part_number")
+                    or ""
+                ).replace(" ", "").upper()
+                if not elv_pn or not ecu_pn or elv_pn == ecu_pn:
+                    self.elv_screen.set_routing(
+                        via_gateway=bool(ecu.via_gateway),
+                        gateway_bridge=bool(ecu.bridge_available),
+                        gateway_channel=0 if ecu.gateway_channel is None else int(ecu.gateway_channel),
+                    )
         self.switch_ecu_view("bus")
 
     def _on_bus_read_ecu(self, ecu: DiscoveredEcu) -> None:
@@ -660,6 +1053,42 @@ class MainWindow(QMainWindow):
         self.terminal.set_target_ecu("bcm")
         self.terminal.ed_tx.setText("70E")
         self.terminal.ed_rx.setText("778")
+
+    def _on_bus_open_mrr_workspace(self, ecu: DiscoveredEcu) -> None:
+        if self.mrr_screen.is_open:
+            self.mrr_screen.set_routing(
+                via_gateway=bool(ecu.via_gateway),
+                gateway_bridge=bool(ecu.bridge_available),
+                gateway_channel=2 if ecu.gateway_channel is None else int(ecu.gateway_channel),
+            )
+            self.switch_ecu_view("mrr")
+            return
+        self.mrr_screen.open_from_discovered(ecu, auto_read=True)
+        self.switch_ecu_view("mrr")
+
+    def _on_mrr_open_terminal(self, _kind: str = "mrr") -> None:
+        self.set_mode("terminal")
+        self.terminal.set_target_ecu("mrr")
+        self.terminal.ed_tx.setText("757")
+        self.terminal.ed_rx.setText("7C1")
+
+    def _on_bus_open_elv_workspace(self, ecu: DiscoveredEcu) -> None:
+        if self.elv_screen.is_open:
+            self.elv_screen.set_routing(
+                via_gateway=bool(ecu.via_gateway),
+                gateway_bridge=bool(ecu.bridge_available),
+                gateway_channel=0 if ecu.gateway_channel is None else int(ecu.gateway_channel),
+            )
+            self.switch_ecu_view("elv")
+            return
+        self.elv_screen.open_from_discovered(ecu)
+        self.switch_ecu_view("elv")
+
+    def _on_elv_open_terminal(self, _kind: str = "elv") -> None:
+        self.set_mode("terminal")
+        self.terminal.set_target_ecu("elv")
+        self.terminal.ed_tx.setText("731")
+        self.terminal.ed_rx.setText("79B")
 
     def _on_bus_restore_ecu(self, ecu: DiscoveredEcu) -> None:
         ident = ecu.to_ident_dict()
@@ -698,7 +1127,7 @@ class MainWindow(QMainWindow):
         if not ensure_ready(self.conn, self):
             return
         port, iface = self.conn.port, self.conn.interface
-        if target_kind in ("j533", "fpke", "bcm"):
+        if target_kind in ("j533", "fpke", "bcm", "mrr", "elv"):
             self.bus_screen.clear_scan()
             self._refresh_header()
 
@@ -726,10 +1155,18 @@ class MainWindow(QMainWindow):
     def _confirm_read(self, ident: dict[str, Any]) -> None:
         is_kombi = ident.get("ecu_kind") == "fpke" or is_fpke_ident(ident.get("ident") or [])
         is_bcm = ident.get("ecu_kind") == "bcm"
+        is_mrr = ident.get("ecu_kind") == "mrr"
+        is_elv = ident.get("ecu_kind") == "elv" or is_elv_ident(ident.get("ident") or [])
         dlg = EcuFoundDialog(ident, self.conn, self)
         if run_dialog(dlg) and not dlg.unsupported:
             if is_bcm:
                 self._read_bcm_over_can(ident)
+                return
+            if is_mrr:
+                self._read_mrr_over_can(ident)
+                return
+            if is_elv:
+                self._read_elv_over_can(ident)
                 return
             if dlg.restore_chosen:
                 if is_kombi:
@@ -741,7 +1178,11 @@ class MainWindow(QMainWindow):
                     self._refresh_screen()
                     self.fpke_screen.restore_dflash_from_file()
                 else:
-                    self.restore_backup()
+                    self._force_j533_restore = True
+                    try:
+                        self.restore_backup()
+                    finally:
+                        self._force_j533_restore = False
             elif is_kombi:
                 self._read_fpke_over_can(ident)
             else:
@@ -777,6 +1218,166 @@ class MainWindow(QMainWindow):
 
         self.runner.run_task(
             tr("Чтение данных 09 BCM", "Reading 09 BCM data"),
+            task,
+            on_success=done,
+        )
+
+    def _read_mrr_over_can(self, ident: dict[str, Any]) -> None:
+        """Read 13 ACC Radar passport, Code Flash CP & SWaP state, DFLASH0 (IKA/GFA), and DTCs, then open MrrScreen."""
+        port, iface = self.conn.port, self.conn.interface
+        via_gw = bool(ident.get("via_gateway", False))
+        gw_br = bool(ident.get("gateway_bridge", ident.get("bridge_available", False)))
+        gw_ch = 2 if ident.get("gateway_channel") is None else int(ident["gateway_channel"])
+        caps = set(ident.get("capabilities") or ())
+        # On direct bench CAN, read full XCP keys + DFLASH0 automatically; via a vehicle gateway, open over pure UDS
+        # first (matching 09 BCM) so opening the screen never interrupts other vehicle buses without explicit confirmation.
+        xcp_on_open = (not via_gw) and (iface in BRIDGE_NATIVE_INTERFACES or "memory" in caps)
+
+        ident_list = list(ident.get("ident") or [])
+        mrr_unit = unit_of_ident(ident_list)
+        if mrr_unit == "unknown":
+            vals = {i.get("did"): i.get("value", "") for i in ident_list}
+            pn = vals.get("F187") or vals.get("F191") or str(ident.get("part_number") or ident.get("hw_number") or "")
+            fz = vals.get("F17C") or str(ident.get("fazit") or "")
+            mrr_unit = unit_name(pn, fz)
+            if mrr_unit == "unknown" and pn:
+                mrr_unit = unit_name(pn, "MRR")
+            if mrr_unit == "unknown":
+                mrr_unit = "mrr_radar"
+        s_dir = new_session(self.conn.out_dir, mrr_unit, "mrr_read", dumps=True)
+
+        def task(rep: Any) -> dict[str, Any]:
+            if xcp_on_open:
+                st_res = can_mrr_read_keys(
+                    port,
+                    interface=iface,
+                    via_gateway=via_gw,
+                    gateway_bridge=gw_br,
+                    gateway_channel=gw_ch,
+                    session_dir=s_dir,
+                    reporter=rep,
+                )
+            else:
+                st_res = can_mrr_status(
+                    port,
+                    interface=iface,
+                    via_gateway=via_gw,
+                    gateway_bridge=False,
+                    gateway_channel=gw_ch,
+                    reporter=rep,
+                )
+                st_res["session_dir"] = str(s_dir)
+                s_dir.mkdir(parents=True, exist_ok=True)
+                (s_dir / "mrr_read_report.json").write_text(
+                    json.dumps(st_res, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+                )
+            if st_res.get("dtcs") is None:
+                try:
+                    dtc_res = can_uds_read_dtc(
+                        port,
+                        0x757,
+                        0x7C1,
+                        interface=iface,
+                        ecu_kind="mrr",
+                        via_gateway=via_gw,
+                        reporter=rep,
+                    )
+                    st_res["dtcs"] = dtc_res.get("dtcs", [])
+                except Exception as exc:  # noqa: BLE001
+                    rep.warning(
+                        tr(
+                            f"Не удалось прочитать ошибки DTC радара 13 ACC ({exc}) — открываем экран без списка DTC.",
+                            f"Could not read 13 ACC radar DTCs ({exc}) — opening workspace without DTC list.",
+                        )
+                    )
+                    st_res["dtcs"] = []
+            return st_res
+
+        def done(res: dict[str, Any]) -> None:
+            saved_dir = Path(str(res.get("session_dir") or s_dir))
+            if saved_dir.is_dir():
+                _remember_recent(saved_dir)
+                self.start_screen.refresh_recent()
+            self._active_screen = "mrr"
+            self.mrr_screen.open_from_status_result(
+                res,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
+            )
+            self._refresh_header()
+            self._refresh_screen()
+
+        self.runner.run_task(
+            tr("Чтение данных 13 ACC Radar", "Reading 13 ACC Radar data"),
+            task,
+            on_success=done,
+        )
+
+    def _read_elv_over_can(self, ident: dict[str, Any]) -> None:
+        """Read 2B ELV passport, status, 32 KB Data Flash (when direct CAN or bridge available), and live 02F9 MAC."""
+        port, iface = self.conn.port, self.conn.interface
+        via_gw = bool(ident.get("via_gateway", False))
+        gw_br = bool(ident.get("gateway_bridge", ident.get("bridge_available", False)))
+        gw_ch = 0 if ident.get("gateway_channel") is None else int(ident["gateway_channel"])
+        caps = set(ident.get("capabilities") or ())
+        read_df_on_open = (not via_gw) and (iface in BRIDGE_NATIVE_INTERFACES or "memory" in caps)
+
+        ident_list = list(ident.get("ident") or [])
+        elv_unit = unit_of_ident(ident_list)
+        if elv_unit == "unknown":
+            vals = {i.get("did"): i.get("value", "") for i in ident_list}
+            pn = vals.get("F187") or vals.get("F191") or "3Q0905861"
+            fz = vals.get("F17C") or "ELV"
+            elv_unit = unit_name(pn, fz)
+            if elv_unit == "unknown":
+                elv_unit = "elv_3q0905861"
+        s_dir = new_session(self.conn.out_dir, elv_unit, "elv_dflash", dumps=True)
+
+        def task(rep: Any) -> dict[str, Any]:
+            if read_df_on_open:
+                res = can_elv_read_dflash(
+                    port,
+                    out_dir=s_dir,
+                    interface=iface,
+                    via_gateway=via_gw,
+                    gateway_bridge=gw_br,
+                    gateway_channel=gw_ch,
+                    reporter=rep,
+                )
+            else:
+                res = can_elv_status(
+                    port,
+                    interface=iface,
+                    via_gateway=via_gw,
+                    gateway_bridge=False,
+                    gateway_channel=gw_ch,
+                    reporter=rep,
+                )
+                s_dir.mkdir(parents=True, exist_ok=True)
+                (s_dir / "elv_report.json").write_text(
+                    json.dumps(res, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+            res["session_dir"] = str(s_dir)
+            return res
+
+        def done(res: dict[str, Any]) -> None:
+            saved_dir = Path(str(res.get("session_dir") or s_dir))
+            if saved_dir.is_dir():
+                _remember_recent(saved_dir)
+                self.start_screen.refresh_recent()
+            self._active_screen = "elv"
+            self.elv_screen.open_from_read_result(
+                res,
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
+            )
+            self._refresh_header()
+            self._refresh_screen()
+
+        self.runner.run_task(
+            tr("Чтение данных 2B ELV", "Reading 2B ELV data"),
             task,
             on_success=done,
         )
@@ -861,10 +1462,8 @@ class MainWindow(QMainWindow):
             self,
             tr("Предупреждение при чтении EEPROM / OPBT", "EEPROM / OPBT read warning"),
             tr(
-                "Основная память шлюза (CodeFlash, Uflash, DataFlash) успешно считана и сохранена, "
-                "однако дополнительные области прочитать не удалось:\n\n",
-                "The gateway's main flash areas (CodeFlash, Uflash, DataFlash) were read and saved "
-                "successfully, however optional hardware areas could not be read:\n\n",
+                "CodeFlash, Uflash и DataFlash сохранены, но часть дополнительных областей не прочиталась:\n\n",
+                "CodeFlash, Uflash, and DataFlash were saved, but optional areas could not be read:\n\n",
             )
             + "\n\n".join(f"• {w}" for w in warnings),
         )
@@ -882,6 +1481,7 @@ class MainWindow(QMainWindow):
     def restore_backup(self, *, force_j533: bool = False) -> None:
         """Write backup files the user picks back into the ECU; the workflow refuses a backup of another ECU."""
         self.set_mode("ecu")  # frees the adapter if the terminal holds it
+        force_j533 = force_j533 or bool(getattr(self, "_force_j533_restore", False))
         if not force_j533 and self._is_fpke_active():
             self.fpke_screen.restore_dflash_from_file()
             return
@@ -892,7 +1492,12 @@ class MainWindow(QMainWindow):
         files, kinds = dict(dlg.files), dlg.kinds
         port, iface = self.conn.port, self.conn.interface
         cf = files.get("cflash")
-        sdir = new_session(self.conn.out_dir, unit_of_cflash(cf.read_bytes() if cf else None), "restore")
+        try:
+            cf_bytes = cf.read_bytes() if cf else None
+            sdir = new_session(self.conn.out_dir, unit_of_cflash(cf_bytes), "restore")
+        except OSError as exc:
+            QMessageBox.critical(self, tr("Ошибка чтения файла", "File read error"), str(exc))
+            return
         names = ", ".join(NAMES[k] for k in kinds)
         self.runner.run_task(
             tr(f"Заливка бэкапа в блок: {names}", f"Writing the backup to the ECU: {names}"),
@@ -900,13 +1505,20 @@ class MainWindow(QMainWindow):
         )
 
     def close_ecu(self) -> None:
-        closing_bcm = self.bcm_screen.is_open and (self._active_screen == "bcm" or (not self.ws.is_open and not self.fpke_screen.is_open))
-        if closing_bcm:
-            self.bcm_screen.close_bcm()
+        closing_elv = self.elv_screen.is_open and (
+            self._active_screen == "elv"
+            or (not self.ws.is_open and not self.fpke_screen.is_open and not self.bcm_screen.is_open and not self.mrr_screen.is_open)
+        )
+        if closing_elv:
+            self.elv_screen.close_elv()
             if self.fpke_screen.is_open:
                 self._active_screen = "fpke"
             elif self.ws.is_open:
                 self._active_screen = "j533"
+            elif self.bcm_screen.is_open:
+                self._active_screen = "bcm"
+            elif self.mrr_screen.is_open:
+                self._active_screen = "mrr"
             elif self.bus_screen.has_scan:
                 self._active_screen = "bus"
             else:
@@ -914,8 +1526,64 @@ class MainWindow(QMainWindow):
             self._refresh_header()
             self._refresh_screen()
             return
-        closing_fpke = self.fpke_screen.is_open and (self._active_screen == "fpke" or not self.ws.is_open)
+        closing_mrr = self.mrr_screen.is_open and (
+            self._active_screen == "mrr"
+            or (not self.ws.is_open and not self.fpke_screen.is_open and not self.bcm_screen.is_open and not self.elv_screen.is_open)
+        )
+        if closing_mrr:
+            self.mrr_screen.close_mrr()
+            if self.fpke_screen.is_open:
+                self._active_screen = "fpke"
+            elif self.ws.is_open:
+                self._active_screen = "j533"
+            elif self.bcm_screen.is_open:
+                self._active_screen = "bcm"
+            elif self.elv_screen.is_open:
+                self._active_screen = "elv"
+            elif self.bus_screen.has_scan:
+                self._active_screen = "bus"
+            else:
+                self._active_screen = "start"
+            self._refresh_header()
+            self._refresh_screen()
+            return
+        closing_bcm = self.bcm_screen.is_open and (
+            self._active_screen == "bcm"
+            or (not self.ws.is_open and not self.fpke_screen.is_open and not self.mrr_screen.is_open and not self.elv_screen.is_open)
+        )
+        if closing_bcm:
+            self.bcm_screen.close_bcm()
+            if self.fpke_screen.is_open:
+                self._active_screen = "fpke"
+            elif self.ws.is_open:
+                self._active_screen = "j533"
+            elif self.mrr_screen.is_open:
+                self._active_screen = "mrr"
+            elif self.elv_screen.is_open:
+                self._active_screen = "elv"
+            elif self.bus_screen.has_scan:
+                self._active_screen = "bus"
+            else:
+                self._active_screen = "start"
+            self._refresh_header()
+            self._refresh_screen()
+            return
+        closing_fpke = self.fpke_screen.is_open and (
+            self._active_screen == "fpke"
+            or (not self.ws.is_open and not self.bcm_screen.is_open and not self.mrr_screen.is_open and not self.elv_screen.is_open)
+        )
         if closing_fpke:
+            if self.fpke_screen.is_cflash_dirty and QMessageBox.question(
+                self,
+                tr("Закрыть блок", "Close the ECU"),
+                tr(
+                    "Патч загрузчика в CodeFlash (Cflash.bin) ещё не сохранён на диск и будет потерян.\n\nЗакрыть без сохранения?",
+                    "The patched CodeFlash (Cflash.bin) bootloader has not been saved to disk and will be lost.\n\nClose without saving?",
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
             if self.fpke_screen.is_dflash_modified and QMessageBox.question(
                 self,
                 tr("Закрыть блок", "Close the ECU"),
@@ -932,6 +1600,10 @@ class MainWindow(QMainWindow):
                 self._active_screen = "j533"
             elif self.bcm_screen.is_open:
                 self._active_screen = "bcm"
+            elif self.mrr_screen.is_open:
+                self._active_screen = "mrr"
+            elif self.elv_screen.is_open:
+                self._active_screen = "elv"
             elif self.bus_screen.has_scan:
                 self._active_screen = "bus"
             else:
@@ -958,6 +1630,10 @@ class MainWindow(QMainWindow):
             self._active_screen = "fpke"
         elif self.bcm_screen.is_open:
             self._active_screen = "bcm"
+        elif self.mrr_screen.is_open:
+            self._active_screen = "mrr"
+        elif self.elv_screen.is_open:
+            self._active_screen = "elv"
         elif self.bus_screen.has_scan:
             self._active_screen = "bus"
         else:
@@ -987,20 +1663,18 @@ class MainWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle(tr("Вход в RAM-Loader закрыт", "RAM-Loader entry closed"))
         box.setText(tr(
-            "В последнем отпечатке программирования этого блока записан ненулевой серийник тестера (так пишут"
-            " ContiTool до 2.0.1e и ODIS с ненулевым отпечатком в настройках), и загрузчик не пускает в RAM-"
-            "Loader. Исправляет это одна перепрошивка приложения по UDS с нулевым серийником; RAM-Loader для "
-            "неё не нужен.\n\nОткуда взять приложение:\n• CodeFlash этого блока: бэкап, снятый ContiTool, или "
-            "файл, который в него записывался (проверяется по FAZIT);\n• FRF или ODX ODIS для этого блока: "
-            "прошивается с подписью из файла, бэкап не нужен.\n\nПриложение будет стёрто и записано заново. Это займёт "
-            "несколько минут; не отключайте питание.",
-            "The last programming fingerprint of this ECU carries a non-zero tester serial (ContiTool before "
-            "2.0.1e writes one, and so does ODIS set up with a non-zero fingerprint), and the bootloader "
-            "keeps the RAM-Loader closed. One reflash of the application over UDS with a zero serial fixes "
-            "it; it needs no RAM-Loader.\n\nWhere the application comes from:\n• this ECU's CodeFlash: a backup "
-            "ContiTool took, or a file that was written into it (checked against FAZIT);\n• an ODIS FRF or ODX "
-            "for this ECU: flashed with the file's own signature, no backup needed.\n\nThe application is erased and"
-            " written again. It takes a few minutes; keep the power on.",
+            "В отпечатке программирования записан ненулевой серийник тестера — загрузчик блокирует вход в RAM-Loader.\n"
+            "Исправляется одной прошивкой приложения по UDS с нулевым серийником (RAM-Loader не нужен).\n\n"
+            "Выберите источник:\n"
+            "• CodeFlash этого блока (бэкап, проверяется по FAZIT);\n"
+            "• Файл FRF / ODX ODIS (прошивается с собственной подписью).\n\n"
+            "Займёт несколько минут — не отключайте питание.",
+            "The last programming fingerprint carries a non-zero tester serial, so the bootloader blocks RAM-Loader entry.\n"
+            "One UDS application reflash with a zero serial fixes it (no RAM-Loader required).\n\n"
+            "Choose a source:\n"
+            "• This ECU's CodeFlash backup (verified against FAZIT);\n"
+            "• An ODIS FRF / ODX file (flashed with its own signature).\n\n"
+            "Takes a few minutes — keep power on.",
         ))
         from_cf = box.addButton(tr("CodeFlash этого блока…", "This ECU's CodeFlash…"), QMessageBox.ButtonRole.AcceptRole)
         from_frf = box.addButton(tr("Файл FRF / ODX…", "FRF / ODX file…"), QMessageBox.ButtonRole.ActionRole)
@@ -1018,7 +1692,11 @@ class MainWindow(QMainWindow):
         if not path or not ensure_ready(self.conn, self):
             return
         port, iface = self.conn.port, self.conn.interface
-        sdir = new_session(self.conn.out_dir, unit_of_cflash(Path(path).read_bytes()), "fingerprint")
+        try:
+            sdir = new_session(self.conn.out_dir, unit_of_cflash(Path(path).read_bytes()), "fingerprint")
+        except OSError as exc:
+            QMessageBox.critical(self, tr("Ошибка чтения файла", "File read error"), str(exc))
+            return
         self.runner.run_task(
             tr(*CURE_TITLE),
             lambda rep: can_cure_fbl_fingerprint(port, Path(path), interface=iface, session_dir=sdir, reporter=rep),
@@ -1064,8 +1742,14 @@ class MainWindow(QMainWindow):
         # engineering bootloader checks none. Both are known from this gateway's latest read or write, if any.
         unit_dir = self.conn.out_dir / unit_of_ident(ident.get("ident") or [])
         cf, uf = latest_area(unit_dir, "Cflash.bin"), latest_area(unit_dir, "Uflash.bin")
-        fbl_modulus = cf.read_bytes()[FBL_MOD_OFFSET : FBL_MOD_OFFSET + 128] if cf else None
-        fbl_open = bool(uf) and analyze_uflash(uf.read_bytes()).rsa_bypassed
+        try:
+            fbl_modulus = cf.read_bytes()[FBL_MOD_OFFSET : FBL_MOD_OFFSET + 128] if cf else None
+        except OSError:
+            fbl_modulus = None
+        try:
+            fbl_open = bool(uf) and analyze_uflash(uf.read_bytes()).rsa_bypassed
+        except (OSError, ValueError):
+            fbl_open = False
         why = frf_signature_problem(frf, fbl_modulus=fbl_modulus, fbl_open=fbl_open)
         if why:
             src = tr(f"\n\nКлюч загрузчика взят из {cf}", f"\n\nBootloader key taken from {cf}") if cf else ""
@@ -1093,7 +1777,11 @@ class MainWindow(QMainWindow):
                                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
         port, iface = self.conn.port, self.conn.interface
-        sdir = new_session(self.conn.out_dir, unit_of_ident(ident.get("ident") or []), "frf")
+        try:
+            sdir = new_session(self.conn.out_dir, unit_of_ident(ident.get("ident") or []), "frf")
+        except OSError as exc:
+            QMessageBox.critical(self, title, str(exc))
+            return
         self.runner.run_task(
             tr(f"Прошивка {frf.name}", f"Flashing {frf.name}"),
             lambda rep: can_flash_frf(port, frf, interface=iface, session_dir=sdir, allow_unlisted=bool(soft),
@@ -1128,6 +1816,18 @@ class MainWindow(QMainWindow):
             work_cf = self.fpke_screen._working_cflash_path
             if self.fpke_screen.is_cflash_modified and work_cf is not None and work_cf.is_file():
                 dumps[f"edited/{work_cf.name}"] = work_cf
+        elif self._is_elv_active():
+            dumps = {}
+            df_path = self.elv_screen._dflash_path
+            if df_path is not None and df_path.is_file():
+                dumps[f"loaded/{df_path.name}"] = df_path
+                for rep_name in ("elv_report.json", "elv_read_report.json", "elv_backup_report.json"):
+                    rep_p = df_path.parent / rep_name
+                    if rep_p.is_file():
+                        dumps[f"loaded/{rep_p.name}"] = rep_p
+            rep_path = getattr(self.elv_screen, "_report_path", None)
+            if isinstance(rep_path, Path) and rep_path.is_file():
+                dumps.setdefault(f"loaded/{rep_path.name}", rep_path)
         else:
             dumps = {f"loaded/{p.name}": p for p in self.ws.original.values()}
             dumps.update({f"edited/{p.name}": p for k, p in self.ws.current.items() if self.ws.modified(k)})
@@ -1167,33 +1867,37 @@ class MainWindow(QMainWindow):
         plain = Style(False)
         sections: list[str] = []
         cf_path = self.ws.path("cflash")
-        cf_raw = cf_path.read_bytes() if cf_path is not None and cf_path.is_file() else None
-        for kind, build in (
-            ("cflash", lambda raw, p: format_cflash_report(analyze_cflash(raw), plain, p)),
-            ("uflash", lambda raw, p: format_uflash_report(analyze_uflash(raw), plain, p)),
-            (
-                "dflash",
-                lambda raw, p: format_dflash_report(
-                    analyze_dflash(raw),
-                    analyze_dflash_swap(raw),
-                    plain,
-                    p,
-                    dataset_summary=analyze_dflash_datasets(raw),
+        try:
+            cf_raw = cf_path.read_bytes() if cf_path is not None and cf_path.is_file() else None
+            for kind, build in (
+                ("cflash", lambda raw, p: format_cflash_report(analyze_cflash(raw), plain, p)),
+                ("uflash", lambda raw, p: format_uflash_report(analyze_uflash(raw), plain, p)),
+                (
+                    "dflash",
+                    lambda raw, p: format_dflash_report(
+                        analyze_dflash(raw),
+                        analyze_dflash_swap(raw),
+                        plain,
+                        p,
+                        dataset_summary=analyze_dflash_datasets(raw),
+                    ),
                 ),
-            ),
-            ("eeprom", lambda raw, p: format_eeprom_report(analyze_eeprom(raw, cf_raw), plain, p)),
-            (
-                "opbt",
-                lambda raw, p: format_opbt_report(
-                    analyze_opbt(raw, extra_idcode=self.ws.extra_idcode, chip_id=self.ws.chip_id),
-                    plain,
-                    p,
+                ("eeprom", lambda raw, p: format_eeprom_report(analyze_eeprom(raw, cf_raw), plain, p)),
+                (
+                    "opbt",
+                    lambda raw, p: format_opbt_report(
+                        analyze_opbt(raw, extra_idcode=self.ws.extra_idcode, chip_id=self.ws.chip_id),
+                        plain,
+                        p,
+                    ),
                 ),
-            ),
-        ):
-            path = self.ws.path(kind)
-            if path is not None:
-                sections.append(build(path.read_bytes(), str(path)))
+            ):
+                path = self.ws.path(kind)
+                if path is not None:
+                    sections.append(build(path.read_bytes(), str(path)))
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка чтения дампа", "Dump read error"), str(exc))
+            return
         run_dialog(
             TextResultDialog(
                 self,
@@ -1272,19 +1976,35 @@ class EcuFoundDialog(Dialog):
         ecu_kind = str(ident.get("ecu_kind") or "")
         is_kombi = ecu_kind == "fpke" or is_fpke_ident(ident.get("ident") or [])
         is_bcm = ecu_kind == "bcm"
+        is_mrr = ecu_kind == "mrr"
+        is_elv = ecu_kind == "elv" or is_elv_ident(ident.get("ident") or [])
         mem_unavail = str(ident.get("memory_unavailable_reason") or "")
-        unsupported = str(ident.get("unsupported") or ("" if (is_kombi or is_bcm) else (unsupported_ecu_reason(ident.get("ident", [])) or "")))
+        unsupported = str(ident.get("unsupported") or ("" if (is_kombi or is_bcm or is_mrr or is_elv) else (unsupported_ecu_reason(ident.get("ident", [])) or "")))
         if not unsupported and is_kombi and ident.get("via_gateway") and not ident.get("bridge_available") and mem_unavail:
             unsupported = mem_unavail
-        in_fbl = bool(ident.get("in_fbl")) and not unsupported and not is_kombi and not is_bcm
+        in_fbl = bool(ident.get("in_fbl")) and not unsupported and not is_kombi and not is_bcm and not is_mrr and not is_elv
         self.unsupported = unsupported
         self.restore_chosen = False
         if unsupported:
-            title = tr("Чтение памяти недоступно", "Memory read unavailable") if (is_bcm or (is_kombi and ident.get("via_gateway"))) else tr("Блок не поддерживается", "Unsupported ECU")
+            title = (
+                tr("Чтение памяти недоступно", "Memory read unavailable")
+                if (is_bcm or is_mrr or is_elv or (is_kombi and ident.get("via_gateway")))
+                else tr("Блок не поддерживается", "Unsupported ECU")
+            )
             if is_bcm:
                 subtitle = tr(
                     f"На {conn.display()} ответил блок бортовой сети BCM (09).",
                     f"A BCM (09) control unit answered on {conn.display()}.",
+                )
+            elif is_mrr:
+                subtitle = tr(
+                    f"На {conn.display()} ответил радар ACC (13).",
+                    f"An ACC Radar (13) control unit answered on {conn.display()}.",
+                )
+            elif is_elv:
+                subtitle = tr(
+                    f"На {conn.display()} ответил блокиратор руля ELV (2B).",
+                    f"An ELV (2B) steering column lock answered on {conn.display()}.",
                 )
             elif is_kombi:
                 subtitle = tr(
@@ -1359,21 +2079,83 @@ class EcuFoundDialog(Dialog):
         elif is_kombi:
             if ident.get("via_gateway"):
                 gw_hint = tr(
-                    "Подключение через шлюз J533: на время чтения шлюз будет автоматически переведён в прозрачный "
-                    "CAN-мост (Diagnosis CAN ↔ Komfort CAN), будут считаны DataFlash (64 КБ) и Extra Area (IDCODE), "
+                    "Через мост шлюза J533 будут считаны DataFlash (64 КБ) и Extra Area (IDCODE), "
                     "после чего шлюз вернётся в штатный режим.",
-                    "Connected via J533 gateway: during the read, the gateway will automatically switch to a transparent "
-                    "CAN bridge (Diagnosis CAN ↔ Komfort CAN) to read DataFlash (64 KB) and Extra Area (IDCODE), "
-                    "and then return to normal Application mode.",
+                    "DataFlash (64 KB) and Extra Area (IDCODE) will be read via the J533 gateway bridge, "
+                    "then the gateway returns to normal mode.",
                 )
             else:
                 gw_hint = tr(
-                    "Будут считаны DataFlash (64 КБ) и область конфигурации процессора (IDCODE). "
-                    "После чтения блок откроется сам; в память ничего не пишется.",
-                    "DataFlash (64 KB) and the MCU configuration area (IDCODE) will be read. "
-                    "The ECU opens once reading finishes; nothing is written to its memory.",
+                    "Будут считаны DataFlash (64 КБ) и Extra Area (IDCODE). В память ничего не пишется.",
+                    "DataFlash (64 KB) and Extra Area (IDCODE) will be read. Nothing is written to memory.",
                 )
             self.body.addWidget(hint(gw_hint))
+            self.btn_ok = button(tr("Считать блок", "Read the ECU"), "PrimaryBtn", slot=self.accept)
+            self.finish(ok=self.btn_ok)
+        elif is_mrr:
+            via_gw = bool(ident.get("via_gateway", False))
+            gw_br = bool(ident.get("gateway_bridge", ident.get("bridge_available", False)))
+            caps = set(ident.get("capabilities") or ())
+            xcp_ok = (not via_gw and (conn.interface in BRIDGE_NATIVE_INTERFACES or "memory" in caps)) or (via_gw and gw_br)
+            if mem_unavail and not xcp_ok:
+                info_box = Callout("info")
+                info_box.label.setText(mem_unavail)
+                self.body.addWidget(info_box)
+            if xcp_ok:
+                mrr_hint = tr(
+                    "Будут считаны паспорт, статус CP, 7 контрольных точек Code Flash, дамп DFLASH0 (64 КиБ, ключи IKA/GFA) "
+                    "и ошибки DTC. Если XcpGate (DID 0x0902 bit 3) закрыт, программа откроет его автоматически; Code Flash не изменяется.",
+                    "Passport, CP status, 7 Code Flash CP sites, DFLASH0 (64 KiB, IKA/GFA keys), and DTCs will be read. "
+                    "If XcpGate (DID 0x0902 bit 3) is closed, ContiTool opens it automatically; Code Flash is not modified.",
+                )
+            else:
+                mrr_hint = tr(
+                    "Будут считаны паспорт, статус защиты компонентов и ошибки DTC по UDS (в память ничего не пишется).",
+                    "Passport, Component Protection status, and DTCs will be read over UDS (nothing is written to memory).",
+                )
+            self.body.addWidget(hint(mrr_hint))
+            self.btn_ok = button(tr("Считать блок", "Read the ECU"), "PrimaryBtn", slot=self.accept)
+            self.finish(ok=self.btn_ok)
+        elif is_elv:
+            via_gw = bool(ident.get("via_gateway", False))
+            gw_br = bool(ident.get("gateway_bridge", ident.get("bridge_available", False)))
+            caps = set(ident.get("capabilities") or ())
+            df_ok = (not via_gw and (conn.interface in BRIDGE_NATIVE_INTERFACES or "memory" in caps)) or (via_gw and gw_br)
+            if mem_unavail and not df_ok:
+                info_box = Callout("info")
+                info_box.label.setText(mem_unavail)
+                self.body.addWidget(info_box)
+            if df_ok and not via_gw:
+                elv_hint = tr(
+                    "Будут считаны паспорт, 32 КБ Data Flash (VIN, ключ иммо K_5, IDp/IDac, все 47 записей), "
+                    "проверка ключа 22 02F9 и ошибки DTC. В память ничего не пишется.",
+                    "Passport, 32 KB Data Flash (VIN, immo key K_5, IDp/IDac, all 47 records), "
+                    "22 02F9 key check, and DTCs will be read. Nothing is written to memory.",
+                )
+            elif df_ok:
+                elv_hint = tr(
+                    "Сначала будут считаны паспорт, статус WFS5 и ошибки DTC по UDS (в память ничего не пишется). "
+                    "Чтение 32 КБ Data Flash через мост шлюза 3Q0 доступно в рабочем окне 2B ELV.",
+                    "Passport, WFS5 status, and DTCs will be read over UDS first (nothing is written). "
+                    "Reading 32 KB Data Flash via the 3Q0 gateway bridge is available inside the 2B ELV workspace.",
+                )
+            elif via_gw:
+                elv_hint = tr(
+                    "Через этот шлюз доступны только статус, ошибки DTC и привязка с известным ключом по UDS "
+                    "(в память ничего не пишется). Для чтения 32 КБ Data Flash нужно прямое подключение к CAN или шлюз 3Q0 с мостом.",
+                    "Through this gateway, only UDS status, DTCs, and adaptation with a known key are available "
+                    "(nothing is written). Reading 32 KB Data Flash needs direct CAN or a 3Q0 bridge.",
+                )
+            else:
+                elv_hint = tr(
+                    "С этим адаптером доступны только статус, ошибки DTC и привязка с известным ключом по UDS "
+                    "(в память ничего не пишется). Для чтения 32 КБ Data Flash нужен нативный CAN-адаптер "
+                    "(CANable / SLCAN / PCAN / Kvaser / Vector).",
+                    "With this adapter, only UDS status, DTCs, and adaptation with a known key are available "
+                    "(nothing is written). Reading 32 KB Data Flash needs a native CAN adapter "
+                    "(CANable / SLCAN / PCAN / Kvaser / Vector).",
+                )
+            self.body.addWidget(hint(elv_hint))
             self.btn_ok = button(tr("Считать блок", "Read the ECU"), "PrimaryBtn", slot=self.accept)
             self.finish(ok=self.btn_ok)
         elif is_bcm:
@@ -1384,12 +2166,10 @@ class EcuFoundDialog(Dialog):
             self.body.addWidget(
                 hint(
                     tr(
-                        "Будут считаны паспорт, статус защиты компонентов, слоты радиоключей FFB и ошибки DTC по UDS "
-                        "(ключи IKA и GFA по умолчанию не считываются, в память ничего не пишется). "
-                        "После опроса сразу откроется рабочее пространство 09 BCM.",
-                        "Passport, Component Protection status, FFB remote key slots, and DTCs will be read over UDS "
-                        "(IKA and GFA keys are not read by default; nothing is written to memory). "
-                        "The 09 BCM workspace opens once reading finishes.",
+                        "Будут считаны паспорт, статус защиты компонентов и ошибки DTC по UDS "
+                        "(в память ничего не пишется).",
+                        "Passport, Component Protection status, and DTCs will be read over UDS "
+                        "(nothing is written to memory).",
                     )
                 )
             )
@@ -1399,12 +2179,10 @@ class EcuFoundDialog(Dialog):
             self.body.addWidget(
                 hint(
                     tr(
-                        "Будет снята полная копия памяти: CodeFlash, Uflash, DataFlash, а также внешняя EEPROM и OPBT "
-                        "(около полутора минут). Блок перейдёт в режим загрузчика и потом вернётся в обычный режим; "
-                        "в память ничего не пишется.",
-                        "A full memory copy will be taken: CodeFlash, Uflash, DataFlash, plus external EEPROM and OPBT "
-                        "(about a minute and a half). The ECU switches to its loader and back to normal afterwards; "
-                        "nothing is written to its memory.",
+                        "Будет снята полная копия памяти (CodeFlash, Uflash, DataFlash, EEPROM, OPBT — около 1,5 мин). "
+                        "В память ничего не пишется.",
+                        "A full memory backup will be read (CodeFlash, Uflash, DataFlash, EEPROM, OPBT — ~1.5 min). "
+                        "Nothing is written to memory.",
                     )
                 )
             )

@@ -929,3 +929,250 @@ def test_bcm_direct_identify_and_connection_dialog_check_link(monkeypatch) -> No
     assert "5Q0937084CG" in dlg.lbl_check.text()
     dlg.close()
     win.close()
+
+
+def test_j533_can_bridge_applet_gafl_whitelist_preserves_default_and_encodes_rules() -> None:
+    import hashlib
+    import struct
+
+    # Default (no target_rx_filter) must remain 100% byte-identical to hardware-verified applets
+    for ch, expected_sha in VERIFIED_BRIDGE_APPLETS.items():
+        assert hashlib.sha256(build_j533_can_bridge_applet(ch)).hexdigest() == expected_sha
+
+    # Filtered ch2 (13 MRR: 0x7C1, 0x77E, 0x1BFEBA01) and ch0 (09 BCM / 17 FPK_E) and ch4 (target > diag_ch)
+    mrr_filter = ((0x7C1, False), (0x77E, False), (0x1BFEBA01, True))
+    blob_mrr = build_j533_can_bridge_applet(2, target_rx_filter=mrr_filter)
+    assert len(build_loader_packet(blob_mrr)) <= MAX_LOADER_PACKET_SIZE
+    # GAFLCFG0 must encode ch2=3 rules, ch3=1 rule -> (3 << 8) | 1 = 0x00000301
+    assert struct.pack("<I", 0x00000301) in blob_mrr
+    # Encoded GAFLID / GAFLM words for std 0x7C1, std 0x77E, ext 0x1BFEBA01
+    assert struct.pack("<I", 0x000007C1) in blob_mrr
+    assert struct.pack("<I", 0xC00007FF) in blob_mrr
+    assert struct.pack("<I", 0x1BFEBA01 | 0x80000000) in blob_mrr
+    assert struct.pack("<I", 0xDFFFFFFF) in blob_mrr
+
+    # ch4 > ch3: GAFLCFG0 has ch3=1 (0x00000001), GAFLCFG1 has ch4=2 (2 << 24)
+    blob_ch4 = build_j533_can_bridge_applet(4, target_rx_filter=((0x773, False), (0x17FE015F, True)))
+    assert struct.pack("<I", 0x02000000) in blob_ch4
+    assert len(build_loader_packet(blob_ch4)) <= MAX_LOADER_PACKET_SIZE
+
+    with pytest.raises(ValueError, match="1..15"):
+        build_j533_can_bridge_applet(0, target_rx_filter=[])
+    with pytest.raises(ValueError, match="1..15"):
+        build_j533_can_bridge_applet(0, target_rx_filter=[(0x700 + i, False) for i in range(16)])
+    with pytest.raises(ValueError, match="Standard filter CAN ID"):
+        build_j533_can_bridge_applet(0, target_rx_filter=[(0x800, False)])
+
+
+def test_j533_can_bridge_close_survives_can_error_and_missed_ready_beacon(monkeypatch) -> None:
+    from contitool.can import workflows
+    from contitool.progress import OperationReporter
+
+    set_lang("en")
+    monkeypatch.setattr(
+        workflows,
+        "enter_ram_loader",
+        lambda link, **kw: {"beacon": "CONTITOOL_RAM_OK", "loader_ready": True},
+    )
+
+    # 1. CanOperationError during _wait_beacon in __exit__ must not mask the inner exception
+    class DropOnStopBus(FakeMultiEcuBus):
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            if self.bridge_stops > 0:
+                raise can.CanOperationError("VCI unplugged")
+            return super().recv(timeout)
+
+    drop_bus = DropOnStopBus()
+    with pytest.raises(ValueError, match="inner-op-error"):
+        with j533_can_bridge("fake", interface="slcan", target_channel=0, bus=drop_bus):
+            raise ValueError("inner-op-error")
+
+    # 2. Missed J533BRDG ready beacon must still attempt STOPBRDG during error cleanup
+    class SilentReadyBus(FakeMultiEcuBus):
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            if msg.arbitration_id == J533_BRIDGE_STOP_ID and b"-END" in bytes(msg.data) and not self.bridge_active:
+                self.bridge_active = True
+                self.bridge_starts += 1
+                # Deliberately drop J533BRDG beacon
+                return
+            super().send(msg, timeout=timeout)
+
+    silent_bus = SilentReadyBus()
+    warnings: list[str] = []
+    rep = OperationReporter(on_log=lambda ev: warnings.append(ev.message) if ev.level == "warning" else None)
+    with pytest.raises(TimeoutError, match="J533BRDG"):
+        with j533_can_bridge("fake", interface="slcan", target_channel=2, bus=silent_bus, ready_timeout=0.05, reporter=rep):
+            pass
+    assert silent_bus.bridge_stops == 1
+
+
+def test_can_scan_bus_reports_nonraw_and_primed_dpdu_slave_limits() -> None:
+    set_lang("en")
+
+    class NonRawBus(FakeMultiEcuBus):
+        nonraw = {0x710: 1}
+
+    scan_nr = can_scan_bus("fake", interface="dpdu", bus=NonRawBus())
+    assert [e.kind for e in scan_nr.ecus] == ["j533"]
+    assert any("fixed links" in n for n in scan_nr.scan_notes)
+
+    class PrimedBus(FakeMultiEcuBus):
+        _raw_needs_prime = True
+
+    scan_pr = can_scan_bus("fake", interface="dpdu", bus=PrimedBus())
+    assert [e.kind for e in scan_pr.ecus] == ["j533"]
+    assert any("CAN1 primed" in n for n in scan_pr.scan_notes)
+
+
+def test_can_scan_bus_warns_about_untested_29bit_dpdu_rawmode_for_bcm_and_mrr() -> None:
+    """H4: D-PDU scans discovering 29-bit memory-capable slaves (BCM/MRR) must emit a bilingual warning in scan_notes."""
+    bus_en = FakeMultiEcuBus(has_j533=True, has_fpke=False, has_bcm=True)
+    set_lang("en")
+    scan_en = can_scan_bus("VAS6154", interface="dpdu", targets=("j533", "bcm"), bus=bus_en)
+    assert any("29-bit" in n and "untested" in n for n in scan_en.scan_notes)
+
+    bus_ru = FakeMultiEcuBus(has_j533=True, has_fpke=False, has_bcm=True)
+    set_lang("ru")
+    scan_ru = can_scan_bus("VAS6154", interface="dpdu", targets=("j533", "bcm"), bus=bus_ru)
+    assert any("29-битных" in n and "не проверена" in n for n in scan_ru.scan_notes)
+
+    # Native SLCAN must not emit the D-PDU 29-bit warning
+    bus_slcan = FakeMultiEcuBus(has_j533=True, has_fpke=False, has_bcm=True)
+    set_lang("en")
+    scan_slcan = can_scan_bus("COM4", interface="slcan", targets=("j533", "bcm"), bus=bus_slcan)
+    assert not any("29-bit" in n for n in scan_slcan.scan_notes)
+
+
+def test_can_scan_bus_retries_sleeping_slave_behind_gateway_but_not_on_can_error() -> None:
+    """M5b: A sleeping slave behind J533 that misses the first 10 03 probe is discovered on the brief 2nd attempt,
+    while a failing adapter raising CanError is not retried."""
+
+    class SleepingBcmBus(FakeMultiEcuBus):
+        def __init__(self) -> None:
+            super().__init__(has_j533=True, has_fpke=False, has_bcm=True)
+            self.bcm_1003_seen = 0
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            if msg.arbitration_id == 0x70E and bytes(msg.data[:3]) == b"\x02\x10\x03":
+                self.bcm_1003_seen += 1
+                if self.bcm_1003_seen == 1:
+                    return  # asleep on first routed probe
+            super().send(msg, timeout=timeout)
+
+    sleep_bus = SleepingBcmBus()
+    scan = can_scan_bus("fake", interface="slcan", targets=("j533", "bcm"), bus=sleep_bus)
+    assert sleep_bus.bcm_1003_seen == 2
+    assert [e.kind for e in scan.ecus] == ["j533", "bcm"]
+
+    class FaultingAdapterBus(FakeMultiEcuBus):
+        def __init__(self) -> None:
+            super().__init__(has_j533=True, has_fpke=False, has_bcm=True)
+            self.bcm_attempts = 0
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            if msg.arbitration_id == 0x70E:
+                self.bcm_attempts += 1
+                raise can.CanOperationError("TX queue error")
+            super().send(msg, timeout=timeout)
+
+    fault_bus = FaultingAdapterBus()
+    scan_fault = can_scan_bus("fake", interface="slcan", targets=("j533", "bcm"), bus=fault_bus)
+    assert fault_bus.bcm_attempts == 1  # no wasted retry on adapter CanError
+    assert [e.kind for e in scan_fault.ecus] == ["j533"]
+
+
+def test_can_uds_read_dtc_uses_aa_flow_control_padding_for_bcm_and_00_for_j533() -> None:
+    """M5b: ISO-TP Flow Control frames to 09 BCM (0x70E/0x778) must be padded with 0xAA, while J533 keeps 0x00."""
+    # Two DTCs (11 bytes total response) -> forces multi-frame ISO-TP FirstFrame + FlowControl
+    multi_dtcs = bytes.fromhex("0102038F0405068F")
+
+    class RecordingBus(FakeMultiEcuBus):
+        def __init__(self) -> None:
+            super().__init__(dtcs_by_tx={0x710: multi_dtcs, 0x70E: multi_dtcs})
+            self.fc_frames: list[tuple[int, bytes]] = []
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            raw = bytes(msg.data)
+            if raw and (raw[0] >> 4) == 3:
+                self.fc_frames.append((msg.arbitration_id, raw))
+            super().send(msg, timeout=timeout)
+
+    rec = RecordingBus()
+    bcm_res = can_uds_read_dtc("fake", 0x70E, 0x778, ecu_kind="bcm", bus=rec)
+    j533_res = can_uds_read_dtc("fake", 0x710, 0x77A, ecu_kind="j533", bus=rec)
+    assert bcm_res["active_count"] == 2 and j533_res["active_count"] == 2
+    assert (0x70E, bytes.fromhex("300000AAAAAAAAAA")) in rec.fc_frames
+    assert (0x710, bytes.fromhex("3000000000000000")) in rec.fc_frames
+
+
+def test_transport_init_closes_log_file_on_bus_failure_and_formats_rx_id_and_caps_drain_rx(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """M3c + LOW + M5b: J533CanLink closes log_file on init failure, reports actual UDS_RX_ID in ISO-TP errors,
+    and caps drain_rx by both frame count and wall-clock time on busy vehicle buses."""
+    from contitool.can import transport
+    from contitool.can.transport import J533CanLink
+
+    # 1. No fd leak when bus initialization fails after log_path is opened
+    opened_files: list[Any] = []
+    real_open = Path.open
+
+    def tracking_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        fh = real_open(self, *args, **kwargs)
+        if self.name == "fail_init.jsonl":
+            opened_files.append(fh)
+        return fh
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    monkeypatch.setattr(can.interface, "Bus", lambda **_k: (_ for _ in ()).throw(can.CanInitializationError("no adapter")))
+    with pytest.raises(can.CanInitializationError, match="no adapter"):
+        J533CanLink("COM99", interface="slcan", log_path=tmp_path / "fail_init.jsonl")
+    assert len(opened_files) == 1 and opened_files[0].closed is True
+    monkeypatch.undo()
+
+    # 2. ISO-TP error/timeout messages use the active UDS_RX_ID (not hardcoded 0x77A)
+    class BadIsoTpBus:
+        def __init__(self, frames: list[bytes]) -> None:
+            self.frames = list(frames)
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            pass
+
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            if self.frames:
+                return can.Message(arbitration_id=0x778, data=self.frames.pop(0), is_extended_id=False)
+            return None
+
+        def shutdown(self) -> None:
+            pass
+
+    with J533CanLink("fake", bus=BadIsoTpBus([bytes.fromhex("320000AAAAAAAAAA")])) as link:
+        link.UDS_TX_ID, link.UDS_RX_ID = 0x70E, 0x778
+        with pytest.raises(RuntimeError, match="from 0x778"):
+            link.receive_flow_control(timeout=0.05)
+
+    with J533CanLink("fake", bus=BadIsoTpBus([bytes.fromhex("21AABBCCDDEEFF00")])) as link:
+        link.UDS_TX_ID, link.UDS_RX_ID = 0x70E, 0x778
+        with pytest.raises(RuntimeError, match="on 0x778"):
+            link.receive_uds(timeout=0.05)
+
+    with J533CanLink("fake", bus=BadIsoTpBus([bytes.fromhex("100E62F187355130"), bytes.fromhex("037F221100000000")])) as link:
+        link.UDS_TX_ID, link.UDS_RX_ID = 0x70E, 0x778
+        with pytest.raises(RuntimeError, match="on 0x778"):
+            link.receive_uds(timeout=0.05)
+
+    # 3. drain_rx terminates promptly under a busy vehicle bus (wall-clock cap)
+    clock = [10.0]
+
+    class BusyVehicleBus:
+        def recv(self, timeout: float | None = None) -> can.Message:
+            clock[0] += 0.05
+            return can.Message(arbitration_id=0x123, data=bytes(8), is_extended_id=False)
+
+        def shutdown(self) -> None:
+            pass
+
+    monkeypatch.setattr(transport.time, "monotonic", lambda: clock[0])
+    with J533CanLink("fake", bus=BusyVehicleBus()) as link:
+        n = link.drain_rx(max_frames=16_384, max_time=0.2)
+    assert 1 <= n <= 5  # stopped by time cap instead of draining 16,384 frames

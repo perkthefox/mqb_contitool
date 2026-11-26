@@ -33,18 +33,18 @@ class Section(QFrame):
 
         self._head_bar = QWidget()
         self.head = QHBoxLayout(self._head_bar)
-        self.head.setContentsMargins(18, 14, 18, 2)
-        self.head.setSpacing(8)
+        self.head.setContentsMargins(18, 13, 18, 4)
+        self.head.setSpacing(10)
         self.lbl_title = QLabel()
         self.lbl_title.setObjectName("SectionTitle")
-        self.head.addWidget(self.lbl_title)
+        self.head.addWidget(self.lbl_title, 0, Qt.AlignmentFlag.AlignVCenter)
         self.head.addStretch(1)
         self._outer.addWidget(self._head_bar)
 
         self._body_wrap = QWidget()
         self.body = QVBoxLayout(self._body_wrap)
-        self.body.setContentsMargins(18, 6, 18, 16)
-        self.body.setSpacing(10)
+        self.body.setContentsMargins(18, 4, 18, 15)
+        self.body.setSpacing(9)
 
         self.lbl_desc = QLabel()
         self.lbl_desc.setObjectName("Hint")
@@ -60,10 +60,10 @@ class Section(QFrame):
 
     def add_footer(self, *buttons: QWidget) -> QHBoxLayout:
         """Append a clean action row inside the same card surface."""
-        self.body.setContentsMargins(18, 6, 18, 10)
+        self.body.setContentsMargins(18, 4, 18, 8)
         foot = QWidget()
         lay = QHBoxLayout(foot)
-        lay.setContentsMargins(18, 4, 18, 16)
+        lay.setContentsMargins(18, 6, 18, 14)
         lay.setSpacing(8)
         for b in buttons:
             lay.addWidget(b)
@@ -103,7 +103,8 @@ def pill(text: str = "", tone: str = "muted") -> QLabel:
 def set_pill(lbl: QLabel, text: str, tone: str) -> None:
     lbl.setText(text)
     set_tone(lbl, tone)
-    lbl.setVisible(bool(text))
+    if lbl.parent() is not None or not text:
+        lbl.setVisible(bool(text))
 
 
 def status_readout(text: str = "", tone: str = "muted") -> QLabel:
@@ -111,7 +112,8 @@ def status_readout(text: str = "", tone: str = "muted") -> QLabel:
     lbl = QLabel(text)
     lbl.setObjectName("StatusReadout")
     set_tone(lbl, tone)
-    lbl.setVisible(bool(text))
+    if not text:
+        lbl.hide()
     return lbl
 
 
@@ -200,19 +202,20 @@ class Dialog(QDialog):
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
         self.body = QVBoxLayout(content)
-        self.body.setContentsMargins(24, 20, 24, 20)
-        self.body.setSpacing(14)
+        self.body.setContentsMargins(22, 18, 22, 18)
+        self.body.setSpacing(12)
         self._scroll.setWidget(content)
         outer.addWidget(self._scroll, 1)
         self._footer = QWidget()
         self._footer.setObjectName("DialogFooter")
         self.buttons = QHBoxLayout(self._footer)
-        self.buttons.setContentsMargins(24, 12, 24, 14)
+        self.buttons.setContentsMargins(22, 11, 22, 13)
         self.buttons.setSpacing(8)
         self._footer.setHidden(True)  # finish() shows it
         outer.addWidget(self._footer)
         lbl = QLabel(title)
         lbl.setObjectName("PageTitle")
+        lbl.setWordWrap(True)
         self.body.addWidget(lbl)
         if subtitle:
             self.body.addWidget(hint(subtitle))

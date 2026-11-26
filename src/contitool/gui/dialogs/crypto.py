@@ -41,7 +41,7 @@ from contitool.gui.widgets.file_drop import DumpFileSelector
 from contitool.gui.widgets.page import Callout, Dialog, button, group_label, hint, row
 from contitool.i18n import get_lang, tr
 
-_SWAP_ROW_H = 27
+_SWAP_ROW_H = 26
 
 def key_selector(private: bool, path: Path | None = None) -> DumpFileSelector:
     """File field accepting an RSA-1024 key bundle, optionally pre-filled with the last key used."""
@@ -73,12 +73,10 @@ class SwapActivateDialog(Dialog):
                 "SWaP/FEC activation in DataFlash",
             ),
             tr(
-                "Отметьте FEC, которые должны быть активны в шлюзе. ContiTool запишет их в слоты Multi-FSC в "
-                "DataFlash; ключ RSA, сертификаты и изменение CodeFlash не нужны.",
-                "Tick the FECs that should be active in the gateway. ContiTool writes them into the Multi-FSC "
-                "slots in DataFlash; no RSA key, certificate or CodeFlash change is needed.",
+                "Отметьте нужные коды FEC — запись идёт напрямую в слоты Multi-FSC DataFlash без правки CodeFlash.",
+                "Select FECs to activate — written directly to Multi-FSC slots in DataFlash without touching CodeFlash.",
             ),
-            width=780,
+            width=760,
         )
         self._swap = swap_summary
         self._dataset = dataset_summary
@@ -139,13 +137,13 @@ class SwapActivateDialog(Dialog):
 
         # 1. Feature table + quick selection buttons
         self.btn_supported = button(
-            tr("Поддерживаемые датасетом", "Dataset-supported"),
-            "GhostBtn",
+            tr("Из датасета", "Dataset-supported"),
+            "Chip",
             slot=self._select_supported,
         )
         self.btn_supported.setEnabled(bool(dataset_summary and dataset_summary.supported_fecs))
-        self.btn_all = button(tr("Выбрать все", "Select all"), "GhostBtn", slot=self._select_all)
-        self.btn_none = button(tr("Снять все", "Clear all"), "GhostBtn", slot=self._select_none)
+        self.btn_all = button(tr("Все", "All"), "Chip", slot=self._select_all)
+        self.btn_none = button(tr("Снять все", "Clear"), "Chip", slot=self._select_none)
         self.body.addLayout(
             row(
                 group_label(tr("1. ФУНКЦИИ SWAP / FEC", "1. SWAP / FEC FEATURES")),
@@ -439,17 +437,13 @@ class RsaKeyDialog(Dialog):
             parent,
             tr("Свой ключ SWaP", "Your SWaP key") if swap else tr("Свой ключ FBL", "Your FBL key"),
             tr(
-                "В CodeFlash вшивается публичная часть ключа RSA-1024 (e = 3). После записи в блок шлюз принимает "
-                "сертификаты функций, подписанные этим ключом.",
-                "The public part of an RSA-1024 (e = 3) key is embedded into CodeFlash. Once written to the ECU, "
-                "the gateway accepts feature certificates signed with this key.",
+                "Вшивает публичный ключ RSA-1024 (e=3) в CodeFlash для приёма сертификатов, подписанных вашим ключом.",
+                "Embeds your RSA-1024 (e=3) public key in CodeFlash so the gateway accepts your signed certificates.",
             )
             if swap
             else tr(
-                "В область загрузчика CodeFlash вшивается публичная часть ключа RSA-1024 (e = 3). Загрузчик будет "
-                "принимать прошивки, подписанные этим ключом.",
-                "The public part of an RSA-1024 (e = 3) key is embedded into the CodeFlash bootloader area. The "
-                "bootloader will accept firmware signed with this key.",
+                "Вшивает публичный ключ RSA-1024 (e=3) в область загрузчика CodeFlash для приёма ваших прошивок.",
+                "Embeds your RSA-1024 (e=3) public key in CodeFlash bootloader area to accept your signed firmware.",
             ),
         )
         self.rb_new = QRadioButton(tr("Создать новую пару ключей", "Create a new keypair"))
@@ -462,10 +456,8 @@ class RsaKeyDialog(Dialog):
 
         self.lbl_new = hint(
             tr(
-                "Пара ключей сохраняется в папку ContiTool_keys рядом с дампами (.json, .private.pem, "
-                ".public.pem), каждый раз в новые файлы. Приватный ключ нужен для подписи — сохраните его.",
-                "The key pair is saved in the ContiTool_keys folder next to the dumps (.json, .private.pem, "
-                ".public.pem), in new files each time. The private key is needed to sign — keep it.",
+                "Ключи сохранятся в ContiTool_keys рядом с дампами (.json, .pem). Сохраните приватный ключ для подписи.",
+                "Keys are saved to ContiTool_keys next to the dumps (.json, .pem). Keep the private key for signing.",
             )
         )
         self.body.addWidget(self.lbl_new)

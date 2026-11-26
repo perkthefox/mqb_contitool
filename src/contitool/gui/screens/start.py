@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 from pathlib import Path
 import re
 from typing import Any
@@ -11,6 +12,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QDragEnterEvent, QDragLeaveEvent, QDropEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QScrollArea,
@@ -66,15 +68,68 @@ def _summarize_recent_folder(folder: Path) -> dict[str, Any]:
     except OSError:
         pass
 
+    is_mrr = (
+        "mrr_keys.json" in file_sizes
+        or "mrr_read_report.json" in file_sizes
+        or "mrr" in raw_name.lower()
+        or part_num.startswith(("3Q0907572", "5Q0907572", "3QF907561"))
+    )
+    is_elv = (
+        not is_mrr
+        and (
+            "elv_dflash_32k.bin" in file_sizes
+            or "elv_dflash_64k.bin" in file_sizes
+            or "elv_report.json" in file_sizes
+            or "elv_backup_report.json" in file_sizes
+            or "elv" in raw_name.lower()
+            or part_num.startswith(("3Q0905861", "5Q0905861", "2Q0905861"))
+        )
+    )
+    if is_elv and not m_pn:
+        for meta_name in ("elv_report.json", "elv_backup_report.json"):
+            if meta_name in file_sizes and file_sizes[meta_name] <= 262144:
+                try:
+                    mdata = json.loads((folder / meta_name).read_text(encoding="utf-8"))
+                    pp = mdata.get("passport") or mdata.get("identity") if isinstance(mdata, dict) else None
+                    if isinstance(pp, dict):
+                        pn_json = str(pp.get("part_number") or "").strip()
+                        fz_json = str(pp.get("fazit") or "").strip()
+                        if pn_json:
+                            part_num = pn_json
+                            fazit = fz_json
+                            break
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+    if is_mrr and not m_pn:
+        for meta_name in ("mrr_keys.json", "mrr_read_report.json"):
+            if meta_name in file_sizes and file_sizes[meta_name] <= 131072:
+                try:
+                    mdata = json.loads((folder / meta_name).read_text(encoding="utf-8"))
+                    pp = mdata.get("passport") if isinstance(mdata, dict) else None
+                    if isinstance(pp, dict):
+                        pn_json = str(pp.get("part_number") or pp.get("hw_part_number") or "").strip()
+                        fz_json = str(pp.get("fazit") or "").strip()
+                        if pn_json:
+                            part_num = pn_json
+                            fazit = fz_json
+                            break
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    pass
     is_fpke = (
-        "extraarea.bin" in file_sizes
-        or "fpke_report.json" in file_sizes
-        or "immo_passport.json" in file_sizes
-        or "fpke" in raw_name.lower()
-        or part_num.startswith(("83A", "5E0", "3G0920", "5G1920", "8W5"))
+        not is_mrr
+        and not is_elv
+        and (
+            "extraarea.bin" in file_sizes
+            or "fpke_report.json" in file_sizes
+            or "immo_passport.json" in file_sizes
+            or "fpke" in raw_name.lower()
+            or part_num.startswith(("83A", "5E0", "3G0920", "5G1920", "8W5"))
+        )
     )
     is_j533 = (
-        not is_fpke
+        not is_mrr
+        and not is_elv
+        and not is_fpke
         and (
             part_num.startswith(("3Q0", "V03"))
             or any(n in file_sizes for n in ("uflash.bin", "eeprom.bin", "opbt.bin", "cflash.bin"))
@@ -85,8 +140,15 @@ def _summarize_recent_folder(folder: Path) -> dict[str, Any]:
     if any("cflash" in n for n in file_sizes):
         sz = next(s for n, s in file_sizes.items() if "cflash" in n)
         tags.append("CF 2M" if sz >= 1_900_000 else "CF 1.5M")
+    if any("application" in n for n in file_sizes):
+        tags.append("APP")
+    if any("bootloader" in n for n in file_sizes):
+        tags.append("BOOT")
     if any("dflash" in n for n in file_sizes):
-        tags.append("DF 64K")
+        sz_df = next(s for n, s in file_sizes.items() if "dflash" in n)
+        tags.append("DF 32K" if sz_df == 32768 else "DF 64K")
+    if any("sram" in n for n in file_sizes):
+        tags.append("SRAM")
     if any("uflash" in n for n in file_sizes):
         tags.append("UF 32K")
     if any("extraarea" in n or "extra_area" in n for n in file_sizes):
@@ -97,6 +159,10 @@ def _summarize_recent_folder(folder: Path) -> dict[str, Any]:
         tags.append("EE 8K")
     if any("opbt" in n for n in file_sizes):
         tags.append("OPBT")
+    if is_mrr and not tags and ("mrr_keys.json" in file_sizes or "mrr_read_report.json" in file_sizes):
+        tags.append("UDS")
+    if is_elv and not tags and ("elv_report.json" in file_sizes or "elv_backup_report.json" in file_sizes):
+        tags.append("UDS")
 
     try:
         when = datetime.fromtimestamp(folder.stat().st_mtime).strftime("%d.%m.%Y  %H:%M")
@@ -104,8 +170,8 @@ def _summarize_recent_folder(folder: Path) -> dict[str, Any]:
         when = ""
 
     return {
-        "addr": "17" if is_fpke else ("19" if is_j533 else "BIN"),
-        "tone": "can" if is_fpke else ("ok" if is_j533 else "muted"),
+        "addr": "2B" if is_elv else ("13" if is_mrr else ("17" if is_fpke else ("19" if is_j533 else "BIN"))),
+        "tone": "warn" if is_elv else ("info" if is_mrr else ("can" if is_fpke else ("ok" if is_j533 else "muted"))),
         "title": part_num or raw_name,
         "subtitle": fazit or (session_tag if not m_pn else ""),
         "session": session_tag,
@@ -120,7 +186,7 @@ class _BusTopologyDiagram(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._mode = "all"
-        self.setFixedHeight(74)
+        self.setFixedHeight(116)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_mode(self, mode: str) -> None:
@@ -203,17 +269,25 @@ class _BusTopologyDiagram(QWidget):
             draw_wire(host_r.right() + 4, cy, gw_r.left() - 4, cy, "Diag CAN ch3", color=theme.INFO)
 
             sl_x = w - pad - sl_w
-            top_h = 26.0
-            r17 = QRectF(sl_x, 8.0, sl_w, top_h)
-            r09 = QRectF(sl_x, h - 8.0 - top_h, sl_w, top_h)
+            row_h = 22.0
+            gap_y = 4.0
+            y0 = (h - (row_h * 4 + gap_y * 3)) / 2.0
+            r17 = QRectF(sl_x, y0, sl_w, row_h)
+            r09 = QRectF(sl_x, y0 + (row_h + gap_y), sl_w, row_h)
+            r2b = QRectF(sl_x, y0 + (row_h + gap_y) * 2, sl_w, row_h)
+            r13 = QRectF(sl_x, y0 + (row_h + gap_y) * 3, sl_w, row_h)
 
-            # Branch trunk from GW ch0
+            # Branch trunk from GW ch0 (Komfort) & ch2 (Extended)
             branch_x = gw_r.right() + (sl_x - gw_r.right()) * 0.62
             p.setPen(QPen(QColor(theme.OK), 1.4))
             p.drawLine(QPointF(gw_r.right() + 4, cy), QPointF(branch_x, cy))
-            p.drawLine(QPointF(branch_x, r17.center().y()), QPointF(branch_x, r09.center().y()))
+            p.drawLine(QPointF(branch_x, r17.center().y()), QPointF(branch_x, r2b.center().y()))
+            p.setPen(QPen(QColor(theme.INFO), 1.4))
+            p.drawLine(QPointF(branch_x, r2b.center().y()), QPointF(branch_x, r13.center().y()))
             draw_wire(branch_x, r17.center().y(), r17.left() - 4, r17.center().y(), "", color=theme.OK)
-            draw_wire(branch_x, r09.center().y(), r09.left() - 4, r09.center().y(), "", color="#5E6880", dashed=True)
+            draw_wire(branch_x, r09.center().y(), r09.left() - 4, r09.center().y(), "", color=theme.OK)
+            draw_wire(branch_x, r2b.center().y(), r2b.left() - 4, r2b.center().y(), "", color=theme.OK)
+            draw_wire(branch_x, r13.center().y(), r13.left() - 4, r13.center().y(), "", color=theme.INFO)
 
             # Trunk label
             p.setFont(f_sub)
@@ -221,19 +295,21 @@ class _BusTopologyDiagram(QWidget):
             p.drawText(
                 QRectF(gw_r.right() + 6, cy - 17.0, branch_x - gw_r.right() - 8, 14.0),
                 Qt.AlignmentFlag.AlignCenter,
-                tr("RAM-мост ch0", "RAM-Bridge ch0"),
+                tr("RAM-мост ch0/ch2", "RAM-Bridge ch0/ch2"),
             )
             p.setPen(QColor(theme.TEXT_MUTED))
             p.drawText(
                 QRectF(gw_r.right() + 6, cy + 3.0, branch_x - gw_r.right() - 8, 14.0),
                 Qt.AlignmentFlag.AlignCenter,
-                "Komfort CAN",
+                "Komfort / Ext CAN",
             )
 
-            # Compact slave pills on right (aligned columns, no middots)
+            # Compact slave pills on right (aligned columns)
             for rect, code, name, can_id, col in (
                 (r17, "17", "FPK_E", "0x714", theme.CAN),
                 (r09, "09", "BCM", "0x70E", theme.TEXT_SECONDARY),
+                (r2b, "2B", "ELV", "0x731", theme.WARN),
+                (r13, "13", "ACC", "0x757", theme.INFO),
             ):
                 sp = QPainterPath()
                 sp.addRoundedRect(rect, 5.0, 5.0)
@@ -257,6 +333,8 @@ class _BusTopologyDiagram(QWidget):
                 "j533": ("[19] J533 Gateway", "T20: Pin 19, Pin 9", "0x710 / 0x77A", theme.OK),
                 "fpke": ("[17] Kombi FPK_E", "T18: Pin 18, Pin 17", "0x714 / 0x77E", theme.CAN),
                 "bcm": ("[09] BCM J519", "Komfort CAN", "0x70E / 0x778", theme.INFO),
+                "mrr": ("[13] ACC Radar MRR", "Extended CAN", "0x757 / 0x7C1", theme.ACCENT),
+                "elv": ("[2B] ELV J764", "T4: Pin 1, Pin 2", "0x731 / 0x79B", theme.WARN),
             }
             title, sub, wire_lbl, accent = spec_map.get(self._mode, spec_map["j533"])
             dst_w = min(230.0, w * 0.34)
@@ -278,7 +356,7 @@ class _TargetCard(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 9, 12, 9)
+        lay.setContentsMargins(13, 10, 13, 10)
         lay.setSpacing(4)
 
         top = QHBoxLayout()
@@ -286,6 +364,8 @@ class _TargetCard(QFrame):
         self.lbl_badge = QLabel(badge_text)
         self.lbl_badge.setObjectName("AddrBadge")
         self.lbl_badge.setFont(mono_font(10, bold=True))
+        self.lbl_badge.setFixedWidth(32)
+        self.lbl_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         if badge_tone:
             set_tone(self.lbl_badge, badge_tone)
 
@@ -342,7 +422,7 @@ class _RecentRow(QFrame):
         badge.setFont(mono_font(10, bold=True))
         badge.setFixedWidth(34)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if meta["tone"] in ("ok", "can", "accent"):
+        if meta["tone"] in ("ok", "can", "accent", "info", "warn"):
             set_tone(badge, meta["tone"])
         lay.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -386,7 +466,7 @@ class _RecentRow(QFrame):
 class StartScreen(QWidget):
     """Engineering start workbench: CAN topology target selector, compact dump drop strip, and recent units."""
 
-    scan_bus_requested = Signal(str)  # target_kind ("all", "j533", "fpke", "bcm")
+    scan_bus_requested = Signal(str)  # target_kind ("all", "j533", "fpke", "bcm", "mrr", "elv")
     read_can_requested = Signal()
     restore_requested = Signal()
     open_files_requested = Signal()
@@ -464,21 +544,29 @@ class StartScreen(QWidget):
         can_top.addWidget(self.lbl_proto, 0, Qt.AlignmentFlag.AlignVCenter)
         self.tile_can.body.addLayout(can_top)
 
-        # Target Matrix (4 crisp hardware cards)
-        target_row = QHBoxLayout()
-        target_row.setSpacing(8)
+        # Target Matrix (3×2 hardware cards — spacious, zero clipping)
+        target_grid = QGridLayout()
+        target_grid.setContentsMargins(0, 0, 0, 0)
+        target_grid.setHorizontalSpacing(8)
+        target_grid.setVerticalSpacing(8)
+        for col in range(3):
+            target_grid.setColumnStretch(col, 1)
         self._target_cards: dict[str, _TargetCard] = {}
-        for code, badge, tone in (
-            ("all", "GW", "accent"),
-            ("j533", "19", "ok"),
-            ("fpke", "17", "can"),
-            ("bcm", "09", ""),
+        for idx, (code, badge, tone) in enumerate(
+            (
+                ("all", "GW", "accent"),
+                ("j533", "19", "ok"),
+                ("fpke", "17", "can"),
+                ("bcm", "09", ""),
+                ("mrr", "13", "info"),
+                ("elv", "2B", "warn"),
+            )
         ):
             card = _TargetCard(code, badge, tone)
             card.clicked.connect(self.set_target_kind)
             self._target_cards[code] = card
-            target_row.addWidget(card, 1)
-        self.tile_can.body.addLayout(target_row)
+            target_grid.addWidget(card, idx // 3, idx % 3)
+        self.tile_can.body.addLayout(target_grid)
 
         # Dynamic Vector Bus Topology Schematic
         self.diagram = _BusTopologyDiagram()
@@ -569,28 +657,42 @@ class StartScreen(QWidget):
             "j533": tr("Считать 19 J533", "Read 19 J533"),
             "fpke": tr("Считать 17 FPK_E", "Read 17 FPK_E"),
             "bcm": tr("Считать 09 BCM", "Read 09 BCM"),
+            "mrr": tr("Считать 13 Радар", "Read 13 Radar"),
+            "elv": tr("Считать 2B ELV", "Read 2B ELV"),
         }
         proto_map = {
             "all": tr("500 кбит/с · Шлюз + ведомые", "500 kbit/s · Gateway + slaves"),
             "j533": tr("500 кбит/с · Прямой CAN 0x710 / 0x77A", "500 kbit/s · Direct CAN 0x710 / 0x77A"),
             "fpke": tr("500 кбит/с · Прямой CAN 0x714 / 0x77E", "500 kbit/s · Direct CAN 0x714 / 0x77E"),
             "bcm": tr("500 кбит/с · Прямой CAN 0x70E / 0x778", "500 kbit/s · Direct CAN 0x70E / 0x778"),
+            "mrr": tr("500 кбит/с · Extended CAN · 0x757 / 0x7C1", "500 kbit/s · Extended CAN · 0x757 / 0x7C1"),
+            "elv": tr("500 кбит/с · Komfort CAN · 0x731 / 0x79B", "500 kbit/s · Komfort CAN · 0x731 / 0x79B"),
         }
         self.btn_scan.setText(tr("Сканировать шину", "Scan CAN bus"))
         self.btn_scan.setVisible(is_gateway_bus)
         self.btn_read.setText(read_map.get(self._target_kind, read_map["all"]))
         self.btn_read.setVisible(not is_gateway_bus)
         self.btn_read.setEnabled(True)
-        is_bcm = self._target_kind == "bcm"
-        self.btn_restore.setVisible(not is_bcm)
-        self.btn_read.setToolTip(
-            tr(
+        hide_restore = self._target_kind in ("fpke", "bcm", "mrr", "elv")
+        self.btn_restore.setVisible(not hide_restore)
+        if self._target_kind == "bcm":
+            read_tip = tr(
                 "Проверить связь по UDS, считать паспорт, статус, радиоключи FFB и ошибки DTC и открыть 09 BCM",
                 "Check UDS link, read passport, status, FFB remote keys & DTCs, and open 09 BCM",
             )
-            if is_bcm
-            else ""
-        )
+        elif self._target_kind == "mrr":
+            read_tip = tr(
+                "Проверить связь по UDS, считать статус CP (7 точек Code Flash), ключи IKA/GFA (DFLASH0) и ошибки DTC радара 13 ACC",
+                "Check UDS link, read CP patch status (7 Code Flash sites), IKA/GFA keys (DFLASH0), and DTCs for 13 ACC Radar",
+            )
+        elif self._target_kind == "elv":
+            read_tip = tr(
+                "Проверить связь, считать паспорт, 32 КБ Data Flash (VIN, ключ иммо, IDp/IDac) и ошибки 2B ELV",
+                "Check link, read passport, 32 KB Data Flash (VIN, immo key, IDp/IDac), and 2B ELV fault codes",
+            )
+        else:
+            read_tip = ""
+        self.btn_read.setToolTip(read_tip)
         self.lbl_proto.setText(proto_map.get(self._target_kind, proto_map["all"]))
 
     def refresh_recent(self) -> None:
@@ -606,27 +708,35 @@ class StartScreen(QWidget):
         self.lbl_title.setText(tr("Подключение к блокам", "Connect to ECU"))
         self.lbl_sub.setText(
             tr(
-                "Выберите способ подключения по CAN или откройте сохранённые дампы",
-                "Choose a CAN connection mode or open saved dumps",
+                "Выберите режим CAN или откройте локальные дампы",
+                "Choose a CAN mode or open local dumps",
             )
         )
         self.lbl_can_eyebrow.setText(tr("ПОДКЛЮЧЕНИЕ ПО CAN", "CAN CONNECTION"))
 
         self._target_cards["all"].set_labels(
-            tr("Шлюз + ведомые", "Gateway + bus"),
-            "19, 17, 09",
+            tr("Шлюз + вся шина", "Gateway + bus"),
+            "19, 17, 09, 13, 2B",
         )
         self._target_cards["j533"].set_labels(
             tr("Шлюз J533", "J533 Gateway"),
             "0x710 / 0x77A",
         )
         self._target_cards["fpke"].set_labels(
-            tr("Панель приборов", "FPK_E Cluster"),
+            tr("Панель приборов", "Instrument Cluster"),
             "FPK_E · 0x714 / 0x77E",
         )
         self._target_cards["bcm"].set_labels(
-            "BCM J519",
+            tr("Блок BCM J519", "BCM J519"),
             "0x70E / 0x778",
+        )
+        self._target_cards["mrr"].set_labels(
+            tr("Радар ACC", "ACC Radar"),
+            "MRR · 0x757 / 0x7C1",
+        )
+        self._target_cards["elv"].set_labels(
+            tr("Защёлка руля ELV", "Steering Lock ELV"),
+            "J764 · 0x731 / 0x79B",
         )
 
         self._update_action_labels()
@@ -638,7 +748,7 @@ class StartScreen(QWidget):
                 "Restore an ECU from a saved backup (including FBL bootloader recovery)",
             )
         )
-        self.btn_wiring.setText(tr("Распиновка T20 / T18", "Pinout T20 / T18"))
+        self.btn_wiring.setText(tr("Распиновка T20 / T18 / T4", "Pinout T20 / T18 / T4"))
         self.btn_wiring.setToolTip(
             tr("Схемы подключения на стенде и справка", "Bench wiring diagrams and reference guide")
         )

@@ -116,11 +116,11 @@ def bcm_get_profile(profile_id: str) -> dict[str, Any]:
     """Return a copy of the BCM firmware profile dict (`'ea_0511'` or `'dd_0273'`)."""
     key = (profile_id or "").strip().lower()
     if key in ("ea", "0511", "ea_0511", "5q0937084ea", "5q0937086bh"):
-        return dict(BCM_PROFILES["ea_0511"])
+        return {**BCM_PROFILES["ea_0511"], "matched": True}
     if key in ("dd", "0273", "dd_0273", "5q0937084dd", "5q0937084cg"):
-        return dict(BCM_PROFILES["dd_0273"])
+        return {**BCM_PROFILES["dd_0273"], "matched": True}
     if key in BCM_PROFILES:
-        return dict(BCM_PROFILES[key])
+        return {**BCM_PROFILES[key], "matched": True}
     raise ValueError(f"Unknown BCM firmware profile: {profile_id!r}")
 
 
@@ -146,11 +146,11 @@ def bcm_detect_profile(
 
     for prof in BCM_PROFILES.values():
         if sw and sw in prof["sw_versions"]:
-            return dict(prof)
+            return {**prof, "matched": True}
     for prof in BCM_PROFILES.values():
         if pn_norm and any(pn_norm.startswith(pref) for pref in prof["part_prefixes"]):
-            return dict(prof)
-    return dict(BCM_PROFILES["ea_0511"])
+            return {**prof, "matched": True}
+    return {**BCM_PROFILES["ea_0511"], "matched": False}
 
 
 # ────────────────────────────── Pure-Python AES-128 ECB & Final-Round Reconstruction ──────────────────────────────
@@ -625,14 +625,25 @@ def bcm_extract_cluster_ffb_material(
 
     decoded_6a: list[dict[str, Any]] = []
     usable_raw_6a: list[tuple[int, bytes]] = []
-    for entry in raw_6a_entries:
+    ordered_6a = sorted(
+        raw_6a_entries,
+        key=lambda e: (int(e.get("slot", 0)), int(e.get("key_number") or 0)),
+    )
+    for entry in ordered_6a:
         if not entry.get("usable"):
             continue
-        slot_num = int(entry.get("key_number") or (int(entry.get("slot", 0)) + 1))
-        cipher = bytes.fromhex(entry["hex"])
+        raw_hex = str(entry.get("hex") or "").strip()
+        if not raw_hex:
+            continue
+        if len(usable_raw_6a) >= 7:
+            break
+        orig_slot_num = int(entry.get("key_number") or (int(entry.get("slot", 0)) + 1))
+        seq_slot_num = len(usable_raw_6a) + 1
+        cipher = bytes.fromhex(raw_hex)
         rec_info: dict[str, Any] = {
             "slot": int(entry.get("slot", 0)),
-            "key_number": slot_num,
+            "orig_key_number": orig_slot_num,
+            "key_number": seq_slot_num,
             "cipher_hex": cipher.hex(),
         }
         if len(k_ffb_bytes) == 16:
@@ -640,14 +651,18 @@ def bcm_extract_cluster_ffb_material(
             parsed = bcm_parse_ffb_key_plaintext(plain)
             rec_info.update(parsed)
         decoded_6a.append(rec_info)
-        usable_raw_6a.append((slot_num, cipher))
+        usable_raw_6a.append((seq_slot_num, cipher))
 
     active_transponders: list[dict[str, Any]] = []
     synthesized_entries: list[tuple[int, bytes]] = []
-    for idx, kid in enumerate(key_ids[:7], start=1):
+    for kid in key_ids[:7]:
         if not kid.get("present") or not kid.get("within_learned_count"):
             continue
-        raw_id = bytes.fromhex(kid["hex"])
+        raw_hex = str(kid.get("hex") or "").strip()
+        if not raw_hex:
+            continue
+        seq_slot = len(active_transponders) + 1
+        raw_id = bytes.fromhex(raw_hex)
         disp = kid.get("display_id") or f"{int.from_bytes(raw_id, 'little'):08X}"
         # Prefer rolling counter from decoded EEL 0x6A if matching serial is present
         counter = 0
@@ -664,10 +679,10 @@ def bcm_extract_cluster_ffb_material(
                 freq_code=freq_code,
             )
             cipher_hex = cipher.hex()
-            synthesized_entries.append((idx, cipher))
+            synthesized_entries.append((seq_slot, cipher))
         active_transponders.append(
             {
-                "slot_number": idx,
+                "slot_number": seq_slot,
                 "serial_le_hex": raw_id.hex(),
                 "display_id": disp,
                 "rolling_counter": counter,
@@ -751,10 +766,11 @@ def bcm_decode_status_dids(
 
     slot_mask_learned = 0
     slot_mask_synced = 0
-    if nvm_meta and "nvm_03" in nvm_meta and len(nvm_meta["nvm_03"]) >= 4:
+    if nvm_meta and "nvm_03" in nvm_meta and len(nvm_meta["nvm_03"]) >= 1:
         m03 = nvm_meta["nvm_03"]
         slot_mask_learned = m03[0]
-        slot_mask_synced = m03[3]
+        if len(m03) >= 4:
+            slot_mask_synced = m03[3]
 
     slots: list[dict[str, Any]] = []
     if nvm_slots:

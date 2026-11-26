@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import time
 from typing import Any
 
 from contitool.can.bridge import BRIDGE_NATIVE_INTERFACES, bridge_bus_label, bridge_bus_ok
@@ -87,6 +88,36 @@ ECU_SPECS: tuple[EcuSpec, ...] = (
         name_en="Central Electrics BCM / J519 (09)",
         short_ru="BCM (09)",
         short_en="BCM (09)",
+        is_gateway=False,
+        gateway_channel=0,  # Komfort CAN (RSCAN0 ch0, STB=P11_12)
+        needs_bridge_for_memory=True,
+        needs_direct_wake=True,
+        full_support=True,
+    ),
+    EcuSpec(
+        kind="mrr",
+        diag_addr="13",
+        uds_tx_id=0x757,
+        uds_rx_id=0x7C1,
+        name_ru="Радар ACC / J428 (13)",
+        name_en="ACC Radar / J428 (13)",
+        short_ru="Радар ACC (13)",
+        short_en="ACC Radar (13)",
+        is_gateway=False,
+        gateway_channel=2,  # Extended CAN (RSCAN0 ch2, STB=P0_6)
+        needs_bridge_for_memory=True,
+        needs_direct_wake=False,
+        full_support=True,
+    ),
+    EcuSpec(
+        kind="elv",
+        diag_addr="2B",
+        uds_tx_id=0x731,
+        uds_rx_id=0x79B,
+        name_ru="Блокиратор руля ELV / J764 (2B)",
+        name_en="Steering Column Lock ELV / J764 (2B)",
+        short_ru="ELV (2B)",
+        short_en="ELV (2B)",
         is_gateway=False,
         gateway_channel=0,  # Komfort CAN (RSCAN0 ch0, STB=P11_12)
         needs_bridge_for_memory=True,
@@ -225,6 +256,42 @@ class DiscoveredEcu:
                     "Direct Komfort CAN, full access (IKA/GFA/FFB)",
                 )
             return tr("Прямой CAN (только UDS)", "Direct CAN (UDS only)")
+        if self.kind == "mrr":
+            if self.via_gateway:
+                if self.bridge_available:
+                    ch = 2 if self.gateway_channel is None else self.gateway_channel
+                    return tr(
+                        f"Через шлюз J533 (RAM-мост ch{ch}: XCP / память / CP / IKA/GFA)",
+                        f"Via J533 gateway (RAM bridge ch{ch}: XCP / memory / CP / IKA/GFA)",
+                    )
+                return tr(
+                    "Через шлюз (UDS: статус / запись IKA и GFA)",
+                    "Via gateway (UDS: status / write IKA & GFA)",
+                )
+            if self.can_read_memory:
+                return tr(
+                    "Прямой Extended CAN, полный доступ (XCP / память / CP / IKA/GFA)",
+                    "Direct Extended CAN, full access (XCP / memory / CP / IKA/GFA)",
+                )
+            return tr("Прямой CAN (только UDS)", "Direct CAN (UDS only)")
+        if self.kind == "elv":
+            if self.via_gateway:
+                if self.bridge_available:
+                    ch = 0 if self.gateway_channel is None else self.gateway_channel
+                    return tr(
+                        f"Через шлюз J533 (RAM-мост ch{ch}: DFLASH 32 КБ / WFS5 / Virgin)",
+                        f"Via J533 gateway (RAM bridge ch{ch}: 32 KB DFLASH / WFS5 / Virgin)",
+                    )
+                return tr(
+                    "Через шлюз (UDS: паспорт / статус / адаптация 02E2)",
+                    "Via gateway (UDS: passport / status / 02E2 adaptation)",
+                )
+            if self.can_read_memory:
+                return tr(
+                    "Прямой Komfort CAN, полный доступ (DFLASH 32 КБ / WFS5 / Virgin)",
+                    "Direct Komfort CAN, full access (32 KB DFLASH / WFS5 / Virgin)",
+                )
+            return tr("Прямой CAN (только UDS)", "Direct CAN (UDS only)")
         return tr("UDS", "UDS")
 
     def to_ident_dict(self) -> dict[str, Any]:
@@ -316,27 +383,43 @@ def _read_ident_dids(
     return ident
 
 
-def _probe_uds_1003(link: J533CanLink, tx_id: int, rx_id: int, *, timeout: float) -> tuple[bool, bool]:
-    """Probe `(tx_id -> rx_id)` with `10 03` (+ `3E 00`). Returns `(responding, in_fbl)`."""
+def _probe_uds_1003_detailed(link: J533CanLink, tx_id: int, rx_id: int, *, timeout: float) -> tuple[bool, bool, bool]:
+    """Probe `(tx_id -> rx_id)` with `10 03` (+ `3E 00`). Returns `(responding, in_fbl, transport_fault)`."""
+    import can
+
     from contitool.can.transport import UdsNegativeResponse
     from contitool.can.workflows import LINK_ERRORS, _is_fbl_session_nrc
 
     link.UDS_TX_ID = tx_id
     link.UDS_RX_ID = rx_id
+    if tx_id == 0x70E or rx_id == 0x778:
+        link.UDS_FC_PAD = 0xAA
+    elif tx_id == 0x731 or rx_id == 0x79B:
+        link.UDS_FC_PAD = 0x55
+    else:
+        link.UDS_FC_PAD = J533CanLink.UDS_FC_PAD
     try:
         link.request_uds(b"\x10\x03", 0x50, timeout=timeout)
         with contextlib.suppress(*LINK_ERRORS):
             link.request_uds(b"\x3e\x00", 0x7E, timeout=min(0.4, timeout))
-        return True, False
+        return True, False, False
     except UdsNegativeResponse as exc:
         if _is_fbl_session_nrc(exc):
-            return True, True
+            return True, True, False
         # Non-FBL NRC (e.g. 0x22 conditionsNotCorrect on BCM with KL15 off): ECU IS responding on rx_id
         with contextlib.suppress(*LINK_ERRORS):
             link.request_uds(b"\x10\x01", 0x50, timeout=min(0.4, timeout))
-        return True, False
+        return True, False, False
+    except can.CanError:
+        return False, False, True
     except LINK_ERRORS:
-        return False, False
+        return False, False, False
+
+
+def _probe_uds_1003(link: J533CanLink, tx_id: int, rx_id: int, *, timeout: float) -> tuple[bool, bool]:
+    """Probe `(tx_id -> rx_id)` with `10 03` (+ `3E 00`). Returns `(responding, in_fbl)`."""
+    ok, in_fbl, _fault = _probe_uds_1003_detailed(link, tx_id, rx_id, timeout=timeout)
+    return ok, in_fbl
 
 
 def _build_gateway_ecu(link: J533CanLink, in_fbl: bool, reporter: OperationReporter) -> DiscoveredEcu:
@@ -528,6 +611,126 @@ def _build_slave_ecu(
             capabilities=("uds", "dtc", "terminal"),
         )
 
+    if spec.kind == "mrr":
+        if via_gateway:
+            if gateway_bridge_capable:
+                mrr_caps: tuple[str, ...] = ("uds", "memory", "bridge_memory", "dtc", "terminal")
+                mrr_mem_err: str | None = None
+            else:
+                mrr_caps = ("uds", "dtc", "terminal")
+                mrr_mem_err = tr(
+                    "Чтение памяти, деактивация CP и чтение IKA/GFA по XCP (29-бит 0x1BFEBA00/01) через шлюз требуют "
+                    "шлюз Continental 3Q0 907 530 и адаптер с произвольным raw CAN для прозрачного RAM-моста ch3 ↔ ch2. "
+                    "Чтение статуса и запись IKA/GFA (2E 00BE / 00BD) по UDS доступны.",
+                    "Reading memory, CP deactivation, and reading IKA/GFA via XCP (29-bit 0x1BFEBA00/01) through a gateway require "
+                    "a Continental 3Q0 907 530 gateway and a raw-CAN adapter for the ch3 ↔ ch2 RAM bridge. "
+                    "UDS status and IKA/GFA writing (2E 00BE / 00BD) are available.",
+                )
+            return DiscoveredEcu(
+                kind="mrr",
+                diag_addr=spec.diag_addr,
+                uds_tx_id=spec.uds_tx_id,
+                uds_rx_id=spec.uds_rx_id,
+                ident=ident,
+                via_gateway=True,
+                gateway_channel=spec.gateway_channel,
+                bridge_available=gateway_bridge_capable,
+                in_fbl=in_fbl,
+                memory_unavailable_reason=mrr_mem_err,
+                capabilities=mrr_caps,
+            )
+        if native_ok:
+            return DiscoveredEcu(
+                kind="mrr",
+                diag_addr=spec.diag_addr,
+                uds_tx_id=spec.uds_tx_id,
+                uds_rx_id=spec.uds_rx_id,
+                ident=ident,
+                via_gateway=False,
+                gateway_channel=None,
+                bridge_available=False,
+                in_fbl=in_fbl,
+                capabilities=("uds", "memory", "dtc", "terminal"),
+            )
+        return DiscoveredEcu(
+            kind="mrr",
+            diag_addr=spec.diag_addr,
+            uds_tx_id=spec.uds_tx_id,
+            uds_rx_id=spec.uds_rx_id,
+            ident=ident,
+            via_gateway=False,
+            gateway_channel=None,
+            bridge_available=False,
+            in_fbl=in_fbl,
+            memory_unavailable_reason=tr(
+                "Работа с 29-битным XCP радара MRRevo14F (0x1BFEBA00/01) требует нативный CAN-адаптер "
+                "(CANable / SLCAN / candleLight).",
+                "29-bit MRRevo14F XCP operations (0x1BFEBA00/01) require a native CAN adapter "
+                "(CANable / SLCAN / candleLight).",
+            ),
+            capabilities=("uds", "dtc", "terminal"),
+        )
+
+    if spec.kind == "elv":
+        if via_gateway:
+            if gateway_bridge_capable:
+                elv_caps: tuple[str, ...] = ("uds", "memory", "bridge_memory", "dtc", "terminal")
+                elv_mem_err: str | None = None
+            else:
+                elv_caps = ("uds", "dtc", "terminal")
+                elv_mem_err = tr(
+                    "Чтение 32 КБ Data Flash ELV (29-бит 0x1BFD8A0B/0A) через шлюз требует шлюз "
+                    "Continental 3Q0 907 530 и адаптер с raw CAN для прозрачного RAM-моста ch3 ↔ ch0. "
+                    "Паспорт, статус, DTC и адаптация 2E 02E2 (при известном K_5) доступны по UDS.",
+                    "Reading 32 KB ELV Data Flash (29-bit 0x1BFD8A0B/0A) behind a gateway requires a "
+                    "Continental 3Q0 907 530 gateway and a raw-CAN adapter for the ch3 ↔ ch0 RAM bridge. "
+                    "Passport, status, DTCs, and 2E 02E2 adaptation (with known K_5) remain available over UDS.",
+                )
+            return DiscoveredEcu(
+                kind="elv",
+                diag_addr=spec.diag_addr,
+                uds_tx_id=spec.uds_tx_id,
+                uds_rx_id=spec.uds_rx_id,
+                ident=ident,
+                via_gateway=True,
+                gateway_channel=spec.gateway_channel,
+                bridge_available=gateway_bridge_capable,
+                in_fbl=in_fbl,
+                memory_unavailable_reason=elv_mem_err,
+                capabilities=elv_caps,
+            )
+        if native_ok:
+            return DiscoveredEcu(
+                kind="elv",
+                diag_addr=spec.diag_addr,
+                uds_tx_id=spec.uds_tx_id,
+                uds_rx_id=spec.uds_rx_id,
+                ident=ident,
+                via_gateway=False,
+                gateway_channel=None,
+                bridge_available=False,
+                in_fbl=in_fbl,
+                capabilities=("uds", "memory", "dtc", "terminal"),
+            )
+        return DiscoveredEcu(
+            kind="elv",
+            diag_addr=spec.diag_addr,
+            uds_tx_id=spec.uds_tx_id,
+            uds_rx_id=spec.uds_rx_id,
+            ident=ident,
+            via_gateway=False,
+            gateway_channel=None,
+            bridge_available=False,
+            in_fbl=in_fbl,
+            memory_unavailable_reason=tr(
+                "Чтение 32 КБ Data Flash ELV (29-бит 0x1BFD8A0B/0A) требует нативный CAN-адаптер "
+                "(CANable / SLCAN / candleLight).",
+                "Reading 32 KB ELV Data Flash (29-bit 0x1BFD8A0B/0A) requires a native CAN adapter "
+                "(CANable / SLCAN / candleLight).",
+            ),
+            capabilities=("uds", "dtc", "terminal"),
+        )
+
     # Any future UDS-only / planned ECU
     return DiscoveredEcu(
         kind=spec.kind,
@@ -570,6 +773,7 @@ def can_scan_bus(
         _j2534_wrapper_bus,
         _j2534_wrapper_problem,
         _probe_bcm_uds_with_wake,
+        _probe_elv_uds_with_wake,
         _probe_fpke_uds_with_wake,
     )
 
@@ -617,13 +821,21 @@ def can_scan_bus(
             if not explicit_slave_only:
                 step += 1
                 reporter.step(step, total_steps, tr("Опрос шлюза J533 (19, 0x710 → 0x77A)", "Probing J533 gateway (19, 0x710 → 0x77A)"))
-            gw_timeout = 0.25 if (explicit_slave_only and bus is None) else (0.45 if bus is not None else 1.0)
+            gw_timeout = (
+                (0.75 if interface == "dpdu" else 0.55)
+                if (explicit_slave_only and bus is None)
+                else (0.45 if bus is not None else 1.0)
+            )
             gw_ok, gw_fbl = _probe_uds_1003(link, 0x710, 0x77A, timeout=gw_timeout)
             if gw_ok:
                 topology = "gateway"
                 gateway = _build_gateway_ecu(link, gw_fbl, reporter)
                 ecus.append(gateway)
-                bridge_adapter_ok = bus is not None or bridge_bus_ok(interface, link.bus)
+                bridge_adapter_ok = (
+                    bridge_bus_ok(interface, link.bus)
+                    if (bus is None or hasattr(link.bus, "every_id_raw"))
+                    else True
+                )
                 gw_bridge_capable = (gateway.unsupported is None) and (not gateway.in_fbl) and bridge_adapter_ok
                 reporter.info(
                     tr(
@@ -640,14 +852,18 @@ def can_scan_bus(
                 elif gw_bridge_capable:
                     reporter.can_log(
                         tr(
-                            f"Доступен прозрачный CAN-мост RAM-Loader ({bridge_bus_label(0)})",
-                            f"Transparent RAM-Loader CAN bridge available ({bridge_bus_label(0)})",
+                            f"Доступен прозрачный CAN-мост RAM-Loader ({bridge_bus_label(0)}; {bridge_bus_label(2)})",
+                            f"Transparent RAM-Loader CAN bridge available ({bridge_bus_label(0)}; {bridge_bus_label(2)})",
                         )
                     )
 
         # 2. Scan slave ECUs (either routed through gateway or directly on bench CAN)
         if topology == "gateway":
             assert gateway is not None
+            is_fixed_dpdu = bool(getattr(link.bus, "uds_only", False) or getattr(link.bus, "nonraw", None))
+            has_uds_session = callable(getattr(link.bus, "uds_session", None))
+            is_primed_dpdu = bool(getattr(link.bus, "_raw_needs_prime", False))
+            has_dynamic_prime = callable(getattr(link.bus, "_prime_for", None))
             if not slave_targets:
                 pass
             elif gateway.in_fbl:
@@ -657,16 +873,28 @@ def can_scan_bus(
                 )
                 scan_notes.append(note)
                 reporter.warning(note)
-            elif getattr(link.bus, "uds_only", False):
+            elif is_fixed_dpdu and not has_uds_session:
                 note = tr(
-                    "Адаптер D-PDU открыл канал только для 0x710/0x77A — опрос ведомых блоков недоступен.",
-                    "This D-PDU adapter opened only 0x710/0x77A — probing slave ECUs is unavailable.",
+                    "Адаптер D-PDU открыл фиксированный канал только для шлюза 0x710/0x77A — опрос ведомых блоков недоступен.",
+                    "This D-PDU adapter opened fixed links only for 0x710/0x77A — probing slave ECUs is unavailable.",
+                )
+                scan_notes.append(note)
+                reporter.warning(note)
+            elif is_primed_dpdu and not has_dynamic_prime:
+                note = tr(
+                    "Этот адаптер VNCI / VAS 6154 требует запуска CAN1 через ISO-TP и фильтрует приём только на 0x710/0x77A — опрос ведомых блоков недоступен.",
+                    "This VNCI / VAS 6154 needs CAN1 primed via ISO-TP and filters reception to 0x710/0x77A only — probing slave ECUs is unavailable.",
                 )
                 scan_notes.append(note)
                 reporter.warning(note)
             else:
+                from contitool.can.dpdu import PRIME_PAIRS
+
+                uds_driver_refused = False
                 for spec in slave_targets:
                     reporter.check_cancelled()
+                    if getattr(link.bus, "spent", False):
+                        break
                     step += 1
                     reporter.step(
                         step,
@@ -676,15 +904,61 @@ def can_scan_bus(
                             f"Probing via gateway: {spec.short_name} ({spec.diag_addr}, 0x{spec.uds_tx_id:03X} → 0x{spec.uds_rx_id:03X})",
                         ),
                     )
-                    ok_s, fbl_s = _probe_uds_1003(
-                        link,
-                        spec.uds_tx_id,
-                        spec.uds_rx_id,
-                        timeout=0.35 if bus is not None else 0.55,
-                    )
-                    if not ok_s:
-                        continue
-                    ident = _read_ident_dids(link, reporter=reporter)
+                    if is_fixed_dpdu:
+                        link.UDS_TX_ID = spec.uds_tx_id
+                        link.UDS_RX_ID = spec.uds_rx_id
+                        if spec.uds_tx_id == 0x70E or spec.uds_rx_id == 0x778:
+                            link.UDS_FC_PAD = 0xAA
+                        elif spec.uds_tx_id == 0x731 or spec.uds_rx_id == 0x79B:
+                            link.UDS_FC_PAD = 0x55
+                        else:
+                            link.UDS_FC_PAD = J533CanLink.UDS_FC_PAD
+                        with link.uds_session() as hw_uds:
+                            if not hw_uds:
+                                refusal = str(getattr(link.bus, "uds_refusal", "") or "")
+                                if refusal and not refusal.startswith("3E 00"):
+                                    uds_driver_refused = True
+                                continue
+                            ok_s, fbl_s, _fault = _probe_uds_1003_detailed(
+                                link,
+                                spec.uds_tx_id,
+                                spec.uds_rx_id,
+                                timeout=0.35 if bus is not None else 0.55,
+                            )
+                            if not ok_s:
+                                continue
+                            ident = _read_ident_dids(link, reporter=reporter)
+                    else:
+                        if is_primed_dpdu and spec.uds_tx_id not in PRIME_PAIRS:
+                            continue
+                        probe_timeout = 0.20 if bus is not None else 0.55
+                        t0 = time.monotonic()
+                        ok_s, fbl_s, transport_fault = _probe_uds_1003_detailed(
+                            link,
+                            spec.uds_tx_id,
+                            spec.uds_rx_id,
+                            timeout=probe_timeout,
+                        )
+                        elapsed = time.monotonic() - t0
+                        if (
+                            not ok_s
+                            and not transport_fault
+                            and not getattr(link.bus, "spent", False)
+                            and elapsed <= probe_timeout + 0.45
+                        ):
+                            # Brief 2nd attempt for sleeping slave ECUs behind J533 woken by the first routed probe
+                            reporter.check_cancelled()
+                            if bus is None:
+                                time.sleep(0.15)
+                            ok_s, fbl_s, _fault = _probe_uds_1003_detailed(
+                                link,
+                                spec.uds_tx_id,
+                                spec.uds_rx_id,
+                                timeout=0.15 if bus is not None else 0.55,
+                            )
+                        if not ok_s:
+                            continue
+                        ident = _read_ident_dids(link, reporter=reporter)
                     ecu = _build_slave_ecu(
                         spec,
                         ident,
@@ -706,6 +980,13 @@ def can_scan_bus(
                             + f" — {ecu.access_summary}",
                         )
                     )
+                if is_fixed_dpdu and uds_driver_refused and not any(not e.spec.is_gateway for e in ecus):
+                    note = tr(
+                        "Адаптер D-PDU открыл фиксированный канал только для шлюза 0x710/0x77A — опрос ведомых блоков недоступен.",
+                        "This D-PDU adapter opened fixed links only for 0x710/0x77A — probing slave ECUs is unavailable.",
+                    )
+                    scan_notes.append(note)
+                    reporter.warning(note)
         else:
             # Direct CAN topology (no gateway answered on 0x710/0x77A)
             for spec in slave_targets:
@@ -724,6 +1005,9 @@ def can_scan_bus(
                     ka_direct = bus is None and interface in BRIDGE_NATIVE_INTERFACES
                 elif spec.kind == "bcm":
                     ok_s, fbl_s = _probe_bcm_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
+                    ka_direct = False
+                elif spec.kind == "elv":
+                    ok_s, fbl_s = _probe_elv_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
                     ka_direct = False
                 else:
                     ok_s, fbl_s = _probe_uds_1003(
@@ -760,6 +1044,22 @@ def can_scan_bus(
                     )
                 )
 
+        ext29_ecus = [e for e in ecus if e.kind in ("bcm", "mrr", "elv") and e.can_read_memory]
+        if interface == "dpdu" and ext29_ecus:
+            names = ", ".join(f"[{e.diag_addr}] {e.spec.short_name}" for e in ext29_ecus)
+            note = tr(
+                f"Внимание: отправка 29-битных расширенных кадров CAN через D-PDU RawMode (VAS 6154 / VNCI) "
+                f"для операций XCP / WFS с {names} не проверена на реальном оборудовании. "
+                "Операции по UDS (паспорт, статус, DTC, запись IKA/GFA) используют 11-бит и работают штатно; "
+                "при сбое 29-битных операций используйте нативный CAN-адаптер (CANable / SLCAN / candleLight).",
+                f"Warning: sending 29-bit extended CAN frames over D-PDU RawMode (VAS 6154 / VNCI) for XCP / WFS "
+                f"operations on {names} is untested on real hardware. 11-bit UDS operations (passport, status, "
+                "DTCs, IKA/GFA writes) work normally; if 29-bit operations fail, use a native CAN adapter "
+                "(CANable / SLCAN / candleLight).",
+            )
+            scan_notes.append(note)
+            reporter.warning(note)
+
     if keep_direct_fpke_alive and len(ecus) == 1 and ecus[0].kind == "fpke":
         with contextlib.suppress(Exception):
             fpke_link = open_or_reuse_fpke_link(port, interface=interface)
@@ -781,14 +1081,25 @@ def can_scan_bus(
             )
         if scan_notes:
             raise RuntimeError(scan_notes[-1])
+        wants_ext = all(ECU_SPEC_BY_KIND[k].gateway_channel == 2 for k in wanted)
+        wants_komfort = all(ECU_SPEC_BY_KIND[k].gateway_channel == 0 for k in wanted)
+        if wants_ext:
+            bus_hint_ru = "к шине Extended CAN шлюза (T20 Pin 7 CAN-L / Pin 17 CAN-H, ch2)"
+            bus_hint_en = "to the gateway Extended CAN bus (T20 Pin 7 CAN-L / Pin 17 CAN-H, ch2)"
+        elif wants_komfort:
+            bus_hint_ru = "к шине Komfort CAN шлюза (T20 Pin 5 CAN-L / Pin 15 CAN-H, ch0)"
+            bus_hint_en = "to the gateway Komfort CAN bus (T20 Pin 5 CAN-L / Pin 15 CAN-H, ch0)"
+        else:
+            bus_hint_ru = "к нужной шине шлюза (Komfort CAN ch0: T20 Pin 5/15 или Extended CAN ch2: T20 Pin 7/17)"
+            bus_hint_en = "to the gateway sub-bus (Komfort CAN ch0: T20 Pin 5/15 or Extended CAN ch2: T20 Pin 7/17)"
         raise RuntimeError(
             tr(
                 f"Шлюз J533 [19] ({gateway.part_number if gateway else '0x710'}) на связи, но целевой блок "
                 f"{target_labels} за шлюзом не ответил. Проверьте питание +12 В / KL15 ведомого блока и подключение "
-                "к шине Komfort CAN шлюза (T20 Pin 5 CAN-L / Pin 15 CAN-H).",
+                f"{bus_hint_ru}.",
                 f"J533 gateway [19] ({gateway.part_number if gateway else '0x710'}) answered, but target ECU "
                 f"{target_labels} did not respond behind it. Check the slave ECU's +12 V / KL15 power and wiring "
-                "to the gateway Komfort CAN bus (T20 Pin 5 CAN-L / Pin 15 CAN-H).",
+                f"{bus_hint_en}.",
             )
         )
 
@@ -827,6 +1138,15 @@ def _wake_direct_fpke_once(link: J533CanLink) -> None:
             link.send_frame(arb_id, ka_data)
 
 
+def _wake_direct_elv_once(link: J533CanLink) -> None:
+    from contitool.core.elv import ELV_NM_WAKE_ID, ELV_NM_WAKE_PAYLOAD
+
+    for _ in range(3):
+        with contextlib.suppress(Exception):
+            link.send_frame(ELV_NM_WAKE_ID, ELV_NM_WAKE_PAYLOAD)
+        time.sleep(0.015)
+
+
 def can_uds_read_dtc(
     port: str,
     tx_id: int,
@@ -844,12 +1164,24 @@ def can_uds_read_dtc(
     with J533CanLink(port, interface=interface, bus=bus) as link:
         link.UDS_TX_ID = tx_id
         link.UDS_RX_ID = rx_id
+        if tx_id == 0x70E or rx_id == 0x778 or ecu_kind == "bcm":
+            link.UDS_FC_PAD = 0xAA
+        elif tx_id == 0x731 or rx_id == 0x79B or ecu_kind == "elv":
+            link.UDS_FC_PAD = 0x55
         reporter.step(1, 1, tr(f"Чтение ошибок DTC (0x{tx_id:03X} → 0x{rx_id:03X})", f"Reading DTCs (0x{tx_id:03X} → 0x{rx_id:03X})"))
         if ecu_kind == "fpke" and not via_gateway and bus is None and interface in BRIDGE_NATIVE_INTERFACES:
             _wake_direct_fpke_once(link)
-        with contextlib.suppress(Exception):
-            link.request_uds(b"\x10\x03", 0x50, timeout=1.5)
-        resp = link.request_uds(b"\x19\x02\xff", 0x59, timeout=3.0)
+        elif (ecu_kind == "elv" or tx_id == 0x731) and not via_gateway and bus is None and interface in BRIDGE_NATIVE_INTERFACES:
+            _wake_direct_elv_once(link)
+        use_hw_session = (
+            bool(getattr(link.bus, "uds_only", False) or getattr(link.bus, "nonraw", None))
+            and (tx_id, rx_id) != (0x710, 0x77A)
+            and callable(getattr(link.bus, "uds_session", None))
+        )
+        with (link.uds_session() if use_hw_session else contextlib.nullcontext()):
+            with contextlib.suppress(Exception):
+                link.request_uds(b"\x10\x03", 0x50, timeout=1.5)
+            resp = link.request_uds(b"\x19\x02\xff", 0x59, timeout=3.0)
 
     active_dtcs: list[dict[str, Any]] = []
     stored_dtcs: list[dict[str, Any]] = []
@@ -867,6 +1199,10 @@ def can_uds_read_dtc(
             disp, desc = dtc_mod.describe_fpke(code)
         elif ecu_kind == "bcm":
             disp, desc = dtc_mod.describe_bcm(code)
+        elif ecu_kind == "mrr":
+            disp, desc = dtc_mod.describe_mrr(code)
+        elif ecu_kind == "elv":
+            disp, desc = dtc_mod.describe_elv(code)
         else:
             disp, desc = f"0x{code:06X}", tr("Код неисправности UDS", "UDS fault code")
         entry = {
@@ -921,12 +1257,24 @@ def can_uds_clear_dtc(
     with J533CanLink(port, interface=interface, bus=bus) as link:
         link.UDS_TX_ID = tx_id
         link.UDS_RX_ID = rx_id
+        if tx_id == 0x70E or rx_id == 0x778 or ecu_kind == "bcm":
+            link.UDS_FC_PAD = 0xAA
+        elif tx_id == 0x731 or rx_id == 0x79B or ecu_kind == "elv":
+            link.UDS_FC_PAD = 0x55
         reporter.step(1, 1, tr(f"Сброс ошибок DTC (0x{tx_id:03X} → 0x{rx_id:03X})", f"Clearing DTCs (0x{tx_id:03X} → 0x{rx_id:03X})"))
         if ecu_kind == "fpke" and not via_gateway and bus is None and interface in BRIDGE_NATIVE_INTERFACES:
             _wake_direct_fpke_once(link)
-        with contextlib.suppress(Exception):
-            link.request_uds(b"\x10\x03", 0x50, timeout=1.5)
-        link.request_uds(b"\x14\xff\xff\xff", 0x54, timeout=3.0)
+        elif (ecu_kind == "elv" or tx_id == 0x731) and not via_gateway and bus is None and interface in BRIDGE_NATIVE_INTERFACES:
+            _wake_direct_elv_once(link)
+        use_hw_session = (
+            bool(getattr(link.bus, "uds_only", False) or getattr(link.bus, "nonraw", None))
+            and (tx_id, rx_id) != (0x710, 0x77A)
+            and callable(getattr(link.bus, "uds_session", None))
+        )
+        with (link.uds_session() if use_hw_session else contextlib.nullcontext()):
+            with contextlib.suppress(Exception):
+                link.request_uds(b"\x10\x03", 0x50, timeout=1.5)
+            link.request_uds(b"\x14\xff\xff\xff", 0x54, timeout=3.0)
     msg = tr("Ошибки блока сброшены.", "Fault codes cleared.")
     reporter.success(msg)
     return {"ok": True, "tx_id": f"0x{tx_id:03X}", "rx_id": f"0x{rx_id:03X}", "summary": msg}

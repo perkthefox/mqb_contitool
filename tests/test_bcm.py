@@ -269,6 +269,7 @@ class FakeBcmBus:
                 0xF191: pn,
                 0xF1A3: b"H34",
                 0xF17C: b"TST-00001.01.2012340511",
+                0xF197: b"BCM MQBAB H",
                 0xF19E: b"EV_BCMMQB",
                 0xF190: b"WVWZZZAUZJW000001",
                 0x0600: bytes(30),
@@ -1039,4 +1040,350 @@ def test_bcm_adapt_ffb_from_live_cluster_verifies_cluster_presence_on_can() -> N
             interface="slcan",
             bus=bcm_only_bus,
         )
+
+
+def test_bcm_unknown_sw_refuses_xcp_reads_and_protects_ffb() -> None:
+    set_lang("en")
+
+    class UnknownSwBcmBus(FakeBcmBus):
+        def _handle_uds(self, payload: bytes) -> None:
+            if payload[:3] == b"\x22\xf1\x87":
+                self._enqueue_isotp(BCM_UDS_RX_ID, b"\x62\xf1\x87" + b"5Q0937084CP ")
+                return
+            if payload[:3] == b"\x22\xf1\x91":
+                self._enqueue_isotp(BCM_UDS_RX_ID, b"\x62\xf1\x91" + b"5Q0937084CP ")
+                return
+            if payload[:3] == b"\x22\xf1\x89":
+                self._enqueue_isotp(BCM_UDS_RX_ID, b"\x62\xf1\x89" + b"0253")
+                return
+            super()._handle_uds(payload)
+
+    bus = UnknownSwBcmBus(profile_id="ea_0511", freq_code=0x03)
+    bus.ffb_serials[1] = bytes.fromhex("532B3512")
+
+    with pytest.raises(RuntimeError, match="Unsupported 09 BCM firmware"):
+        can_bcm_read_keys("fake", interface="slcan", bus=bus)
+    with pytest.raises(RuntimeError, match="Unsupported 09 BCM firmware"):
+        can_bcm_read_gfa("fake", interface="slcan", bus=bus)
+    # Learned FFB key must NEVER have been wiped by 80 01
+    assert bus.ffb_serials[1] == bytes.fromhex("532B3512")
+
+
+def test_bcm_pass2_failure_restores_ffb_and_persists_backup(monkeypatch, tmp_path) -> None:
+    from contitool.can import bcm as bcm_can_mod
+
+    set_lang("en")
+    bus = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    bus.nvm_read_blocked = True  # force 2-pass Job 3 read (Pass 1 reads K_ffb, Pass 2 reads IKA)
+    bus.ffb_serials[1] = bytes.fromhex("532B3512")
+    orig_kffb = bytes(bus.k_ffb)
+
+    real_job3 = bcm_can_mod._read_bcm_job3_target_in_session
+    calls = {"n": 0}
+
+    def _fail_second_pass(link, profile, *, target_addr, trigger_80_01_pdu=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # Simulate failure right after Pass 1's HardReset zeroed gfa_aes_buf
+            bus.gfa_aes_buf = bytes(16)
+            raise TimeoutError("simulated pass-2 timeout")
+        return real_job3(link, profile, target_addr=target_addr, trigger_80_01_pdu=trigger_80_01_pdu)
+
+    monkeypatch.setattr(bcm_can_mod, "_read_bcm_job3_target_in_session", _fail_second_pass)
+    with pytest.raises(TimeoutError, match="simulated pass-2 timeout"):
+        can_bcm_read_keys("fake", interface="slcan", bus=bus, output_dir=tmp_path)
+
+    # Backup JSON must exist on disk AND FFB key + K_ffb must be restored using Pass 1's GFA!
+    assert (tmp_path / "bcm_ffb_backup.json").is_file()
+    assert bus.k_ffb == orig_kffb
+    assert bus.ffb_serials[1] == bytes.fromhex("532B3512")
+
+
+def test_bcm_adapt_ffb_from_cluster_refuses_before_writing_gfa_without_bridge() -> None:
+    from test_fpke import build_synthetic_fpke_dflash
+
+    set_lang("en")
+    bus = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    orig_gfa = bytes(bus.gfa)
+    df = build_synthetic_fpke_dflash()
+
+    with pytest.raises(RuntimeError, match="Aborted before modifying GFA"):
+        can_bcm_adapt_ffb_from_cluster(
+            "fake",
+            fpke_dflash=df,
+            sync_bcm_gfa_to_cluster=True,
+            current_bcm_ika=bus.ika,
+            interface="slcan",
+            via_gateway=True,
+            gateway_bridge=False,
+            bus=bus,
+        )
+    assert bus.gfa == orig_gfa
+
+
+def test_bcm_write_keys_partial_failure_surfaces_new_ika() -> None:
+    set_lang("en")
+
+    class Fail00BdBus(FakeBcmBus):
+        def _handle_uds(self, payload: bytes) -> None:
+            if payload[:3] == b"\x2e\x00\xbd":
+                self._enqueue_isotp(BCM_UDS_RX_ID, b"\x7f\x2e\x22")
+                return
+            super()._handle_uds(payload)
+
+    bus = Fail00BdBus(profile_id="ea_0511", freq_code=0x03)
+    new_ika = bytes.fromhex("a1b2c3d4e5f60718293a4b5c6d7e8f90")
+    new_gfa = bytes.fromhex("102030405060708090a0b0c0d0e0f001")
+    with pytest.raises(RuntimeError, match=new_ika.hex().upper()):
+        can_bcm_write_keys(
+            "fake",
+            current_ika=bus.ika,
+            new_ika=new_ika,
+            new_gfa=new_gfa,
+            interface="slcan",
+            bus=bus,
+        )
+
+
+def test_bcm_h15_non_sequential_key_number_normalized(monkeypatch) -> None:
+    """H15: gaps in EEL 0x6A / key_ids must be renumbered sequentially 1..N so 80 02 never triggers NRC 0x31."""
+    from contitool.core import bcm as bcm_core_mod
+
+    kc = bytes.fromhex("459E1F01A61C337B9216A35319A12AD9")
+    gfa = bytes.fromhex("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf")
+    k_ffb = bcm_derive_k_ffb(kc)
+    c1 = bcm_encrypt_ffb_key_record(k_ffb, 0x11223344, rolling_counter=10, freq_code=0x03)
+    c3 = bcm_encrypt_ffb_key_record(k_ffb, 0x55667788, rolling_counter=25, freq_code=0x03)
+    c5 = bcm_encrypt_ffb_key_record(k_ffb, 0x99AABBCC, rolling_counter=40, freq_code=0x03)
+
+    fake_analysis = {
+        "metadata": {"part_number": "83A920700E", "vin": "WAUZZZ00000000001", "immo_mode": 6},
+        "items": [
+            {"key_id": "kc", "hex": kc.hex()},
+            {"key_id": "cp1_bank_0", "hex": gfa.hex()},
+            {"key_id": "ika_cp3", "hex": "11" * 16},
+        ],
+        "transponder_records": {
+            "learned_keys": 3,
+            "allowed_keys": 7,
+            "entries": [
+                {"slot": 4, "key_number": 5, "usable": True, "hex": c5.hex()},
+                {"slot": 1, "key_number": 2, "usable": False, "hex": "ff" * 16},
+                {"slot": 0, "key_number": 1, "usable": True, "hex": c1.hex()},
+                {"slot": 2, "key_number": 3, "usable": True, "hex": c3.hex()},
+            ],
+            "key_ids": [
+                {"present": False, "within_learned_count": False, "hex": "00000000"},
+                {"present": True, "within_learned_count": True, "hex": (0x11223344).to_bytes(4, "little").hex()},
+                {"present": False, "within_learned_count": False, "hex": "00000000"},
+                {"present": True, "within_learned_count": True, "hex": (0x55667788).to_bytes(4, "little").hex()},
+            ],
+        },
+    }
+    monkeypatch.setattr(bcm_core_mod, "analyze_fpke_dflash", lambda *_a, **_kw: fake_analysis)
+
+    mat = bcm_extract_cluster_ffb_material(b"\x00" * 64, freq_code=0x03)
+    assert mat["raw_6a_matches_freq"] is True
+    assert [s for s, _c in mat["recommended_entries"]] == [1, 2, 3]
+    assert [c for _s, c in mat["recommended_entries"]] == [c1.hex(), c3.hex(), c5.hex()]
+    assert [t["slot_number"] for t in mat["active_transponders"]] == [1, 2]
+
+    # Direct can_bcm_adapt_ffb with non-sequential entries (and an empty entry) must renumber 1..3 and succeed on BCM
+    bus = FakeBcmBus(profile_id="ea_0511", gfa=gfa, freq_code=0x03)
+    res = can_bcm_adapt_ffb(
+        "fake",
+        gfa=gfa,
+        k_ffb=k_ffb,
+        entries=[(1, c1), (2, b""), (3, c3), (5, c5)],
+        freq_code=0x03,
+        interface="slcan",
+        bus=bus,
+    )
+    assert res["resp_80_02_hex"] == "c002"
+    assert res["keys_adapted"] == 3
+    pop = [s for s in res["status_after"]["ffb_slots"] if s["populated"]]
+    assert [s["display_id"] for s in pop] == ["11223344", "55667788", "99AABBCC"]
+
+
+def test_bcm_m6b_nvm_03_single_byte_slot_mask_decoded() -> None:
+    """M6b: NvM 0x03 is 1 byte (slot_mask_learned in byte 0), not >= 4 bytes."""
+    decoded = bcm_decode_status_dids(
+        {},
+        nvm_slots={
+            1: (bytes.fromhex("532B3512"), (12).to_bytes(4, "big"), b"\x00"),
+            2: (bytes.fromhex("00000000"), bytes(4), b"\x00"),
+            3: (bytes.fromhex("A1B2C3D4"), (99).to_bytes(4, "big"), b"\x00"),
+        },
+        nvm_meta={"nvm_03": bytes([(1 << 1) | (1 << 3)])},
+    )
+    assert decoded["slot_mask_learned"] == 0x0A
+    by_slot = {s["slot"]: s for s in decoded["ffb_slots"]}
+    assert by_slot[1]["mask_learned"] is True
+    assert by_slot[2]["mask_learned"] is False
+    assert by_slot[3]["mask_learned"] is True
+
+    # Also verify live status poll against FakeBcmBus (which serves 1-byte NvM 0x03)
+    bus = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    bus.ffb_serials[1] = bytes.fromhex("532B3512")
+    bus.ffb_learned_mask = (1 << 1) | (1 << 2)
+    st = can_bcm_status("fake", interface="slcan", bus=bus)
+    assert st["status"]["slot_mask_learned"] == 0x06
+
+
+def test_bcm_m5c_isotp_cf_seq_xcp_short_resp_and_wfs_78_cap() -> None:
+    """M5c: reject out-of-sequence/short CFs, short XCP responses, and unbounded WFS 0x78 loops."""
+    bus = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    with BcmCanLink("fake", bus=bus) as link:
+        # 1. Out-of-sequence CF (SN=2 instead of expected SN=1)
+        bus.rx_queue.clear()
+        bus._enqueue_frame(BCM_UDS_RX_ID, b"\x10\x10" + b"\x62\xf1\x87\x35\x51\x30")
+        bus._enqueue_frame(BCM_UDS_RX_ID, b"\x22" + b"937084E")
+        with pytest.raises(RuntimeError, match="sequence"):
+            link.receive_isotp_channel(BCM_UDS_TX_ID, BCM_UDS_RX_ID, timeout=0.5)
+
+        # 2. Truncated CF (shorter than required remaining bytes)
+        bus.rx_queue.clear()
+        bus.rx_queue.append(
+            can.Message(arbitration_id=BCM_UDS_RX_ID, data=b"\x10\x0b\x62\xf1\x87\x35\x51\x30", is_extended_id=False)
+        )
+        bus.rx_queue.append(
+            can.Message(arbitration_id=BCM_UDS_RX_ID, data=b"\x21\x39\x33", is_extended_id=False)
+        )
+        with pytest.raises(RuntimeError, match="Truncated"):
+            link.receive_isotp_channel(BCM_UDS_TX_ID, BCM_UDS_RX_ID, timeout=0.5)
+
+        # 3. Malformed SingleFrame (sf_len exceeds actual frame bytes)
+        bus.rx_queue.clear()
+        bus.rx_queue.append(
+            can.Message(arbitration_id=BCM_UDS_RX_ID, data=b"\x07\x62\xf1", is_extended_id=False)
+        )
+        with pytest.raises(RuntimeError, match="Malformed"):
+            link.receive_isotp_channel(BCM_UDS_TX_ID, BCM_UDS_RX_ID, timeout=0.5)
+
+        # 4. Short XCP SHORT_UPLOAD response (< 1 + chunk_len)
+        class ShortXcpBus(FakeBcmBus):
+            def send(self, msg: can.Message, timeout: float | None = None) -> None:
+                if msg.arbitration_id == int(self.profile["xcp_tx_id"]) and msg.data[0] == 0xF4:
+                    self.rx_queue.append(
+                        can.Message(arbitration_id=int(self.profile["xcp_rx_id"]), data=b"\xff\xaa\xbb", is_extended_id=True)
+                    )
+                    return
+                super().send(msg, timeout=timeout)
+
+        short_bus = ShortXcpBus(profile_id="ea_0511")
+        with BcmCanLink("fake", bus=short_bus) as short_link:
+            with pytest.raises(RuntimeError, match="Short XCP SHORT_UPLOAD"):
+                short_link.xcp_read_memory(0x40000000, 4, timeout=0.5)
+
+        # 5. Stuck WFS 7F 80 01 78 ResponsePending loop bounded by max_pending_retries
+        class StuckWfsBus(FakeBcmBus):
+            def _handle_wfs(self, pdu: bytes) -> None:
+                for _ in range(10):
+                    self._enqueue_isotp(BCM_WFS_RX_ID, b"\x7f\x80\x01\x78")
+
+        stuck_bus = StuckWfsBus(profile_id="ea_0511")
+        with BcmCanLink("fake", bus=stuck_bus) as stuck_link:
+            with pytest.raises(TimeoutError, match="0x78"):
+                stuck_link.request_wfs(b"\x80\x01" + bytes(16), timeout=0.5, max_pending_retries=3)
+
+
+def test_bcm_passport_f197_f19e_distinct_and_empty_bytes_key_handling() -> None:
+    """LOW: keep 0xF197 (system_name) and 0xF19E (asam_odx) distinct, and treat empty b'' key inputs as None."""
+    bus = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    st = can_bcm_status("fake", interface="slcan", bus=bus)
+    assert st["passport"]["system_name"] == "BCM MQBAB H"
+    assert st["passport"]["asam_odx"] == "EV_BCMMQB"
+
+    new_gfa = bytes.fromhex("102030405060708090a0b0c0d0e0f001")
+    wr = can_bcm_write_keys(
+        "fake",
+        current_ika=bus.ika,
+        new_ika=b"",
+        new_gfa=new_gfa,
+        interface="slcan",
+        bus=bus,
+    )
+    assert wr["ika_written"] is False
+    assert wr["gfa_written"] is True
+    assert bus.gfa == new_gfa
+
+    with pytest.raises(ValueError, match="At least one of new_ika or new_gfa"):
+        can_bcm_write_keys("fake", current_ika=bus.ika, new_ika=b"", new_gfa=b"", interface="slcan", bus=bus)
+
+
+def test_bcm_h4_dpdu_uds_session_and_29bit_warning() -> None:
+    """H4: route UDS through DPduBus.uds_session(0x70E, 0x778) on uds_only/nonraw and warn on dpdu 29-bit ops."""
+    import contextlib
+    from contitool.progress import OperationReporter
+
+    set_lang("en")
+    inner = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+
+    class FakeDpduBcmBus:
+        def __init__(self, *, uds_only: bool = False, nonraw: dict[int, int] | None = None) -> None:
+            self.uds_only = uds_only
+            self.nonraw = dict(nonraw or {})
+            self.spent = False
+            self.session_calls: list[tuple[int, int]] = []
+            self.uds_requests: list[bytes] = []
+            self.raw_sends: list[int] = []
+
+        @contextlib.contextmanager
+        def uds_session(self, tx_id: int = 0x710, rx_id: int = 0x77A):
+            self.session_calls.append((tx_id, rx_id))
+            yield True
+
+        def end_uds_session(self) -> None:
+            pass
+
+        def request_uds(self, req: bytes, *, timeout: float = 2.0, allow_pending: bool = True) -> bytes:
+            self.uds_requests.append(bytes(req))
+            inner.rx_queue.clear()
+            inner._handle_uds(bytes(req))
+            # Reassemble ISO-TP response enqueued by FakeBcmBus
+            first = inner.rx_queue.popleft()
+            raw0 = bytes(first.data)
+            kind = raw0[0] >> 4
+            if kind == 0:
+                return raw0[1 : 1 + (raw0[0] & 0x0F)]
+            total = ((raw0[0] & 0x0F) << 8) | raw0[1]
+            out = bytearray(raw0[2:])
+            while len(out) < total:
+                out.extend(bytes(inner.rx_queue.popleft().data)[1:])
+            return bytes(out[:total])
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            self.raw_sends.append(msg.arbitration_id)
+            raise AssertionError("Raw send should not be used when uds_session is active")
+
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            return None
+
+        def shutdown(self) -> None:
+            pass
+
+    dpdu_bus = FakeDpduBcmBus(uds_only=True)
+    st = can_bcm_status("fake", interface="dpdu", bus=dpdu_bus)
+    assert dpdu_bus.session_calls == [(BCM_UDS_TX_ID, BCM_UDS_RX_ID)]
+    assert len(dpdu_bus.uds_requests) > 0
+    assert dpdu_bus.raw_sends == []
+    assert st["passport"]["part_number"] == "5Q0937084EA"
+
+    # Direct BcmCanLink on nonraw D-PDU bus also routes via uds_session(0x70E, 0x778)
+    nonraw_bus = FakeDpduBcmBus(nonraw={0x710: 1})
+    with BcmCanLink("fake", interface="dpdu", bus=nonraw_bus) as link:
+        resp = link.request_uds(b"\x10\x03", 0x50)
+        assert resp[0] == 0x50
+    assert nonraw_bus.session_calls == [(BCM_UDS_TX_ID, BCM_UDS_RX_ID)]
+
+    # 29-bit XCP / WFS Ch 3 operation on interface="dpdu" emits bilingual warning
+    warnings: list[str] = []
+
+    class RecReporter(OperationReporter):
+        def warning(self, message: str) -> None:
+            warnings.append(message)
+
+    can_bcm_read_gfa("fake", interface="dpdu", bus=inner, reporter=RecReporter())
+    assert any("29-bit" in w and "RawMode" in w and "native CAN" in w for w in warnings)
+
 

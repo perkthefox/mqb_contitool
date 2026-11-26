@@ -282,7 +282,7 @@ class ExecutionPanel(QFrame):
             if snap.eta_sec is not None:
                 parts.append(tr(f"осталось {format_eta(snap.eta_sec)}", f"{format_eta(snap.eta_sec)} left"))
         parts.append(format_eta(time.monotonic() - self._started_mono))
-        self.lbl_metrics.setText("    ".join(parts))
+        self.lbl_metrics.setText("  ·  ".join(parts))
 
     def _on_log(self, entry: LogEntry) -> None:
         ts = time.strftime("%H:%M:%S", time.localtime(entry.timestamp)) + f".{int(entry.timestamp * 1000) % 1000:03d}"
@@ -351,8 +351,8 @@ class ExecutionPanel(QFrame):
         if not self._items:
             idle = html.escape(
                 tr(
-                    "Журнал операций пуст — ход чтения, записи и диагностики отображается здесь.",
-                    "Operation log is empty — read, write, and diagnostic progress appears here.",
+                    "Журнал пуст — здесь отображается ход чтения, записи и диагностики.",
+                    "Log is empty — read, write, and diagnostic progress appears here.",
                 )
             )
             self.txt_short.setHtml(f"<div style='color:{muted}; padding-top:2px'>{idle}</div>")

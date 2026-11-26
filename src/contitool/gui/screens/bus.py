@@ -131,18 +131,28 @@ class _LiveTopologyDiagram(QWidget):
             sl_x = w - pad - sl_w
             trunk_col = theme.OK if self._res.gateway_bridge_capable else "#4C556B"
             branch_x = gw_r.right() + (sl_x - gw_r.right()) * 0.62
+            bus_chs = sorted({int(sl.gateway_channel) for sl in slaves if sl.gateway_channel is not None})
+            if bus_chs == [2]:
+                ch_str, bus_name = "ch2", "Extended CAN"
+            elif 0 in bus_chs and 2 in bus_chs:
+                ch_str, bus_name = "ch0/ch2", "Komfort / Extended"
+            elif bus_chs:
+                ch_str = "/".join(f"ch{c}" for c in bus_chs)
+                bus_name = "Komfort CAN"
+            else:
+                ch_str, bus_name = "ch0/ch2", "Komfort / Extended"
             p.setFont(f_sub)
             p.setPen(QColor(trunk_col))
             p.drawText(
                 QRectF(gw_r.right() + 4, cy - 17, branch_x - gw_r.right() - 8, 14),
                 Qt.AlignmentFlag.AlignCenter,
-                "RAM-Bridge ch0" if self._res.gateway_bridge_capable else "UDS routing",
+                f"RAM-Bridge {ch_str}" if self._res.gateway_bridge_capable else "UDS routing",
             )
             p.setPen(QColor(theme.TEXT_MUTED))
             p.drawText(
                 QRectF(gw_r.right() + 4, cy + 3, branch_x - gw_r.right() - 8, 14),
                 Qt.AlignmentFlag.AlignCenter,
-                "Komfort CAN",
+                bus_name,
             )
 
             if slaves:
@@ -159,7 +169,11 @@ class _LiveTopologyDiagram(QWidget):
                 for idx, sl in enumerate(slaves):
                     ry = y0 + idx * (row_h + gap_y)
                     rect = QRectF(sl_x, ry, sl_w, row_h)
-                    col = theme.CAN if sl.kind == "fpke" else theme.INFO
+                    col = (
+                        theme.CAN
+                        if sl.kind == "fpke"
+                        else (theme.ACCENT if sl.kind == "mrr" else (theme.WARN if sl.kind == "elv" else theme.INFO))
+                    )
                     draw_arrow(branch_x, rect.center().y(), rect.left() - 5, rect.center().y(), col if sl.memory_access_available else "#586278", dashed=not sl.memory_access_available)
                     sp = QPainterPath()
                     sp.addRoundedRect(rect, 5.0, 5.0)
@@ -208,7 +222,11 @@ class _LiveTopologyDiagram(QWidget):
             y0 = cy - total_h / 2.0
             for idx, ecu in enumerate(ecus):
                 ry = y0 + idx * (row_h + gap_y)
-                col = theme.CAN if ecu.kind == "fpke" else theme.OK
+                col = (
+                    theme.CAN
+                    if ecu.kind == "fpke"
+                    else (theme.ACCENT if ecu.kind == "mrr" else (theme.WARN if ecu.kind == "elv" else theme.OK))
+                )
                 r_e = draw_box(sl_x, ry, sl_w, row_h, f"[{ecu.diag_addr}] {ecu.part_number}", f"0x{ecu.uds_tx_id:03X} → 0x{ecu.uds_rx_id:03X}", col)
                 draw_arrow(host_r.right() + 6, cy, r_e.left() - 6, r_e.center().y(), col)
 
@@ -218,12 +236,14 @@ class _LiveTopologyDiagram(QWidget):
 class BusScreen(QWidget):
     """Interactive topology view of all ECUs discovered on Diagnosis CAN or a direct bench harness."""
 
-    scan_requested = Signal(str)  # target_kind ("all", "j533", "fpke", "bcm")
+    scan_requested = Signal(str)  # target_kind ("all", "j533", "fpke", "bcm", "mrr", "elv")
     read_ecu_requested = Signal(object)  # DiscoveredEcu
     restore_ecu_requested = Signal(object)  # DiscoveredEcu
     open_j533_workspace_requested = Signal()
     open_fpke_workspace_requested = Signal(object)  # DiscoveredEcu
     open_bcm_workspace_requested = Signal(object)  # DiscoveredEcu
+    open_mrr_workspace_requested = Signal(object)  # DiscoveredEcu
+    open_elv_workspace_requested = Signal(object)  # DiscoveredEcu
     open_terminal_requested = Signal(object)  # DiscoveredEcu
     back_requested = Signal()
     note = Signal(str)
@@ -242,6 +262,8 @@ class BusScreen(QWidget):
         self.j533_loaded: bool = False
         self.fpke_loaded: bool = False
         self.bcm_loaded: bool = False
+        self.mrr_loaded: bool = False
+        self.elv_loaded: bool = False
         self._dtc_cache: dict[str, list[dict[str, Any]]] = {}
         self._status_cache: dict[str, tuple[str, str]] = {}
 
@@ -277,15 +299,27 @@ class BusScreen(QWidget):
             self._status_cache.clear()
             self.refresh()
 
-    def set_loaded_flags(self, *, j533_loaded: bool, fpke_loaded: bool, bcm_loaded: bool = False) -> None:
+    def set_loaded_flags(
+        self,
+        *,
+        j533_loaded: bool,
+        fpke_loaded: bool,
+        bcm_loaded: bool = False,
+        mrr_loaded: bool = False,
+        elv_loaded: bool = False,
+    ) -> None:
         if (
             self.j533_loaded != j533_loaded
             or self.fpke_loaded != fpke_loaded
             or self.bcm_loaded != bcm_loaded
+            or self.mrr_loaded != mrr_loaded
+            or self.elv_loaded != elv_loaded
         ):
             self.j533_loaded = j533_loaded
             self.fpke_loaded = fpke_loaded
             self.bcm_loaded = bcm_loaded
+            self.mrr_loaded = mrr_loaded
+            self.elv_loaded = elv_loaded
             self.refresh()
 
     def selected_target_kind(self) -> str:
@@ -343,7 +377,9 @@ class BusScreen(QWidget):
         elif res.topology == "gateway":
             self.lbl_title.setText(tr(f"Шина CAN ({len(res.ecus)})", f"CAN Bus ({len(res.ecus)})"))
             if res.gateway_bridge_capable:
-                self.lbl_topology.setText(tr("Через шлюз (RAM-мост ch0)", "Via gateway (RAM-Bridge ch0)"))
+                bus_chs = sorted({int(sl.gateway_channel) for sl in res.slaves if sl.gateway_channel is not None})
+                ch_s = "/".join(f"ch{c}" for c in bus_chs) if bus_chs else "ch0/ch2"
+                self.lbl_topology.setText(tr(f"Через шлюз (RAM-мост {ch_s})", f"Via gateway (RAM-Bridge {ch_s})"))
                 set_tone(self.lbl_topology, "ok")
             else:
                 self.lbl_topology.setText(tr("Через шлюз (UDS)", "Via gateway (UDS)"))
@@ -369,8 +405,8 @@ class BusScreen(QWidget):
             empty.set_text(
                 tr("Шина CAN не просканирована", "CAN bus not scanned"),
                 tr(
-                    "Подключите адаптер к диагностическому CAN шлюза (T20: Pin 19 / Pin 9) или напрямую к приборной панели (T18: Pin 18 / Pin 17).",
-                    "Connect the adapter to gateway Diagnosis CAN (T20: Pin 19 / Pin 9) or directly to the cluster (T18: Pin 18 / Pin 17).",
+                    "Подключите адаптер к CAN шлюза (T20: Pin 19 / 9) или напрямую к блоку (панель T18, защёлка ELV T4).",
+                    "Connect to gateway CAN (T20: Pin 19 / 9) or directly to an ECU (cluster T18, ELV T4).",
                 ),
             )
             btn_go = button(tr("Сканировать шину", "Scan CAN bus"), "PrimaryBtn", slot=self._emit_scan)
@@ -411,8 +447,8 @@ class BusScreen(QWidget):
                 no_sl.set_text(
                     tr("Опрашивался только шлюз 19 J533", "Only 19 J533 gateway was probed"),
                     tr(
-                        "Чтобы найти приборную панель (17) и BCM (09) за шлюзом, просканируйте всю шину.",
-                        "Scan the full bus to discover the instrument cluster (17) and BCM (09) behind the gateway.",
+                        "Просканируйте всю шину, чтобы найти панель (17), BCM (09), защёлку руля ELV (2B) и радар ACC (13) за шлюзом.",
+                        "Scan the full bus to find the cluster (17), BCM (09), steering lock ELV (2B), and ACC radar (13) behind the gateway.",
                     ),
                 )
                 btn_all = button(
@@ -427,8 +463,10 @@ class BusScreen(QWidget):
                 no_sl.set_text(
                     tr("Ведомые блоки не ответили", "No slave ECUs responded"),
                     tr(
-                        "Проверьте питание ведомых блоков и шину Komfort CAN ch0 (T20 Pin 5 / Pin 15): 17 Kombi (0x714), 09 BCM (0x70E).",
-                        "Check slave ECU power and Komfort CAN ch0 wiring (T20 Pin 5 / Pin 15): 17 Kombi (0x714), 09 BCM (0x70E).",
+                        "Проверьте питание ведомых блоков и шины шлюза: Komfort CAN ch0 (T20 Pin 5 / 15: 17 Kombi, 09 BCM, 2B ELV) "
+                        "или Extended CAN ch2 (T20 Pin 7 / 17: 13 ACC).",
+                        "Check slave power and gateway buses: Komfort CAN ch0 (T20 Pin 5 / 15: 17 Kombi, 09 BCM, 2B ELV) "
+                        "or Extended CAN ch2 (T20 Pin 7 / 17: 13 ACC).",
                     ),
                 )
                 lay.addWidget(no_sl)
@@ -604,10 +642,40 @@ class BusScreen(QWidget):
                 )
                 btn_open_bcm.setEnabled(not busy)
                 left_actions.append(btn_open_bcm)
+        elif ecu.kind == "mrr":
+            btn_read_mrr = button(
+                tr("Считать 13 Радар", "Read 13 Radar"),
+                "PrimaryBtn",
+                slot=lambda e=ecu: self.read_ecu_requested.emit(e),
+            )
+            btn_read_mrr.setEnabled(not busy and not ecu.unsupported_reason)
+            left_actions.append(btn_read_mrr)
+
+            btn_open_mrr = button(
+                tr("Открыть 13", "Open 13") if self.mrr_loaded else tr("Рабочее место 13", "Workbench 13"),
+                slot=lambda e=ecu: self.open_mrr_workspace_requested.emit(e),
+            )
+            btn_open_mrr.setEnabled(not busy)
+            left_actions.append(btn_open_mrr)
+        elif ecu.kind == "elv":
+            btn_read_elv = button(
+                tr("Считать 2B ELV", "Read 2B ELV"),
+                "PrimaryBtn",
+                slot=lambda e=ecu: self.read_ecu_requested.emit(e),
+            )
+            btn_read_elv.setEnabled(not busy and not ecu.unsupported_reason)
+            left_actions.append(btn_read_elv)
+
+            btn_open_elv = button(
+                tr("Открыть 2B", "Open 2B") if self.elv_loaded else tr("Рабочее место 2B", "Workbench 2B"),
+                slot=lambda e=ecu: self.open_elv_workspace_requested.emit(e),
+            )
+            btn_open_elv.setEnabled(not busy)
+            left_actions.append(btn_open_elv)
 
         btn_dtc = button(
             tr("Ошибки DTC", "Read DTCs"),
-            "PrimaryBtn" if ecu.kind not in ("j533", "fpke", "bcm") else "",
+            "PrimaryBtn" if ecu.kind not in ("j533", "fpke", "bcm", "mrr", "elv") else "",
             slot=lambda e=ecu: self._read_ecu_dtcs(e),
         )
         btn_dtc.setEnabled(not busy)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from contitool.core.dtc_bcm import BCM_DTCS
+from contitool.core.dtc_elv import ELV_DTCS
 from contitool.core.dtc_fpke import FPKE_DTCS
 from contitool.core.dtc_j533 import J533_DTCS
+from contitool.core.dtc_mrr import MRR_DTCS
 from contitool.i18n import tr
 
 # ISO 14229-1 DTC status bits, as they read to a technician
@@ -50,6 +52,24 @@ def describe_bcm(code: int) -> tuple[str, str]:
     hit = BCM_DTCS.get(code)
     if hit is None:
         return sae_code(code), tr("Неизвестный код неисправности 09 BCM", "Unknown 09 BCM trouble code")
+    display, ru, en = hit
+    return display or sae_code(code), tr(ru, en)
+
+
+def describe_mrr(code: int) -> tuple[str, str]:
+    """(ODIS display code, description) for MQB 13 ACC Radar / J428 (MRR1Plus / MRRevo14F)."""
+    hit = MRR_DTCS.get(code)
+    if hit is None:
+        return sae_code(code), tr("Неизвестный код неисправности 13 ACC Radar", "Unknown 13 ACC Radar trouble code")
+    display, ru, en = hit
+    return display or sae_code(code), tr(ru, en)
+
+
+def describe_elv(code: int) -> tuple[str, str]:
+    """(ODIS display code, description) for MQB 2B ELV / J764 (Marquardt 3Q0 905 861)."""
+    hit = ELV_DTCS.get(code)
+    if hit is None:
+        return sae_code(code), tr("Неизвестный код неисправности 2B ELV", "Unknown 2B ELV trouble code")
     display, ru, en = hit
     return display or sae_code(code), tr(ru, en)
 

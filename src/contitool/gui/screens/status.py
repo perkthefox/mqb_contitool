@@ -336,10 +336,8 @@ def swap_features(ws: Workspace) -> State:
                 tr(f"чужой VCRN: {n}", f"foreign VCRN: {n}"),
                 "warn",
                 tr(
-                    f"В DataFlash осталось {n} сертификат(ов) от другого блока (чужой VCRN) — шлюз их не принимает. "
-                    "Откройте «Настроить функции SWaP…», чтобы пересобрать нужные функции под текущий VCRN.",
-                    f"DataFlash contains {n} certificate(s) issued for another ECU (foreign VCRN) — the gateway rejects them. "
-                    "Open “Configure SWaP features…” to rebuild the needed features for this ECU's VCRN.",
+                    f"В DataFlash {n} сертификат(ов) от другого блока (чужой VCRN). Пересоберите их через «Настроить функции SWaP…».",
+                    f"DataFlash has {n} certificate(s) for another ECU (foreign VCRN). Rebuild them via “Configure SWaP features…”.",
                 ),
                 key="warn",
             )

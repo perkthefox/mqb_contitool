@@ -176,6 +176,14 @@ T18_KOMBI_BENCH_PINS: tuple[tuple[int, str, str, str], ...] = (
     (17, "CAN-L", "Шина CAN приборной панели Low (500 кбит/с): терминатор или резистор 120 Ом к Pin 18!", "Instrument cluster CAN Low (500 kbit/s): terminator on or a 120 Ω resistor to Pin 18!"),
 )
 
+# Official VW MQB Passat B8 / Kodiaq J764 (T4dg / T4al) 4-pin ELV bench pinout
+T4_ELV_BENCH_PINS: tuple[tuple[int, str, str, str], ...] = (
+    (1, "CAN-H", "Шина CAN Komfort High (500 кбит/с, к шлюзу J533 T20 Pin 15)", "Komfort CAN High (500 kbit/s, to J533 gateway T20 Pin 15)"),
+    (2, "CAN-L", "Шина CAN Komfort Low (500 кбит/с, терминатор 120 Ом к Pin 1!)", "Komfort CAN Low (500 kbit/s, 120 Ω terminator to Pin 1!)"),
+    (3, "KL30 (+12V)", "Постоянное питание +12 В (аккумулятор / ЛБП; пробуждение по CAN 0x1B000010)", "Permanent +12V battery / bench PSU (wake-up via CAN 0x1B000010)"),
+    (4, "KL31 (GND)", "Масса (минус блока питания и GND CAN-адаптера)", "Ground (PSU minus & CAN adapter GND)"),
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class SlotSpec:

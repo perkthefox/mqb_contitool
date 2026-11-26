@@ -38,7 +38,6 @@ from PySide6.QtWidgets import (
 
 from contitool.can.fpke import (
     FPKE_CAN_PRESETS,
-    FPKE_MFL_BUTTONS,
     FPKE_NATIVE_INTERFACES,
     atomic_write,
     can_fpke_full_read,
@@ -76,8 +75,6 @@ from contitool.core.fpke import (
     format_fpke_report,
     format_fpke_transfer_plan,
     fpke_derive_k_ffb,
-    fpke_s0_s1_from_slots,
-    fpke_slots_from_s0_s1,
     fpke_verify_s0_s1,
     is_fpke_dflash,
     plan_fpke_a_to_b_transfer,
@@ -187,12 +184,10 @@ class _FpkeOdxSignDialog(Dialog):
             parent,
             tr("Подписать блок прошивки FPK_E для ODX", "Sign FPK_E firmware block for ODX"),
             tr(
-                "Вычисляет <FW-SIGNATURE> (RSA-1024, e = 3, SHA-1) для блока данных <FLASHDATA> процессора AC (RH850), "
-                "чтобы заводской загрузчик BOLO принял прошивку с вшитым ключом .FBL_RSAKEY.",
-                "Computes <FW-SIGNATURE> (RSA-1024, e = 3, SHA-1) for an AC (RH850) <FLASHDATA> block so the stock BOLO "
-                "bootloader accepts firmware signed with your embedded .FBL_RSAKEY.",
+                "Вычисляет <FW-SIGNATURE> (RSA-1024, e=3, SHA-1) для блока <FLASHDATA> процессора RH850 под ваш ключ .FBL_RSAKEY.",
+                "Computes <FW-SIGNATURE> (RSA-1024, e=3, SHA-1) for an RH850 <FLASHDATA> block under your .FBL_RSAKEY.",
             ),
-            width=640,
+            width=620,
         )
         self._default_dir = default_dir or Path.home()
         self._data_path: Path | None = None
@@ -210,7 +205,7 @@ class _FpkeOdxSignDialog(Dialog):
         self.ed_data.setReadOnly(True)
         self.ed_data.setPlaceholderText(tr("Выберите бинарный файл блока данных…", "Select binary datablock file…"))
         self.ed_data.setFont(mono_font(11))
-        btn_browse = button(tr("Выбрать…", "Browse…"), slot=self._pick_data)
+        btn_browse = button(tr("Выбрать…", "Browse…"), "InlineBtn", slot=self._pick_data)
         grid.addWidget(lbl_data, 0, 0)
         grid.addWidget(self.ed_data, 0, 1)
         grid.addWidget(btn_browse, 0, 2)
@@ -361,6 +356,7 @@ class FpkeScreen(QWidget):
         self._orig_cflash_bytes: bytes | None = None
         self._working_cflash_path: Path | None = None
         self._cflash_bytes: bytes | None = None
+        self._cflash_dirty: bool = False
         self._cflash_boot_info: dict[str, Any] | None = None
         self._cflash_boot_err: str | None = None
         self._fbl_key_file: Path | None = None
@@ -481,6 +477,11 @@ class FpkeScreen(QWidget):
             and self._cflash_bytes != self._orig_cflash_bytes
         )
 
+    @property
+    def is_cflash_dirty(self) -> bool:
+        """True when Cflash was patched in memory without a workspace folder and has not been saved to disk yet."""
+        return self._cflash_dirty
+
     def _set_cflash_bytes(
         self,
         raw: bytes | None,
@@ -504,6 +505,8 @@ class FpkeScreen(QWidget):
             self._cflash_boot_err = str(exc)
 
     def open_from_ident(self, ident: dict[str, Any]) -> None:
+        self._session_gen += 1
+        self._cflash_dirty = False
         self.is_open = True
         self.source = "can"
         self.via_gateway = bool(ident.get("via_gateway", False))
@@ -554,6 +557,7 @@ class FpkeScreen(QWidget):
         self._orig_cflash_path = None
         self._orig_cflash_bytes = None
         self._working_cflash_path = None
+        self._cflash_dirty = False
         self._fbl_key_file = None
         self._set_cflash_bytes(None)
         if source != "can":
@@ -665,6 +669,7 @@ class FpkeScreen(QWidget):
         self._orig_cflash_path = None
         self._orig_cflash_bytes = None
         self._working_cflash_path = None
+        self._cflash_dirty = False
         self._fbl_key_file = None
         self._set_cflash_bytes(None)
         self._donor_path = None
@@ -683,15 +688,22 @@ class FpkeScreen(QWidget):
 
     def _commit_dflash_bytes(self, new_df: bytes, log_msg: str) -> None:
         """Save modified DataFlash into a non-destructive working copy (`ContiTool_edited/Dflash.bin`) and refresh UI."""
-        self._working_dflash_bytes = new_df
         if self.folder is not None and self.folder.is_dir():
             edit_dir = self.folder / "ContiTool_edited"
-            edit_dir.mkdir(parents=True, exist_ok=True)
             out_name = self._orig_dflash_path.name if self._orig_dflash_path else "Dflash.bin"
             work_path = edit_dir / out_name
-            work_path.write_bytes(new_df)
+            try:
+                atomic_write(work_path, new_df)
+            except OSError as exc:
+                QMessageBox.warning(
+                    self,
+                    tr("Ошибка сохранения Dflash.bin", "Failed to save Dflash.bin"),
+                    str(exc),
+                )
+                return
             self._working_dflash_path = work_path
             self.files["dflash"] = work_path
+        self._working_dflash_bytes = new_df
         self.dflash_info = analyze_fpke_dflash(new_df, self._cflash_bytes)
         self.refresh()
         self.changed.emit()
@@ -730,7 +742,15 @@ class FpkeScreen(QWidget):
         if not dest:
             return
         out_path = Path(dest)
-        out_path.write_bytes(df_bytes)
+        try:
+            atomic_write(out_path, df_bytes)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                tr("Ошибка сохранения Dflash.bin", "Failed to save Dflash.bin"),
+                str(exc),
+            )
+            return
         self.note.emit(tr(f"Дамп DataFlash сохранён: {out_path}", f"DataFlash dump saved: {out_path}"))
 
     def _record_can_status(self, msg: str, tone: str) -> None:
@@ -776,16 +796,20 @@ class FpkeScreen(QWidget):
             return
         target_dir = Path(dest)
         copied = 0
-        for kind in ("dflash", "extra", "cflash", "uflash", "bflash", "report"):
-            if kind == "dflash" and self._orig_dflash_path:
-                src = self._orig_dflash_path
-            elif kind == "cflash" and self._orig_cflash_path:
-                src = self._orig_cflash_path
-            else:
-                src = self.files.get(kind)
-            if src is not None and src.is_file():
-                shutil.copy2(src, target_dir / src.name)
-                copied += 1
+        try:
+            for kind in ("dflash", "extra", "cflash", "uflash", "bflash", "report"):
+                if kind == "dflash" and self._orig_dflash_path:
+                    src = self._orig_dflash_path
+                elif kind == "cflash" and self._orig_cflash_path:
+                    src = self._orig_cflash_path
+                else:
+                    src = self.files.get(kind)
+                if src is not None and src.is_file():
+                    shutil.copy2(src, target_dir / src.name)
+                    copied += 1
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка экспорта бэкапа", "Backup export error"), str(exc))
+            return
         if copied:
             self.note.emit(
                 tr(f"Экспортировано файлов: {copied} → {target_dir}", f"Exported {copied} file(s) → {target_dir}")
@@ -816,7 +840,11 @@ class FpkeScreen(QWidget):
             return
         passport = extract_fpke_immo_passport(df_bytes, cf_bytes)
         out_path = Path(dest)
-        out_path.write_text(json.dumps(passport, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            out_path.write_text(json.dumps(passport, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка сохранения", "Save error"), str(exc))
+            return
         self.note.emit(tr(f"Immo-паспорт сохранён: {out_path}", f"Immo passport saved: {out_path}"))
 
     def compare_immo_with_file(self, other_path: Path | None = None) -> None:
@@ -1032,7 +1060,11 @@ class FpkeScreen(QWidget):
         if not dest:
             return
         out_path = Path(dest)
-        out_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            out_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка сохранения", "Save error"), str(exc))
+            return
         self.note.emit(tr(f"План переноса сохранён: {out_path}", f"Transfer plan saved: {out_path}"))
 
     def show_report(self) -> None:
@@ -1111,14 +1143,14 @@ class FpkeScreen(QWidget):
         self.sec_id = QFrame()
         self.sec_id.setObjectName("IdentityBar")
         body = QVBoxLayout(self.sec_id)
-        body.setContentsMargins(24, 12, 24, 12)
-        body.setSpacing(10)
+        body.setContentsMargins(24, 10, 24, 10)
+        body.setSpacing(7)
 
         head = QHBoxLayout()
-        head.setSpacing(10)
+        head.setSpacing(8)
         self.lbl_pn = QLabel()
         self.lbl_pn.setObjectName("PartNumber")
-        self.lbl_pn.setFont(mono_font(20, bold=True))
+        self.lbl_pn.setFont(mono_font(18, bold=True))
         self.lbl_pn.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         self.lbl_sys = QLabel()
@@ -1136,7 +1168,7 @@ class FpkeScreen(QWidget):
         head.addWidget(self.sep_source, 0, Qt.AlignmentFlag.AlignVCenter)
         head.addWidget(self.pill_source, 0, Qt.AlignmentFlag.AlignVCenter)
         head.addWidget(self.lbl_folder, 1, Qt.AlignmentFlag.AlignVCenter)
-        head.addSpacing(8)
+        head.addSpacing(6)
 
         self.btn_can_ctrl = button("", slot=self.open_can_control_dialog)
         self.btn_restore = button("", slot=self.restore_dflash_from_file)
@@ -1152,13 +1184,13 @@ class FpkeScreen(QWidget):
         body.addWidget(divider())
 
         self.grid_id = QGridLayout()
-        self.grid_id.setHorizontalSpacing(22)
+        self.grid_id.setHorizontalSpacing(20)
         self.grid_id.setVerticalSpacing(2)
         body.addLayout(self.grid_id)
 
         self.grid_mcu_id = QGridLayout()
         self.grid_mcu_id.setContentsMargins(0, 0, 0, 0)
-        self.grid_mcu_id.setHorizontalSpacing(28)
+        self.grid_mcu_id.setHorizontalSpacing(26)
         self.grid_mcu_id.setVerticalSpacing(2)
         body.addLayout(self.grid_mcu_id)
         return self.sec_id
@@ -1166,7 +1198,7 @@ class FpkeScreen(QWidget):
     def _build_nav(self) -> QWidget:
         pane = QFrame()
         pane.setObjectName("NavPane")
-        pane.setFixedWidth(306)
+        pane.setFixedWidth(284)
         lay = QVBoxLayout(pane)
         lay.setContentsMargins(6, 6, 6, 0)
         lay.setSpacing(0)
@@ -1292,20 +1324,23 @@ class FpkeScreen(QWidget):
         meta = (self.dflash_info or {}).get("metadata") or {}
 
         self.lbl_pn.setText(self.part_number)
-        sys_txt = vals.get("F197") or tr("Приборная панель FPK_E", "FPK_E instrument cluster")
+        sys_txt = vals.get("F197") or "KOMBI FPK_E"
         self.lbl_sys.setText(sys_txt)
 
         is_can = self.source == "can"
         if self.via_gateway:
             self.pill_source.setText(
-                tr("Через шлюз J533 (RAM-мост ch0)", "Via J533 gateway (RAM-Bridge ch0)")
+                tr(
+                    f"Через шлюз J533 (RAM-мост ch{self.gateway_channel})",
+                    f"Via J533 gateway (RAM-Bridge ch{self.gateway_channel})",
+                )
                 if self.gateway_bridge
                 else tr("Через шлюз J533 (UDS)", "Via J533 gateway (UDS)")
             )
             set_tone(self.pill_source, "ok" if self.gateway_bridge else "info")
         else:
             self.pill_source.setText(
-                tr("Считан по CAN", "Read over CAN") if is_can else tr("Открыт из файлов", "Opened from files")
+                tr("Считан по CAN", "Read over CAN") if is_can else tr("Из файлов", "From files")
             )
             set_tone(self.pill_source, "info" if is_can else "muted")
         self.lbl_folder.setVisible(bool(self.folder))
@@ -1315,7 +1350,7 @@ class FpkeScreen(QWidget):
         else:
             self.lbl_folder.set_path("")
 
-        self.btn_can_ctrl.setText(tr("Управление по CAN", "CAN control"))
+        self.btn_can_ctrl.setText(tr("CAN-пульт", "CAN control"))
         self.btn_can_ctrl.setToolTip(
             tr("Открыть отдельное окно управления по CAN", "Open standalone CAN control window")
         )
@@ -1327,12 +1362,12 @@ class FpkeScreen(QWidget):
             )
         )
         self.btn_restore.setEnabled(not self.runner.is_busy)
-        self.btn_export.setText(tr("Экспорт бэкапа", "Export backup"))
+        self.btn_export.setText(tr("Экспорт…", "Export…"))
         self.btn_export.setToolTip(
             tr("Копирует считанные дампы в выбранную папку", "Copies the dumps to a folder you pick")
         )
         self.btn_export.setEnabled(bool(self.files))
-        self.btn_report.setText(tr("Подробный отчёт", "Full report"))
+        self.btn_report.setText(tr("Отчёт", "Report"))
         self.btn_report.setEnabled(bool(self.dflash_info or self.extra_info or self.ident_items or self._cflash_boot_info))
         self.btn_close.setText(tr("Закрыть", "Close"))
 
@@ -1382,7 +1417,7 @@ class FpkeScreen(QWidget):
             mcu_fields.append(
                 (tr("ЗАЩИТА ПРОЦЕССОРА", "MCU PROTECTION"), _human_protection_mode(self.extra_info.get("protection_mode", "")))
             )
-        self.grid_mcu_id.setContentsMargins(0, 6 if (top_fields and mcu_fields) else 0, 0, 0)
+        self.grid_mcu_id.setContentsMargins(0, 4 if (top_fields and mcu_fields) else 0, 0, 0)
         for col, (k, v) in enumerate(mcu_fields):
             lbl_k = QLabel(k)
             lbl_k.setObjectName("GroupLabel")
@@ -1508,7 +1543,7 @@ class FpkeScreen(QWidget):
         page = QWidget()
         page.setObjectName("PageCanvas")
         outer = QHBoxLayout(page)
-        outer.setContentsMargins(24, 6, 24, 4)
+        outer.setContentsMargins(20, 6, 20, 4)
         outer.setSpacing(0)
 
         column = QWidget()
@@ -1527,12 +1562,12 @@ class FpkeScreen(QWidget):
         if self._key == "secrets" and self.dflash_info:
             btn_cmp = button(
                 tr("Сверить с файлом…", "Compare with file…"),
-                "GhostBtn",
+                "InlineBtn",
                 slot=lambda: self.compare_immo_with_file(),
             )
             btn_immo_json = button(
-                tr("Экспорт паспорта JSON…", "Export passport JSON…"),
-                "GhostBtn",
+                tr("Экспорт JSON…", "Export JSON…"),
+                "InlineBtn",
                 slot=self.export_immo_passport,
             )
             head_row.addWidget(btn_cmp)
@@ -1540,30 +1575,29 @@ class FpkeScreen(QWidget):
         elif self._key == "keys" and self.dflash_info:
             btn_coil_learn = button(
                 tr("Обучение через катушку…", "Learn via LF coil…"),
-                "GhostBtn",
+                "InlineBtn",
                 slot=self.open_coil_key_learn_dialog,
             )
             head_row.addWidget(btn_coil_learn)
         elif self._key == "transfer" and self.dflash_info:
-            btn_pick_donor = button(
-                tr("Выбрать донора…", "Select donor…")
-                if self._donor_passport is None
-                else tr("Сменить донора…", "Change donor…"),
-                "GhostBtn" if self._donor_passport is not None else "",
-                slot=self.pick_donor_source,
-            )
-            head_row.addWidget(btn_pick_donor)
+            if self._donor_passport is not None:
+                btn_pick_donor = button(
+                    tr("Сменить донора…", "Change donor…"),
+                    "InlineBtn",
+                    slot=self.pick_donor_source,
+                )
+                head_row.addWidget(btn_pick_donor)
             if self._donor_dflash is not None:
                 btn_save_plan = button(
                     tr("Экспорт плана JSON…", "Export plan JSON…"),
-                    "GhostBtn",
+                    "InlineBtn",
                     slot=self.export_transfer_plan,
                 )
                 head_row.addWidget(btn_save_plan)
         elif self._key == "can_ctrl":
             btn_pop = button(
                 tr("В отдельном окне…", "Open in window…"),
-                "GhostBtn",
+                "InlineBtn",
                 slot=self.open_can_control_dialog,
             )
             head_row.addWidget(btn_pop)
@@ -1589,7 +1623,12 @@ class FpkeScreen(QWidget):
         lay.addStretch(1)
         outer.addWidget(column, 1)
         outer.addStretch(0)
+        old_page = self.page_area.takeWidget()
         self.page_area.setWidget(page)
+        if old_page is not None:
+            old_page.hide()
+            old_page.setParent(self)
+            old_page.deleteLater()
 
     def _copy_hex(self, hex_value: str, label: str) -> None:
         cleaned = hex_value.strip().upper()
@@ -1637,7 +1676,8 @@ class FpkeScreen(QWidget):
         lbl_badge = QLabel(badge_text)
         lbl_badge.setFont(mono_font(10))
         set_tone(lbl_badge, badge_tone)
-        lbl_badge.setVisible(bool(badge_text))
+        if not badge_text:
+            lbl_badge.hide()
         top.addWidget(lbl_cap, 1)
         top.addWidget(lbl_badge, 0)
         vlay.addLayout(top)
@@ -1691,8 +1731,8 @@ class FpkeScreen(QWidget):
         sec_calc.set_text(
             tr("Калькулятор ключа радиоканала K_ffb", "Radio channel secret K_ffb calculator"),
             tr(
-                "Расчёт 16-байтного секрета радиоканала брелоков K_ffb = AES-128-ECB(K_c, C16) из мастер-ключа панели приборов CS / K_c (EEL 0x68+0x28, ROM C16 @ 0x19DA90) для блока 09 BCM.",
-                "Derive the 16-byte remote key radio-channel secret K_ffb = AES-128-ECB(K_c, C16) from the cluster master key CS / K_c (EEL 0x68+0x28, ROM C16 @ 0x19DA90) for 09 BCM.",
+                "Расчёт 16-байтного ключа радиоканала K_ffb = AES-128-ECB(K_c, C16) из секрета панели CS / K_c для блока 09 BCM.",
+                "Derives the 16-byte remote key secret K_ffb = AES-128-ECB(K_c, C16) from cluster key CS / K_c for 09 BCM.",
             ),
         )
         row_calc = QHBoxLayout()
@@ -1704,11 +1744,11 @@ class FpkeScreen(QWidget):
         ed_kc_in.setPlaceholderText("32 HEX (16 B, EEL 0x68+0x28)")
         btn_cp_kc_in = button(
             tr("Копировать", "Copy"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: self._copy_hex(ed_kc_in.text(), "CS / Kc"),
         )
         c_kc_in, b_kc_in = self._field_box(
-            tr("СЕКРЕТ ИММОБИЛАЙЗЕРА CS / KC (16 БАЙТ)", "IMMOBILIZER SECRET CS / KC (16 BYTES)"),
+            tr("СЕКРЕТ ИММО CS / KC (16 Б)", "IMMO SECRET CS / KC (16 B)"),
             ed_kc_in,
             trailing=(btn_cp_kc_in,),
             tip="EEL 0x68 + 0x28..0x37 (16 bytes)",
@@ -1722,11 +1762,11 @@ class FpkeScreen(QWidget):
         ed_kffb_out.setPlaceholderText("AES-128-ECB(K_c, C16)")
         btn_cp_kffb_out = button(
             tr("Копировать", "Copy"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: self._copy_hex(ed_kffb_out.text(), "K_ffb"),
         )
         c_kffb_out, b_kffb_out = self._field_box(
-            tr("КЛЮЧ РАДИОКАНАЛА K_FFB (16 БАЙТ, ДЛЯ 09 BCM)", "RADIO CHANNEL KEY K_FFB (16 BYTES, FOR 09 BCM)"),
+            tr("КЛЮЧ РАДИОКАНАЛА K_FFB (09 BCM)", "RADIO CHANNEL KEY K_FFB (09 BCM)"),
             ed_kffb_out,
             trailing=(btn_cp_kffb_out,),
             tip="K_ffb = AES128_ECB_ENC(K_c, e7ad3585e2f937e81c75df6e47f11a71)",
@@ -1737,6 +1777,7 @@ class FpkeScreen(QWidget):
             if len(raw) == 32 and all(c in "0123456789ABCDEF" for c in raw) and raw != "FF" * 16:
                 derived = fpke_derive_k_ffb(raw).hex().upper()
                 ed_kffb_out.setText(derived)
+                ed_kffb_out.setCursorPosition(0)
                 b_kffb_out.setText("AES_Kc(C16)")
                 set_tone(b_kffb_out, "ok")
                 btn_cp_kffb_out.setEnabled(True)
@@ -1863,7 +1904,7 @@ class FpkeScreen(QWidget):
         row1.addWidget(c_kpath, 3)
         sec_immo.body.addLayout(row1)
 
-        # Row 2: [CS / Kc (16 B) + Copy | VDO CS+ Slot A (4 B) | VDO CS+ Slot B (4 B)]
+        # Row 2: [CS / Kc (16 B) + Copy | K_ffb (16 B) + Copy] — full 32-hex width, zero clipping
         row2 = QHBoxLayout()
         row2.setSpacing(10)
 
@@ -1872,15 +1913,60 @@ class FpkeScreen(QWidget):
         ed_kc = QLineEdit(cur_kc)
         ed_kc.setFont(mono_font(12, bold=True))
         ed_kc.setMinimumWidth(0)
+        ed_kc.setCursorPosition(0)
         ed_kc.setPlaceholderText("32 HEX (16 B)")
-        btn_copy_kc = button(tr("Копировать", "Copy"), "GhostBtn", slot=lambda: self._copy_hex(ed_kc.text(), "CS / Kc"))
+        btn_copy_kc = button(tr("Копировать", "Copy"), "InlineBtn", slot=lambda: self._copy_hex(ed_kc.text(), "CS / Kc"))
         c_kc, b_kc = self._field_box(
-            tr("СЕКРЕТ ИММОБИЛАЙЗЕРА CS / KC (16 БАЙТ)", "IMMOBILIZER SECRET CS / KC (16 BYTES)"),
+            tr("СЕКРЕТ CS / KC (16 Б)", "IMMO SECRET CS / KC (16 B)"),
             ed_kc,
             trailing=(btn_copy_kc,),
             tip="EEL 0x68 + 0x28..0x37 (16 bytes)",
         )
         self._bind_hex_validator(ed_kc, b_kc, 16)
+
+        ed_k_ffb = QLineEdit()
+        ed_k_ffb.setReadOnly(True)
+        ed_k_ffb.setFont(mono_font(12, bold=True))
+        ed_k_ffb.setMinimumWidth(0)
+        ed_k_ffb.setPlaceholderText("AES-128-ECB(K_c, C16)")
+        btn_copy_k_ffb = button(
+            tr("Копировать", "Copy"),
+            "InlineBtn",
+            slot=lambda: self._copy_hex(ed_k_ffb.text(), "K_ffb"),
+        )
+        c_k_ffb, b_k_ffb = self._field_box(
+            tr("КЛЮЧ K_FFB (09 BCM)", "RADIO KEY K_FFB (09 BCM)"),
+            ed_k_ffb,
+            trailing=(btn_copy_k_ffb,),
+            tip="K_ffb = AES128_ECB_ENC(K_c, C16 @ 0x19DA90: e7ad3585e2f937e81c75df6e47f11a71)",
+        )
+
+        def _sync_live_k_ffb(txt: str) -> None:
+            raw = "".join(txt.split()).replace("0x", "").replace("0X", "").upper()
+            if len(raw) == 32 and all(c in "0123456789ABCDEF" for c in raw) and raw != "FF" * 16:
+                derived = fpke_derive_k_ffb(raw).hex().upper()
+                ed_k_ffb.setText(derived)
+                ed_k_ffb.setCursorPosition(0)
+                b_k_ffb.setText("AES_Kc(C16)")
+                set_tone(b_k_ffb, "ok")
+                btn_copy_k_ffb.setEnabled(True)
+            else:
+                ed_k_ffb.setText("")
+                b_k_ffb.setText(tr("нужен K_c", "needs K_c"))
+                set_tone(b_k_ffb, "muted")
+                btn_copy_k_ffb.setEnabled(False)
+            b_k_ffb.setVisible(True)
+
+        ed_kc.textChanged.connect(_sync_live_k_ffb)
+        _sync_live_k_ffb(ed_kc.text())
+
+        row2.addWidget(c_kc, 1)
+        row2.addWidget(c_k_ffb, 1)
+        sec_immo.body.addLayout(row2)
+
+        # Row 3: [VDO CS+ Slot A (4 B) | VDO CS+ Slot B (4 B)]
+        row3 = QHBoxLayout()
+        row3.setSpacing(10)
 
         raw_crc_a = (slots.get("A_crc32_le") or "").upper()
         ed_crc_a = QLineEdit("" if raw_crc_a == "FFFFFFFF" else raw_crc_a)
@@ -1906,46 +1992,12 @@ class FpkeScreen(QWidget):
         )
         self._bind_hex_validator(ed_crc_b, b_crc_b, 4)
 
-        ed_k_ffb = QLineEdit()
-        ed_k_ffb.setReadOnly(True)
-        ed_k_ffb.setFont(mono_font(12, bold=True))
-        ed_k_ffb.setMinimumWidth(0)
-        ed_k_ffb.setPlaceholderText("AES-128-ECB(K_c, C16)")
-        btn_copy_k_ffb = button(
-            tr("Копировать", "Copy"),
-            "GhostBtn",
-            slot=lambda: self._copy_hex(ed_k_ffb.text(), "K_ffb"),
-        )
-        c_k_ffb, b_k_ffb = self._field_box(
-            tr("КЛЮЧ РАДИОКАНАЛА K_FFB (09 BCM)", "RADIO CHANNEL KEY K_FFB (09 BCM)"),
-            ed_k_ffb,
-            trailing=(btn_copy_k_ffb,),
-            tip="K_ffb = AES128_ECB_ENC(K_c, C16 @ 0x19DA90: e7ad3585e2f937e81c75df6e47f11a71)",
-        )
-
-        def _sync_live_k_ffb(txt: str) -> None:
-            raw = "".join(txt.split()).replace("0x", "").replace("0X", "").upper()
-            if len(raw) == 32 and all(c in "0123456789ABCDEF" for c in raw) and raw != "FF" * 16:
-                derived = fpke_derive_k_ffb(raw).hex().upper()
-                ed_k_ffb.setText(derived)
-                b_k_ffb.setText("AES_Kc(C16)")
-                set_tone(b_k_ffb, "ok")
-                btn_copy_k_ffb.setEnabled(True)
-            else:
-                ed_k_ffb.setText("")
-                b_k_ffb.setText(tr("нужен K_c", "needs K_c"))
-                set_tone(b_k_ffb, "muted")
-                btn_copy_k_ffb.setEnabled(False)
-            b_k_ffb.setVisible(True)
-
-        ed_kc.textChanged.connect(_sync_live_k_ffb)
-        _sync_live_k_ffb(ed_kc.text())
-
-        row2.addWidget(c_kc, 5)
-        row2.addWidget(c_k_ffb, 5)
-        row2.addWidget(c_crc_a, 2)
-        row2.addWidget(c_crc_b, 2)
-        sec_immo.body.addLayout(row2)
+        row3.addWidget(c_crc_a, 1)
+        row3.addWidget(c_crc_b, 1)
+        row3.addStretch(2)
+        sec_immo.body.setSpacing(5)
+        sec_immo.body.setContentsMargins(14, 2, 14, 8)
+        sec_immo.body.addLayout(row3)
         lay.addWidget(sec_immo)
 
         # ── Card 2: Partner Modules & MAC Synchronization Codes (EEL 0x66) ──
@@ -1953,12 +2005,11 @@ class FpkeScreen(QWidget):
         sec_mac.set_text(
             tr("Привязанные блоки (MAC)", "Partner modules (MAC)"),
         )
-        lbl_mac4 = QLabel()
-        lbl_mac4.setFont(mono_font(12, bold=True))
-        set_tone(lbl_mac4, "info")
+        lbl_mac4 = status_readout("MAC4: —", "info")
+        lbl_mac4.setFont(mono_font(11, bold=True))
         btn_copy_mac4 = button(
             tr("Копировать", "Copy"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: self._copy_hex(lbl_mac4.property("raw_mac4") or "", "MAC4"),
         )
         sec_mac.head.addWidget(lbl_mac4, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -2101,7 +2152,9 @@ class FpkeScreen(QWidget):
             "GhostBtn",
             slot=self._render_page,
         )
-        sec_mac.add_footer(btn_write_immo, btn_apply_immo, btn_reset_immo)
+        foot_mac = sec_mac.add_footer(btn_write_immo, btn_apply_immo, btn_reset_immo)
+        sec_mac.body.setContentsMargins(14, 2, 14, 4)
+        foot_mac.setContentsMargins(14, 2, 14, 8)
         lay.addWidget(sec_mac)
 
     # ────────────────────────────── Page 2: Component Protection (CP) ──────────────────────────────
@@ -2118,8 +2171,8 @@ class FpkeScreen(QWidget):
         sec_cp.set_text(
             tr("Защита компонентов (CP)", "Component Protection (CP)"),
             tr(
-                "Индивидуальный ключ IKA (/3, 00BE) связывает панель приборов со шлюзом J533; ключ слота /1 (GFA, 00BD) используется для обмена с узлом 0x0E (BCM 09, радиоканал ключей) и проверки 0x29E→0x29F.",
-                "The 16-byte IKA (/3, 00BE) key binds the cluster to the J533 gateway; the /1 slot key (GFA, 00BD) is used for channel 3 node 0x0E (BCM 09, remote key sync) and 0x29E→0x29F.",
+                "Ключ IKA (/3, 00BE) привязывает панель к шлюзу J533; ключ GFA (/1, 00BD) — для обмена с BCM 09 (радиоканал).",
+                "IKA (/3, 00BE) binds the cluster to the J533 gateway; GFA (/1, 00BD) links with 09 BCM (remote keys).",
             ),
         )
         err_cnt = cp_st.get("error_counter")
@@ -2135,19 +2188,20 @@ class FpkeScreen(QWidget):
         ed_ika = QLineEdit("" if raw_ika == "FF" * 16 else raw_ika)
         ed_ika.setFont(mono_font(12, bold=True))
         ed_ika.setMinimumWidth(0)
+        ed_ika.setCursorPosition(0)
         ed_ika.setPlaceholderText("32 HEX (16 B)")
         btn_gen_ika = button(
             tr("Сгенерировать", "Generate"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: ed_ika.setText(_py_secrets.token_hex(16).upper()),
         )
         btn_cp_ika = button(
             tr("Копировать", "Copy"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: self._copy_hex(ed_ika.text(), "IKA"),
         )
         c_ika, b_ika = self._field_box(
-            tr("КЛЮЧ IKA ДЛЯ ШЛЮЗА J533 (16 БАЙТ)", "IKA KEY FOR J533 GATEWAY (16 BYTES)"),
+            tr("КЛЮЧ IKA ДЛЯ ШЛЮЗА J533 (16 Б)", "IKA KEY FOR J533 GATEWAY (16 B)"),
             ed_ika,
             trailing=(btn_gen_ika, btn_cp_ika),
             tip="EEL 0x6B + 0x02..0x11 (CP /3 working key)",
@@ -2159,19 +2213,20 @@ class FpkeScreen(QWidget):
         ed_gfa = QLineEdit("" if raw_gfa == "FF" * 16 else raw_gfa)
         ed_gfa.setFont(mono_font(12))
         ed_gfa.setMinimumWidth(0)
+        ed_gfa.setCursorPosition(0)
         ed_gfa.setPlaceholderText("32 HEX (16 B)")
         btn_gen_gfa = button(
             tr("Сгенерировать", "Generate"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: ed_gfa.setText(_py_secrets.token_hex(16).upper()),
         )
         btn_cp_gfa = button(
             tr("Копировать", "Copy"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: self._copy_hex(ed_gfa.text(), "GFA"),
         )
         c_gfa, b_gfa = self._field_box(
-            tr("КЛЮЧ СЛОТА /1 — GFA / УЗЕЛ 0x0E (BCM 09, 16 БАЙТ)", "CP /1 KEY — GFA / NODE 0x0E (BCM 09, 16 BYTES)"),
+            tr("КЛЮЧ СЛОТА /1 — GFA (BCM 09, 16 Б)", "CP /1 KEY — GFA (BCM 09, 16 B)"),
             ed_gfa,
             trailing=(btn_gen_gfa, btn_cp_gfa),
             tip="EEL 0x6B + 0x12..0x21 (UDS 00BD: 0x17F8140E & 0x29E/0x29F)",
@@ -2291,7 +2346,7 @@ class FpkeScreen(QWidget):
         c_odo, _ = self._field_box(
             tr("ПРОБЕГ (КМ)", "ODOMETER (KM)"),
             spn_odo,
-            badge_text=tr("шаг 2 км", "2 km step"),
+            badge_text=tr("шаг 2 км", "2 km"),
             badge_tone="muted",
         )
 
@@ -2299,14 +2354,15 @@ class FpkeScreen(QWidget):
         ed_coding = QLineEdit(cur_cod)
         ed_coding.setFont(mono_font(12))
         ed_coding.setMinimumWidth(0)
+        ed_coding.setCursorPosition(0)
         ed_coding.setPlaceholderText(tr("40 HEX-символов (20 байт)", "40 hex chars (20 bytes)"))
         btn_cp_cod = button(
             tr("Копировать", "Copy"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: self._copy_hex(ed_coding.text(), "Coding"),
         )
         c_cod, b_cod = self._field_box(
-            tr("ДЛИННОЕ КОДИРОВАНИЕ (20 БАЙТ)", "LONG CODING (20 BYTES)"),
+            tr("ДЛИННОЕ КОДИРОВАНИЕ (20 Б)", "LONG CODING (20 B)"),
             ed_coding,
             trailing=(btn_cp_cod,),
             tip="EEL 0x30 + 11..30 (DID 0x0600, 20 bytes)",
@@ -2314,15 +2370,20 @@ class FpkeScreen(QWidget):
         if cur_cod:
             self._bind_hex_validator(ed_coding, b_cod, 20, allow_empty=True)
 
+        odo_row.addWidget(c_odo, 2)
+        odo_row.addWidget(c_cod, 5)
+        sec_odo.body.addLayout(odo_row)
+
         cur_k_ffb = str(immo_cfg.get("k_ffb_hex") or "").upper()
         ed_keys_kffb = QLineEdit(cur_k_ffb)
         ed_keys_kffb.setReadOnly(True)
         ed_keys_kffb.setFont(mono_font(12, bold=True))
         ed_keys_kffb.setMinimumWidth(0)
+        ed_keys_kffb.setCursorPosition(0)
         ed_keys_kffb.setPlaceholderText("AES-128-ECB(K_c, C16)")
         btn_cp_keys_kffb = button(
             tr("Копировать", "Copy"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: self._copy_hex(ed_keys_kffb.text(), "K_ffb"),
         )
         btn_cp_keys_kffb.setEnabled(bool(cur_k_ffb))
@@ -2334,11 +2395,7 @@ class FpkeScreen(QWidget):
             trailing=(btn_cp_keys_kffb,),
             tip="K_ffb = AES128_ECB_ENC(K_c, C16 @ 0x19DA90: e7ad3585e2f937e81c75df6e47f11a71)",
         )
-
-        odo_row.addWidget(c_odo, 2)
-        odo_row.addWidget(c_cod, 4)
-        odo_row.addWidget(c_keys_kffb, 4)
-        sec_odo.body.addLayout(odo_row)
+        sec_odo.body.addWidget(c_keys_kffb)
         lay.addWidget(sec_odo)
 
         # ── Card 2: 8 Transponder Key Slots ──
@@ -2509,10 +2566,8 @@ class FpkeScreen(QWidget):
             sec_donor.head.addWidget(status_readout(tr("Не выбран", "Not loaded"), "warn"), 0, Qt.AlignmentFlag.AlignVCenter)
             lbl_empty_d = QLabel(
                 tr(
-                    "Загрузите дамп DataFlash (64 КБ) или сохранённый Immo-паспорт (.json) родной панели приборов автомобиля, "
-                    "из которой нужно перенести иммобилайзер, ключи и пробег.",
-                    "Load the 64 KB DataFlash dump or exported Immo passport (.json) of the car's original cluster "
-                    "to transfer its immobilizer identity, keys, and mileage.",
+                    "Загрузите дамп DataFlash (64 КБ) или Immo-паспорт (.json) родной панели приборов.",
+                    "Load the 64 KB DataFlash dump or Immo passport (.json) of the car's original cluster.",
                 )
             )
             lbl_empty_d.setObjectName("Hint")
@@ -2528,7 +2583,7 @@ class FpkeScreen(QWidget):
             im_d = donor_passport.get("immo") or {}
             meta_d = donor_passport.get("cluster_metadata") or {}
             cnt_d = im_d.get("counts") or {}
-            d_pn = meta_d.get("part_number") or (self._donor_path.name if self._donor_path else "Донор")
+            d_pn = meta_d.get("part_number") or (self._donor_path.name if self._donor_path else tr("Донор", "Donor"))
             sec_donor.head.addWidget(
                 status_readout(str(d_pn), "info"),
                 0,
@@ -2538,7 +2593,7 @@ class FpkeScreen(QWidget):
             d_grid.setHorizontalSpacing(12)
             d_grid.setVerticalSpacing(3)
             d_odo = meta_d.get("odometer_km")
-            d_odo_str = f"{int(d_odo):,} км".replace(",", " ") if d_odo is not None else "—"
+            d_odo_str = tr(f"{int(d_odo):,} км", f"{int(d_odo):,} km").replace(",", " ") if d_odo is not None else "—"
             d_rows = (
                 ("VIN", im_d.get("vin") or "—"),
                 ("PC / MAC4", f"{im_d.get('power_class_hex') or '—'}   •   {im_d.get('mac4') or '—'}"),
@@ -2576,7 +2631,7 @@ class FpkeScreen(QWidget):
         meta_t = (target_passport or {}).get("cluster_metadata") or {}
         cnt_t = im_t.get("counts") or {}
         t_odo = meta_t.get("odometer_km")
-        t_odo_str = f"{int(t_odo):,} км".replace(",", " ") if t_odo is not None else "—"
+        t_odo_str = tr(f"{int(t_odo):,} км", f"{int(t_odo):,} km").replace(",", " ") if t_odo is not None else "—"
         t_grid = QGridLayout()
         t_grid.setHorizontalSpacing(12)
         t_grid.setVerticalSpacing(3)
@@ -2689,7 +2744,7 @@ class FpkeScreen(QWidget):
         )
 
         d_odo_val = meta_d.get("odometer_km")
-        d_odo_preview = f"{int(d_odo_val):,} км".replace(",", " ") if d_odo_val is not None else "—"
+        d_odo_preview = tr(f"{int(d_odo_val):,} км", f"{int(d_odo_val):,} km").replace(",", " ") if d_odo_val is not None else "—"
         prev_odo = (
             f"{t_odo_str}  →  {d_odo_preview}"
             if donor_passport
@@ -2770,11 +2825,14 @@ class FpkeScreen(QWidget):
             ex = self.extra_info
             sec_ex = _FpkeCanControlPanel._compact_section(Section())
             sec_ex.set_text(
-                tr("Параметры защиты процессора RH850 (Extra Area)", "RH850 MCU security parameters (Extra Area)"),
+                tr("Защита процессора RH850 (Extra Area)", "RH850 MCU security (Extra Area)"),
             )
-            grid = QGridLayout()
+            ex_box = QFrame()
+            ex_box.setObjectName("MetaStrip")
+            grid = QGridLayout(ex_box)
+            grid.setContentsMargins(12, 8, 12, 8)
             grid.setHorizontalSpacing(20)
-            grid.setVerticalSpacing(4)
+            grid.setVerticalSpacing(5)
 
             rows_data: list[tuple[str, str, str]] = [
                 ("IDCODE", ex.get("idcode_spaced", "—"), ""),
@@ -2783,7 +2841,7 @@ class FpkeScreen(QWidget):
                 ok = self.idauth_info["idst_after_idcode"] == "00000000"
                 rows_data.append(
                     (
-                        tr("Аппаратная проверка IDCODE", "Hardware IDCODE check"),
+                        tr("Проверка IDCODE", "IDCODE verification"),
                         tr("подтверждён процессором", "verified by MCU") if ok else tr("отклонён", "rejected"),
                         "ok" if ok else "err",
                     )
@@ -2792,13 +2850,13 @@ class FpkeScreen(QWidget):
                 [
                     (tr("Режим защиты", "Protection mode"), _human_protection_mode(ex.get("protection_mode", "")), ""),
                     (
-                        tr("Последовательное программирование", "Serial programming"),
+                        tr("Последовательное прогр.", "Serial programming"),
                         tr("разрешено", "enabled") if ex.get("serial_programming_enabled") else tr("запрещено", "disabled"),
                         "ok" if ex.get("serial_programming_enabled") else "warn",
                     ),
                     (
                         tr("Слово защиты и OPBT0", "Security word & OPBT0"),
-                        f"{ex.get('security_raw', '—')}   •   OPBT0: {ex.get('opbt0', '—')}",
+                        f"{ex.get('security_raw', '—')}  ·  OPBT0: {ex.get('opbt0', '—')}",
                         "",
                     ),
                 ]
@@ -2818,17 +2876,20 @@ class FpkeScreen(QWidget):
                 grid.addWidget(lbl_k, r, 0)
                 grid.addWidget(lbl_v, r, 1)
             grid.setColumnStretch(1, 1)
-            sec_ex.body.addLayout(grid)
+            sec_ex.body.addWidget(ex_box)
             lay.addWidget(sec_ex)
 
         if has_fd11 and self.dflash_info:
             sec_fd = _FpkeCanControlPanel._compact_section(Section())
             sec_fd.set_text(
-                tr("Диагностический доступ поставщика FD11 (EEL 0x63)", "Continental FD11 vendor diagnostic access (EEL 0x63)"),
+                tr("Доступ поставщика FD11 (EEL 0x63)", "Continental FD11 access (EEL 0x63)"),
             )
-            fd_grid = QGridLayout()
+            fd_box = QFrame()
+            fd_box.setObjectName("MetaStrip")
+            fd_grid = QGridLayout(fd_box)
+            fd_grid.setContentsMargins(12, 8, 12, 8)
             fd_grid.setHorizontalSpacing(16)
-            fd_grid.setVerticalSpacing(4)
+            fd_grid.setVerticalSpacing(5)
             fd_rows: list[tuple[str, str, bool | None]] = []
             if "fd11_l0_6" in by_id:
                 im = by_id["fd11_l0_6"]
@@ -2849,12 +2910,10 @@ class FpkeScreen(QWidget):
                 fd_grid.addWidget(lk, r, 0)
                 fd_grid.addWidget(lv, r, 1)
                 if crc_ok is not None:
-                    lc = QLabel(tr("CRC верна", "CRC valid") if crc_ok else tr("ошибка CRC", "CRC error"))
-                    lc.setObjectName("Hint")
-                    set_tone(lc, "ok" if crc_ok else "err")
-                    fd_grid.addWidget(lc, r, 2, Qt.AlignmentFlag.AlignLeft)
+                    lc = status_readout(tr("CRC OK", "CRC OK") if crc_ok else tr("ошибка CRC", "CRC error"), "ok" if crc_ok else "err")
+                    fd_grid.addWidget(lc, r, 2, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             fd_grid.setColumnStretch(2, 1)
-            sec_fd.body.addLayout(fd_grid)
+            sec_fd.body.addWidget(fd_box)
             lay.addWidget(sec_fd)
 
     # ────────────────────────── Page 6: Engineering Bootloader (BOLO & .FBL_RSAKEY) ──────────────────────────
@@ -2867,20 +2926,14 @@ class FpkeScreen(QWidget):
         sec_key = _FpkeCanControlPanel._compact_section(Section())
         sec_key.set_text(
             tr(
-                "Свой ключ FBL RSA-1024 в DataFlash (.FBL_RSAKEY @ 0xFF20ED00) — запись по CAN",
-                "Custom FBL RSA-1024 key in DataFlash (.FBL_RSAKEY @ 0xFF20ED00) — write over CAN",
+                "Свой ключ FBL RSA-1024 (DataFlash)",
+                "Custom FBL RSA-1024 key (DataFlash)",
             ),
             tr(
-                "Открытый модуль RSA-1024 (128 Б, e = 3) загрузчика BOLO хранится в DataFlash по адресу 0xFF20ED00 "
-                "(Dflash.bin + 0xED00..0xED7F) вне пула EEL T01. Замена ключа затрагивает строго два 64-байтных блока "
-                "(0xED00 и 0xED40) и записывается в приборную панель по CAN кнопкой «Записать в блок» за < 1 с без правки CodeFlash. "
-                "Применяется к блокам процессора AC (RH850: 0xF0, Dataset, ПО RH850 SW_2); графические разделы GC (R-Car) "
-                "дополнительно проверяются загрузчиком GC по отдельному ключу в GC NOR (0x9002E000).",
-                "The BOLO bootloader's 128-byte RSA-1024 public modulus (e = 3) resides in DataFlash at 0xFF20ED00 "
-                "(Dflash.bin + 0xED00..0xED7F) outside the EEL T01 pool. Replacing it touches strictly two 64-byte blocks "
-                "(0xED00 and 0xED40) and writes over CAN via “Write to ECU” in < 1 s without touching CodeFlash. "
-                "Covers AC (RH850) blocks (0xF0, Dataset, RH850 SW_2); GC (R-Car) graphic blocks are also verified by GC "
-                "loaderKernel against a separate key in GC NOR (0x9002E000).",
+                "Открытый модуль RSA-1024 (128 Б, e=3) загрузчика BOLO в DataFlash @ 0xFF20ED00. "
+                "Записывается по CAN кнопкой «Записать в блок» за < 1 с без правки CodeFlash (разделы AC / RH850).",
+                "BOLO bootloader's 128-byte RSA-1024 public modulus (e=3) in DataFlash @ 0xFF20ED00. "
+                "Flashes over CAN via “Write to ECU” in < 1 s without editing CodeFlash (AC / RH850 blocks).",
             ),
         )
         fbl_key = analyze_fpke_dflash_fbl_key(df_bytes) if df_bytes is not None else {"state": "missing"}
@@ -2901,37 +2954,59 @@ class FpkeScreen(QWidget):
             ver_hex = str(fbl_key.get("key_version_hex") or "—")
             fds_hex = str(fbl_key.get("fds_project_data_hex") or "—")
 
-            row_meta = QHBoxLayout()
-            row_meta.setSpacing(10)
-            ed_addr = QLineEdit("0xFF20ED00 (Dflash + 0xED00, 128 B LE, e = 3)")
-            ed_addr.setReadOnly(True)
-            ed_addr.setFont(mono_font(11))
-            c_addr, _ = self._field_box(tr("АДРЕС В DATAFLASH", "DATAFLASH ADDRESS"), ed_addr)
-
-            ed_ver = QLineEdit(f"ver={ver_hex} • FDS={fds_hex}")
-            ed_ver.setReadOnly(True)
-            ed_ver.setFont(mono_font(11))
-            c_ver, _ = self._field_box(tr("ВЕРСИЯ КЛЮЧА И ПРОЕКТ FDS (0xED80)", "KEY VERSION & FDS PROJECT (0xED80)"), ed_ver)
-
-            row_meta.addWidget(c_addr, 1)
-            row_meta.addWidget(c_ver, 1)
-            sec_key.body.addLayout(row_meta)
+            meta_strip = QFrame()
+            meta_strip.setObjectName("MetaStrip")
+            ms_lay = QHBoxLayout(meta_strip)
+            ms_lay.setContentsMargins(11, 5, 11, 5)
+            ms_lay.setSpacing(12)
+            for idx_m, (m_k, m_v, m_tip) in enumerate(
+                (
+                    (
+                        tr("АДРЕС", "ADDRESS"),
+                        "0xFF20ED00",
+                        "0xFF20ED00 (Dflash + 0xED00, 128 B LE, e=3)",
+                    ),
+                    (tr("ВЕРСИЯ", "VER"), ver_hex, "0xED80 key version"),
+                    ("FDS", fds_hex, "FDS project data @ 0xED80"),
+                )
+            ):
+                if idx_m > 0:
+                    sep_m = vdivider()
+                    sep_m.setFixedHeight(13)
+                    ms_lay.addWidget(sep_m, 0, Qt.AlignmentFlag.AlignVCenter)
+                pair_lay = QHBoxLayout()
+                pair_lay.setContentsMargins(0, 0, 0, 0)
+                pair_lay.setSpacing(5)
+                lk = group_label(m_k)
+                lv = QLabel(m_v)
+                lv.setFont(mono_font(11))
+                lv.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                lk.setToolTip(m_tip)
+                lv.setToolTip(m_tip)
+                pair_lay.addWidget(lk, 0, Qt.AlignmentFlag.AlignVCenter)
+                pair_lay.addWidget(lv, 0, Qt.AlignmentFlag.AlignVCenter)
+                ms_lay.addLayout(pair_lay)
+            ms_lay.addStretch(1)
+            sec_key.body.setSpacing(6)
+            sec_key.body.setContentsMargins(14, 3, 14, 5)
+            sec_key.body.addWidget(meta_strip)
 
             ed_mod_be = QLineEdit(mod_be)
             ed_mod_be.setReadOnly(True)
             ed_mod_be.setFont(mono_font(11))
+            ed_mod_be.setCursorPosition(0)
             btn_cp_be = button(
                 tr("Копировать BE", "Copy BE"),
-                "GhostBtn",
+                "InlineBtn",
                 slot=lambda: self._copy_hex(mod_be, "FBL RSA-1024 N (BE)"),
             )
             btn_cp_le = button(
                 tr("Копировать LE", "Copy LE"),
-                "GhostBtn",
+                "InlineBtn",
                 slot=lambda: self._copy_hex(mod_le, "FBL RSA-1024 N (LE)"),
             )
             c_mod, _ = self._field_box(
-                tr("МОДУЛЬ RSA-1024 N (128 БАЙТ, BIG-ENDIAN)", "RSA-1024 MODULUS N (128 BYTES, BIG-ENDIAN)"),
+                tr("МОДУЛЬ RSA-1024 N (128 Б, BIG-ENDIAN)", "RSA-1024 MODULUS N (128 B, BIG-ENDIAN)"),
                 ed_mod_be,
                 badge_text="128 B",
                 badge_tone="ok" if k_state in ("stock", "custom") else "warn",
@@ -2940,51 +3015,49 @@ class FpkeScreen(QWidget):
             sec_key.body.addWidget(c_mod)
 
         btn_gen_key = button(
-            tr("Сгенерировать и вшить свой ключ", "Generate & embed keypair"),
+            tr("Сгенерировать и вшить", "Generate & embed key"),
             "PrimaryBtn" if k_state == "stock" else "",
             slot=self.generate_and_embed_fbl_rsa_key,
         )
         btn_gen_key.setEnabled(not busy and df_bytes is not None)
         btn_load_key = button(
-            tr("Вшить ключ из файла…", "Embed key from file…"),
+            tr("Из файла…", "From file…"),
             slot=lambda: self.embed_fbl_rsa_key_from_file(),
         )
         btn_load_key.setEnabled(not busy and df_bytes is not None)
         btn_sign_odx = button(
-            tr("Подписать блок ODX…", "Sign ODX datablock…"),
+            tr("Подписать ODX…", "Sign ODX…"),
             slot=self.sign_odx_datablock,
         )
         btn_sign_odx.setEnabled(not busy)
         key_btns: list[QWidget] = [btn_gen_key, btn_load_key, btn_sign_odx]
         if k_state != "stock" and df_bytes is not None:
             btn_rest_key = button(
-                tr("Вернуть заводской ключ VAG", "Restore factory VAG key"),
+                tr("Вернуть ключ VAG", "Restore VAG key"),
                 "GhostBtn",
                 slot=self.restore_stock_fbl_rsa_key,
             )
             btn_rest_key.setEnabled(not busy)
             key_btns.append(btn_rest_key)
-        sec_key.add_footer(*key_btns)
+        fk_lay = sec_key.add_footer(*key_btns)
+        sec_key.body.setContentsMargins(14, 2, 14, 4)
+        fk_lay.setContentsMargins(14, 2, 14, 8)
         lay.addWidget(sec_key)
 
         # ── Card 2: Offline Engineering Bootloader BOLO Patch in CodeFlash (.LoaderRAMCOPY + .MemCheckCrcTblApp[0]) ──
         sec_bolo = _FpkeCanControlPanel._compact_section(Section())
+        sec_bolo.body.setSpacing(6)
+        sec_bolo.body.setContentsMargins(14, 3, 14, 5)
         sec_bolo.set_text(
             tr(
-                "Офлайн-патч загрузчика BOLO без проверки RSA (Cflash.bin, 0x000000..0x02FFFF)",
-                "Offline RSA-Free BOLO bootloader patch (Cflash.bin, 0x000000..0x02FFFF)",
+                "Офлайн-патч BOLO (RSA-Free, Cflash.bin)",
+                "Offline BOLO patch (RSA-Free, Cflash.bin)",
             ),
             tr(
-                "На FPK_E область Uflash (0x01000000) пуста; загрузчик BOLO находится в CodeFlash (0x000000..0x02FFFF) "
-                "и распаковывает .LoaderRAMCOPY (Okumura LZSS) в ОЗУ 0xFEDD4D08. Операция ниже патчит локальный файл "
-                "Cflash.bin (4 литеральных байта rsa_verify в потоке LZSS + пересчёт .MemCheckCrcTblApp[0] @ 0x0003138C) "
-                "для последующей записи программатором (по CAN CodeFlash не записывается). Отключает проверку RSA на AC (RH850); "
-                "проверка графических разделов на GC (R-Car) остаётся отдельной.",
-                "On FPK_E, Uflash (0x01000000) is blank; the BOLO bootloader lives in CodeFlash (0x000000..0x02FFFF) and "
-                "decompresses .LoaderRAMCOPY (Okumura LZSS) into SRAM at 0xFEDD4D08. This patches the local Cflash.bin file "
-                "(4 LZSS literal bytes in rsa_verify + updated .MemCheckCrcTblApp[0] CRC-32 @ 0x0003138C) for flashing via "
-                "external programmer (CodeFlash is not written over CAN). Disables RSA on AC (RH850); GC (R-Car) verification "
-                "for graphic blocks remains separate.",
+                "Патчит локальный Cflash.bin (4 байта rsa_verify в потоке LZSS + CRC-32 .MemCheckCrcTblApp[0]) "
+                "для записи программатором — отключает проверку RSA на RH850.",
+                "Patches local Cflash.bin (4 LZSS rsa_verify bytes + .MemCheckCrcTblApp[0] CRC-32) "
+                "for external programmer flashing — disables RSA verification on RH850.",
             ),
         )
 
@@ -3011,61 +3084,72 @@ class FpkeScreen(QWidget):
             bolo_crc_ok = bool(b_entry.get("valid"))
             all_crc_ok = bool(bolo_info.get("memcheck_crc_valid"))
             if bolo_crc_ok and all_crc_ok:
-                crc_status_txt = tr("BOLO [0] ОК • все 6 диапазонов ОК", "BOLO [0] OK • all 6 ranges OK")
+                crc_status_txt = tr("BOLO [0] ОК · 6/6 диапазонов", "BOLO [0] OK · 6/6 ranges")
                 crc_tone = "ok"
             elif bolo_crc_ok:
-                crc_status_txt = tr("BOLO [0] ОК • App [1..5] изменены", "BOLO [0] OK • App [1..5] modified")
+                crc_status_txt = tr("BOLO [0] ОК · App [1..5] изм.", "BOLO [0] OK · App [1..5] mod.")
                 crc_tone = "warn"
             else:
                 crc_status_txt = tr("ошибка CRC BOLO [0]", "BOLO [0] CRC mismatch")
                 crc_tone = "err"
 
             offs_str = ", ".join(bolo_info["patch_cflash_offsets"])
-            grid = QGridLayout()
+            bolo_box = QFrame()
+            bolo_box.setObjectName("MetaStrip")
+            grid = QGridLayout(bolo_box)
+            grid.setContentsMargins(12, 8, 12, 8)
             grid.setHorizontalSpacing(18)
-            grid.setVerticalSpacing(4)
+            grid.setVerticalSpacing(5)
             rows_b = [
                 (
-                    tr("Версия загрузчика BOLO (0x02FB00)", "BOLO bootloader version (0x02FB00)"),
-                    f"BOLO {bolo_info['bolo_version']}   •   .secinfo @ {bolo_info['secinfo_offset']} → {bolo_info['loader_ram_addr']}",
+                    tr("Загрузчик BOLO", "BOLO bootloader"),
+                    f"BOLO {bolo_info['bolo_version']}  ·  .secinfo @ {bolo_info['secinfo_offset']} → {bolo_info['loader_ram_addr']}",
                     "",
+                    f"0x02FB00 · .secinfo @ {bolo_info['secinfo_offset']} → {bolo_info['loader_ram_addr']}",
                 ),
                 (
-                    tr("Проверка rsa_verify в .LOADER_RAM_CODE", "rsa_verify check in .LOADER_RAM_CODE"),
-                    f"bne @ {bolo_info['rsa_bne_ram_addr']} = {bolo_info['bne_hex']}, "
+                    tr("Проверка rsa_verify", "rsa_verify check"),
+                    f"bne @ {bolo_info['rsa_bne_ram_addr']} = {bolo_info['bne_hex']},  "
                     f"cmov @ {bolo_info['rsa_cmov_ram_addr']} = {bolo_info['cmov_hex']}",
                     "ok" if bolo_info["state"] == "engineering" else "",
+                    ".LOADER_RAM_CODE",
                 ),
                 (
-                    tr("Точки патча в Cflash.bin (литералы LZSS)", "Patch offsets in Cflash.bin (LZSS literals)"),
+                    tr("Точки патча (LZSS)", "LZSS patch offsets"),
                     offs_str,
                     "",
+                    tr("Смещения литералов LZSS в Cflash.bin", "LZSS literal offsets in Cflash.bin"),
                 ),
                 (
-                    tr("Самотестирование .MemCheckCrcTblApp[0]", "Self-test .MemCheckCrcTblApp[0]"),
-                    f"{b_entry['start']}..+{b_entry['length']} → CRC-32 @ {b_entry['crc_offset']} = {b_entry['stored_crc']} "
-                    f"({crc_status_txt})",
+                    tr("Самотест CRC-32", "Self-test CRC-32"),
+                    f"{b_entry['stored_crc']} @ {b_entry['crc_offset']}  ·  {crc_status_txt}",
                     crc_tone,
+                    f".MemCheckCrcTblApp[0]: {b_entry['start']}..+{b_entry['length']}",
                 ),
                 (
-                    tr("Ключ шифрования .FBL_AESKEY (0x02FBE0)", "Encryption key .FBL_AESKEY (0x02FBE0)"),
+                    tr("Ключ .FBL_AESKEY", ".FBL_AESKEY"),
                     str(bolo_info["fbl_aes_key_hex"]),
                     "",
+                    "CodeFlash @ 0x02FBE0",
                 ),
             ]
-            for r, (k, v, tone) in enumerate(rows_b):
+            for r, (k, v, tone, tip_txt) in enumerate(rows_b):
                 lk = QLabel(k)
                 lk.setObjectName("FieldKey")
                 lv = QLabel(v)
                 lv.setFont(mono_font(11, bold=(r in (1, 3))))
                 lv.setWordWrap(True)
+                lv.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
                 lv.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                if tip_txt:
+                    lk.setToolTip(tip_txt)
+                    lv.setToolTip(tip_txt)
                 if tone:
                     set_tone(lv, tone)
-                grid.addWidget(lk, r, 0)
-                grid.addWidget(lv, r, 1)
+                grid.addWidget(lk, r, 0, Qt.AlignmentFlag.AlignTop)
+                grid.addWidget(lv, r, 1, Qt.AlignmentFlag.AlignTop)
             grid.setColumnStretch(1, 1)
-            sec_bolo.body.addLayout(grid)
+            sec_bolo.body.addWidget(bolo_box)
         elif bolo_err:
             err_call = Callout("err")
             err_call.label.setText(bolo_err)
@@ -3074,10 +3158,9 @@ class FpkeScreen(QWidget):
             info_call = Callout("info")
             info_call.label.setText(
                 tr(
-                    "Дамп <b>Cflash.bin</b> (2 МБ) ещё не загружен. Считайте CodeFlash во вкладке <b>«Чтение памяти»</b> "
-                    "или выберите готовый файл <b>Cflash.bin</b> кнопкой ниже.",
-                    "No <b>Cflash.bin</b> (2 MB) dump is loaded yet. Read CodeFlash in the <b>“Memory read”</b> tab "
-                    "or load an existing <b>Cflash.bin</b> file below.",
+                    "Дамп <b>Cflash.bin</b> (2 МБ) не загружен. Считайте CodeFlash в разделе <b>«Чтение памяти»</b> "
+                    "или откройте локальный файл кнопкой ниже.",
+                    "No <b>Cflash.bin</b> (2 MB) loaded. Read CodeFlash in <b>“Memory read”</b> or open a local file below.",
                 )
             )
             sec_bolo.body.addWidget(info_call)
@@ -3114,7 +3197,9 @@ class FpkeScreen(QWidget):
         )
         btn_pick_cf.setEnabled(not busy)
         bolo_btns.append(btn_pick_cf)
-        sec_bolo.add_footer(*bolo_btns)
+        fb_lay = sec_bolo.add_footer(*bolo_btns)
+        sec_bolo.body.setContentsMargins(14, 2, 14, 4)
+        fb_lay.setContentsMargins(14, 2, 14, 8)
         lay.addWidget(sec_bolo)
 
     def generate_and_embed_fbl_rsa_key(self) -> None:
@@ -3246,10 +3331,11 @@ class FpkeScreen(QWidget):
                 )
             )
 
+        # runner is still busy inside on_success: defer modal dialog until idle
         self.runner.run_task(
             tr("Подпись блока ODX FPK_E (RSA-1024, e=3)", "Signing FPK_E ODX datablock (RSA-1024, e=3)"),
             task,
-            on_success=done,
+            on_success=lambda sig: QTimer.singleShot(0, lambda s=sig: done(s)),
         )
 
     def restore_stock_fbl_rsa_key(self) -> None:
@@ -3291,6 +3377,7 @@ class FpkeScreen(QWidget):
         self._orig_cflash_path = path
         self._orig_cflash_bytes = raw
         self._working_cflash_path = path
+        self._cflash_dirty = False
         self._set_cflash_bytes(raw, precomputed_info=b_info)
         self.files["cflash"] = path
         if self._working_dflash_bytes is not None:
@@ -3319,6 +3406,7 @@ class FpkeScreen(QWidget):
             return
 
         out_path: Path | None = None
+        needs_save_prompt = False
         reverted_to_orig = self._orig_cflash_bytes is not None and patched_cf == self._orig_cflash_bytes
         if reverted_to_orig:
             old_work = self._working_cflash_path
@@ -3330,6 +3418,7 @@ class FpkeScreen(QWidget):
                 with contextlib.suppress(OSError):
                     old_work.unlink()
             self._working_cflash_path = self._orig_cflash_path
+            self._cflash_dirty = False
             if self._orig_cflash_path is not None:
                 self.files["cflash"] = self._orig_cflash_path
                 out_path = self._orig_cflash_path
@@ -3349,10 +3438,18 @@ class FpkeScreen(QWidget):
                 return
             self._working_cflash_path = out_path
             self.files["cflash"] = out_path
+            self._cflash_dirty = False
+        else:
+            self._cflash_dirty = True
+            needs_save_prompt = True
 
         self._set_cflash_bytes(patched_cf, precomputed_info=after_info)
         self.refresh()
         self.changed.emit()
+        if needs_save_prompt:
+            saved = self.save_cflash_as()
+            if saved is not None:
+                out_path = saved
         crc_str = after_info["memcheck_bolo_entry"]["stored_crc"]
         offs_str = ", ".join(after_info["patch_cflash_offsets"])
         if restore_stock:
@@ -3371,11 +3468,11 @@ class FpkeScreen(QWidget):
             )
         self.note.emit(msg)
 
-    def save_cflash_as(self) -> None:
+    def save_cflash_as(self) -> Path | None:
         """Export the current working `Cflash.bin` image to a user-chosen file."""
         if self._cflash_bytes is None:
-            return
-        default_dir = self.folder or Path.home()
+            return None
+        default_dir = self.folder or (self._orig_cflash_path.parent if self._orig_cflash_path else Path.home())
         state = (self._cflash_boot_info or {}).get("state")
         if state == "engineering":
             suffix = "Cflash_engineering.bin"
@@ -3390,7 +3487,7 @@ class FpkeScreen(QWidget):
             "CodeFlash 2 MB (*.bin);;All files (*)",
         )
         if not dest:
-            return
+            return None
         out_path = Path(dest)
         try:
             atomic_write(out_path, self._cflash_bytes)
@@ -3400,8 +3497,13 @@ class FpkeScreen(QWidget):
                 tr("Ошибка сохранения Cflash.bin", "Failed to save Cflash.bin"),
                 str(exc),
             )
-            return
+            return None
+        self._cflash_dirty = False
+        if self.folder is None:
+            self._working_cflash_path = out_path
+            self.files["cflash"] = out_path
         self.note.emit(tr(f"Дамп CodeFlash сохранён: {out_path}", f"CodeFlash dump saved: {out_path}"))
+        return out_path
 
     # ────────────────────────────── Page 4: Memory Read ──────────────────────────────
 
@@ -3558,16 +3660,21 @@ class FpkeScreen(QWidget):
     # ────────────────────────────── Actions ──────────────────────────────
 
     def _run_full_read(self) -> None:
-        if not ensure_ready(self.conn, self):
+        if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
+        gen = self._session_gen
         port, iface = self.conn.port, self.conn.interface
         ident_list = list(self.ident_items or [{"did": "F187", "value": self.part_number}])
-        sdir = new_session(
-            self.conn.out_dir,
-            unit_of_ident(ident_list),
-            "fpke_read",
-            dumps=True,
-        )
+        try:
+            sdir = new_session(
+                self.conn.out_dir,
+                unit_of_ident(ident_list),
+                "fpke_read",
+                dumps=True,
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка создания папки сессии", "Session directory error"), str(exc))
+            return
         use_stream = self._opt_stream
         read_uf = self._opt_uflash
         read_bf = self._opt_bflash
@@ -3595,7 +3702,7 @@ class FpkeScreen(QWidget):
             )
 
         def done(res: dict[str, Any]) -> None:
-            if not _qt_valid(self) or not self.is_open:
+            if not _qt_valid(self) or not self.is_open or self._session_gen != gen:
                 return
             out_folder = Path(str(res.get("session_dir", sdir)))
             detected = detect_fpke_files([out_folder])
@@ -3612,19 +3719,24 @@ class FpkeScreen(QWidget):
         self.runner.run_task(
             tr("Чтение памяти блока", "Reading the ECU memory"),
             task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+            on_success=lambda res: QTimer.singleShot(0, lambda r=res: done(r)),
         )
 
     def _run_region_read(self, mode: str, *, use_stream: bool = False) -> None:
-        if not ensure_ready(self.conn, self):
+        if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
+        gen = self._session_gen
         port, iface = self.conn.port, self.conn.interface
-        sdir = new_session(
-            self.conn.out_dir,
-            unit_of_ident(self.ident_items or [{"did": "F187", "value": self.part_number}]),
-            f"fpke_{mode}",
-            dumps=True,
-        )
+        try:
+            sdir = new_session(
+                self.conn.out_dir,
+                unit_of_ident(self.ident_items or [{"did": "F187", "value": self.part_number}]),
+                f"fpke_{mode}",
+                dumps=True,
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка создания папки сессии", "Session directory error"), str(exc))
+            return
         via_gw = self.via_gateway
         gw_bridge = self.gateway_bridge
         gw_ch = self.gateway_channel
@@ -3644,7 +3756,7 @@ class FpkeScreen(QWidget):
             )
 
         def done(res: dict[str, Any]) -> None:
-            if not _qt_valid(self) or not self.is_open:
+            if not _qt_valid(self) or not self.is_open or self._session_gen != gen:
                 return
             out_folder = Path(str(res.get("session_dir", sdir)))
             detected = detect_fpke_files([out_folder])
@@ -3662,11 +3774,19 @@ class FpkeScreen(QWidget):
         self.runner.run_task(
             tr(f"Чтение области {mode.upper()}", f"Reading {mode.upper()} area"),
             task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+            on_success=lambda res: QTimer.singleShot(0, lambda r=res: done(r)),
         )
 
-    def _adopt_written_session(self, res: dict[str, Any], fallback_dir: Path) -> None:
+    def _adopt_written_session(
+        self,
+        res: dict[str, Any],
+        fallback_dir: Path,
+        *,
+        expected_gen: int | None = None,
+    ) -> None:
         if not _qt_valid(self) or not self.is_open:
+            return
+        if expected_gen is not None and self._session_gen != expected_gen:
             return
         old_work = self._working_dflash_path
         if old_work is not None and old_work != self._orig_dflash_path and old_work.parent.name == "ContiTool_edited":
@@ -3780,14 +3900,19 @@ class FpkeScreen(QWidget):
             if ans != QMessageBox.StandardButton.Yes:
                 return
 
+        gen = self._session_gen
         port = self.conn.port
         ident_list = list(self.ident_items or [{"did": "F187", "value": self.part_number}])
-        sdir = new_session(
-            self.conn.out_dir,
-            unit_of_ident(ident_list),
-            "fpke_write",
-            dumps=True,
-        )
+        try:
+            sdir = new_session(
+                self.conn.out_dir,
+                unit_of_ident(ident_list),
+                "fpke_write",
+                dumps=True,
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка создания папки сессии", "Session directory error"), str(exc))
+            return
 
         via_gw = self.via_gateway
         gw_bridge = self.gateway_bridge
@@ -3814,7 +3939,9 @@ class FpkeScreen(QWidget):
         self.runner.run_task(
             tr("Запись изменений в приборную панель", "Writing changes to instrument cluster"),
             task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: self._adopt_written_session(res, sdir)),
+            on_success=lambda res: QTimer.singleShot(
+                0, lambda r=res: self._adopt_written_session(r, sdir, expected_gen=gen)
+            ),
         )
 
     def restore_dflash_from_file(self, path: Path | None = None, *, confirm: bool = True) -> None:
@@ -3872,14 +3999,19 @@ class FpkeScreen(QWidget):
             if ans != QMessageBox.StandardButton.Yes:
                 return
 
+        gen = self._session_gen
         port = self.conn.port
         ident_list = list(self.ident_items or [{"did": "F187", "value": self.part_number}])
-        sdir = new_session(
-            self.conn.out_dir,
-            unit_of_ident(ident_list),
-            "fpke_restore",
-            dumps=True,
-        )
+        try:
+            sdir = new_session(
+                self.conn.out_dir,
+                unit_of_ident(ident_list),
+                "fpke_restore",
+                dumps=True,
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка создания папки сессии", "Session directory error"), str(exc))
+            return
 
         via_gw = self.via_gateway
         gw_bridge = self.gateway_bridge
@@ -3906,7 +4038,9 @@ class FpkeScreen(QWidget):
         self.runner.run_task(
             tr("Запись бэкапа DataFlash в приборную панель", "Writing DataFlash backup to cluster"),
             task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: self._adopt_written_session(res, sdir)),
+            on_success=lambda res: QTimer.singleShot(
+                0, lambda r=res: self._adopt_written_session(r, sdir, expected_gen=gen)
+            ),
         )
 
     def _build_can_ctrl_page(self, lay: QVBoxLayout) -> None:
@@ -4125,13 +4259,23 @@ class FpkeDtcDialog(Dialog):
         if cb is not None:
             cb.setText(self.format_plain_text())
 
+    def finish_clear(self, msg: str) -> None:
+        if _qt_valid(self) and msg:
+            self.cleared.emit(msg)
+            self.accept()
+
+    def reset_clear_button(self) -> None:
+        if _qt_valid(self) and hasattr(self, "btn_clear") and _qt_valid(self.btn_clear):
+            self.btn_clear.setEnabled(True)
+
     def _on_clear(self) -> None:
         if self._clear_callback is None:
             return
+        if hasattr(self, "btn_clear") and _qt_valid(self.btn_clear):
+            self.btn_clear.setEnabled(False)
         msg = self._clear_callback()
         if msg:
-            self.cleared.emit(msg)
-            self.accept()
+            self.finish_clear(msg)
 
 
 class _FpkeCanControlPanel(QWidget):
@@ -4139,6 +4283,8 @@ class _FpkeCanControlPanel(QWidget):
 
     note = Signal(str)
     state_changed = Signal()
+    dtc_cleared = Signal(str)
+    dtc_clear_failed = Signal()
 
     def __init__(
         self,
@@ -4211,7 +4357,7 @@ class _FpkeCanControlPanel(QWidget):
             if _qt_valid(b):
                 b.setEnabled(not busy)
         if _qt_valid(self.btn_send_pkt):
-            self.btn_send_pkt.setEnabled(not busy)
+            self.btn_send_pkt.setEnabled(not busy and not self.via_gateway)
         self._refresh_ui()
 
     def apply_external_status(self, text: str, tone: str) -> None:
@@ -4229,23 +4375,19 @@ class _FpkeCanControlPanel(QWidget):
         self._last_dtcs = list(dtcs)
         self.btn_dtc_details.setVisible(bool(self._last_dtcs))
 
-    def _ensure_link(self):
-        link = get_active_fpke_link(self.conn.port or None, self.conn.interface or None)
-        if link is not None and link.via_gateway == self.via_gateway:
-            return link
+    def _prepare_link_params(self) -> tuple[Any | None, str, str, bool] | None:
+        """Check in-memory reusable link or validate adapter readiness on the GUI thread without blocking CAN I/O."""
+        port = self.conn.port
+        iface = self.conn.interface or "slcan"
+        via_gw = self.via_gateway
+        existing = get_active_fpke_link(port or None, iface or None)
+        if existing is not None and existing.via_gateway == via_gw:
+            return existing, port, iface, via_gw
         if not ensure_ready(self.conn, self):
             return None
         if not _qt_valid(self):
             return None
-        try:
-            return open_or_reuse_fpke_link(
-                self.conn.port,
-                interface=self.conn.interface or "slcan",
-                via_gateway=self.via_gateway,
-            )
-        except Exception as exc:
-            self._set_status(str(exc), "err")
-            return None
+        return None, self.conn.port, self.conn.interface or "slcan", self.via_gateway
 
     def _set_status(self, text: str, tone: str = "info") -> None:
         self._last_msg = text
@@ -4358,46 +4500,107 @@ class _FpkeCanControlPanel(QWidget):
         self.lbl_rpm_val.setText(f"{self.sld_rpm.value()} " + tr("об/м", "RPM"))
 
     def _on_kl15_toggled(self, checked: bool) -> None:
+        if self.runner.is_busy or self.via_gateway:
+            self._refresh_ui()
+            return
         if not checked:
             link = get_active_fpke_link()
-            if link is not None:
-                link.set_kl15(False)
             self._sweep_timer.stop()
-            self._set_status(tr("Зажигание KL15 выключено.", "KL15 ignition turned OFF."), "muted")
+            if link is None:
+                self._set_status(tr("Зажигание KL15 выключено.", "KL15 ignition turned OFF."), "muted")
+                return
+
+            def task_off(_rep: Any) -> bool:
+                link.set_kl15(False)
+                return True
+
+            self.runner.run_task(
+                tr("Выключение зажигания KL15", "Turning KL15 ignition OFF"),
+                task_off,
+                on_success=lambda _r: QTimer.singleShot(
+                    0,
+                    lambda: _qt_valid(self)
+                    and self._set_status(tr("Зажигание KL15 выключено.", "KL15 ignition turned OFF."), "muted"),
+                ),
+            )
             return
-        link = self._ensure_link()
-        if not _qt_valid(self):
+
+        params = self._prepare_link_params()
+        if params is None:
+            if _qt_valid(self):
+                self.sw_kl15.setChecked(False)
             return
-        if link is None:
-            self.sw_kl15.setChecked(False)
-            return
-        link.set_kl15(True)
-        self._set_status(tr("Зажигание KL15 включено.", "KL15 ignition turned ON."), "ok")
+        existing, port, iface, via_gw = params
+
+        def task_on(_rep: Any) -> bool:
+            lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
+            lnk.set_kl15(True)
+            return True
+
+        self.runner.run_task(
+            tr("Включение зажигания KL15", "Turning KL15 ignition ON"),
+            task_on,
+            on_success=lambda _r: QTimer.singleShot(
+                0,
+                lambda: _qt_valid(self)
+                and self._set_status(tr("Зажигание KL15 включено.", "KL15 ignition turned ON."), "ok"),
+            ),
+        )
 
     def _on_drive_toggled(self, checked: bool) -> None:
+        if self.runner.is_busy or self.via_gateway:
+            self._refresh_ui()
+            return
         if not checked:
             link = get_active_fpke_link()
-            if link is not None:
-                link.stop_drive_simulation()
             self._sweep_timer.stop()
-            self._set_status(tr("Эмуляция движения остановлена.", "Drive simulation stopped."), "muted")
+            if link is None:
+                self._set_status(tr("Эмуляция движения остановлена.", "Drive simulation stopped."), "muted")
+                return
+
+            def task_stop(_rep: Any) -> bool:
+                link.stop_drive_simulation()
+                return True
+
+            self.runner.run_task(
+                tr("Остановка эмуляции движения", "Stopping drive simulation"),
+                task_stop,
+                on_success=lambda _r: QTimer.singleShot(
+                    0,
+                    lambda: _qt_valid(self)
+                    and self._set_status(tr("Эмуляция движения остановлена.", "Drive simulation stopped."), "muted"),
+                ),
+            )
             return
-        link = self._ensure_link()
-        if not _qt_valid(self):
+
+        params = self._prepare_link_params()
+        if params is None:
+            if _qt_valid(self):
+                self.sw_drive.setChecked(False)
             return
-        if link is None:
-            self.sw_drive.setChecked(False)
-            return
+        existing, port, iface, via_gw = params
         auto = self.btn_auto_sweep.isChecked()
-        link.set_drive_targets(
-            speed_kmh=float(self.sld_speed.value()),
-            rpm=float(self.sld_rpm.value()),
-            auto_sweep=auto,
+        speed_val = float(self.sld_speed.value())
+        rpm_val = float(self.sld_rpm.value())
+
+        def task_start(_rep: Any) -> bool:
+            lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
+            lnk.set_drive_targets(speed_kmh=speed_val, rpm=rpm_val, auto_sweep=auto)
+            lnk.start_drive_simulation(auto_sweep=auto)
+            return True
+
+        def on_started(_r: Any) -> None:
+            if not _qt_valid(self):
+                return
+            if auto:
+                self._sweep_timer.start()
+            self._set_status(tr("Эмуляция движения запущена.", "Drive simulation started."), "ok")
+
+        self.runner.run_task(
+            tr("Запуск эмуляции движения", "Starting drive simulation"),
+            task_start,
+            on_success=lambda r: QTimer.singleShot(0, lambda res=r: on_started(res)),
         )
-        link.start_drive_simulation(auto_sweep=auto)
-        if auto:
-            self._sweep_timer.start()
-        self._set_status(tr("Эмуляция движения запущена.", "Drive simulation started."), "ok")
 
     def _on_manual_gauge_moved(self, _val: int) -> None:
         if self.btn_auto_sweep.isChecked():
@@ -4529,6 +4732,16 @@ class _FpkeCanControlPanel(QWidget):
         send_row.addWidget(self.ed_can_data, 1)
         send_row.addWidget(self.btn_send_pkt)
         sec.body.addLayout(send_row)
+        if self.via_gateway:
+            lbl_gw_pkt = QLabel(
+                tr(
+                    "Произвольные кадры Komfort CAN (0x3C0 / 0x5BF) доступны только при прямом подключении T18 — через шлюз J533 используйте UDS-процедуры ниже.",
+                    "Raw Komfort CAN frames (0x3C0 / 0x5BF) require a direct T18 bench connection — via J533 gateway use the UDS procedures below.",
+                )
+            )
+            lbl_gw_pkt.setObjectName("Hint")
+            lbl_gw_pkt.setWordWrap(True)
+            sec.body.addWidget(lbl_gw_pkt)
         sec.body.addStretch(1)
 
         self._on_preset_selected(0)
@@ -4542,36 +4755,64 @@ class _FpkeCanControlPanel(QWidget):
             self.ed_can_data.setText(hex_str)
 
     def _send_mfl(self, code: int, event: int, title: str) -> None:
-        link = self._ensure_link()
-        if link is None or not _qt_valid(self):
+        if self.runner.is_busy or self.via_gateway:
             return
-        try:
-            link.send_mfl_button(code, event, hold_s=0.15)
-            self._set_status(
-                tr(f"Нажата кнопка руля: {title}", f"Steering button pressed: {title}"),
-                "ok",
-            )
-        except Exception as exc:
-            self._set_status(str(exc), "err")
+        params = self._prepare_link_params()
+        if params is None:
+            return
+        existing, port, iface, via_gw = params
+
+        def task(_rep: Any) -> bool:
+            lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
+            lnk.send_mfl_button(code, event, hold_s=0.15)
+            return True
+
+        self.runner.run_task(
+            tr(f"Кнопка руля: {title}", f"Steering button: {title}"),
+            task,
+            on_success=lambda _r: QTimer.singleShot(
+                0,
+                lambda: _qt_valid(self)
+                and self._set_status(
+                    tr(f"Нажата кнопка руля: {title}", f"Steering button pressed: {title}"),
+                    "ok",
+                ),
+            ),
+        )
 
     def _send_selected_packet(self) -> None:
-        link = self._ensure_link()
-        if link is None or not _qt_valid(self):
+        if self.runner.is_busy or self.via_gateway:
             return
         try:
             arb_id, extended = parse_id(self.ed_can_id.text())
             data = parse_hex(self.ed_can_data.text(), 8)
-            link.send_frame(arb_id, data, extended=extended)
-            id_fmt = f"0x{arb_id:08X}" if extended else f"0x{arb_id:03X}"
-            self._set_status(
-                tr(
-                    f"Отправлено {id_fmt}: {data.hex(' ').upper()}",
-                    f"Sent {id_fmt}: {data.hex(' ').upper()}",
-                ),
-                "ok",
-            )
         except Exception as exc:
             self._set_status(str(exc), "err")
+            return
+        params = self._prepare_link_params()
+        if params is None:
+            return
+        existing, port, iface, via_gw = params
+        id_fmt = f"0x{arb_id:08X}" if extended else f"0x{arb_id:03X}"
+        hex_str = data.hex(" ").upper()
+
+        def task(_rep: Any) -> bool:
+            lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
+            lnk.send_frame(arb_id, data, extended=extended)
+            return True
+
+        self.runner.run_task(
+            tr(f"Отправка CAN {id_fmt}", f"Sending CAN {id_fmt}"),
+            task,
+            on_success=lambda _r: QTimer.singleShot(
+                0,
+                lambda: _qt_valid(self)
+                and self._set_status(
+                    tr(f"Отправлено {id_fmt}: {hex_str}", f"Sent {id_fmt}: {hex_str}"),
+                    "ok",
+                ),
+            ),
+        )
 
     # ── 3. Clean 3-Column Procedures Deck ──
 
@@ -4661,22 +4902,42 @@ class _FpkeCanControlPanel(QWidget):
         return sec
 
     def _clear_dtcs_sync(self) -> str | None:
-        link = self._ensure_link()
-        if link is None:
+        """Clear cluster DTCs asynchronously via OperationRunner (never blocks the Qt main thread)."""
+        if self.runner.is_busy:
+            self.dtc_clear_failed.emit()
             return None
-        try:
-            res = fpke_run_procedure(link, "clear_dtc")
+        params = self._prepare_link_params()
+        if params is None:
+            self.dtc_clear_failed.emit()
+            return None
+        existing, port, iface, via_gw = params
+        sink = self._status_sink
+        dtcs_sink = self._dtcs_sink
+
+        def task(rep: Any) -> dict[str, Any]:
+            lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
+            return fpke_run_procedure(lnk, "clear_dtc", reporter=rep)
+
+        def done(res: dict[str, Any]) -> None:
             msg = str(res.get("summary") or tr("Ошибки блока сброшены.", "Fault codes cleared."))
+            if dtcs_sink is not None:
+                dtcs_sink([])
+            if sink is not None:
+                sink(msg, "ok")
+            if not _qt_valid(self):
+                return
             self._last_dtcs = []
-            if self._dtcs_sink is not None:
-                self._dtcs_sink([])
-            if _qt_valid(self) and _qt_valid(self.btn_dtc_details):
+            if _qt_valid(self.btn_dtc_details):
                 self.btn_dtc_details.setVisible(False)
             self._set_status(msg, "ok")
-            return msg
-        except Exception as exc:
-            self._set_status(str(exc), "err")
-            return None
+            self.dtc_cleared.emit(msg)
+
+        self.runner.run_task(
+            tr("Сброс ошибок блока", "Clearing fault codes"),
+            task,
+            on_success=lambda res: QTimer.singleShot(0, lambda r=res: done(r)),
+        )
+        return None
 
     def show_dtc_dialog(self) -> None:
         if not self._last_dtcs or not _qt_valid(self):
@@ -4687,7 +4948,22 @@ class _FpkeCanControlPanel(QWidget):
             clear_callback=self._clear_dtcs_sync,
             parent=self.window(),
         )
-        run_dialog(dlg)
+        def _on_op_done(ok: bool, _msg: str, _path: Any) -> None:
+            if not ok:
+                dlg.reset_clear_button()
+
+        self.dtc_cleared.connect(dlg.finish_clear)
+        self.dtc_clear_failed.connect(dlg.reset_clear_button)
+        self.runner.operation_finished.connect(_on_op_done)
+        try:
+            run_dialog(dlg)
+        finally:
+            with contextlib.suppress(RuntimeError, TypeError):
+                self.dtc_cleared.disconnect(dlg.finish_clear)
+            with contextlib.suppress(RuntimeError, TypeError):
+                self.dtc_clear_failed.disconnect(dlg.reset_clear_button)
+            with contextlib.suppress(RuntimeError, TypeError):
+                self.runner.operation_finished.disconnect(_on_op_done)
 
     def _run_proc(self, proc_id: str, title: str) -> None:
         if self.runner.is_busy:
@@ -4713,12 +4989,14 @@ class _FpkeCanControlPanel(QWidget):
                     reporter=rep,
                 )
         else:
-            link = self._ensure_link()
-            if link is None or not _qt_valid(self):
+            params = self._prepare_link_params()
+            if params is None:
                 return
+            existing, port, iface, via_gw = params
 
             def task(rep: Any) -> dict[str, Any]:
-                return fpke_run_procedure(link, proc_id, reporter=rep)
+                lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
+                return fpke_run_procedure(lnk, proc_id, reporter=rep)
 
         sink = self._status_sink
         dtcs_sink = self._dtcs_sink
@@ -4769,7 +5047,18 @@ class _FpkeCanControlPanel(QWidget):
             if not direct_only
             else ""
         )
-        for ctrl in (self.sw_kl15, self.sw_drive, self.sld_speed, self.sld_rpm, self.btn_auto_sweep, *self._mfl_buttons):
+        for ctrl in (
+            self.sw_kl15,
+            self.sw_drive,
+            self.sld_speed,
+            self.sld_rpm,
+            self.btn_auto_sweep,
+            self.cmb_preset,
+            self.ed_can_id,
+            self.ed_can_data,
+            self.btn_send_pkt,
+            *self._mfl_buttons,
+        ):
             if _qt_valid(ctrl):
                 ctrl.setEnabled(direct_only and not self.runner.is_busy)
                 if not direct_only:
@@ -4957,7 +5246,7 @@ class FpkeCoilKeyLearnDialog(Dialog):
         set_tone(self.lbl_live_status, "info")
         self.btn_poll_coil = button(
             tr("Опросить катушку (02E4)", "Poll LF coil (02E4)"),
-            "GhostBtn",
+            "InlineBtn",
             slot=self.run_poll_coil,
         )
         st_lay.addWidget(self.lbl_live_status, 1)
@@ -4967,17 +5256,15 @@ class FpkeCoilKeyLearnDialog(Dialog):
         # ── Step 1: Slot Secret S0 / S1 (32 B) ──
         sec_s01 = _tight_card(Section())
         sec_s01.set_text(
-            tr("Шаг 1. Секрет слотов S0 / S1 (32 байта)", "Step 1. Slot secret S0 / S1 (32 bytes)"),
+            tr("Шаг 1. Секрет слотов S0 / S1 (32 Б)", "Step 1. Slot secret S0 / S1 (32 B)"),
         )
         self.lbl_crc_state = status_readout(tr("Ожидание S0/S1", "Awaiting S0/S1"), "warn")
         sec_s01.head.addWidget(self.lbl_crc_state, 0, Qt.AlignmentFlag.AlignVCenter)
 
         lbl_s01_hint = QLabel(
             tr(
-                "Приложите рабочий ключ (Ключ 1) к штатной катушке при включённом KL15 и нажмите "
-                "«Считать S0 / S1 с рабочего ключа», либо введите 32 байта вручную.",
-                "Hold a working key (Key 1) at the stock LF coil with ignition ON and click "
-                "“Extract S0 / S1 from working key”, or enter the 32 bytes manually.",
+                "Приложите рабочий ключ к катушке (KL15 ВКЛ) и считайте S0 / S1 из ОЗУ, либо введите 32 байта вручную.",
+                "Hold a working key at the LF coil (KL15 ON) and extract S0 / S1 from RAM, or enter 32 bytes manually.",
             )
         )
         lbl_s01_hint.setObjectName("Hint")
@@ -5028,16 +5315,14 @@ class FpkeCoilKeyLearnDialog(Dialog):
         sec_02f7 = _tight_card(Section())
         sec_02f7.set_text(
             tr(
-                "Шаг 2. Вход в режим обучения (Способ А без удаления старых / 2E 02F7)",
-                "Step 2. Enter learning mode (Method A keep old keys / 2E 02F7)",
+                "Шаг 2. Режим обучения (добавление / перезапись)",
+                "Step 2. Enter learning mode (add / overwrite)",
             ),
         )
         lbl_02f7_warn = QLabel(
             tr(
-                "Способ А (рекомендуется) через ОЗУ включает режим 5 и сохраняет старые ключи — прикладывать нужно только новую болванку. "
-                "Способ Б (2E 02F7) очищает 0x67 (нужно приложить все ключи).",
-                "Method A (recommended) activates mode 5 in RAM and keeps existing keys — only place the new blank key. "
-                "Method B (2E 02F7) clears 0x67 (all keys must be presented).",
+                "1А (рекомендуется) — дописывает новый ключ в режиме 5 без удаления старых. 1Б (2E 02F7) — очищает 0x67, нужно приложить все ключи.",
+                "1A (recommended) — adds a new key in mode 5 keeping existing ones. 1B (2E 02F7) — clears 0x67, all keys must be presented.",
             )
         )
         lbl_02f7_warn.setObjectName("Hint")
@@ -5081,10 +5366,8 @@ class FpkeCoilKeyLearnDialog(Dialog):
         )
         lbl_lrn_hint = QLabel(
             tr(
-                "По очереди прикладывайте каждый ключ к катушке и нажимайте «2. Обучить ключ в катушке (40 00)». "
-                "В чистую болванку Megamos AES (бит 1 в 0x01F = 1) панель приборов запишет K_c, слоты A/B и метку 0x9911 (~3–5 с).",
-                "Place each key on the coil one by one and click “2. Learn key in coil (40 00)”. "
-                "For a blank Megamos AES chip (bit 1 of 0x01F = 1), the cluster writes K_c, slots A/B, and marker 0x9911 (~3–5 s).",
+                "По очереди прикладывайте ключи к катушке и нажимайте «2. Обучить ключ». Для чистой болванки Megamos AES запись длится ~3–5 с.",
+                "Present each key to the coil and click “2. Learn key”. Programming a blank Megamos AES transponder takes ~3–5 s.",
             )
         )
         lbl_lrn_hint.setObjectName("Hint")
@@ -5163,18 +5446,18 @@ class FpkeCoilKeyLearnDialog(Dialog):
             self.btn_prepare_additive.setEnabled(False)
             self.btn_start_02f7.setEnabled(False)
 
-    def _ensure_link(self) -> Any | None:
+    def _prepare_link_params(self) -> tuple[Any | None, str, str, bool] | None:
+        port = self.conn.port
+        iface = self.conn.interface or "slcan"
+        via_gw = self.via_gateway
+        existing = get_active_fpke_link(port or None, iface or None)
+        if existing is not None and existing.via_gateway == via_gw:
+            return existing, port, iface, via_gw
         if not ensure_ready(self.conn, self):
             return None
-        try:
-            return open_or_reuse_fpke_link(
-                self.conn.port,
-                interface=self.conn.interface,
-                via_gateway=self.via_gateway,
-            )
-        except Exception as exc:
-            self._set_status(str(exc), "err")
+        if not _qt_valid(self):
             return None
+        return None, self.conn.port, self.conn.interface or "slcan", self.via_gateway
 
     def _run_l8_task(
         self,
@@ -5206,17 +5489,19 @@ class FpkeCoilKeyLearnDialog(Dialog):
                     reporter=rep,
                 )
         else:
-            link = self._ensure_link()
-            if link is None:
+            params = self._prepare_link_params()
+            if params is None:
                 return
+            existing, port, iface, via_gw = params
 
             def task(rep: Any) -> dict[str, Any]:
-                return fn(link, rep)
+                lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
+                return fn(lnk, rep)
 
         self.runner.run_task(
             title,
             task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: on_done(res)),
+            on_success=lambda res: QTimer.singleShot(0, lambda r=res: on_done(r)),
         )
 
     def _set_status(self, msg: str, tone: str = "info") -> None:
@@ -5229,12 +5514,14 @@ class FpkeCoilKeyLearnDialog(Dialog):
     def run_poll_coil(self) -> None:
         if self.runner.is_busy:
             return
-        link = self._ensure_link()
-        if link is None:
+        params = self._prepare_link_params()
+        if params is None:
             return
+        existing, port, iface, via_gw = params
 
         def task(rep: Any) -> dict[str, Any]:
-            return fpke_coil_poll_transponder(link, reporter=rep)
+            lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
+            return fpke_coil_poll_transponder(lnk, reporter=rep)
 
         def done(res: dict[str, Any]) -> None:
             if not _qt_valid(self):
@@ -5248,7 +5535,7 @@ class FpkeCoilKeyLearnDialog(Dialog):
         self.runner.run_task(
             tr("Опрос штатной катушки LF (02E4 / 02ED)", "Polling stock LF coil (02E4 / 02ED)"),
             task,
-            on_success=lambda res: QTimer.singleShot(0, lambda: done(res)),
+            on_success=lambda res: QTimer.singleShot(0, lambda r=res: done(r)),
         )
 
     def run_extract_s0_s1(self) -> None:
@@ -5362,7 +5649,12 @@ class FpkeCoilKeyLearnDialog(Dialog):
 
         self._run_l8_task(
             tr("Завершение обучения ключей (2E 02E1 80 00)", "Finishing key learning (2E 02E1 80 00)"),
-            lambda lnk, rep: fpke_finish_coil_key_learning(lnk, sync_channel3=sync_ch3, reporter=rep),
+            lambda lnk, rep: fpke_finish_coil_key_learning(
+                lnk,
+                sync_channel3=sync_ch3,
+                restore_key_flags=self._key_flags,
+                reporter=rep,
+            ),
             done,
             needs_level8=bool((self._key_flags & 0x80) and self.gateway_bridge),
         )

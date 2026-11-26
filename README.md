@@ -1,6 +1,6 @@
 <div align="center">
 
-# ContiTool v2.1 — Continental VAG MQB Gateway J533 (`3Q0 907 530`)
+# ContiTool — Continental VAG MQB Gateway J533 (`3Q0 907 530`)
 ### Renesas RH850/F1L — Diagnosis CAN Studio, Component Protection (`KSCHUTZ`), Engineering Mode & `SWaP / RSA-1024`
 
 [![English README](https://img.shields.io/badge/lang-English-2563EB?style=for-the-badge)](README.en.md)
@@ -107,9 +107,9 @@ flowchart LR
 ### Вариант 1 — Готовая программа (рекомендуется)
 
 Скачайте архив из раздела **Releases**:
-- **Windows**: распакуйте `ContiTool-v2.2.0-windows-amd64.zip` и запустите **`ContiTool.exe`**.
-- **macOS**: откройте `ContiTool-v2.2.0-macos-arm64.dmg` (или `.zip`) и запустите **`ContiTool.app`**.
-- **Linux**: распакуйте `ContiTool-v2.2.0-linux-x86_64.tar.gz` и запустите **`ContiTool/ContiTool`**.
+- **Windows**: распакуйте `ContiTool-v2.2.1-windows-amd64.zip` и запустите **`ContiTool.exe`**.
+- **macOS**: откройте `ContiTool-v2.2.1-macos-arm64.dmg` (или `.zip`) и запустите **`ContiTool.app`**.
+- **Linux**: распакуйте `ContiTool-v2.2.1-linux-x86_64.tar.gz` и запустите **`ContiTool/ContiTool`**.
 
 Установка Python и сторонних библиотек не требуется.
 

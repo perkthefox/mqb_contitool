@@ -54,7 +54,14 @@ from contitool.can.fpke import (
     FPKE_UDS_RX_ID,
     FPKE_UDS_TX_ID,
 )
-from contitool.can.transport import TRANSPORT_ERRORS, J533CanLink, UdsNegativeResponse
+from contitool.can.transport import (
+    LOADER_ERR_FRAMES,
+    TRANSPORT_ERRORS,
+    J533CanLink,
+    UdsNegativeResponse,
+    describe_loader_error,
+)
+from contitool.core.elv import ELV_NM_WAKE_ID, ELV_NM_WAKE_PAYLOAD, ELV_UDS_RX_ID, ELV_UDS_TX_ID, is_elv_ident
 from contitool.core.fpke import is_fpke_ident
 from contitool.core.analyzer import (
     FBL_LIBRARY_ID,
@@ -148,6 +155,9 @@ FED_READS_PER_PAYLOAD = 16  # 64 KB per upload outside DataFlash; verified: full
 # On D-PDU VCIs (VAS 6154A / VNCI over TCP, #28) an unpaused 8,192-frame (2.6 s) burst lets PDUAPI_VW.dll's monitor
 # queue fall seconds behind past ~1 MB; 4 x 4 KB (16 KB = 2,048 frames, ~0.65 s) drains the queue cleanly between bursts.
 DPDU_FED_READS_PER_PAYLOAD = 4
+# J2534 drivers (e.g. Scanmatik SM2 USB, #45) often have a finite RX ring buffer that overflows (ERR_BUFFER_OVERFLOW
+# 0x12) on an unpaused 8,192-frame (64 KB) burst; 16 KB (2,048 frames) drains cleanly and steps down to 4 KB on 0x12.
+J2534_FED_READS_PER_PAYLOAD = 4
 AREA_READ_RETRIES = 2
 SELFID_OFFSET = CFLASH_IDCODE_OFFSET
 SELFID_SIZE = IDCODE_SIZE
@@ -211,9 +221,15 @@ def _probe_beacon_in_loader(link: J533CanLink, reporter: OperationReporter) -> s
     deadline = time.monotonic() + 5.0
     while len(received) < len(BEACON_ASCII) and time.monotonic() < deadline:
         frame = link.receive_frame(link.LOADER_RX_ID, timeout=1.0)
-        received.extend(bytes(frame.data))
+        chunk = bytes(frame.data)
+        received.extend(chunk)
+        if not received.startswith(BEACON_ASCII[: len(received)]) and chunk in LOADER_ERR_FRAMES:
+            break
     beacon_bytes = bytes(received[: len(BEACON_ASCII)])
     if beacon_bytes != BEACON_ASCII:
+        detail = describe_loader_error(bytes(received))
+        if detail:
+            raise RuntimeError(f"Unexpected RAM-loader beacon reply: {received.hex()} ({detail})")
         raise RuntimeError(f"Unexpected RAM-loader beacon reply: {received.hex()}")
     _consume_loader_end_frame(link, timeout=1.5, label="beacon")
     return beacon_bytes.decode("ascii")
@@ -319,6 +335,50 @@ class Stage1SilentError(TimeoutError):
     A retry would be just as silent; can_cure_fbl_fingerprint is the cure."""
 
 
+class ProgrammingConditionsError(UdsNegativeResponse):
+    """The ECU refused `10 02` (Programming Session) with NRC 0x22 (`conditionsNotCorrect`, #52)."""
+
+    def __init__(self, exc: UdsNegativeResponse, precondition_codes: bytes = b"") -> None:
+        self.precondition_codes = bytes(precondition_codes)
+        codes_ru = (
+            f" Коды предусловий 31 01 02 03: {self.precondition_codes.hex(' ').upper()}."
+            if self.precondition_codes
+            else ""
+        )
+        codes_en = (
+            f" Precondition codes from 31 01 02 03: {self.precondition_codes.hex(' ').upper()}."
+            if self.precondition_codes
+            else ""
+        )
+        msg = tr(
+            f"Шлюз отклонил вход в сессию программирования (10 02 -> 7F 10 22, conditionsNotCorrect).{codes_ru} "
+            "Проверьте питание на столе: +12 В должно быть подано и на контакт 1 (KL30), и на контакт 14 (KL15, "
+            "зажигание), напряжение стабильно 12.5–13.5 В; если блок подключён в автомобиле — зажигание должно "
+            "быть включено, двигатель заглушен, а лучше выполнять работы на снятом блоке на столе. Если условия "
+            "выполнены, а ошибка повторяется — приложите отчёт о проблеме.",
+            f"The gateway refused Programming Session (10 02 -> 7F 10 22, conditionsNotCorrect).{codes_en} "
+            "Check bench power: +12 V must be supplied to both Pin 1 (KL30) and Pin 14 (KL15, ignition) at a "
+            "stable 12.5–13.5 V; if connected in a vehicle, switch ignition ON with the engine stopped (working "
+            "on the bench is strongly recommended). If all conditions are met and this repeats, attach a problem report.",
+        )
+        RuntimeError.__init__(self, msg)
+        self.sid, self.nrc, self.resp = exc.sid, exc.nrc, exc.resp
+
+
+def _precondition_codes(resp: bytes) -> bytes:
+    """Return non-zero precondition failure bytes from a `31 01 02 03` (`71 01 02 03 ...`) reply, or b'' if clear."""
+    if len(resp) <= 4 or resp[:4] != bytes.fromhex("71010203"):
+        return b""
+    tail = resp[4:]
+    return b"" if all(b == 0 for b in tail) else tail
+
+
+def _is_rx_overflow(exc: BaseException) -> bool:
+    from contitool.can.j2534 import J2534BufferOverflowError
+
+    return isinstance(exc, J2534BufferOverflowError)
+
+
 def _is_sa_delay_nrc(exc: BaseException) -> bool:
     """True when SecurityAccess answered NRC 0x37 `requiredTimeDelayNotExpired`."""
     return isinstance(exc, UdsNegativeResponse) and exc.sid == 0x27 and exc.nrc == 0x37
@@ -390,6 +450,7 @@ def _enter_ram_loader_once(link: J533CanLink, reporter: OperationReporter) -> di
         "payload_sha256": EXPECTED_BEACON_SHA256,
         "flash_commands_sent": False,
     }
+    precond_codes = b""
     reporter.can_log(tr("UDS 10 03 -> Расширенная диагностическая сессия", "UDS 10 03 -> Extended Diagnostic Session"))
     try:
         info["session_1003"] = link.request_uds(b"\x10\x03", 0x50, timeout=2.0).hex()
@@ -419,10 +480,23 @@ def _enter_ram_loader_once(link: J533CanLink, reporter: OperationReporter) -> di
             )
         else:
             info["security_2704"] = link.request_uds(bytes.fromhex("2704caffe012"), 0x67, timeout=2.0).hex()
-            info["preconditions"] = link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0).hex()
+            precond_resp = link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0)
+            info["preconditions"] = precond_resp.hex()
+            precond_codes = _precondition_codes(precond_resp)
+            if precond_codes:
+                info["precondition_codes"] = precond_codes.hex(" ").upper()
+                reporter.warning(tr(
+                    f"Шлюз сообщил невыполненные предусловия программирования (31 01 02 03): {info['precondition_codes']}",
+                    f"Gateway reported unmet programming preconditions (31 01 02 03): {info['precondition_codes']}",
+                ))
 
     reporter.can_log(tr("UDS 10 02 -> Переход в загрузчик FBL (Programming Session)", "UDS 10 02 -> Entering FBL Programming Session"))
-    info["session_1002"] = link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True).hex()
+    try:
+        info["session_1002"] = link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True).hex()
+    except UdsNegativeResponse as exc:
+        if exc.sid == 0x10 and exc.nrc == 0x22:
+            raise ProgrammingConditionsError(exc, precond_codes) from exc
+        raise
     time.sleep(1.0)
 
     reporter.can_log(tr("UDS 27 11 + multi-DID 0x22 Stage 1/2 -> Подготовка дескриптора 0x0100120E", "UDS 27 11 + multi-DID 0x22 Stage 1/2 -> Staging descriptor 0x0100120E"))
@@ -589,6 +663,8 @@ def enter_ram_loader(
             raise  # a retry would only stage another entry: another key attempt, or the same silence
         if isinstance(first_err, UdsNegativeResponse):
             _abort_if_unsupported_ecu(link)
+        if isinstance(first_err, ProgrammingConditionsError):
+            raise  # ECU explicitly refused 10 02 (conditionsNotCorrect): probing 0x6F0 or resetting will not cure it
         if allow_already_active:
             try:
                 reporter.info(
@@ -620,7 +696,7 @@ def enter_ram_loader(
             )
         )
         try:
-            _reset_to_application(link, reporter=reporter, allow_fbl=True)
+            _reset_to_application(link, reporter=reporter, allow_fbl=True, loader_reset_attempts=1)
         except LINK_ERRORS as recovery_err:
             # Keep the entry failure in the GUI and manifest: the recovery timeout alone hides which step failed.
             raise RuntimeError(tr(
@@ -776,13 +852,21 @@ def read_memory_area(
         and type(bus_obj).__name__ == "DPduBus"
         and not getattr(bus_obj, "nonraw", None)
     )
-    max_reads = DPDU_FED_READS_PER_PAYLOAD if is_dpdu_raw else FED_READS_PER_PAYLOAD
+    is_j2534 = getattr(link, "interface", "") == "j2534" or type(bus_obj).__name__ == "J2534Bus"
+    if is_dpdu_raw:
+        max_reads = DPDU_FED_READS_PER_PAYLOAD
+    elif is_j2534:
+        max_reads = J2534_FED_READS_PER_PAYLOAD
+    else:
+        max_reads = FED_READS_PER_PAYLOAD
     while offset < total:
         reporter.check_cancelled()
         addr = start + offset
-        reads = 1 if in_dflash else min(max_reads, (total - offset) // READ_CHUNK_BYTES)
-        size = reads * READ_CHUNK_BYTES
+        chunk = b""
+        size = 0
         for attempt in range(AREA_READ_RETRIES + 1):
+            reads = 1 if in_dflash else min(max_reads, (total - offset) // READ_CHUNK_BYTES)
+            size = reads * READ_CHUNK_BYTES
             try:
                 if in_dflash:  # FACI blank-check reader: erased words come back as FF
                     chunk = read_memory_bytes(link, addr, size)
@@ -798,17 +882,35 @@ def read_memory_area(
                         elif getattr(getattr(link, "bus", None), "nonraw", None):
                             reporter.error(tr(*NONRAW_ADAPTER_HINT))
                     raise
-                reporter.warning(
-                    tr(
-                        f"{label}: сбой чтения @ 0x{addr:08X} ({exc}) — повтор {attempt + 1}/{AREA_READ_RETRIES}",
-                        f"{label}: read failed @ 0x{addr:08X} ({exc}) — retry {attempt + 1}/{AREA_READ_RETRIES}",
+                if not in_dflash and max_reads > 1 and _is_rx_overflow(exc):
+                    next_reads = max(1, max_reads // 4)
+                    reporter.warning(
+                        tr(
+                            f"{label}: переполнение буфера приёма @ 0x{addr:08X} ({exc}) — уменьшаем пакет с "
+                            f"{max_reads * 4} до {next_reads * 4} КБ, повтор {attempt + 1}/{AREA_READ_RETRIES}",
+                            f"{label}: RX buffer overflow @ 0x{addr:08X} ({exc}) — reducing burst from "
+                            f"{max_reads * 4} to {next_reads * 4} KB, retry {attempt + 1}/{AREA_READ_RETRIES}",
+                        )
                     )
-                )
+                    max_reads = next_reads
+                else:
+                    reporter.warning(
+                        tr(
+                            f"{label}: сбой чтения @ 0x{addr:08X} ({exc}) — повтор {attempt + 1}/{AREA_READ_RETRIES}",
+                            f"{label}: read failed @ 0x{addr:08X} ({exc}) — retry {attempt + 1}/{AREA_READ_RETRIES}",
+                        )
+                    )
                 time.sleep(2.5)  # a 64 KB stream lasts ~2.1 s: let a broken one run out before the next sync
-                link.drain_rx(max_frames=100_000)
+                clear_rx = getattr(getattr(link, "bus", None), "clear_rx_buffer", None)
+                if callable(clear_rx):
+                    with contextlib.suppress(*LINK_ERRORS):
+                        clear_rx()
+                with contextlib.suppress(*LINK_ERRORS):
+                    link.drain_rx(max_frames=100_000)
                 drain_quiet = getattr(link, "drain_until_quiet", None)
                 if callable(drain_quiet):
-                    drain_quiet(link.LOADER_RX_ID, quiet_window=0.15, max_wait=2.0)
+                    with contextlib.suppress(*LINK_ERRORS):
+                        drain_quiet(link.LOADER_RX_ID, quiet_window=0.15, max_wait=2.0)
         if len(chunk) != size:
             raise RuntimeError(f"Short chunk at 0x{addr:08X}: {len(chunk)}")
         with output_path.open("ab") as fh:
@@ -895,11 +997,25 @@ def run_rsa_probe(
     }
 
 
-def _loader_reset_command(link: J533CanLink) -> str:
-    try:
-        link.send_loader_payload(LOADER_RESET_PAYLOAD)
-    except LINK_ERRORS as exc:
-        return f"sync-error:{exc}"
+def _loader_reset_command(link: J533CanLink, *, attempts: int = 3) -> str:
+    last_exc: BaseException | None = None
+    tries = max(1, attempts)
+    for attempt in range(tries):
+        try:
+            link.send_loader_payload(LOADER_RESET_PAYLOAD)
+            last_exc = None
+            break
+        except LINK_ERRORS as exc:
+            last_exc = exc
+            if attempt + 1 >= tries or getattr(getattr(link, "bus", None), "spent", False):
+                break
+            drain_quiet = getattr(link, "drain_until_quiet", None)
+            if callable(drain_quiet):
+                with contextlib.suppress(*LINK_ERRORS):
+                    drain_quiet(link.LOADER_RX_ID, quiet_window=0.05, max_wait=0.5)
+            time.sleep(0.1)
+    if last_exc is not None:
+        return f"sync-error:{last_exc}"
     try:
         return bytes(link.receive_frame(link.LOADER_RX_ID, timeout=1.0).data).hex()
     except TimeoutError:
@@ -996,6 +1112,7 @@ def _reset_to_application(
     *,
     reporter: OperationReporter = NULL_REPORTER,
     allow_fbl: bool = False,
+    loader_reset_attempts: int = 3,
 ) -> dict[str, Any]:
     info: dict[str, Any] = {}
     try:
@@ -1014,7 +1131,7 @@ def _reset_to_application(
                 "Trying FE FF MCU reset via factory RAM-Loader (0x6F0)…",
             )
         )
-        info["loader_reset"] = _loader_reset_command(link)
+        info["loader_reset"] = _loader_reset_command(link, attempts=loader_reset_attempts)
         if info["loader_reset"].startswith("sync-error:"):
             reporter.warning(tr(
                 f"Не удалось передать сброс через заводской RAM-Loader: {info['loader_reset']}",
@@ -1119,6 +1236,8 @@ def unsupported_ecu_reason(ident: list[dict[str, str]]) -> str | None:
 
 BCM_UDS_TX_ID = 0x70E
 BCM_UDS_RX_ID = 0x778
+MRR_UDS_TX_ID = 0x757
+MRR_UDS_RX_ID = 0x7C1
 
 
 def _send_fpke_keepalive_burst(link: J533CanLink) -> None:
@@ -1128,10 +1247,83 @@ def _send_fpke_keepalive_burst(link: J533CanLink) -> None:
         time.sleep(0.002)
 
 
+def _probe_mrr_uds_once(link: J533CanLink, *, timeout: float) -> tuple[bool, bool]:
+    """Single UDS probe on `13` ACC Radar (`0x757 -> 0x7C1`), tolerating NRC `0x22` via `10 01`."""
+    link.UDS_TX_ID = MRR_UDS_TX_ID
+    link.UDS_RX_ID = MRR_UDS_RX_ID
+    link.UDS_FC_PAD = J533CanLink.UDS_FC_PAD
+    try:
+        link.request_uds(b"\x10\x03", 0x50, timeout=timeout)
+        with contextlib.suppress(*LINK_ERRORS):
+            link.request_uds(b"\x3e\x00", 0x7E, timeout=min(0.4, timeout))
+        return True, False
+    except UdsNegativeResponse as exc:
+        if _is_fbl_session_nrc(exc):
+            return True, True
+        with contextlib.suppress(*LINK_ERRORS):
+            link.request_uds(b"\x10\x01", 0x50, timeout=min(0.5, timeout))
+        return True, False
+    except LINK_ERRORS:
+        return False, False
+
+
+def _probe_elv_uds_once(link: J533CanLink, *, timeout: float) -> tuple[bool, bool]:
+    """Single UDS probe on `2B` ELV (`0x731 -> 0x79B`), tolerating bootloader / NRC `0x22` via `10 01`."""
+    link.UDS_TX_ID = ELV_UDS_TX_ID
+    link.UDS_RX_ID = ELV_UDS_RX_ID
+    link.UDS_FC_PAD = 0x55
+    try:
+        link.request_uds(b"\x10\x03", 0x50, timeout=timeout)
+        return True, False
+    except UdsNegativeResponse as exc:
+        if _is_fbl_session_nrc(exc):
+            return True, True
+        with contextlib.suppress(*LINK_ERRORS):
+            link.request_uds(b"\x10\x01", 0x50, timeout=min(0.5, timeout))
+        return True, False
+    except LINK_ERRORS:
+        return False, False
+
+
+def _send_elv_nm_wake(link: J533CanLink) -> None:
+    """Send Komfort CAN OSEK-NM wakeup (`0x1B000010`) to wake a sleeping Marquardt ELV on direct native CAN."""
+    import can
+
+    for _ in range(3):
+        with contextlib.suppress(*LINK_ERRORS):
+            link.bus.send(
+                can.Message(arbitration_id=ELV_NM_WAKE_ID, data=ELV_NM_WAKE_PAYLOAD, is_extended_id=True),
+                timeout=0.2,
+            )
+        time.sleep(0.015)
+
+
+def _probe_elv_uds_with_wake(
+    link: J533CanLink,
+    *,
+    bus: Any | None,
+    interface: str,
+    reporter: OperationReporter,
+) -> tuple[bool, bool]:
+    """Probe `2B` ELV (`0x731 -> 0x79B`), sending OSEK-NM wakeup on direct native CAN if needed."""
+    ok, fbl = _probe_elv_uds_once(link, timeout=0.35 if bus is not None else 0.7)
+    if ok or bus is not None or interface not in FPKE_NATIVE_INTERFACES:
+        return ok, fbl
+    reporter.can_log(
+        tr(
+            "ELV (2B) не ответил сразу — отправка NM пробуждения 0x1B000010 и повторный опрос…",
+            "ELV (2B) did not reply immediately — sending 0x1B000010 NM wake and retrying…",
+        )
+    )
+    _send_elv_nm_wake(link)
+    return _probe_elv_uds_once(link, timeout=0.8)
+
+
 def _probe_bcm_uds_once(link: J533CanLink, *, timeout: float) -> tuple[bool, bool]:
     """Single UDS probe on `09` BCM (`0x70E -> 0x778`), tolerating NRC `0x22` (e.g. KL15 off) via `10 01`."""
     link.UDS_TX_ID = BCM_UDS_TX_ID
     link.UDS_RX_ID = BCM_UDS_RX_ID
+    link.UDS_FC_PAD = 0xAA
     try:
         link.request_uds(b"\x10\x03", 0x50, timeout=timeout)
         with contextlib.suppress(*LINK_ERRORS):
@@ -1196,6 +1388,7 @@ def _probe_fpke_uds_with_wake(
     """Wake and probe Kombi / FPK_E on `0x714 -> 0x77E` without breaking the 200 ms keepalive cadence."""
     link.UDS_TX_ID = FPKE_UDS_TX_ID
     link.UDS_RX_ID = FPKE_UDS_RX_ID
+    link.UDS_FC_PAD = J533CanLink.UDS_FC_PAD
     if bus is not None or interface not in FPKE_NATIVE_INTERFACES:
         try:
             link.request_uds(b"\x10\x03", 0x50, timeout=0.4 if bus is not None else 1.0)
@@ -1255,14 +1448,17 @@ def can_identify(
 
     if bus is None:
         close_active_fpke_link()
+    norm_target = (target or "auto").strip().lower()
     result: dict[str, Any] = {
         "responding": False,
         "ident": [],
-        "ecu_kind": target if target in ("fpke", "bcm") else "j533",
+        "ecu_kind": norm_target if norm_target in ("fpke", "bcm", "mrr", "elv") else "j533",
     }
     in_fbl = False
     probed_fpke = False
     probed_bcm = False
+    probed_mrr = False
+    probed_elv = False
     keep_fpke_alive = False
     with J533CanLink(port, interface=interface, bus=bus) as link:
         if link.interface == "dpdu" and callable(getattr(link.bus, "describe", None)):
@@ -1271,7 +1467,7 @@ def can_identify(
                 result["adapter_warning"] = _j2534_wrapper_problem(wrapped)
                 reporter.warning(result["adapter_warning"])
         reporter.step(1, 2, tr("Проверка связи с блоком (UDS 10 03)", "Checking the link to the ECU (UDS 10 03)"))
-        if target == "fpke":
+        if norm_target == "fpke":
             ok_fpke, in_fbl = _probe_fpke_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
             if not ok_fpke:
                 raise RuntimeError(
@@ -1283,7 +1479,7 @@ def can_identify(
                     )
                 )
             probed_fpke = True
-        elif target == "bcm":
+        elif norm_target == "bcm":
             ok_bcm, in_fbl = _probe_bcm_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
             if not ok_bcm:
                 raise RuntimeError(
@@ -1295,7 +1491,34 @@ def can_identify(
                     )
                 )
             probed_bcm = True
-        else:
+        elif norm_target == "mrr":
+            ok_mrr, in_fbl = _probe_mrr_uds_once(link, timeout=0.35 if bus is not None else 0.7)
+            if not ok_mrr:
+                raise RuntimeError(
+                    tr(
+                        "Радар адаптивного круиз-контроля 13 ACC (0x757 → 0x7C1) не отвечает по CAN. Проверьте питание +12 В, "
+                        "массу, линии Extended CAN-H / CAN-L и терминатор 120 Ом.",
+                        "Adaptive Cruise Control Radar 13 ACC (0x757 → 0x7C1) does not answer on CAN. Check +12 V power, "
+                        "ground, Extended CAN-H / CAN-L lines, and the 120 Ω terminator.",
+                    )
+                )
+            probed_mrr = True
+        elif norm_target == "elv":
+            ok_elv, in_fbl = _probe_elv_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
+            if not ok_elv:
+                raise RuntimeError(
+                    tr(
+                        "Блокиратор руля ELV (2B, 0x731 → 0x79B) не отвечает по CAN. Проверьте питание +12 В (Pin 3), "
+                        "массу (Pin 4), линии CAN-H / CAN-L (Pin 1 / Pin 2) и терминатор 120 Ом.",
+                        "Steering column lock ELV (2B, 0x731 → 0x79B) does not answer on CAN. Check +12 V (Pin 3), "
+                        "ground (Pin 4), CAN-H / CAN-L (Pin 1 / Pin 2), and the 120 Ω terminator.",
+                    )
+                )
+            probed_elv = True
+        elif norm_target == "j533":
+            link.UDS_TX_ID = J533CanLink.UDS_TX_ID
+            link.UDS_RX_ID = J533CanLink.UDS_RX_ID
+            link.UDS_FC_PAD = J533CanLink.UDS_FC_PAD
             try:
                 link.request_uds(b"\x10\x03", 0x50, timeout=1.2)
                 with contextlib.suppress(*LINK_ERRORS):
@@ -1303,38 +1526,93 @@ def can_identify(
             except LINK_ERRORS as exc:
                 if _is_fbl_session_nrc(exc):
                     in_fbl = True
+                elif isinstance(exc, UdsNegativeResponse) and exc.sid == 0x10 and exc.nrc == 0x22:
+                    reporter.can_log(
+                        tr(
+                            "Шлюз J533 отклонил 10 03 (NRC 0x22 — условия не выполнены, например выключено зажигание или работает двигатель) — переход к сессии по умолчанию 10 01.",
+                            "J533 gateway refused 10 03 (NRC 0x22 — conditionsNotCorrect, e.g. KL15 off or engine running) — falling back to default session 10 01.",
+                        )
+                    )
+                    with contextlib.suppress(*LINK_ERRORS):
+                        link.request_uds(b"\x10\x01", 0x50, timeout=0.6)
                 else:
-                    # Fast check for an already-awake 09 BCM before spending ~4 s waking a Kombi
+                    raise RuntimeError(
+                        tr(
+                            f"Шлюз J533 (19, 0x710 → 0x77A) не отвечает на запросы UDS ({exc}). Проверьте питание +12 В, "
+                            "массу, линии CAN-H / CAN-L (шлюз T20: Pin 19 и Pin 9) и что включён CAN-терминатор 120 Ом (см. «Справка»).",
+                            f"J533 gateway (19, 0x710 → 0x77A) does not answer UDS requests ({exc}). Check +12 V, ground, "
+                            "CAN-H / CAN-L (gateway T20: Pin 19 and Pin 9), and that 120 Ω CAN termination is on (see “Help”).",
+                        )
+                    ) from exc
+        else:
+            link.UDS_TX_ID = J533CanLink.UDS_TX_ID
+            link.UDS_RX_ID = J533CanLink.UDS_RX_ID
+            link.UDS_FC_PAD = J533CanLink.UDS_FC_PAD
+            try:
+                link.request_uds(b"\x10\x03", 0x50, timeout=1.2)
+                with contextlib.suppress(*LINK_ERRORS):
+                    link.request_uds(b"\x3e\x00", 0x7E, timeout=0.5)
+            except LINK_ERRORS as exc:
+                if _is_fbl_session_nrc(exc):
+                    in_fbl = True
+                elif isinstance(exc, UdsNegativeResponse) and exc.sid == 0x10 and exc.nrc == 0x22:
+                    reporter.can_log(
+                        tr(
+                            "Шлюз J533 отклонил 10 03 (NRC 0x22 — условия не выполнены, например выключено зажигание или работает двигатель) — переход к сессии по умолчанию 10 01.",
+                            "J533 gateway refused 10 03 (NRC 0x22 — conditionsNotCorrect, e.g. KL15 off or engine running) — falling back to default session 10 01.",
+                        )
+                    )
+                    with contextlib.suppress(*LINK_ERRORS):
+                        link.request_uds(b"\x10\x01", 0x50, timeout=0.6)
+                else:
+                    # Fast check for an already-awake 09 BCM or 13 ACC Radar before spending ~4 s waking a Kombi
                     ok_bcm, fbl_bcm = _probe_bcm_uds_once(link, timeout=0.2 if bus is not None else 0.35)
                     if ok_bcm:
                         probed_bcm = True
                         in_fbl = fbl_bcm
                     else:
-                        ok_fpke, fbl_fpke = _probe_fpke_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
-                        if ok_fpke:
-                            probed_fpke = True
-                            in_fbl = fbl_fpke
+                        ok_mrr, fbl_mrr = _probe_mrr_uds_once(link, timeout=0.2 if bus is not None else 0.35)
+                        if ok_mrr:
+                            probed_mrr = True
+                            in_fbl = fbl_mrr
                         else:
-                            # Retry 09 BCM once after NM + KL15 wake pulses in case it was asleep on direct bench CAN
-                            if bus is None and interface in FPKE_NATIVE_INTERFACES:
-                                _send_bcm_nm_wake(link)
-                            ok_bcm, fbl_bcm = _probe_bcm_uds_once(link, timeout=0.2 if bus is not None else 0.45)
-                            if ok_bcm:
-                                probed_bcm = True
-                                in_fbl = fbl_bcm
+                            ok_elv, fbl_elv = _probe_elv_uds_once(link, timeout=0.2 if bus is not None else 0.35)
+                            if ok_elv:
+                                probed_elv = True
+                                in_fbl = fbl_elv
                             else:
-                                link.UDS_TX_ID = J533CanLink.UDS_TX_ID
-                                link.UDS_RX_ID = J533CanLink.UDS_RX_ID
-                                raise RuntimeError(
-                                    tr(
-                                        f"Блок не отвечает на базовые диагностические запросы UDS ({exc}). Проверьте питание +12 В, "
-                                        "массу, линии CAN-H / CAN-L (шлюз T20: Pin 19 и Pin 9; панель приборов T18: Pin 18 и Pin 17; BCM: 0x70E) "
-                                        "и что включён CAN-терминатор 120 Ом (см. «Справка»).",
-                                        f"The ECU does not answer basic UDS diagnostic requests ({exc}). Check +12 V, ground, "
-                                        "CAN-H / CAN-L (gateway T20: Pin 19 and Pin 9; cluster T18: Pin 18 and Pin 17; BCM: 0x70E) "
-                                        "and that 120 Ω CAN termination is on (see “Help”).",
-                                    )
-                                ) from exc
+                                ok_fpke, fbl_fpke = _probe_fpke_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
+                                if ok_fpke:
+                                    probed_fpke = True
+                                    in_fbl = fbl_fpke
+                                else:
+                                    # Retry 09 BCM / 2B ELV once after NM wake pulses in case asleep on direct bench CAN
+                                    if bus is None and interface in FPKE_NATIVE_INTERFACES:
+                                        _send_bcm_nm_wake(link)
+                                        _send_elv_nm_wake(link)
+                                    ok_bcm, fbl_bcm = _probe_bcm_uds_once(link, timeout=0.2 if bus is not None else 0.45)
+                                    if ok_bcm:
+                                        probed_bcm = True
+                                        in_fbl = fbl_bcm
+                                    else:
+                                        ok_elv, fbl_elv = _probe_elv_uds_once(link, timeout=0.2 if bus is not None else 0.45)
+                                        if ok_elv:
+                                            probed_elv = True
+                                            in_fbl = fbl_elv
+                                        else:
+                                            link.UDS_TX_ID = J533CanLink.UDS_TX_ID
+                                            link.UDS_RX_ID = J533CanLink.UDS_RX_ID
+                                            link.UDS_FC_PAD = J533CanLink.UDS_FC_PAD
+                                            raise RuntimeError(
+                                                tr(
+                                                    f"Блок не отвечает на базовые диагностические запросы UDS ({exc}). Проверьте питание +12 В, "
+                                                    "массу, линии CAN-H / CAN-L (шлюз T20: Pin 19 и Pin 9; панель приборов T18: Pin 18 и Pin 17; BCM: 0x70E; радар ACC: 0x757; ELV T4: Pin 1 и Pin 2) "
+                                                    "и что включён CAN-терминатор 120 Ом (см. «Справка»).",
+                                                    f"The ECU does not answer basic UDS diagnostic requests ({exc}). Check +12 V, ground, "
+                                                    "CAN-H / CAN-L (gateway T20: Pin 19 and Pin 9; cluster T18: Pin 18 and Pin 17; BCM: 0x70E; ACC radar: 0x757; ELV T4: Pin 1 and Pin 2) "
+                                                    "and that 120 Ω CAN termination is on (see “Help”).",
+                                                )
+                                            ) from exc
         result["responding"] = True
         reporter.step(2, 2, tr("Чтение идентификации блока", "Reading the ECU identification"))
         for did, ru, en in ECU_IDENT_DIDS:
@@ -1358,12 +1636,48 @@ def can_identify(
             result["diag_addr"] = "09"
             result["uds_tx_id"] = f"0x{BCM_UDS_TX_ID:03X}"
             result["uds_rx_id"] = f"0x{BCM_UDS_RX_ID:03X}"
-            result["memory_unavailable_reason"] = tr(
-                "Чтение и редактирование дампов BCM (09) запланировано в следующих версиях. "
-                "Сейчас доступны идентификация, чтение/сброс DTC и CAN-терминал.",
-                "BCM (09) memory dump read/edit is planned for a future release. "
-                "UDS identification, DTC read/clear, and the CAN terminal are available now.",
-            )
+            if bus is None and interface not in FPKE_NATIVE_INTERFACES:
+                result["capabilities"] = ["uds", "dtc", "terminal"]
+                result["memory_unavailable_reason"] = tr(
+                    "Работа с 29-битными протоколами BCM (XCP / WFS канал 3) требует нативный CAN-адаптер "
+                    "(CANable / SLCAN / candleLight). По UDS доступны паспорт, статус, DTC и запись IKA/GFA.",
+                    "29-bit BCM protocols (XCP / WFS Channel 3) require a native CAN adapter "
+                    "(CANable / SLCAN / candleLight). UDS passport, status, DTCs, and IKA/GFA writes remain available.",
+                )
+            else:
+                result["capabilities"] = ["uds", "memory", "dtc", "terminal"]
+            skip_gateway_checks = True
+        elif probed_mrr:
+            result["ecu_kind"] = "mrr"
+            result["diag_addr"] = "13"
+            result["uds_tx_id"] = f"0x{MRR_UDS_TX_ID:03X}"
+            result["uds_rx_id"] = f"0x{MRR_UDS_RX_ID:03X}"
+            if bus is None and interface not in FPKE_NATIVE_INTERFACES:
+                result["capabilities"] = ["uds", "dtc", "terminal"]
+                result["memory_unavailable_reason"] = tr(
+                    "Работа с 29-битным XCP радара 13 ACC (0x1BFEBA00/01) требует нативный CAN-адаптер "
+                    "(CANable / SLCAN / candleLight). По UDS доступны чтение паспорта, статуса, ошибок DTC и запись IKA/GFA.",
+                    "29-bit 13 ACC radar XCP operations (0x1BFEBA00/01) require a native CAN adapter "
+                    "(CANable / SLCAN / candleLight). UDS passport, status, DTCs, and IKA/GFA writes remain available.",
+                )
+            else:
+                result["capabilities"] = ["uds", "memory", "dtc", "terminal"]
+            skip_gateway_checks = True
+        elif probed_elv or is_elv_ident(result["ident"]):
+            result["ecu_kind"] = "elv"
+            result["diag_addr"] = "2B"
+            result["uds_tx_id"] = f"0x{ELV_UDS_TX_ID:03X}"
+            result["uds_rx_id"] = f"0x{ELV_UDS_RX_ID:03X}"
+            if bus is None and interface not in FPKE_NATIVE_INTERFACES:
+                result["capabilities"] = ["uds", "dtc", "terminal"]
+                result["memory_unavailable_reason"] = tr(
+                    "Чтение 32 КБ Data Flash ELV (29-бит 0x1BFD8A0B/0A) требует нативный CAN-адаптер "
+                    "(CANable / SLCAN / candleLight). По UDS доступны паспорт, статус, DTC и адаптация 2E 02E2 (при известном K_5).",
+                    "Reading 32 KB ELV Data Flash (29-bit 0x1BFD8A0B/0A) requires a native CAN adapter "
+                    "(CANable / SLCAN / candleLight). UDS passport, status, DTCs, and 2E 02E2 adaptation (with known K_5) remain available.",
+                )
+            else:
+                result["capabilities"] = ["uds", "memory", "dtc", "terminal"]
             skip_gateway_checks = True
         elif probed_fpke or is_fpke_ident(result["ident"]):
             result["ecu_kind"] = "fpke"
@@ -2947,11 +3261,18 @@ def _enter_fbl_uds_programming(link: J533CanLink, reporter: OperationReporter, *
     `resend=False` while the ECU may be switched off: a request it does not answer must not move the link off the
     adapter's hardware ISO-TP (see J533CanLink.request_uds)."""
     kw = {} if resend else {"resend": False}
+    precond_codes = b""
     try:
         link.request_uds(b"\x10\x03", 0x50, timeout=1.5, **kw)
         link.request_uds(b"\x27\x03", 0x67, timeout=2.0, **kw)
         link.request_uds(bytes.fromhex("2704caffe012"), 0x67, timeout=2.0, **kw)
-        link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0, **kw)
+        precond_resp = link.request_uds(bytes.fromhex("31010203"), 0x71, timeout=2.0, **kw)
+        precond_codes = _precondition_codes(precond_resp)
+        if precond_codes:
+            reporter.warning(tr(
+                f"Шлюз сообщил невыполненные предусловия программирования (31 01 02 03): {precond_codes.hex(' ').upper()}",
+                f"Gateway reported unmet programming preconditions (31 01 02 03): {precond_codes.hex(' ').upper()}",
+            ))
     except RuntimeError as exc:
         # The preconditions are best effort, as in the hardware-verified 2.0.1c: in FBL they are refused by design
         # (7F 10 7E, 7F 27 7F/12), and in the application a 27 03 delay (7F 27 37) or a refused 31 01 0203 does not
@@ -2959,7 +3280,12 @@ def _enter_fbl_uds_programming(link: J533CanLink, reporter: OperationReporter, *
         # are not RuntimeError and still end the operation.
         if not (_is_fbl_session_nrc(exc) or _is_fbl_precondition_nrc(exc)):
             reporter.can_log(tr(f"Предусловие отклонено ({exc}) — пробуем 10 02", f"Precondition refused ({exc}) — trying 10 02"))
-    link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True, **kw)
+    try:
+        link.request_uds(b"\x10\x02", 0x50, timeout=5.0, allow_pending=True, **kw)
+    except UdsNegativeResponse as exc:
+        if exc.sid == 0x10 and exc.nrc == 0x22:
+            raise ProgrammingConditionsError(exc, precond_codes) from exc
+        raise
     time.sleep(1.0)
 
 
@@ -3100,7 +3426,21 @@ def _program_application_uds(
             reporter.check_cancelled()
             chunk = app_bytes[offset : offset + chunk_size]
             seq = (blk_idx + 1) & 0xFF
-            link.request_uds(bytes([0x36, seq]) + chunk, 0x76, timeout=30.0, allow_pending=True)
+            block_req = bytes([0x36, seq]) + chunk
+            for td_try in range(2):
+                try:
+                    link.request_uds(block_req, 0x76, timeout=30.0, allow_pending=True)
+                    break
+                except TimeoutError as exc:
+                    if td_try == 1 or getattr(getattr(link, "bus", None), "spent", False):
+                        raise
+                    reporter.warning(tr(
+                        f"TransferData: таймаут на блоке {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X}: {exc}) — повтор блока…",
+                        f"TransferData: timeout on block {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X}: {exc}) — retrying block…",
+                    ))
+                    time.sleep(0.25)
+                    with contextlib.suppress(*LINK_ERRORS):
+                        link.drain_rx(max_frames=256, quick=True)
             done = offset + len(chunk)
             info["bytes_transferred"] = done
             if blk_idx % 8 == 0 or done == APP_SIZE:

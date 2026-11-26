@@ -50,11 +50,20 @@ from contitool.core.bcm import (
     bcm_detect_profile,
     bcm_encrypt_ffb_key_record,
     bcm_extract_cluster_ffb_material,
+    bcm_get_profile,
     bcm_gfa_raw_to_working,
     bcm_recover_ika_from_job3,
 )
 from contitool.i18n import tr
 from contitool.progress import NULL_REPORTER, OperationReporter
+
+# Exact RX IDs from 09 BCM on Komfort CAN (ch0) -> J533 bridge hardware GAFL filter
+BCM_BRIDGE_RX_FILTER: tuple[tuple[int, bool], ...] = (
+    (BCM_UDS_RX_ID, False),
+    (BCM_WFS_RX_ID, True),
+    (BCM_XCP_RX_ID, True),
+    (BCM_XCP_DD_RX_ID, True),
+)
 
 BCM_STATUS_DIDS: tuple[int, ...] = (
     0x03DE,  # Component Protection mismatch counter (2 B)
@@ -73,7 +82,7 @@ BCM_PASSPORT_DIDS: tuple[tuple[str, int], ...] = (
     ("hw_part_number", 0xF191),
     ("hw_version", 0xF1A3),
     ("fazit", 0xF17C),
-    ("system_name", 0xF19E),
+    ("system_name", 0xF197),
     ("asam_odx", 0xF19E),
     ("vin", 0xF190),
     ("coding", 0x0600),
@@ -83,6 +92,14 @@ BCM_KOMFORT_WAKE_FRAMES: tuple[tuple[int, bytes], ...] = (
     (0x17F00010, b"\x10\x00\x07\x00\x01\x00\x00\x00"),  # MQB Komfort CAN NM wake
     (0x3C0, b"\x00\x00\x03\x00"),  # Klemmen_Status_01 (ZAS_Kl_15 = 1)
 )
+
+
+def _has_key_input(val: bytes | bytearray | memoryview | str | None) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        return len(val) > 0
+    return bool(str(val).strip())
 
 
 def _norm_key_16b(val: bytes | str, label: str) -> bytes:
@@ -225,24 +242,82 @@ class BcmCanLink(J533CanLink):
                 raise RuntimeError(f"ISO-TP FlowControl Overflow/Abort from 0x{rx_id:X}: {raw.hex()}")
         raise TimeoutError(f"Timed out waiting for ISO-TP FlowControl from 0x{rx_id:X}")
 
+    def _should_use_hw_uds(self) -> bool:
+        """Return True when the underlying bus requires hardware ISO-TP (`uds_only` / `nonraw` D-PDU)."""
+        if self._hw_uds:
+            return False
+        bus_ctx = getattr(self.bus, "uds_session", None)
+        if not callable(bus_ctx):
+            return False
+        return bool(getattr(self.bus, "uds_only", False)) or bool(getattr(self.bus, "nonraw", None))
+
+    def request_uds(
+        self,
+        uds_payload: bytes,
+        expected_sid: int | None = None,
+        *,
+        timeout: float = 2.0,
+        allow_pending: bool = True,
+        resend: bool = True,
+    ) -> bytes:
+        """Send UDS request on `0x70E/0x778`, routing via `uds_session` on `uds_only`/`nonraw` D-PDU buses."""
+        if self._should_use_hw_uds():
+            with self.uds_session():
+                return super().request_uds(
+                    uds_payload,
+                    expected_sid,
+                    timeout=timeout,
+                    allow_pending=allow_pending,
+                    resend=resend,
+                )
+        return super().request_uds(
+            uds_payload,
+            expected_sid,
+            timeout=timeout,
+            allow_pending=allow_pending,
+            resend=resend,
+        )
+
     def receive_isotp_channel(self, tx_id: int, rx_id: int, timeout: float = 2.0) -> bytes:
         first = self.receive_frame(rx_id, timeout=timeout)
         raw0 = bytes(first.data)
+        if not raw0:
+            raise RuntimeError(f"Empty ISO-TP frame on 0x{rx_id:X}")
         kind = raw0[0] >> 4
         if kind == 0:
             sf_len = raw0[0] & 0x0F
+            if sf_len == 0 or sf_len > 7 or len(raw0) < 1 + sf_len:
+                raise RuntimeError(f"Malformed ISO-TP SingleFrame on 0x{rx_id:X}: {raw0.hex()}")
             return raw0[1 : 1 + sf_len]
         if kind != 1:
             raise RuntimeError(f"Unexpected ISO-TP frame on 0x{rx_id:X}: {raw0.hex()}")
+        if len(raw0) < 2:
+            raise RuntimeError(f"Truncated ISO-TP FirstFrame on 0x{rx_id:X}: {raw0.hex()}")
         length = ((raw0[0] & 0x0F) << 8) | raw0[1]
-        output = bytearray(raw0[2:])
+        if length == 0 or len(raw0) < min(8, 2 + length):
+            raise RuntimeError(f"Malformed ISO-TP FirstFrame on 0x{rx_id:X} (len={length}): {raw0.hex()}")
+        output = bytearray(raw0[2 : 2 + min(6, length)])
+        expected_sn = 1
         self.send_frame(tx_id, b"\x30\x00\x00", pad=0xAA)
         while len(output) < length:
             msg = self.receive_frame(rx_id, timeout=timeout)
             cf = bytes(msg.data)
-            if (cf[0] >> 4) != 2:
+            if not cf or (cf[0] >> 4) != 2:
                 raise RuntimeError(f"Expected ISO-TP ConsecutiveFrame on 0x{rx_id:X}, got: {cf.hex()}")
-            output.extend(cf[1:])
+            sn = cf[0] & 0x0F
+            if sn != expected_sn:
+                raise RuntimeError(
+                    f"ISO-TP ConsecutiveFrame sequence error on 0x{rx_id:X}: "
+                    f"expected SN 0x{expected_sn:X}, got 0x{sn:X} ({cf.hex()})"
+                )
+            need = min(7, length - len(output))
+            if len(cf) < 1 + need:
+                raise RuntimeError(
+                    f"Truncated ISO-TP ConsecutiveFrame on 0x{rx_id:X}: "
+                    f"expected at least {1 + need} B, got {len(cf)} B ({cf.hex()})"
+                )
+            output.extend(cf[1 : 1 + need])
+            expected_sn = (expected_sn + 1) & 0x0F
         return bytes(output[:length])
 
     def send_uds(self, uds_payload: bytes) -> None:
@@ -257,18 +332,37 @@ class BcmCanLink(J533CanLink):
         *,
         expected_first_byte: int | None = 0xC0,
         timeout: float = 3.0,
+        max_pending_retries: int = 12,
     ) -> bytes:
         """Send a WFS Channel 3 request on `0x17F8140E` and wait for the `0x17FA0E14` reply."""
         self.drain_rx(quick=True)
         self.send_isotp_channel(BCM_WFS_TX_ID, BCM_WFS_RX_ID, payload, st_min_floor=0.005, timeout=timeout)
         wait = timeout
+        pending_count = 0
+        overall_deadline = time.monotonic() + max(timeout + P2_STAR_WAIT * max(1, max_pending_retries), 30.0)
         while True:
-            resp = self.receive_isotp_channel(BCM_WFS_TX_ID, BCM_WFS_RX_ID, timeout=wait)
+            rem_overall = overall_deadline - time.monotonic()
+            if rem_overall <= 0:
+                raise TimeoutError(
+                    tr(
+                        f"Истёк общий таймаут ответа WFS Ch 3 (0x{BCM_WFS_RX_ID:08X}) после {pending_count} ответов 0x78",
+                        f"Exceeded overall WFS Ch 3 deadline (0x{BCM_WFS_RX_ID:08X}) after {pending_count} pending (0x78) replies",
+                    )
+                )
+            resp = self.receive_isotp_channel(BCM_WFS_TX_ID, BCM_WFS_RX_ID, timeout=min(wait, rem_overall))
             if len(resp) >= 3 and resp[0] == 0x7F:
                 # WFS Channel 3 (`FUN_000b809c` / `FUN_000b8fda`) emits 4-byte negative/pending replies:
                 # `7F 80 <sub_cmd> <NRC>` (e.g. `7F 80 01 78` or `7F 80 02 78` while writing NvM blocks).
                 nrc = resp[3] if len(resp) >= 4 else resp[2]
                 if nrc == 0x78:
+                    pending_count += 1
+                    if pending_count > max_pending_retries:
+                        raise TimeoutError(
+                            tr(
+                                f"Превышен лимит повторов ResponsePending (0x78) от 09 BCM по WFS Ch 3 ({pending_count} подряд)",
+                                f"Exceeded WFS Ch 3 ResponsePending (0x78) retry limit from 09 BCM ({pending_count} consecutive replies)",
+                            )
+                        )
                     wait = max(timeout, P2_STAR_WAIT)
                     continue
             if expected_first_byte is not None and (not resp or resp[0] != expected_first_byte):
@@ -320,6 +414,9 @@ class BcmCanLink(J533CanLink):
                 if resp and resp[0] == 0xFF:
                     self.xcp_tx_id = tx_id
                     self.xcp_rx_id = rx_id
+                    if profile is not None and int(profile.get("xcp_tx_id", tx_id)) != tx_id:
+                        matched_id = "dd_0273" if tx_id == BCM_XCP_DD_TX_ID else "ea_0511"
+                        profile.update(bcm_get_profile(matched_id))
                     return resp
                 last_exc = RuntimeError(f"XCP CONNECT rejected on 0x{tx_id:08X}: {resp.hex()}")
             except TRANSPORT_ERRORS as exc:
@@ -333,6 +430,8 @@ class BcmCanLink(J533CanLink):
 
     def xcp_read_memory(self, address: int, size: int, *, timeout: float = 1.0) -> bytes:
         """Read `size` bytes from BCM RAM/Flash at `address` using XCP `SHORT_UPLOAD` (`0xF4`)."""
+        if size < 0:
+            raise ValueError(f"XCP read size must be non-negative, got {size}")
         output = bytearray()
         for offset in range(0, size, 7):
             chunk_len = min(7, size - offset)
@@ -341,6 +440,11 @@ class BcmCanLink(J533CanLink):
             resp = self.xcp_command(cmd, timeout=timeout)
             if not resp or resp[0] != 0xFF:
                 raise RuntimeError(f"XCP SHORT_UPLOAD @ 0x{addr:08X} failed: {resp.hex()}")
+            if len(resp) < 1 + chunk_len:
+                raise RuntimeError(
+                    f"Short XCP SHORT_UPLOAD response @ 0x{addr:08X}: "
+                    f"expected at least {1 + chunk_len} B, got {len(resp)} B ({resp.hex()})"
+                )
             output.extend(resp[1 : 1 + chunk_len])
         return bytes(output)
 
@@ -370,6 +474,17 @@ class BcmCanLink(J533CanLink):
         return resp[1:]
 
 
+def _warn_dpdu_29bit_bcm(reporter: OperationReporter) -> None:
+    reporter.warning(
+        tr(
+            "29-битный режим D-PDU RawMode для XCP / WFS канала 3 блока 09 BCM не проверен на реальном оборудовании; "
+            "рекомендуется нативный CAN-адаптер (CANable / gs_usb / PCAN / SocketCAN).",
+            "29-bit D-PDU RawMode for 09 BCM XCP / WFS Channel 3 is unverified on hardware; "
+            "a native CAN adapter (CANable / gs_usb / PCAN / SocketCAN) is recommended.",
+        )
+    )
+
+
 @contextlib.contextmanager
 def _managed_bcm_session(
     port: str,
@@ -386,6 +501,8 @@ def _managed_bcm_session(
 ) -> Iterator[tuple[BcmCanLink, bool]]:
     """Open a `BcmCanLink` over direct Komfort CAN or through J533 Gateway (engaging RAM-Bridge only when 29-bit frames are needed)."""
     if not via_gateway or not needs_raw_komfort:
+        if needs_raw_komfort and interface == "dpdu":
+            _warn_dpdu_29bit_bcm(reporter)
         with BcmCanLink(
             port,
             interface=interface,
@@ -394,6 +511,12 @@ def _managed_bcm_session(
             via_gateway=via_gateway,
             sw_profile=sw_profile,
         ) as link:
+            if not needs_raw_komfort and link._should_use_hw_uds():
+                with link.uds_session():
+                    if not via_gateway and not link._hw_uds:
+                        link.send_komfort_wake_burst()
+                    yield link, False
+                return
             if not via_gateway:
                 link.send_komfort_wake_burst()
             yield link, False
@@ -413,14 +536,18 @@ def _managed_bcm_session(
             )
         )
 
+    if interface == "dpdu":
+        _warn_dpdu_29bit_bcm(reporter)
+
     from contitool.can.bridge import j533_can_bridge
 
     with j533_can_bridge(
         port,
         interface=interface,
         target_channel=gateway_channel,
-        log_path=log_path,
+        log_path=None,
         bus=bus,
+        target_rx_filter=BCM_BRIDGE_RX_FILTER,
         reporter=reporter,
     ) as bridge:
         with BcmCanLink(
@@ -582,6 +709,39 @@ def _read_bcm_dtcs_in_session(link: BcmCanLink) -> list[dict[str, Any]]:
     return active_dtcs + stored_dtcs
 
 
+def _require_verified_bcm_profile(
+    passport: dict[str, Any],
+    profile: dict[str, Any],
+    *,
+    sw_profile: str | None = None,
+) -> None:
+    """Refuse XCP / Job 3 / WFS `80 01` reads on unknown BCM SW versions to prevent wrong SRAM reads and FFB key loss."""
+    if sw_profile:
+        return
+    if not passport:
+        raise RuntimeError(
+            tr(
+                "Блок 09 BCM (0x70E / 0x778) не ответил на запросы паспорта UDS — операции XCP/WFS отменены.",
+                "09 BCM (0x70E / 0x778) did not answer UDS passport requests — XCP/WFS operations aborted.",
+            )
+        )
+    if not profile.get("matched", True):
+        pn = passport.get("part_number") or "—"
+        sw = passport.get("sw_version") or "—"
+        raise RuntimeError(
+            tr(
+                f"Неподдерживаемая версия ПО 09 BCM ({pn}, ПО {sw}) для операций XCP/Job 3: проверены только "
+                "5Q0 937 084 EA / 086 BH (ПО 0511) и 5Q0 937 084 DD / CG (ПО 0273). "
+                "Чтение ключей отменено, чтобы не повредить радиоключи FFB в DFLASH. "
+                "По UDS доступны чтение статуса, ошибок DTC и запись IKA/GFA (2E 00BE / 00BD).",
+                f"Unsupported 09 BCM firmware ({pn}, SW {sw}) for XCP/Job 3 operations: only "
+                "5Q0 937 084 EA / 086 BH (SW 0511) and 5Q0 937 084 DD / CG (SW 0273) are verified. "
+                "Key extraction aborted to prevent erasing FFB remote keys in DFLASH. "
+                "Standard UDS status, DTCs, and IKA/GFA writes (2E 00BE / 00BD) remain available.",
+            )
+        )
+
+
 def _hard_reset_and_wait_bcm(
     link: BcmCanLink,
     profile: dict[str, Any] | None = None,
@@ -590,9 +750,18 @@ def _hard_reset_and_wait_bcm(
 ) -> bool:
     """Send UDS `11 01` HardReset and wait cleanly past NvM flush + MCU reboot for BCM to reload clean SRAM."""
     sent = False
-    with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
-        link.request_uds(b"\x11\x01", 0x51, timeout=1.5)
-        sent = True
+    for attempt in range(2):
+        try:
+            link.request_uds(b"\x11\x01", 0x51, timeout=1.5)
+            sent = True
+            break
+        except UdsNegativeResponse as exc:
+            if attempt == 0 and exc.nrc in (0x7F, 0x22):
+                _enter_bcm_diagnostic_session(link, 0x03, timeout=1.2)
+                continue
+            return False
+        except (*TRANSPORT_ERRORS, UnexpectedUdsResponse):
+            break
     if not sent:
         return False
 
@@ -673,7 +842,7 @@ def _backup_bcm_ffb_for_read(
         _enter_bcm_diagnostic_session(link, 0x01, timeout=1.2)
 
     if len(k_ffb) != 16 and profile is not None and profile.get("ffb_nvm_key_addr"):
-        if (not link.via_gateway) or link.gateway_bridge:
+        if not link.via_gateway:
             with contextlib.suppress(Exception):
                 link.xcp_connect(profile=profile, timeout=1.2)
                 raw_xcp_kffb = link.xcp_read_memory(int(profile["ffb_nvm_key_addr"]), 16, timeout=1.2)
@@ -735,20 +904,43 @@ def _restore_bcm_ffb_after_read(
         return False
 
     if populated_slots:
-        entries: list[tuple[int, bytes]] = []
-        # BCM 80 02 handler (`0x000C795E` on EA/0511) requires sequential 1..N slot indices in the header nibble.
-        for seq_idx, sl in enumerate(populated_slots[:7], start=1):
-            ser_u32 = int(str(sl["display_id"]), 16)
-            cnt_u32 = int(sl.get("rolling_counter", 0))
-            cipher = bcm_encrypt_ffb_key_record(
-                k_ffb,
-                ser_u32,
-                rolling_counter=cnt_u32,
-                freq_code=freq_code,
-            )
-            entries.append((seq_idx, cipher))
+        def _build_restore_entries(f_code: int) -> list[tuple[int, bytes]]:
+            out_entries: list[tuple[int, bytes]] = []
+            # BCM 80 02 handler (`0x000C795E` on EA/0511) requires sequential 1..N slot indices in the header nibble.
+            for seq_idx, sl in enumerate(populated_slots[:7], start=1):
+                ser_u32 = int(str(sl["display_id"]), 16)
+                cnt_u32 = int(sl.get("rolling_counter", 0))
+                cipher = bcm_encrypt_ffb_key_record(
+                    k_ffb,
+                    ser_u32,
+                    rolling_counter=cnt_u32,
+                    freq_code=f_code,
+                )
+                out_entries.append((seq_idx, cipher))
+            return out_entries
+
+        entries = _build_restore_entries(freq_code)
         pdu_80_02 = bcm_build_wfs_80_02(entries)
-        resp2 = link.request_wfs(pdu_80_02, expected_first_byte=0xC0, timeout=3.5)
+        try:
+            resp2 = link.request_wfs(pdu_80_02, expected_first_byte=0xC0, timeout=3.5)
+        except UdsNegativeResponse as exc_22:
+            if exc_22.nrc != 0x22:
+                raise
+            resp2 = b""
+            for cand_freq in (0x03, 0x02, 0x01, 0x00):
+                if cand_freq == freq_code:
+                    continue
+                cand_entries = _build_restore_entries(cand_freq)
+                try:
+                    link.request_wfs(pdu_80_01, expected_first_byte=0xC0, timeout=3.0)
+                    resp2 = link.request_wfs(bcm_build_wfs_80_02(cand_entries), expected_first_byte=0xC0, timeout=3.5)
+                    if resp2[:2] == b"\xc0\x02":
+                        entries = cand_entries
+                        break
+                except UdsNegativeResponse as retry_exc:
+                    if retry_exc.nrc == 0x22:
+                        continue
+                    raise
         if resp2[:2] != b"\xc0\x02":
             reporter.warning(
                 tr(
@@ -887,12 +1079,50 @@ def _read_bcm_job3_target_in_session(
     }
 
 
+def _persist_ffb_backup(
+    backup: dict[str, Any],
+    *,
+    output_dir: Path | None = None,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> None:
+    """Log and optionally save backed-up FFB key material to disk BEFORE WFS `80 01` clears DFLASH."""
+    k_ffb = bytes(backup.get("k_ffb") or b"")
+    slots = list(backup.get("populated_slots") or [])
+    if len(k_ffb) != 16 and not slots:
+        return
+    slot_summary = ", ".join(
+        f"#{s.get('slot')}:{s.get('display_id')}({s.get('rolling_counter', 0)})" for s in slots
+    )
+    reporter.can_log(
+        tr(
+            f"Резервная копия FFB перед WFS 80 01: K_ffb={k_ffb.hex().upper() or '—'}, "
+            f"частота=0x{int(backup.get('freq_code', 0x03)):02X}, слоты=[{slot_summary}]",
+            f"FFB pre-wipe backup before WFS 80 01: K_ffb={k_ffb.hex().upper() or '—'}, "
+            f"freq=0x{int(backup.get('freq_code', 0x03)):02X}, slots=[{slot_summary}]",
+        )
+    )
+    if output_dir is not None:
+        with contextlib.suppress(OSError):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            bkp_payload = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "k_ffb_hex": k_ffb.hex(),
+                "freq_code": int(backup.get("freq_code", 0x03)) & 0xFF,
+                "populated_slots": slots,
+            }
+            (output_dir / "bcm_ffb_backup.json").write_text(
+                json.dumps(bkp_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+
 def _read_bcm_keys_in_session(
     link: BcmCanLink,
     profile: dict[str, Any],
     *,
     pre_status: dict[str, Any] | None = None,
     preserve_ffb: bool = True,
+    output_dir: Path | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, str]:
     """Run two-stage WFS Job 3 queue + XCP read to recover working `IKA`, `GFA`, and `K_ffb`, restoring SRAM & FFB keys."""
@@ -901,9 +1131,12 @@ def _read_bcm_keys_in_session(
         if preserve_ffb
         else {"k_ffb": b"", "freq_code": 0x03, "populated_slots": []}
     )
+    if preserve_ffb:
+        _persist_ffb_backup(ffb_backup, output_dir=output_dir, reporter=reporter)
 
     k_ffb_hex = ffb_backup["k_ffb"].hex() if len(ffb_backup.get("k_ffb") or b"") == 16 else ""
     ika_trigger_pdu: bytes | None = None
+    pass1_gfa_working: bytes | None = None
 
     # If the BCM has learned FFB remote keys and `NvM 0x02` (`K_ffb`) is blocked on UDS `23 12` / XCP,
     # run a first Job 3 pass targeting `ffb_nvm_key_addr` (`0x40005D24` on EA/0511, `0x40004356` on DD/0273).
@@ -921,7 +1154,9 @@ def _read_bcm_keys_in_session(
         )
         ffb_backup["k_ffb"] = kffb_pass["plaintext_bytes"]
         k_ffb_hex = kffb_pass["plaintext_hex"]
-        ika_trigger_pdu = bcm_build_wfs_80_01(kffb_pass["gfa_working"], ffb_backup["k_ffb"])
+        pass1_gfa_working = kffb_pass["gfa_working"]
+        _persist_ffb_backup(ffb_backup, output_dir=output_dir, reporter=reporter)
+        ika_trigger_pdu = bcm_build_wfs_80_01(pass1_gfa_working, ffb_backup["k_ffb"])
         _hard_reset_and_wait_bcm(link, profile=profile)
 
     try:
@@ -934,15 +1169,27 @@ def _read_bcm_keys_in_session(
     except Exception:
         if preserve_ffb and len(ffb_backup.get("k_ffb") or b"") == 16:
             with contextlib.suppress(Exception):
-                gfa_err_raw = link.xcp_read_memory(int(profile["gfa_aes_buf"]), 16, timeout=1.2)
-                if gfa_err_raw not in (bytes(16), b"\xff" * 16):
-                    _restore_bcm_ffb_after_read(link, bcm_gfa_raw_to_working(gfa_err_raw), ffb_backup, reporter=reporter)
+                gfa_restore = pass1_gfa_working
+                if gfa_restore is None:
+                    gfa_err_raw = link.xcp_read_memory(int(profile["gfa_aes_buf"]), 16, timeout=1.2)
+                    if gfa_err_raw not in (bytes(16), b"\xff" * 16):
+                        gfa_restore = bcm_gfa_raw_to_working(gfa_err_raw)
+                if gfa_restore is not None:
+                    _restore_bcm_ffb_after_read(link, gfa_restore, ffb_backup, reporter=reporter)
         raise
 
     gfa_working = ika_pass["gfa_working"]
 
     # Restore clean working IKA in SRAM from NvM so repeated reads and subsequent 2E 00BE/00BD writes are deterministic.
-    _hard_reset_and_wait_bcm(link, profile=profile)
+    if not _hard_reset_and_wait_bcm(link, profile=profile):
+        reporter.warning(
+            tr(
+                "Предупреждение: блок 09 BCM не подтвердил HardReset (11 01) после чтения IKA — рабочее ОЗУ могло остаться "
+                "изменённым. Перед записью 2E 00BE/00BD выключите/включите зажигание или переподключите питание.",
+                "Warning: 09 BCM did not confirm HardReset (11 01) after IKA read — working SRAM may still be modified. "
+                "Cycle ignition or bench power before writing 2E 00BE/00BD.",
+            )
+        )
 
     # Restore pre-existing K_ffb & learned FFB remote keys that `80 01` cleared in DFLASH.
     if preserve_ffb:
@@ -1028,36 +1275,6 @@ def can_bcm_read_all(
             ),
         )
         status = _read_bcm_status_in_session(link, include_nvm_slots=True, profile=profile)
-        if (
-            not can_xcp
-            and via_gateway
-            and gateway_bridge
-            and not status.get("ffb_slots")
-            and (status.get("ffb_learned_count") or 0) > 0
-        ):
-            with contextlib.suppress(Exception):
-                from contitool.can.bridge import j533_can_bridge
-
-                with j533_can_bridge(
-                    port,
-                    interface=interface,
-                    target_channel=gateway_channel,
-                    log_path=log_path,
-                    bus=bus,
-                    reporter=reporter,
-                ) as br:
-                    with BcmCanLink(
-                        port,
-                        interface=interface,
-                        log_path=log_path,
-                        bus=br.bus,
-                        via_gateway=False,
-                        sw_profile=sw_profile,
-                    ) as br_link:
-                        br_link.send_komfort_wake_burst()
-                        xcp_slots = _read_ffb_slots_via_xcp(br_link, profile)
-                        if xcp_slots:
-                            status = _read_bcm_status_in_session(br_link, include_nvm_slots=True, profile=profile)
 
         reporter.step(
             3,
@@ -1083,6 +1300,7 @@ def can_bcm_read_all(
                 tr("Чтение ключей IKA + GFA (WFS Ch 3 + XCP)", "Reading IKA + GFA keys (WFS Ch 3 + XCP)"),
             )
             try:
+                _require_verified_bcm_profile(passport, profile, sw_profile=sw_profile)
                 key_info = _read_bcm_keys_in_session(link, profile, pre_status=status, reporter=reporter)
                 ika_hex = key_info["ika_hex"]
                 gfa_working_hex = key_info["gfa_working_hex"]
@@ -1132,6 +1350,8 @@ def _read_bcm_gfa_in_session(
         if preserve_ffb
         else {"k_ffb": b"", "freq_code": 0x03, "populated_slots": []}
     )
+    if preserve_ffb:
+        _persist_ffb_backup(ffb_backup, reporter=reporter)
     k_ffb_hex = ffb_backup["k_ffb"].hex() if len(ffb_backup.get("k_ffb") or b"") == 16 else ""
 
     if (
@@ -1147,8 +1367,15 @@ def _read_bcm_gfa_in_session(
         )
         ffb_backup["k_ffb"] = kffb_pass["plaintext_bytes"]
         k_ffb_hex = kffb_pass["plaintext_hex"]
+        _persist_ffb_backup(ffb_backup, reporter=reporter)
         gfa_working = kffb_pass["gfa_working"]
-        _hard_reset_and_wait_bcm(link, profile=profile)
+        if not _hard_reset_and_wait_bcm(link, profile=profile):
+            reporter.warning(
+                tr(
+                    "Предупреждение: блок 09 BCM не подтвердил HardReset (11 01) после чтения K_ffb.",
+                    "Warning: 09 BCM did not confirm HardReset (11 01) after K_ffb read.",
+                )
+            )
         try:
             _restore_bcm_ffb_after_read(link, gfa_working, ffb_backup, reporter=reporter)
         except Exception as exc:
@@ -1315,6 +1542,7 @@ def can_bcm_read_gfa(
         )
         passport = _read_bcm_passport_in_session(link)
         profile = bcm_detect_profile(passport, sw_profile=sw_profile)
+        _require_verified_bcm_profile(passport, profile, sw_profile=sw_profile)
         reporter.step(
             2,
             2,
@@ -1374,6 +1602,7 @@ def can_bcm_read_keys(
         )
         passport = _read_bcm_passport_in_session(link)
         profile = bcm_detect_profile(passport, sw_profile=sw_profile)
+        _require_verified_bcm_profile(passport, profile, sw_profile=sw_profile)
 
         reporter.step(
             2,
@@ -1383,7 +1612,7 @@ def can_bcm_read_keys(
                 "Reading IKA + GFA (WFS Ch 3 + XCP) and restoring SRAM",
             ),
         )
-        key_info = _read_bcm_keys_in_session(link, profile, reporter=reporter)
+        key_info = _read_bcm_keys_in_session(link, profile, output_dir=output_dir, reporter=reporter)
         status = _read_bcm_status_in_session(link, include_nvm_slots=True, profile=profile)
 
         result: dict[str, Any] = {
@@ -1432,9 +1661,9 @@ def can_bcm_write_keys(
       `restore_gfa`) (`0x00BD`) is written SECOND (encrypted under the updated `active_ika`).
     """
     cur_ika_bytes = _norm_key_16b(current_ika, "current_ika")
-    new_ika_bytes = _norm_key_16b(new_ika, "new_ika") if new_ika is not None and str(new_ika).strip() else None
-    eff_gfa_input = new_gfa if (new_gfa is not None and str(new_gfa).strip()) else restore_gfa
-    new_gfa_bytes = _norm_key_16b(eff_gfa_input, "new_gfa") if eff_gfa_input is not None and str(eff_gfa_input).strip() else None
+    new_ika_bytes = _norm_key_16b(new_ika, "new_ika") if _has_key_input(new_ika) else None
+    eff_gfa_input = new_gfa if _has_key_input(new_gfa) else restore_gfa
+    new_gfa_bytes = _norm_key_16b(eff_gfa_input, "new_gfa") if _has_key_input(eff_gfa_input) else None
 
     if new_ika_bytes is None and new_gfa_bytes is None:
         raise ValueError("At least one of new_ika or new_gfa must be specified for can_bcm_write_keys()")
@@ -1503,12 +1732,26 @@ def can_bcm_write_keys(
                     "Requesting 22 02F9 challenge and writing vehicle group key GFA (2E 00BD)",
                 ),
             )
-            ch_resp = link.request_uds(b"\x22\x02\xf9", 0x62, timeout=3.0)
-            challenge_gfa_hex = ch_resp[3:].hex()
-            container_gfa = bcm_build_cp_key_container(active_ika, new_gfa_bytes, BCM_CP_KEY_TYPE_GFA)
-            resp_bd = link.request_uds(b"\x2e\x00\xbd" + container_gfa, 0x6E, timeout=6.0)
-            if resp_bd[:3] != b"\x6e\x00\xbd":
-                raise RuntimeError(f"Unexpected 2E 00BD response: {resp_bd.hex()}")
+            try:
+                ch_resp = link.request_uds(b"\x22\x02\xf9", 0x62, timeout=3.0)
+                challenge_gfa_hex = ch_resp[3:].hex()
+                container_gfa = bcm_build_cp_key_container(active_ika, new_gfa_bytes, BCM_CP_KEY_TYPE_GFA)
+                resp_bd = link.request_uds(b"\x2e\x00\xbd" + container_gfa, 0x6E, timeout=6.0)
+                if resp_bd[:3] != b"\x6e\x00\xbd":
+                    raise RuntimeError(f"Unexpected 2E 00BD response: {resp_bd.hex()}")
+            except Exception as exc:
+                if ika_written:
+                    raise RuntimeError(
+                        tr(
+                            f"ВНИМАНИЕ: новый IKA ({active_ika.hex().upper()}) УЖЕ записан в 09 BCM (2E 00BE), "
+                            f"но запись GFA (2E 00BD) завершилась ошибкой: {exc}. "
+                            f"Сохраните этот новый IKA и используйте его как текущий при повторной записи GFA!",
+                            f"WARNING: new IKA ({active_ika.hex().upper()}) was ALREADY written to 09 BCM (2E 00BE), "
+                            f"but GFA write (2E 00BD) failed: {exc}. "
+                            f"Keep this new IKA and use it as Current IKA when retrying the GFA write!",
+                        )
+                    ) from exc
+                raise
             gfa_written = True
             reporter.info(
                 tr(
@@ -1585,8 +1828,8 @@ def can_bcm_adapt_ffb(
         status_before = _read_bcm_status_in_session(link, include_nvm_slots=False)
         eff_freq = int(status_before.get("freq_code", 0x03) if freq_code is None else freq_code) & 0xFF
 
-        if gfa is not None and str(gfa).strip():
-            gfa_bytes = _norm_key_16b(gfa, "gfa")
+        if _has_key_input(gfa):
+            gfa_bytes = _norm_key_16b(gfa, "gfa")  # type: ignore[arg-type]
             gfa_source = "provided"
         else:
             reporter.info(
@@ -1599,10 +1842,10 @@ def can_bcm_adapt_ffb(
             gfa_bytes = bytes.fromhex(gfa_info["gfa_working_hex"])
             gfa_source = "bcm_xcp"
 
-        if k_ffb is not None and str(k_ffb).strip():
-            k_ffb_bytes = _norm_key_16b(k_ffb, "k_ffb")
-        elif kc is not None and str(kc).strip():
-            kc_bytes = _norm_key_16b(kc, "kc")
+        if _has_key_input(k_ffb):
+            k_ffb_bytes = _norm_key_16b(k_ffb, "k_ffb")  # type: ignore[arg-type]
+        elif _has_key_input(kc):
+            kc_bytes = _norm_key_16b(kc, "kc")  # type: ignore[arg-type]
             k_ffb_bytes = bcm_derive_k_ffb(kc_bytes)
         else:
             raise ValueError("Either kc (Immobilizer master key K_c) or k_ffb must be provided for FFB adaptation")
@@ -1612,9 +1855,16 @@ def can_bcm_adapt_ffb(
         if clear_all:
             norm_entries = []
         elif entries is not None:
-            for idx, (slot_num, c_val) in enumerate(entries, start=1):
-                c_bytes = _norm_key_16b(c_val, f"FFB entry #{idx}")
-                norm_entries.append((int(slot_num), c_bytes))
+            # BCM 80 02 handler (`0x000C795E` on EA/0511) requires sequential 1..N slot indices in the header nibble.
+            # Preserve slot order, skip empty entries, and renumber sequentially 1..N so gaps never trigger NRC 0x31.
+            non_empty = [
+                (int(slot_num), c_val)
+                for slot_num, c_val in entries
+                if _has_key_input(c_val)
+            ]
+            for seq_idx, (_slot_num, c_val) in enumerate(non_empty, start=1):
+                c_bytes = _norm_key_16b(c_val, f"FFB entry #{seq_idx}")
+                norm_entries.append((seq_idx, c_bytes))
         elif keys is not None:
             # If the live BCM just reported its DID 0x0A65 frequency in Step 1, prefer the BCM's actual DID 0x0A65
             # frequency code because BCM firmware (`0x000C7998` on EA/0511) rejects any 80 02 record whose P[8]
@@ -1886,6 +2136,17 @@ def can_bcm_adapt_ffb_from_cluster(
             tr(
                 "В дампе панели приборов 17 FPK_E отсутствует мастер-ключ иммобилайзера K_c (EEL 0x68).",
                 "Immobilizer master key K_c (EEL 0x68) is missing in the 17 FPK_E cluster DataFlash.",
+            )
+        )
+
+    # Verify bridge availability BEFORE any flash write (2E 00BD GFA sync) so a non-bridgeable setup never mutates flash first
+    if via_gateway and not gateway_bridge:
+        raise RuntimeError(
+            tr(
+                "Адаптация радиоключей FFB (WFS канал 3) через шлюз требует шлюз Continental 3Q0 907 530 и адаптер "
+                "с произвольным raw CAN для RAM-моста ch3 ↔ ch0. Операция остановлена до изменения GFA.",
+                "FFB remote key adaptation (WFS Channel 3) through a gateway requires a Continental 3Q0 907 530 "
+                "gateway and an arbitrary raw-CAN adapter for the ch3 ↔ ch0 RAM bridge. Aborted before modifying GFA.",
             )
         )
 

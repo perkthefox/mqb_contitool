@@ -781,6 +781,7 @@ class FpkeCanLink:
         self._t0 = time.monotonic()
         self._tx_lock = threading.Lock()
         self._history_lock = threading.Lock()
+        self._log_lock = threading.Lock()
         self._history: list[tuple[float, str, int, bool, bytes]] = []
         self._rx_trace_suspended = 0
         self._log_file = None
@@ -832,13 +833,14 @@ class FpkeCanLink:
         self._timer_held = _acquire_win_timer()
 
     def attach_log(self, log_path: Path | None) -> None:
-        if self._log_file is not None:
-            with contextlib.suppress(Exception):
-                self._log_file.close()
-            self._log_file = None
-        if log_path is not None:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._log_file = log_path.open("a", encoding="utf-8", buffering=1)
+        with self._log_lock:
+            if self._log_file is not None:
+                with contextlib.suppress(Exception):
+                    self._log_file.close()
+                self._log_file = None
+            if log_path is not None:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                self._log_file = log_path.open("a", encoding="utf-8", buffering=1)
 
     def close(self) -> None:
         self.is_closed = True
@@ -859,10 +861,11 @@ class FpkeCanLink:
 
             dpdu.release_session(self._borrowed)
             self._borrowed = None
-        if self._log_file is not None:
-            with contextlib.suppress(Exception):
-                self._log_file.close()
-            self._log_file = None
+        with self._log_lock:
+            if self._log_file is not None:
+                with contextlib.suppress(Exception):
+                    self._log_file.close()
+                self._log_file = None
 
     def __enter__(self) -> FpkeCanLink:
         return self
@@ -875,20 +878,21 @@ class FpkeCanLink:
         if not (direction == "rx" and self._rx_trace_suspended):
             with self._history_lock:
                 self._history.append((rel_t, direction, arb_id, extended, data))
-            if self._log_file is not None:
-                self._log_file.write(
-                    json.dumps(
-                        {
-                            "time": time.time(),
-                            "direction": direction,
-                            "id": f"0x{arb_id:08X}" if extended else f"0x{arb_id:03X}",
-                            "extended": extended,
-                            "dlc": len(data),
-                            "data": data.hex(),
-                        }
+            with self._log_lock:
+                if self._log_file is not None:
+                    self._log_file.write(
+                        json.dumps(
+                            {
+                                "time": time.time(),
+                                "direction": direction,
+                                "id": f"0x{arb_id:08X}" if extended else f"0x{arb_id:03X}",
+                                "extended": extended,
+                                "dlc": len(data),
+                                "data": data.hex(),
+                            }
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
 
     @contextlib.contextmanager
     def suspend_rx_trace(self) -> Iterator[None]:
@@ -899,21 +903,22 @@ class FpkeCanLink:
             self._rx_trace_suspended -= 1
 
     def write_stream_summary(self, address: int, expected: int, received: int, frames: int) -> None:
-        if self._log_file is not None:
-            self._log_file.write(
-                json.dumps(
-                    {
-                        "time": time.time(),
-                        "direction": "rx_stream",
-                        "id": f"0x{self.STREAM_RX_ID:03X}",
-                        "address": f"0x{address:08X}",
-                        "expected_bytes": expected,
-                        "received_bytes": received,
-                        "frames": frames,
-                    }
+        with self._log_lock:
+            if self._log_file is not None:
+                self._log_file.write(
+                    json.dumps(
+                        {
+                            "time": time.time(),
+                            "direction": "rx_stream",
+                            "id": f"0x{self.STREAM_RX_ID:03X}",
+                            "address": f"0x{address:08X}",
+                            "expected_bytes": expected,
+                            "received_bytes": received,
+                            "frames": frames,
+                        }
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
 
     def save_can_log(self, path: Path) -> None:
         """Save TX/RX frame history in the `audi-83a-keyless-can-access.md` `.can.log` text format."""
@@ -966,6 +971,13 @@ class FpkeCanLink:
 
     def set_kl15(self, enabled: bool) -> None:
         """Enable or disable periodic KL15 ignition broadcast (`0x3C0` + `0x663` + `0x585` + `0x3BE`)."""
+        if self.via_gateway:
+            raise RuntimeError(
+                tr(
+                    "Стендовая эмуляция зажигания KL15 (Komfort CAN) запрещена в режиме подключения через шлюз J533 (OBD).",
+                    "Bench Komfort CAN KL15 ignition spoofing is not allowed when connected via J533 gateway (OBD).",
+                )
+            )
         if enabled:
             self.start_keepalive()
             with contextlib.suppress(Exception):
@@ -1009,6 +1021,13 @@ class FpkeCanLink:
 
     def start_drive_simulation(self, *, auto_sweep: bool | None = None) -> None:
         """Start background gauge signal generator (`0x31B`, `0x107`, `0x640`, `0x647`, `0x040`) with E2E CRC8H2F."""
+        if self.via_gateway:
+            raise RuntimeError(
+                tr(
+                    "Стендовая симуляция движения и стрелок (Komfort CAN) запрещена в режиме подключения через шлюз J533 (OBD).",
+                    "Bench Komfort CAN drive/gauge simulation is not allowed when connected via J533 gateway (OBD).",
+                )
+            )
         if auto_sweep is not None:
             self.sim_auto_sweep = bool(auto_sweep)
         if self.is_drive_simulation_running():
@@ -1394,8 +1413,13 @@ def open_or_reuse_fpke_link(
     if cur is not None and not cur.is_closed:
         cur.close()
     new_link = FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway)
+    superseded: FpkeCanLink | None = None
     with _ACTIVE_LINK_LOCK:
+        superseded = _ACTIVE_LINK
         _ACTIVE_LINK = new_link
+    if superseded is not None and superseded is not new_link and not superseded.is_closed:
+        with contextlib.suppress(Exception):
+            superseded.close()
     return new_link
 
 
@@ -1417,12 +1441,7 @@ def _managed_fpke_link(
         and (bus is None or getattr(active, "bus", None) is bus)
     )
     if keep_open or reused:
-        link = open_or_reuse_fpke_link(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway)
-        try:
-            yield link
-        finally:
-            if not keep_open and not reused:
-                close_active_fpke_link()
+        yield open_or_reuse_fpke_link(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway)
     else:
         with FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway) as link:
             yield link
@@ -1530,13 +1549,20 @@ def _managed_fpke_session(
 
     from contitool.can.bridge import j533_can_bridge
 
+    fpke_rx_filter = (
+        (FPKE_UDS_RX_ID, False),
+        (FPKE_STREAM_RX_ID, False),
+        (FPKE_ARM_RESPONSE_ID, True),
+        (FPKE_CF_CH9_ID, True),
+    )
     with j533_can_bridge(
         port,
         interface=interface,
         target_channel=gateway_channel,
-        log_path=log_path,
+        log_path=None,
         bus=bus,
         burst_frames=fpke_level8_frames(burst_profile) if burst_profile else None,
+        target_rx_filter=fpke_rx_filter,
         reporter=reporter,
     ) as bridge:
         with FpkeCanLink(
@@ -3546,7 +3572,12 @@ def fpke_finish_coil_key_learning(
     eff_restore_flags = restore_key_flags if restore_key_flags is not None else (saved_pair[1] if saved_pair else None)
     kessy_restored = False
     if eff_restore_flags is not None and (eff_restore_flags & 0x80):
-        if link.level8_active or fpke_check_level8(link) is not None:
+        has_l8 = link.level8_active or fpke_check_level8(link) is not None
+        if not has_l8 and not link.via_gateway:
+            with contextlib.suppress(Exception):
+                fpke_ensure_level8(link, wake_seconds=1.5, reporter=reporter)
+                has_l8 = bool(link.level8_active or fpke_check_level8(link) is not None)
+        if has_l8:
             with contextlib.suppress(Exception):
                 link.request_uds(b"\x10\x60", 0x50, timeout=2.0)
                 flag_addr = (
@@ -4147,14 +4178,15 @@ def can_fpke_write_dflash(
                     active_nums = {b["vb"] for b in blocks_live if b["state"] == "active"}
                     ring_start = 0
                     if 0 in active_nums and (n_vb - 1) in active_nums and len(active_nums) < n_vb:
-                        for c_vb in sorted(active_nums):
-                            if ((c_vb - 1) % n_vb) not in active_nums:
-                                ring_start = c_vb
-                                break
+                        ring_start = n_vb - 1
+                        while ((ring_start - 1) % n_vb) in active_nums:
+                            ring_start = (ring_start - 1) % n_vb
                     active_sorted = sorted(
                         (b for b in blocks_live if b["state"] == "active"),
                         key=lambda blk: (blk["ec"] or 0, (blk["vb"] - ring_start) % n_vb),
                     )
+                    if not active_sorted:
+                        raise RuntimeError("No active EEL virtual blocks found in live DataFlash pool")
                     head_vb = active_sorted[-1]["vb"]
                     scan_vbs = [head_vb, (head_vb + 1) % n_vb, (head_vb + 2) % n_vb]
                     for v_idx in scan_vbs:
@@ -4194,12 +4226,50 @@ def can_fpke_write_dflash(
                     synth_before_mask = eel_faci_word_mask(lay, live_clean_df)
                     appended_df = eel_append_records(live_clean_df, eel_updates, cflash_bytes)
                     eel_target_clean, eel_target_mask = normalize_fpke_dflash_for_faci(appended_df, cflash_bytes)
-                    # Preserve exact hardware BCST on untouched words inside scanned VBs so only newly appended EEL words are programmed
+                    blocks_after, _ = eel_parse_pool(lay, eel_target_clean, eel_target_mask)
+                    newly_activated_vbs = {
+                        v_idx
+                        for v_idx in range(n_vb)
+                        if blocks_live[v_idx]["state"] != "active" and blocks_after[v_idx]["state"] == "active"
+                    }
+                    # Check if rollover touched any VB outside `scan_vbs` and blank-check it as well
+                    for v_idx in range(n_vb):
+                        vb_off = lay["base"] + v_idx * vb_sz
+                        if vb_off in scanned_eel_offsets:
+                            continue
+                        if (
+                            v_idx in newly_activated_vbs
+                            or eel_target_clean[vb_off : vb_off + vb_sz] != live_clean_df[vb_off : vb_off + vb_sz]
+                            or eel_target_mask[vb_off : vb_off + vb_sz] != synth_before_mask[vb_off : vb_off + vb_sz]
+                        ):
+                            bc_slice, bc_mask = fpke_read_dflash_blank_checked(
+                                link,
+                                offset=vb_off,
+                                length=vb_sz,
+                                cpu_dflash=dflash_before,
+                                reporter=reporter,
+                            )
+                            live_clean_mut[vb_off : vb_off + vb_sz] = bc_slice
+                            live_mask_mut[vb_off : vb_off + vb_sz] = bc_mask
+                            target_clean_mut[vb_off : vb_off + vb_sz] = bc_slice
+                            target_mask_mut[vb_off : vb_off + vb_sz] = bc_mask
+                            for bo in range(vb_off, vb_off + vb_sz, 64):
+                                scanned_eel_offsets.add(bo)
+                    live_clean_df = bytes(live_clean_mut)
+                    live_mask = live_mask_mut
+                    # Apply all newly added, newly erased (invalid VB rollover), or modified EEL words while
+                    # preserving exact hardware BCST on untouched words inside already-active VBs.
                     for bo in scanned_eel_offsets:
+                        v_idx = (bo - lay["base"]) // vb_sz
+                        in_new_vb = v_idx in newly_activated_vbs
                         for w in range(16):
                             pos = bo + w * 4
-                            newly_added = (not any(synth_before_mask[pos : pos + 4])) and any(eel_target_mask[pos : pos + 4])
-                            if newly_added:
+                            before_prog = any(synth_before_mask[pos : pos + 4])
+                            after_prog = any(eel_target_mask[pos : pos + 4])
+                            word_changed = in_new_vb or (before_prog != after_prog) or (
+                                after_prog and eel_target_clean[pos : pos + 4] != live_clean_df[pos : pos + 4]
+                            )
+                            if word_changed:
                                 target_mask_mut[pos : pos + 4] = eel_target_mask[pos : pos + 4]
                                 target_clean_mut[pos : pos + 4] = eel_target_clean[pos : pos + 4]
 

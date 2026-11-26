@@ -27,40 +27,30 @@ class DisclaimerDialog(Dialog):
         self.body.addWidget(risk)
 
         self.body.addWidget(self._text(tr(
-            "<b>Этой программой пользоваться НЕ НУЖНО, если:</b><br>"
-            "• вы не понимаете, зачем она вам «нужна»;<br>"
-            "• вы не умеете работать с ODIS или VCTool;<br>"
-            "• есть ХОТЬ КАКИЕ-ТО, даже малейшие подозрения на неисправность адаптера, проводки или питания;<br>"
-            "• у вас дешёвый китайский адаптер — даже если программа с ним «дружит», безопасным он не считается.",
+            "<b>Не используйте программу, если:</b><br>"
+            "• не понимаете, для чего она нужна, или не работали с ODIS / VCTool;<br>"
+            "• есть сомнения в исправности адаптера, проводки или питания;<br>"
+            "• используется дешёвый китайский адаптер — он не считается безопасным.",
             "<b>Do NOT use this program if:</b><br>"
-            "• you do not know why you “need” it;<br>"
-            "• you cannot work with ODIS or VCTool;<br>"
-            "• you have ANY, even the slightest doubt that the adapter, the wiring or the power supply is sound;<br>"
-            "• you have a cheap Chinese adapter — even if the program “gets along” with it, it is not considered safe.",
+            "• you are unsure why you need it or lack experience with ODIS / VCTool;<br>"
+            "• you have any doubt about the adapter, wiring, or power supply;<br>"
+            "• you are using a cheap clone adapter — it is not considered safe.",
         )))
 
         self.body.addWidget(self._text(tr(
-            "<b>Почему не в рабочей машине.</b> Работайте со снятым шлюзом на столе и со стабилизированным блоком питания. "
-            "В машине шлюз связывает все блоки между собой: пока он в загрузчике или если запись сорвётся, блоки "
-            "перестают видеть друг друга — машина может не завестись и не поехать, и вы останетесь с ней там, где "
-            "стоите. Кроме того, за время записи напряжение бортсети проседает, а любая просадка или обрыв во время "
-            "записи — прямой путь к кирпичу.",
-            "<b>Why not in a working car.</b> Work with the gateway removed, on a bench, with a regulated power supply. "
-            "In a car the gateway connects all the modules: while it sits in its bootloader, or if a write fails, the "
-            "modules stop seeing each other — the car may not start or drive, and you are stuck wherever it stands. "
-            "Besides, the car's voltage sags during a long write, and any dip or dropout during a write is a straight "
-            "road to a brick.",
+            "<b>Только на стенде.</b> Работайте со снятым блоком и стабилизированным питанием +12 В. "
+            "В автомобиле просадка напряжения или сбой записи могут обездвижить машину и вывести блок из строя.",
+            "<b>Bench use only.</b> Work with the ECU removed on a regulated +12 V supply. "
+            "In a vehicle, a voltage sag or write dropout can immobilize the car and brick the ECU.",
         )))
 
         self.body.addWidget(self._text(tr(
-            "<b>Ответственность.</b> Если вы подключаете программу к автомобилю, вы делаете это на свой страх и риск: "
-            "автор не несёт <b>никакой</b> ответственности за испорченный блок или автомобиль. Писать об этом автору "
-            f'в личные сообщения не нужно — <a href="{ISSUES_PAGE}">создайте Issue на GitHub</a> и ждите ответа.<br>'
-            "Программа бесплатная, не для продажи и предоставляется «как есть», без каких-либо гарантий.",
-            "<b>Liability.</b> If you connect the program to a car, you do it at your own risk: the author takes "
-            "<b>no</b> responsibility whatsoever for a damaged ECU or car. Do not message the author about it — "
-            f'<a href="{ISSUES_PAGE}">open an issue on GitHub</a> and wait for an answer.<br>'
-            "The program is free, not for sale, and provided “as is”, without warranty of any kind.",
+            "<b>Ответственность.</b> Вы используете программу на свой страх и риск; автор не несёт ответственности "
+            f'за повреждённый блок или автомобиль. Вопросы и баги — только через <a href="{ISSUES_PAGE}">GitHub Issues</a>.<br>'
+            "Бесплатный инструмент, не для продажи, предоставляется «как есть» без гарантий.",
+            "<b>Liability.</b> Use at your own risk; the author assumes no liability for a damaged ECU or car. "
+            f'Report issues via <a href="{ISSUES_PAGE}">GitHub Issues</a> only (no direct messages).<br>'
+            "Free community tool, not for sale, provided “as is” without warranty.",
         )))
 
         self.chk_agree = QCheckBox(tr(

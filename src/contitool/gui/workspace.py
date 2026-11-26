@@ -13,6 +13,7 @@ from contitool.core import (
     detect_dump_file,
     discover_hw_identity,
 )
+from contitool.i18n import tr
 
 KINDS = ("cflash", "dflash", "uflash")
 OPTIONAL_KINDS = ("eeprom", "opbt")
@@ -47,6 +48,26 @@ def kind_of(det: DetectedDumpFile) -> str | None:
     if not det.valid:
         return None
     return next((k for k, accepted in ACCEPTS.items() if det.kind in accepted), None)
+
+
+def other_ecu_dflash_label(raw: bytes) -> str | None:
+    """Return a short ECU label if `raw` is a DataFlash dump of FPK_E, 2B ELV, or 13 ACC MRR (never J533)."""
+    from contitool.core.elv import elv_is_dflash_bytes
+    from contitool.core.fpke import is_fpke_dflash
+    from contitool.core.mrr import MRR_DFLASH_SIZE, mrr_parse_dflash_fee
+
+    if is_fpke_dflash(raw):
+        return "17 FPK_E"
+    if elv_is_dflash_bytes(raw):
+        return "2B ELV"
+    if len(raw) == MRR_DFLASH_SIZE:
+        try:
+            fee = mrr_parse_dflash_fee(raw)
+            if fee.get("encryption_scheme", "unknown") != "unknown" or fee.get("shadow_secret_present"):
+                return "13 ACC MRR"
+        except (ValueError, KeyError):
+            pass
+    return None
 
 
 class Workspace(QObject):
@@ -130,6 +151,12 @@ class Workspace(QObject):
         rejected = []
         for p in paths:
             kind = kind_of(detect_dump_file(p))
+            if kind in ("dflash", "uflash"):
+                try:
+                    if other_ecu_dflash_label(p.read_bytes()) is not None:
+                        kind = None
+                except OSError:
+                    kind = None
             if kind is None:
                 rejected.append(p.name)
             else:
@@ -146,7 +173,14 @@ class Workspace(QObject):
         for kind in KINDS:
             p = files.get(kind)
             det = detect_dump_file(p) if p else None
-            if det is not None and kind_of(det) == kind:
+            valid_slot = det is not None and kind_of(det) == kind
+            if valid_slot and p is not None and kind in ("dflash", "uflash"):
+                try:
+                    if other_ecu_dflash_label(p.read_bytes()) is not None:
+                        valid_slot = False
+                except OSError:
+                    valid_slot = False
+            if valid_slot and p is not None and det is not None:
                 self.original[kind] = self.current[kind] = p
                 self._info[kind] = det
             else:
@@ -202,6 +236,16 @@ class Workspace(QObject):
         det = detect_dump_file(path)
         if kind_of(det) != kind:
             return det.summary_text
+        if kind in ("dflash", "uflash"):
+            try:
+                other = other_ecu_dflash_label(path.read_bytes())
+            except OSError as exc:
+                return str(exc)
+            if other is not None:
+                return tr(
+                    f"Этот файл — дамп DataFlash блока {other}, а не шлюза J533.",
+                    f"This file is a {other} DataFlash dump, not a J533 gateway dump.",
+                )
         self.original[kind] = self.current[kind] = path
         self.written.pop(kind, None)
         self.read_warnings.pop(kind, None)

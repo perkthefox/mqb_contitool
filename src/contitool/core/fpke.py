@@ -323,16 +323,26 @@ def fpke_verify_s0_s1(
     crc_a_le = struct.pack("<I", zlib.crc32(slot_a))
     crc_b_le = struct.pack("<I", zlib.crc32(slot_b))
 
-    def _norm_crc(val: bytes | str | None) -> bytes | None:
+    def _norm_crc(val: bytes | str | None, label: str) -> bytes | None:
         if val is None:
             return None
         if isinstance(val, str):
             cleaned = "".join(val.split()).replace("0x", "").replace("0X", "")
-            return bytes.fromhex(cleaned) if len(cleaned) == 8 else None
-        return bytes(val) if len(val) == 4 else None
+            if not cleaned:
+                return None
+            if len(cleaned) != 8:
+                raise ValueError(f"{label} must be 8 hex digits (4 bytes), got {val!r}")
+            try:
+                return bytes.fromhex(cleaned)
+            except ValueError as exc:
+                raise ValueError(f"{label} must be valid hex (4 bytes), got {val!r}") from exc
+        raw = bytes(val)
+        if len(raw) != 4:
+            raise ValueError(f"{label} must be 4 bytes, got {len(raw)} bytes")
+        return raw
 
-    exp_a = _norm_crc(expected_crc_a_le)
-    exp_b = _norm_crc(expected_crc_b_le)
+    exp_a = _norm_crc(expected_crc_a_le, "expected_crc_a_le")
+    exp_b = _norm_crc(expected_crc_b_le, "expected_crc_b_le")
     not_blank = (
         s0 not in (b"\xff" * 16, b"\x00" * 16, b"\xaa" * 16)
         and s1 not in (b"\xff" * 16, b"\x00" * 16, b"\xaa" * 16)
@@ -407,18 +417,58 @@ def build_fpke_02f7_payload(
     force_local_coil: bool = True,
 ) -> tuple[bytes, bytes]:
     """Build 87-byte `2E 02F7` UDS request (`2E 02 F7 || AES128_ECB_Kc(P[80]) || CRC32_BE(P)`) and 80-byte plaintext."""
+    _blank_16 = (b"\xff" * 16, b"\x00" * 16, b"\xaa" * 16)
     vin_clean = vin.strip().upper()
     if len(vin_clean) != 17 or not all(0x20 <= ord(c) < 0x7F for c in vin_clean):
-        raise ValueError(f"VIN must be 17 ASCII characters, got {vin!r}")
+        raise ValueError(
+            tr(
+                f"VIN должен содержать 17 ASCII-символов (получено: {vin!r}).",
+                f"VIN must be 17 ASCII characters, got {vin!r}.",
+            )
+        )
     if len(s0) != 16 or len(s1) != 16:
-        raise ValueError("S0 and S1 must each be 16 bytes")
-    if s0 in (b"\xff" * 16, b"\x00" * 16) or s1 in (b"\xff" * 16, b"\x00" * 16):
-        raise ValueError("Refusing to build 02F7 with blank/erased S0/S1")
+        raise ValueError(
+            tr(
+                "S0 и S1 должны иметь длину по 16 байт каждый.",
+                "S0 and S1 must each be 16 bytes.",
+            )
+        )
+    if s0 in _blank_16 or s1 in _blank_16:
+        raise ValueError(
+            tr(
+                "Запрещено формировать 2E 02F7 с пустыми или заглушечными слотами S0/S1 (00/FF/AA).",
+                "Refusing to build 02F7 with blank/erased/sentinel S0/S1 (00/FF/AA).",
+            )
+        )
     if len(current_kc) != 16:
-        raise ValueError("current_kc must be 16 bytes")
+        raise ValueError(
+            tr(
+                "current_kc должен иметь длину 16 байт.",
+                "current_kc must be 16 bytes.",
+            )
+        )
+    if current_kc in _blank_16:
+        raise ValueError(
+            tr(
+                "Запрещено формировать 2E 02F7 с пустым или заглушечным ключом current_kc (00/FF/AA).",
+                "Refusing to build 02F7 with blank/erased/sentinel current_kc (00/FF/AA).",
+            )
+        )
     eff_new_kc = current_kc if new_kc is None else new_kc
     if len(eff_new_kc) != 16:
-        raise ValueError("new_kc must be 16 bytes")
+        raise ValueError(
+            tr(
+                "new_kc должен иметь длину 16 байт.",
+                "new_kc must be 16 bytes.",
+            )
+        )
+    if eff_new_kc in _blank_16:
+        raise ValueError(
+            tr(
+                "Запрещено формировать 2E 02F7 с пустым или заглушечным ключом new_kc (00/FF/AA).",
+                "Refusing to build 02F7 with blank/erased/sentinel new_kc (00/FF/AA).",
+            )
+        )
 
     p = bytearray(80)
     p[0x00:0x11] = vin_clean.encode("ascii")
@@ -617,8 +667,8 @@ def fpke_eel_layout(cflash: bytes | None = None, dflash: bytes | None = None) ->
             ):
                 return _parse_eel_desc(cflash, known_off)
         for magic in (FDL_POOL_MAGIC_120MHZ, FDL_POOL_MAGIC):
-            at = cflash.find(magic)
-            while at >= 0x10:
+            at = cflash.find(magic, 0x10)
+            while at != -1:
                 vblk, _thr, idl, _ram, n_ids = struct.unpack_from("<HHIIH", cflash, at - 0x10)
                 if 0 < vblk < 64 and 0 < n_ids < 512 and (idl & 0xFFFFFF) + 4 * n_ids <= len(cflash):
                     return _parse_eel_desc(cflash, at - 0x10)
@@ -745,8 +795,12 @@ def eel_faci_word_mask(lay: dict[str, Any], df: bytes) -> bytearray:
 
     def _emit_entries(b: int, entries: list[tuple[int, int, int]]) -> None:
         for drp_addr, top, rec_len in entries:
-            for o in (0, 4, 8, 0xC):
-                put(drp_addr + o)
+            put(drp_addr)
+            if word(drp_addr + 4) == EEL_MARK:
+                put(drp_addr + 4)
+            if word(drp_addr + 8) == EEL_MARK:
+                put(drp_addr + 8)
+            put(drp_addr + 0xC)
             for i in range(0, rec_len, 4):
                 if b + 0x18 <= top - i <= b + vb_sz - 8:
                     put(top - i)
@@ -778,6 +832,9 @@ def eel_faci_word_mask(lay: dict[str, Any], df: bytes) -> bytearray:
 
     if has_fg_noise:
         # Reconstruct exact active RWP-linked chain so ghost 0x55555555 words in prepared/erased cells are ignored
+        def _is_invalid(idx: int) -> bool:
+            return bool(vb_meta[idx]["i0"] and vb_meta[idx]["i1"])
+
         succ: dict[int, int] = {}
         pred: dict[int, int] = {}
         for n in range(n_vb):
@@ -796,23 +853,24 @@ def eel_faci_word_mask(lay: dict[str, Any], df: bytes) -> bytearray:
 
         best_chain: list[int] = []
         for start in range(n_vb):
-            if start in pred or not (vb_meta[start]["p"] and vb_meta[start]["a0"] and vb_meta[start]["ec_ok"]):
+            if _is_invalid(start):
+                continue
+            if start in pred and not _is_invalid(pred[start]):
+                continue
+            if not (vb_meta[start]["p"] and vb_meta[start]["a0"] and vb_meta[start]["ec_ok"]):
                 continue
             chain = [start]
             cur_idx = start
-            while cur_idx in succ and succ[cur_idx] not in chain:
+            while cur_idx in succ and not _is_invalid(succ[cur_idx]) and succ[cur_idx] not in chain:
                 cur_idx = succ[cur_idx]
                 chain.append(cur_idx)
-            # Validate single-block candidate if no RWP chain exists
-            if len(chain) == 1:
-                if not vb_meta[start]["rwp_ok"] or (vb_meta[start]["i0"] and vb_meta[start]["i1"]):
+            # Validate single-block candidate if not RWP-linked from a predecessor
+            if len(chain) == 1 and start not in pred:
+                if not vb_meta[start]["rwp_ok"]:
                     continue
                 _sep, ents = _scan_drps(vb_meta[start]["b"], vb_meta[start]["b"] + vb_sz - 4, True)
                 if not ents:
                     continue
-            # Trim invalidated tail predecessor(s) at the start of the chain (e.g. VB 15 before active VB 16)
-            while len(chain) > 1 and vb_meta[chain[0]]["i0"] and vb_meta[chain[0]]["i1"]:
-                chain.pop(0)
             if len(chain) > len(best_chain) or (
                 len(chain) == len(best_chain)
                 and best_chain
@@ -820,13 +878,32 @@ def eel_faci_word_mask(lay: dict[str, Any], df: bytes) -> bytearray:
             ):
                 best_chain = chain
 
-        active_set = set(best_chain)
+        active_set = {n for n in best_chain if not _is_invalid(n)}
         if len(best_chain) <= 1:
             for n, m in enumerate(vb_meta):
-                if m["p"] and m["a0"] and m["ec_ok"] and m["rwp_ok"] and not (m["i0"] and m["i1"]):
+                if not _is_invalid(n) and m["p"] and m["a0"] and m["ec_ok"] and m["rwp_ok"]:
                     _sep, ents = _scan_drps(m["b"], m["b"] + vb_sz - 4, True)
                     if ents:
                         active_set.add(n)
+
+        cur_ec = 0
+        active_first = 0
+        wrapped = False
+        if active_set:
+            ring_start = 0
+            if 0 in active_set and (n_vb - 1) in active_set and len(active_set) < n_vb:
+                ring_start = n_vb - 1
+                while ((ring_start - 1) % n_vb) in active_set:
+                    ring_start = (ring_start - 1) % n_vb
+            active_ordered = sorted(
+                active_set,
+                key=lambda idx: (vb_meta[idx]["ec"] or 0, (idx - ring_start) % n_vb),
+            )
+            active_first = active_ordered[0]
+            active_head = active_ordered[-1]
+            wrapped = active_first > active_head
+            cur_ec = vb_meta[active_head]["ec"] or 0
+
         for n, m in enumerate(vb_meta):
             b = m["b"]
             if n in active_set:
@@ -842,22 +919,38 @@ def eel_faci_word_mask(lay: dict[str, Any], df: bytes) -> bytearray:
                 limit = vb_meta[succ[n]]["rwp"] if (n in succ and succ[n] in active_set) else (b + vb_sz - 4)
                 _sep, ents = _scan_drps(b, limit, True)
                 _emit_entries(b, ents)
-            elif m["i0"] and m["i1"] and (n in succ or (m["ec"] is not None and best_chain and m["ec"] < (vb_meta[best_chain[-1]]["ec"] or 0))):
-                put(b)
-                put(b + vb_sz - 4)
-                if m["p"]:
+            elif m["i0"] and m["i1"]:
+                is_true_invalid = n in succ or not active_set
+                if not is_true_invalid and m["ec"] is not None:
+                    if m["ec"] < cur_ec:
+                        is_true_invalid = True
+                    elif m["ec"] == cur_ec:
+                        if m["rwp_ok"] or (not wrapped and n < active_first):
+                            is_true_invalid = True
+                        elif m["a0"]:
+                            _sep_inv, ents_inv = _scan_drps(b, b + vb_sz - 4, True)
+                            if ents_inv:
+                                is_true_invalid = True
+                if is_true_invalid:
+                    put(b)
+                    put(b + vb_sz - 4)
+                    if m["p"]:
+                        put(b + 4)
+                    if m["a0"]:
+                        put(b + 8)
+                        limit = vb_meta[succ[n]]["rwp"] if n in succ else (b + vb_sz - 4)
+                        _sep, ents = _scan_drps(b, limit, True)
+                        _emit_entries(b, ents)
+                    if m["a1"]:
+                        put(b + 0xC)
+                    if m["ec_ok"]:
+                        put(b + 0x10)
+                    if m["rwp_ok"]:
+                        put(b + 0x14)
+                elif m["p"]:
                     put(b + 4)
-                if m["a0"]:
-                    put(b + 8)
-                    limit = vb_meta[succ[n]]["rwp"] if n in succ else (b + vb_sz - 4)
-                    _sep, ents = _scan_drps(b, limit, True)
-                    _emit_entries(b, ents)
-                if m["a1"]:
-                    put(b + 0xC)
-                if m["ec_ok"]:
-                    put(b + 0x10)
-                if m["rwp_ok"]:
-                    put(b + 0x14)
+                    if m["ec_ok"]:
+                        put(b + 0x10)
             elif m["p"]:
                 put(b + 4)
                 if m["ec_ok"]:
@@ -998,10 +1091,9 @@ def eel_parse_pool(
     active_nums = {b["vb"] for b in blocks if b["state"] == "active"}
     ring_start = 0
     if 0 in active_nums and (lay["n_vb"] - 1) in active_nums and len(active_nums) < lay["n_vb"]:
-        for cand in sorted(active_nums):
-            if ((cand - 1) % lay["n_vb"]) not in active_nums:
-                ring_start = cand
-                break
+        ring_start = lay["n_vb"] - 1
+        while ((ring_start - 1) % lay["n_vb"]) in active_nums:
+            ring_start = (ring_start - 1) % lay["n_vb"]
 
     def _active_order(blk: dict[str, Any]) -> tuple[int, int]:
         return (blk["ec"] or 0, (blk["vb"] - ring_start) % lay["n_vb"])
@@ -1108,10 +1200,12 @@ def parse_fpke_transponders(r67: bytes | None, r6a: bytes | None) -> dict[str, A
             "entries": [],
             "usable_key_data": False,
         }
-    allowed = r67[0x22]
-    learned_flags = r67[0x23]
+    allowed = 0 if r67[0x22] == 0xFF else r67[0x22]
+    learned_flags = 0 if r67[0x23] == 0xFF else r67[0x23]
     learned = learned_flags & 0x0F
-    queue_count = r67[0x24]
+    queue_count = 0 if r67[0x24] == 0xFF else r67[0x24]
+    queue_pending_mask = 0 if r67[0x25] == 0xFF else r67[0x25]
+    queue_flags = 0 if r67[0x26] == 0xFF else r67[0x26]
     key_ids = []
     display_ids: list[str | None] = []
     for slot in range(8):
@@ -1155,8 +1249,8 @@ def parse_fpke_transponders(r67: bytes | None, r6a: bytes | None) -> dict[str, A
         "learned_keys": learned,
         "session_xor_flags": learned_flags >> 4,
         "queue_count": queue_count,
-        "queue_pending_mask": r67[0x25],
-        "queue_flags": r67[0x26],
+        "queue_pending_mask": queue_pending_mask,
+        "queue_flags": queue_flags,
         "key_ids": key_ids,
         "display_ids": display_ids,
         "entries": entries,
@@ -1663,11 +1757,11 @@ def apply_fpke_dflash_fbl_rsa_key(
         if len(raw) != FPKE_DFLASH_FBL_RSAKEY_SIZE:
             raise ValueError(f"FBL RSA-1024 modulus must be 128 bytes, got {len(raw)} bytes")
         mod_be = raw[::-1] if input_little_endian else raw
-        if (mod_be[0] & 0x80) == 0 or (mod_be[-1] & 1) == 0:
+        if (mod_be[0] & 0x80) == 0 or (mod_be[-1] & 1) == 0 or mod_be == b"\xff" * FPKE_DFLASH_FBL_RSAKEY_SIZE or len(set(mod_be)) == 1:
             raise ValueError(
                 tr(
-                    "Некорректный модуль RSA-1024: старший бит должен быть равен 1 (1024 бита), а младший бит — нечётным.",
-                    "Invalid RSA-1024 modulus: MSB must have bit 7 set (1024-bit) and LSB must be odd.",
+                    "Некорректный модуль RSA-1024: старший бит должен быть равен 1 (1024 бита), младший бит — нечётным, и ключ не может быть пустым (0xFF).",
+                    "Invalid RSA-1024 modulus: MSB must have bit 7 set (1024-bit), LSB must be odd, and key cannot be blank (0xFF).",
                 )
             )
         mod_le = mod_be[::-1]
@@ -1892,15 +1986,30 @@ def apply_fpke_cflash_rsa_patch(
     cflash: bytes,
     *,
     restore_stock: bool = False,
+    allow_custom: bool = False,
 ) -> tuple[bytes, dict[str, Any]]:
     """Patch (or restore) `BOLO` `.LoaderRAMCOPY` RSA-1024 signature check in `Cflash.bin` and update `.MemCheckCrcTblApp[0]`.
 
     - Replaces the 4 raw LZSS literal bytes of `rsa_verify` (`bne +0x2A` -> `mov 0, r10` and `cmov z, 1, r28, r28` -> `mov 1, r28; nop`).
+    - Refuses to overwrite unknown/custom instructions (`state == "custom"`) unless `allow_custom=True`.
     - Verifies that Okumura LZSS decompression into `.LOADER_RAM_CODE` (`0xFEDD4D08`) changes only positions within those 4 bytes
       (guaranteeing zero perturbed LZSS back-references anywhere in `.LOADER_RAM_CODE`).
     - Updates `.MemCheckCrcTblApp[0]` at `0x0003138C` (`fpke_crc32_app(cflash[s1:s1+length])`) and verifies entry `[0]`.
     """
     before, _sec, dec_before, patch_ram_offsets = _analyze_fpke_cflash_bootloader_with_dec(cflash)
+    if before["state"] == "custom" and not allow_custom:
+        raise ValueError(
+            tr(
+                f"В загрузчике BOLO обнаружены нестандартные инструкции проверки RSA "
+                f"(bne={before['bne_hex']}, cmov={before['cmov_hex']}; состояние='custom'). "
+                f"Перезапись заблокирована для защиты модифицированного загрузчика "
+                f"(передайте allow_custom=True для принудительной перезаписи).",
+                f"Custom/unknown BOLO RSA verification instructions detected "
+                f"(bne={before['bne_hex']}, cmov={before['cmov_hex']}; state='custom'). "
+                f"Refusing to blindly overwrite modified bootloader instructions "
+                f"(pass allow_custom=True to force overwrite).",
+            )
+        )
     c_offs = before["patch_cflash_offsets_int"]
     target_bytes = (
         (_FPKE_BOLO_RSA_STOCK_BNE + _FPKE_BOLO_RSA_STOCK_CMOV)
@@ -1997,11 +2106,11 @@ def sign_fpke_odx_datablock(
             )
         )
     mod_be = n_bytes[::-1] if input_modulus_little_endian else bytes(n_bytes)
-    if (mod_be[0] & 0x80) == 0 or (mod_be[-1] & 1) == 0:
+    if (mod_be[0] & 0x80) == 0 or (mod_be[-1] & 1) == 0 or mod_be == b"\xff" * FPKE_DFLASH_FBL_RSAKEY_SIZE or len(set(mod_be)) == 1:
         raise ValueError(
             tr(
-                "Некорректный модуль RSA-1024: старший бит должен быть равен 1 (1024 бита), а младший бит — нечётным.",
-                "Invalid RSA-1024 modulus: MSB must have bit 7 set (1024-bit) and LSB must be odd.",
+                "Некорректный модуль RSA-1024: старший бит должен быть равен 1 (1024 бита), младший бит — нечётным, и ключ не может быть пустым (0xFF).",
+                "Invalid RSA-1024 modulus: MSB must have bit 7 set (1024-bit), LSB must be odd, and key cannot be blank (0xFF).",
             )
         )
     n_int = int.from_bytes(mod_be, "big")
@@ -2182,6 +2291,20 @@ def extract_fpke_immo_passport(
     }
 
 
+def _partner_mac_map(immo: dict[str, Any], *, secondary_only: bool = False) -> dict[str, str]:
+    primary = {"MSG_1", "GSG", "ELV"}
+    out: dict[str, str] = {}
+    for p in immo.get("partners") or []:
+        if isinstance(p, dict) and p.get("code"):
+            code = str(p["code"]).upper()
+            if secondary_only and code in primary:
+                continue
+            val = str(p.get("mac_id_hex") or "").upper()
+            if val:
+                out[code] = val
+    return out
+
+
 def compare_fpke_immo_passports(
     first: dict[str, Any] | bytes,
     second: dict[str, Any] | bytes,
@@ -2199,12 +2322,18 @@ def compare_fpke_immo_passports(
     c1, c2 = im1["counts"], im2["counts"]
     mf1, mf2 = im1["mode_and_flags"], im2["mode_and_flags"]
 
+    if im1.get("partners") is not None and im2.get("partners") is not None:
+        partner_macs_match = _partner_mac_map(im1) == _partner_mac_map(im2)
+    else:
+        partner_macs_match = _partner_mac_map(im1, secondary_only=True) == _partner_mac_map(im2, secondary_only=True)
+
     checks: dict[str, bool] = {
         "vin": im1["vin"] == im2["vin"] and im1["vin_state"] == im2["vin_state"],
         "cs": im1["cs"] == im2["cs"] and im1["cs_state"] == im2["cs_state"],
         "vdo_cs_plus": im1["vdo_cs_plus"] == im2["vdo_cs_plus"],
         "power_class": im1["power_class"] == im2["power_class"],
         "mac_fields": im1["mac_fields"] == im2["mac_fields"],
+        "partner_macs": partner_macs_match,
         "mac4": im1["mac4"] == im2["mac4"],
         "keys": im1["keys"] == im2["keys"],
         "allowed_keys": c1["allowed_keys"] == c2["allowed_keys"],
@@ -2253,12 +2382,25 @@ def plan_fpke_a_to_b_transfer(
 
     warnings: list[str] = []
     if not im_a["personalized"]:
-        warnings.append("Donor A is not personalized (CS is empty FF*16)")
+        warnings.append(
+            tr(
+                "Донор A не персонализирован (CS пустой: FF×16).",
+                "Donor A is not personalized (CS is empty FF*16).",
+            )
+        )
     if im_a["vin_state"] != "present":
-        warnings.append(f"Donor A VIN state is {im_a['vin_state']}")
+        warnings.append(
+            tr(
+                f"Состояние VIN Донора A: {im_a['vin_state']}.",
+                f"Donor A VIN state is {im_a['vin_state']}.",
+            )
+        )
     if im_a["s0_s1"]["state"] != "present":
         warnings.append(
-            "Donor A S0/S1 (0x69) is empty (normal in mode 1): do not invoke UDS 02F7 with stub/FF S0/S1"
+            tr(
+                "Слоты S0/S1 (0x69) Донора A пусты (норма для режима 1): не вызывайте UDS 02F7 с заглушкой/FF S0/S1.",
+                "Donor A S0/S1 (0x69) is empty (normal in mode 1): do not invoke UDS 02F7 with stub/FF S0/S1.",
+            )
         )
 
     return {
@@ -2331,13 +2473,28 @@ def _parse_exact_hex(val: str, byte_len: int, field_name: str, *, allow_empty: b
     if not cleaned or cleaned in ("—", "-"):
         if allow_empty:
             return b"\xff" * byte_len
-        raise ValueError(f"{field_name}: expected {byte_len * 2} hex digits")
+        raise ValueError(
+            tr(
+                f"{field_name}: требуется {byte_len * 2} HEX-символов ({byte_len} Б).",
+                f"{field_name}: expected {byte_len * 2} hex digits.",
+            )
+        )
     if len(cleaned) != byte_len * 2:
-        raise ValueError(f"{field_name}: expected {byte_len * 2} hex digits ({byte_len} bytes), got {len(cleaned)}")
+        raise ValueError(
+            tr(
+                f"{field_name}: требуется {byte_len * 2} HEX-символов ({byte_len} Б), получено {len(cleaned)}.",
+                f"{field_name}: expected {byte_len * 2} hex digits ({byte_len} bytes), got {len(cleaned)}.",
+            )
+        )
     try:
         return bytes.fromhex(cleaned)
     except ValueError as exc:
-        raise ValueError(f"{field_name}: invalid hex string '{val}'") from exc
+        raise ValueError(
+            tr(
+                f"{field_name}: некорректная HEX-строка «{val}».",
+                f"{field_name}: invalid hex string '{val}'.",
+            )
+        ) from exc
 
 
 def eel_append_records(
@@ -2353,7 +2510,12 @@ def eel_append_records(
     - Verifies that every written record reads back as `generation == 'current'` via `eel_read_record_any()`.
     """
     if len(dflash) != FPKE_DFLASH_SIZE:
-        raise ValueError(f"Expected 65,536-byte FPK_E DataFlash, got {len(dflash)} bytes")
+        raise ValueError(
+            tr(
+                f"Ожидается образ DataFlash FPK_E размером 65 536 байт (получено {len(dflash)} Б).",
+                f"Expected 65,536-byte FPK_E DataFlash, got {len(dflash)} bytes.",
+            )
+        )
     if not updates:
         return bytes(dflash)
 
@@ -2362,10 +2524,20 @@ def eel_append_records(
     pending: list[tuple[int, bytes]] = []
     for ident, raw_rec in updates.items():
         if ident not in lay["ids"]:
-            raise KeyError(f"EEL ID 0x{ident:02X} is not defined in layout")
+            raise KeyError(
+                tr(
+                    f"Идентификатор EEL 0x{ident:02X} отсутствует в таблице разметки.",
+                    f"EEL ID 0x{ident:02X} is not defined in layout.",
+                )
+            )
         size = lay["ids"][ident]
         if len(raw_rec) != size:
-            raise ValueError(f"EEL 0x{ident:02X} record must be {size} bytes, got {len(raw_rec)}")
+            raise ValueError(
+                tr(
+                    f"Запись EEL 0x{ident:02X} должна иметь размер {size} Б (получено {len(raw_rec)} Б).",
+                    f"EEL 0x{ident:02X} record must be {size} bytes, got {len(raw_rec)}.",
+                )
+            )
         norm_rec = struct.pack("<H", size) + bytes(raw_rec[2:])
         with contextlib.suppress(KeyError):
             cur_rec, cur_src = eel_read_record_any(lay, bytes(df), ident)
@@ -2384,17 +2556,21 @@ def eel_append_records(
         active_nums = {b["vb"] for b in blocks if b["state"] == "active"}
         ring_start = 0
         if 0 in active_nums and (lay["n_vb"] - 1) in active_nums and len(active_nums) < lay["n_vb"]:
-            for cand in sorted(active_nums):
-                if ((cand - 1) % lay["n_vb"]) not in active_nums:
-                    ring_start = cand
-                    break
+            ring_start = lay["n_vb"] - 1
+            while ((ring_start - 1) % lay["n_vb"]) in active_nums:
+                ring_start = (ring_start - 1) % lay["n_vb"]
 
         active_sorted = sorted(
             (b for b in blocks if b["state"] == "active"),
             key=lambda blk: (blk["ec"] or 0, (blk["vb"] - ring_start) % lay["n_vb"]),
         )
         if not active_sorted:
-            raise RuntimeError("No active EEL virtual blocks found in DataFlash pool")
+            raise RuntimeError(
+                tr(
+                    "В пуле EEL (DataFlash) не найдено ни одного активного виртуального блока.",
+                    "No active EEL virtual blocks found in DataFlash pool.",
+                )
+            )
         head = active_sorted[-1]
         b_addr = lay["base"] + head["vb"] * lay["vb"]
         ref_addr = b_addr + int(head.get("separator", 0x18))
@@ -2411,24 +2587,31 @@ def eel_append_records(
         if not fits:
             next_vb = (head["vb"] + 1) % lay["n_vb"]
             if blocks[next_vb]["state"] == "active":
-                raise RuntimeError(f"EEL pool full: next virtual block VB {next_vb} is already active")
+                raise RuntimeError(
+                    tr(
+                        f"Пул EEL (EEL pool) переполнен: следующий виртуальный блок VB {next_vb} уже активен.",
+                        f"EEL pool full: next virtual block VB {next_vb} is already active.",
+                    )
+                )
             remaining_free = sum(
                 1 for blk in blocks if blk["vb"] != next_vb and blk["state"] in ("prepared", "invalid")
             )
             if remaining_free < 1:
                 raise RuntimeError(
-                    "EEL pool exhausted: at least one prepared/invalidated virtual block must remain free for R_EEL_Startup"
+                    tr(
+                        "Пул EEL (EEL pool) исчерпан: для R_EEL_Startup должен оставаться хотя бы один свободный подготовленный/аннулированный блок.",
+                        "EEL pool exhausted: at least one prepared/invalidated virtual block must remain free for R_EEL_Startup.",
+                    )
                 )
             nb = lay["base"] + next_vb * lay["vb"]
             old_sep = ref_addr  # full DataFlash pool byte offset of previous head's separator (`0x14D10A`)
             df[old_sep : old_sep + 4] = b"\xff\xff\xff\xff"
-            expected_ec = (head["ec"] or 1) + (1 if next_vb == 0 else 0)
+            expected_ec = (1 if head["ec"] is None else head["ec"]) + (1 if next_vb == 0 else 0)
             if (
                 blocks[next_vb]["state"] == "prepared"
                 and (blocks[next_vb]["ec"] or 0) == expected_ec
                 and not any(faci_mask[nb + 0x18 : nb + lay["vb"] - 4])
             ):
-                df[nb] = 0xFF
                 df[nb : nb + 4] = b"\xff\xff\xff\xff"
                 df[nb + 0x18 : nb + lay["vb"]] = b"\xff" * (lay["vb"] - 0x18)
                 struct.pack_into("<I", df, nb + 0x08, EEL_MARK)
@@ -2463,7 +2646,12 @@ def eel_append_records(
     for ident, expected_rec in pending:
         read_back, src = eel_read_record_any(lay, out_bytes, ident)
         if src.get("generation") != "current" or read_back != expected_rec:
-            raise RuntimeError(f"Post-write verification failed for EEL 0x{ident:02X}")
+            raise RuntimeError(
+                tr(
+                    f"Контрольное чтение после записи EEL 0x{ident:02X} не пройдено.",
+                    f"Post-write verification failed for EEL 0x{ident:02X}.",
+                )
+            )
     return out_bytes
 
 
@@ -2496,8 +2684,16 @@ def apply_fpke_dflash_edits(
 ) -> bytes:
     """Selectively update semantic fields in a 64 KiB FPK_E DataFlash image via EEL T01 append.
 
-    Never overwrites unrelated bytes inside `EEL 0x68`, `0x66`, `0x67`, `0x6B`, `0x6D`, `0x60`, or `0x30`.
+    Never overwrites unrelated bytes inside `EEL 0x68`, `0x66`, `0x67`, `0x69`, `0x6B`, `0x6D`, `0x60`, or `0x30`.
+    Note: `odometer_km` must be an even integer in `0..999,998` because `EEL 0x60` stores mileage in 2-km units (`km // 2`).
     """
+    if len(dflash) != FPKE_DFLASH_SIZE:
+        raise ValueError(
+            tr(
+                f"Ожидается образ DataFlash FPK_E размером 65 536 байт (получено {len(dflash)} Б).",
+                f"Expected 65,536-byte FPK_E DataFlash, got {len(dflash)} bytes.",
+            )
+        )
     lay = fpke_eel_layout(cflash, dflash)
 
     def _base_record(ident: int) -> bytearray:
@@ -2539,11 +2735,27 @@ def apply_fpke_dflash_edits(
         if power_class is not None:
             if isinstance(power_class, str):
                 pc_s = power_class.strip().replace("0x", "").replace("0X", "")
-                pc_val = 0xFF if not pc_s or pc_s == "—" else int(pc_s, 16)
+                if not pc_s or pc_s in ("—", "-"):
+                    pc_val = 0xFF
+                else:
+                    try:
+                        pc_val = int(pc_s, 16)
+                    except ValueError as exc:
+                        raise ValueError(
+                            tr(
+                                f"PowerClass: некорректное HEX-значение «{power_class}».",
+                                f"PowerClass: invalid hex value '{power_class}'.",
+                            )
+                        ) from exc
             else:
                 pc_val = int(power_class)
             if not (0 <= pc_val <= 0xFF):
-                raise ValueError("PowerClass must be in range 0x00..0xFF")
+                raise ValueError(
+                    tr(
+                        "PowerClass должен быть в диапазоне 0x00..0xFF.",
+                        "PowerClass must be in range 0x00..0xFF.",
+                    )
+                )
             r68[0x40] = pc_val
         if partners_mask is not None:
             r68[0x41] = int(partners_mask) & 0xFF
@@ -2585,40 +2797,74 @@ def apply_fpke_dflash_edits(
         r67 = _base_record(0x67)
         if key_display_ids is not None:
             if len(key_display_ids) > 8:
-                raise ValueError("Up to 8 transponder key slots are supported")
+                raise ValueError(
+                    tr(
+                        "Поддерживается не более 8 слотов транспондеров (ключей).",
+                        "Up to 8 transponder key slots are supported.",
+                    )
+                )
+            parsed_slots: list[bytes] = []
             for slot in range(8):
                 disp = key_display_ids[slot] if slot < len(key_display_ids) else None
                 cleaned = (disp or "").strip().replace(" ", "").replace("0x", "").replace("0X", "").upper()
                 if not cleaned or cleaned in ("—", "-", "FFFFFFFF"):
-                    r67[2 + slot * 4 : 6 + slot * 4] = b"\xff\xff\xff\xff"
-                else:
-                    if len(cleaned) != 8:
-                        raise ValueError(
-                            tr(
-                                f"Ключ {slot + 1}: требуется 8 HEX-символов (4 байта).",
-                                f"Key {slot + 1}: expected 8 hex digits (4 bytes).",
-                            )
+                    continue
+                if len(cleaned) != 8:
+                    raise ValueError(
+                        tr(
+                            f"Ключ {slot + 1}: требуется 8 HEX-символов (4 байта).",
+                            f"Key {slot + 1}: expected 8 hex digits (4 bytes).",
                         )
-                    try:
-                        val_u32 = int(cleaned, 16)
-                    except ValueError as exc:
-                        raise ValueError(f"Key {slot + 1}: invalid hex '{disp}'") from exc
-                    r67[2 + slot * 4 : 6 + slot * 4] = val_u32.to_bytes(4, "little")
-        if allowed_keys is not None:
-            r67[0x22] = max(0, min(8, int(allowed_keys)))
+                    )
+                try:
+                    val_u32 = int(cleaned, 16)
+                except ValueError as exc:
+                    raise ValueError(
+                        tr(
+                            f"Ключ {slot + 1}: некорректное HEX-значение «{disp}».",
+                            f"Key {slot + 1}: invalid hex '{disp}'.",
+                        )
+                    ) from exc
+                parsed_slots.append(val_u32.to_bytes(4, "little"))
+            for slot in range(8):
+                r67[2 + slot * 4 : 6 + slot * 4] = (
+                    parsed_slots[slot] if slot < len(parsed_slots) else b"\xff\xff\xff\xff"
+                )
+            present_count = len(parsed_slots)
+        else:
+            present_count = 0
+            for slot in range(8):
+                if r67[2 + slot * 4 : 6 + slot * 4] != b"\xff\xff\xff\xff":
+                    present_count += 1
+                else:
+                    break
+
         cur_lf = 0x20 if r67[0x23] == 0xFF else r67[0x23]
-        cur_learned = cur_lf & 0x0F
+        cur_learned = present_count if key_display_ids is not None else (cur_lf & 0x0F)
         cur_xor = (cur_lf >> 4) & 0x0F
         if learned_keys is not None:
             cur_learned = max(0, min(8, int(learned_keys)))
+        # Keep learned_keys consistent with populated slots and blank out unused slots >= cur_learned with 0xFFFFFFFF
+        cur_learned = min(cur_learned, present_count)
+        for slot in range(cur_learned, 8):
+            r67[2 + slot * 4 : 6 + slot * 4] = b"\xff\xff\xff\xff"
+        if allowed_keys is not None:
+            r67[0x22] = max(0, min(8, int(allowed_keys)))
+        elif r67[0x22] == 0xFF or r67[0x22] < cur_learned:
+            r67[0x22] = cur_learned
         if session_xor_flags is not None:
             cur_xor = int(session_xor_flags) & 0x0F
         r67[0x23] = (cur_xor << 4) | cur_learned
+        # Byte +0x24 is EEL 0x6A pending key queue_count (NOT learned_keys); +0x25/+0x26 are queue mask/flags.
         if r67[0x24] == 0xFF:
-            r67[0x24] = cur_learned
+            r67[0x24] = 0
+        if r67[0x25] == 0xFF:
+            r67[0x25] = 0
+        if r67[0x26] == 0xFF:
+            r67[0x26] = 0
         updates[0x67] = bytes(r67)
 
-    # 3b. EEL 0x69 (Temporary slot secret S0 / S1)
+    # 3b. EEL 0x69 (Temporary slot secret S0 / S1) and synchronized EEL 0x68[0x44] bit 0 flag
     if slot_s0_hex is not None or slot_s1_hex is not None:
         r69 = _base_record(0x69)
         if slot_s0_hex is not None:
@@ -2626,6 +2872,13 @@ def apply_fpke_dflash_edits(
         if slot_s1_hex is not None:
             r69[0x12:0x22] = _parse_exact_hex(slot_s1_hex, 16, "Slot S1 (0x69)")
         updates[0x69] = bytes(r69)
+        s0_s1_present = r69[0x02:0x12] != b"\xff" * 16 or r69[0x12:0x22] != b"\xff" * 16
+        r68_sync = bytearray(updates[0x68]) if 0x68 in updates else _base_record(0x68)
+        cur_flags = 0x00 if r68_sync[0x44] == 0xFF else r68_sync[0x44]
+        new_flags = (cur_flags | 0x01) if s0_s1_present else (cur_flags & ~0x01)
+        if r68_sync[0x44] != new_flags or 0x68 in updates:
+            r68_sync[0x44] = new_flags
+            updates[0x68] = bytes(r68_sync)
 
     # 4. EEL 0x6B & 0x6D (Component Protection keys & adaptation status)
     if ika_key_hex is not None or gfa_key_hex is not None:
@@ -2647,7 +2900,19 @@ def apply_fpke_dflash_edits(
     if odometer_km is not None:
         km = int(odometer_km)
         if not (0 <= km <= 999_998):
-            raise ValueError("Odometer must be between 0 and 999,998 km")
+            raise ValueError(
+                tr(
+                    "Пробег должен быть в диапазоне от 0 до 999 998 км.",
+                    "Odometer must be between 0 and 999,998 km.",
+                )
+            )
+        if km % 2 != 0:
+            raise ValueError(
+                tr(
+                    f"Пробег в EEL 0x60 хранится с шагом 2 км — укажите чётное значение (получено {km} км).",
+                    f"EEL 0x60 stores odometer in 2 km units — enter an even value (got {km} km).",
+                )
+            )
         half = km // 2
         r60 = _base_record(0x60)
         if r60[2:4] == b"\xff\xff":
@@ -2697,51 +2962,75 @@ def transfer_fpke_donor_to_target(
     partner_macs: dict[str, str] = {}
     for p in im_a.get("partners") or []:
         if isinstance(p, dict) and p.get("code"):
-            partner_macs[str(p["code"])] = str(p.get("mac_id_hex") or "")
+            partner_macs[str(p["code"])] = str(p["mac_id_hex"]) if p.get("mac_id_hex") else "FFFF"
     if not partner_macs and isinstance(im_a.get("mac_fields"), dict):
         mf_dict = im_a["mac_fields"]
-        partner_macs = {
-            "MSG_1": str(mf_dict.get("ecu") or ""),
-            "GSG": str(mf_dict.get("tcu") or ""),
-            "ELV": str(mf_dict.get("elv") or ""),
-        }
+        if any(mf_dict.get(k) for k in ("ecu", "tcu", "elv")):
+            for p_code, mf_key in (("MSG_1", "ecu"), ("GSG", "tcu"), ("ELV", "elv")):
+                if mf_key in mf_dict:
+                    val = mf_dict.get(mf_key)
+                    partner_macs[p_code] = str(val) if val else "FFFF"
 
-    mac_dash = str((im_a.get("mac_fields") or {}).get("dash") or "")
+    raw_mac_dash = (im_a.get("mac_fields") or {}).get("dash")
+    mac_dash = str(raw_mac_dash) if raw_mac_dash else None
     donor_pc = im_a.get("power_class_int")
     if donor_pc is None and im_a.get("power_class"):
         donor_pc = str(im_a["power_class"])
 
+    donor_vin = im_a.get("vin") or None
+    donor_cs = im_a.get("cs") or None
+    donor_crc_a = im_a.get("crc32_a_le") or None
+    donor_crc_b = im_a.get("crc32_b_le") or None
+    donor_immo_mode = mf_a.get("immo_mode")
+    donor_kessy = mf_a.get("key_over_can")
+    donor_partners_mask = mf_a.get("partners_mask")
+    has_donor_immo = any(
+        v is not None
+        for v in (donor_vin, donor_cs, donor_crc_a, donor_crc_b, donor_pc, donor_immo_mode, donor_kessy, donor_partners_mask, mac_dash)
+    ) or bool(partner_macs)
+
+    raw_keys = im_a.get("keys")
+    donor_keys = list(raw_keys) if (isinstance(raw_keys, list) and any(k for k in raw_keys)) else None
+    donor_allowed = cnt_a.get("allowed_keys") if donor_keys is not None else None
+    donor_learned = cnt_a.get("learned_keys") if donor_keys is not None else None
+    donor_xor_flags = cnt_a.get("session_xor_flags") if donor_keys is not None else None
+    has_donor_keys = donor_keys is not None
+
+    donor_ika = cp_a.get("ika_cp3") or None
+    donor_gfa = cp_a.get("cp1_gfa") or None
+    has_donor_cp = bool(donor_ika or donor_gfa)
+
     updated_df = apply_fpke_dflash_edits(
         target_dflash,
-        vin=(im_a.get("vin") or "") if copy_immo else None,
-        cs_hex=(im_a.get("cs") or "") if copy_immo else None,
-        crc_a_hex=(im_a.get("crc32_a_le") or "") if copy_immo else None,
-        crc_b_hex=(im_a.get("crc32_b_le") or "") if copy_immo else None,
+        vin=donor_vin if copy_immo else None,
+        cs_hex=donor_cs if copy_immo else None,
+        crc_a_hex=donor_crc_a if copy_immo else None,
+        crc_b_hex=donor_crc_b if copy_immo else None,
         power_class=donor_pc if copy_immo else None,
-        immo_mode=(mf_a.get("immo_mode") if mf_a.get("immo_mode") is not None else 1) if copy_immo else None,
-        key_over_can=bool(mf_a.get("key_over_can")) if copy_immo else None,
-        partners_mask=(mf_a.get("partners_mask") if mf_a.get("partners_mask") is not None else 0) if copy_immo else None,
-        clear_lockouts=bool(copy_immo),
+        immo_mode=donor_immo_mode if copy_immo else None,
+        key_over_can=(bool(donor_kessy) if donor_kessy is not None else None) if copy_immo else None,
+        partners_mask=donor_partners_mask if copy_immo else None,
+        clear_lockouts=bool(copy_immo and has_donor_immo),
         mac_dash_hex=mac_dash if copy_immo else None,
-        partner_macs=partner_macs if copy_immo else None,
-        key_display_ids=list(im_a.get("keys") or []) if copy_keys else None,
-        allowed_keys=cnt_a.get("allowed_keys", 8) if copy_keys else None,
-        learned_keys=cnt_a.get("learned_keys", 0) if copy_keys else None,
-        session_xor_flags=cnt_a.get("session_xor_flags", 0) if copy_keys else None,
+        partner_macs=(partner_macs or None) if copy_immo else None,
+        key_display_ids=donor_keys if copy_keys else None,
+        allowed_keys=donor_allowed if copy_keys else None,
+        learned_keys=donor_learned if copy_keys else None,
+        session_xor_flags=donor_xor_flags if copy_keys else None,
         odometer_km=meta_a.get("odometer_km") if (copy_odometer and meta_a.get("odometer_km") is not None) else None,
-        ika_key_hex=(cp_a.get("ika_cp3") or "") if copy_cp else None,
-        gfa_key_hex=(cp_a.get("cp1_gfa") or "") if copy_cp else None,
-        reset_cp_counter=bool(copy_cp),
+        ika_key_hex=donor_ika if copy_cp else None,
+        gfa_key_hex=donor_gfa if copy_cp else None,
+        reset_cp_counter=bool(copy_cp and has_donor_cp),
         cflash=target_cflash,
     )
 
     after_passport = extract_fpke_immo_passport(updated_df, target_cflash)
     summary = {
         "copied_sections": {
-            "immo": copy_immo,
-            "keys": copy_keys,
+            "immo": bool(copy_immo and has_donor_immo),
+            "keys": bool(copy_keys and has_donor_keys),
             "odometer": copy_odometer and (meta_a.get("odometer_km") is not None),
-            "cp": copy_cp,
+            "cp": bool(copy_cp and has_donor_cp),
         },
         "donor_part_number": meta_a.get("part_number"),
         "target_part_number": (after_passport.get("cluster_metadata") or {}).get("part_number"),
@@ -2881,7 +3170,7 @@ def summarize_fpke_dflash_changes(
         )
         short_tags.append(tr("режим иммо", "immo mode"))
 
-    if im1.get("mac_fields") != im2.get("mac_fields"):
+    if im1.get("mac_fields") != im2.get("mac_fields") or _partner_mac_map(im1) != _partner_mac_map(im2):
         lines.append(f"MAC IDs (EEL 0x66): MAC4={im1.get('mac4') or '—'} → {im2.get('mac4') or '—'}")
         short_tags.append("MAC")
 

@@ -1984,3 +1984,307 @@ def test_closing_link_while_echoes_arrive_never_races_echo_trace(tmp_path) -> No
             link.send_frame(0x6F0, LOADER_SYNC)
     assert not bus.spent and bus._rx_error is None and bus.echo_trace is None
     bus.shutdown()
+
+
+def test_vci_programs_running_survives_non_utf8_and_none_stdout(monkeypatch) -> None:
+    """Issue #47: Turkish Windows `tasklist` writes OEM codepage bytes that killed subprocess's reader thread
+    and left `.stdout` as None, crashing Link check with `'NoneType' object has no attribute 'splitlines'`."""
+    seen_kwargs: list[dict] = []
+
+    def fake_run(*_args, **kwargs):
+        seen_kwargs.append(kwargs)
+        return type("R", (), {"stdout": None})()
+
+    monkeypatch.setattr(dpdu.sys, "platform", "win32")
+    monkeypatch.setattr(dpdu.subprocess, "run", fake_run)
+    assert dpdu.vci_programs_running() == []
+    dpdu.check_vci_free()
+    assert seen_kwargs and seen_kwargs[0].get("errors") == "replace"
+
+    # Also survives bytes containing non-UTF-8 OEM sequences and UnicodeDecodeError
+    raw_oem = b'"sistem\x8d.exe","4","Services","0","12 K"\r\n"VCTool.exe","778","Console","1","1 K"\r\n'
+    monkeypatch.setattr(dpdu.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": raw_oem})())
+    assert dpdu.vci_programs_running() == ["VCTool.exe"]
+
+    def bad_decode(*_a, **_k):
+        raise UnicodeDecodeError("cp1254", b"\x8d", 0, 1, "invalid")
+
+    monkeypatch.setattr(dpdu.subprocess, "run", bad_decode)
+    assert dpdu.vci_programs_running() == []
+
+
+def test_slow_rawmode_vci_raises_tx_window_and_drops_back_on_queue_full(monkeypatch) -> None:
+    """Issue #49: a VNCI whose RawMode TX primitives take ~150 ms exceeds the RAM-Loader's inter-frame timeout at
+    window=1; DPduBus pipelines up to SLOW_TX_IN_FLIGHT once waited TX RTT is slow, ignores idle caller pauses,
+    and drops immediately back to MAX_TX_IN_FLIGHT on ERR_TX_QUEUE_FULL."""
+    clock = [100.0]
+
+    class SlowRawApi(FakePduApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pending_due: list[tuple[int, float]] = []
+            self.delay = 0.0
+            self.queue_full_once = False
+
+        def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+            if hcll != self.monitor and cop == COPT_SENDRECV and self.queue_full_once:
+                self.queue_full_once = False
+                return dpdu.ERR_TX_QUEUE_FULL
+            rc = super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+            if rc == 0 and hcll != self.monitor and cop == COPT_SENDRECV and self.tx_open:
+                self.pending_due.append((self.tx_open.pop(), clock[0] + self.delay))
+                self.max_open = max(self.max_open, len(self.pending_due))
+            return rc
+
+        def _get_event(self, hmod, hcll, out) -> int:
+            if hcll != self.monitor:
+                ready = [item for item in self.pending_due if item[1] <= clock[0]]
+                if ready:
+                    cop, _ = ready[0]
+                    self.pending_due.remove(ready[0])
+                    st = C.c_uint32(0x8012)
+                    self.keep.append(st)
+                    self.events[hcll].append(EventItem(IT_STATUS, cop, None, 0, C.cast(C.pointer(st), C.c_void_p)))
+            return super()._get_event(hmod, hcll, out)
+
+    api = SlowRawApi()
+    bus = DPduBus(dll=api)
+    monkeypatch.setattr(dpdu.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(dpdu.time, "sleep", lambda dt: clock.__setitem__(0, clock[0] + max(dt, 0.02)))
+
+    # 1. Idle gap between fast frames must NOT falsely expand the TX window
+    api.delay = 0.002
+    bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False))
+    clock[0] += 0.25  # caller paused between requests; primitive already finished at +2 ms
+    bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False))
+    assert bus._tx_window == MAX_TX_IN_FLIGHT
+
+    # 2. Genuine 140 ms RawMode TX RTT during a back-to-back burst expands window to SLOW_TX_IN_FLIGHT
+    clock[0] += 0.1
+    api.delay = 0.14
+    api.max_open = 0
+    for _ in range(6):
+        bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False))
+    assert bus._tx_window == dpdu.SLOW_TX_IN_FLIGHT
+    assert api.max_open == dpdu.SLOW_TX_IN_FLIGHT
+
+    # 3. ERR_TX_QUEUE_FULL immediately clamps window back to MAX_TX_IN_FLIGHT
+    clock[0] += 0.2
+    api.queue_full_once = True
+    bus.send(can.Message(arbitration_id=0x6F0, data=bytes(8), is_extended_id=False))
+    assert bus._tx_window == MAX_TX_IN_FLIGHT
+    bus.shutdown()
+
+
+def test_transient_hw_isotp_0x105_on_transfer_data_retries_without_dropping_hw_uds(monkeypatch) -> None:
+    """Issue #44: a single PDU_ERR_EVT_PROT_ERR (0x105) on `36 2F` leaves the D-PDU ISO_15765 link ONLINE.
+    ContiTool must retry the idempotent `36` block on hardware ISO-TP instead of permanently dropping to RawMode."""
+    from contitool.can import J533CanLink, transport, workflows
+    from contitool.core.constants import APP_SIZE
+    from contitool.progress import OperationReporter
+
+    class GlitchOnceUdsApi(UdsCapablePduApi):
+        def __init__(self) -> None:
+            super().__init__(require_resource_lookup=True, finish_on_78=True)
+            self.glitched = False
+
+        def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+            if (
+                hcll in self.uds_links
+                and cop == COPT_SENDRECV
+                and size > 2
+                and data[0] == 0x36
+                and data[1] == 0x2F
+                and not self.glitched
+            ):
+                self.glitched = True
+                cid = self.next_cop
+                self.next_cop += 1
+                hcop._obj.value = cid
+                err = dpdu.ErrorData(0x105, 0x208)  # PDU_ERR_EVT_PROT_ERR, ExtraError=520
+                ev = EventItem(IT_ERROR, cid, None, 0, C.cast(C.pointer(err), C.c_void_p))
+                self.keep += [err, ev]
+                self.events[hcll].append(ev)
+                self._queue_uds_done(hcll, cid)
+                return 0
+            return super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+
+    set_lang("en")
+    monkeypatch.setattr(workflows.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(transport.time, "sleep", lambda _s: None)
+    warnings: list[str] = []
+
+    class Rep(OperationReporter):
+        def warning(self, message: str) -> None:
+            warnings.append(message)
+
+    api = GlitchOnceUdsApi()
+    bus = DPduBus(dll=api)
+    app_image = bytes(((i * 53) ^ (i >> 7)) & 0xFF for i in range(APP_SIZE))
+    with J533CanLink("", bus=bus) as link:
+        res = workflows._program_application_uds(link, app_image, reporter=Rep())
+    assert api.glitched is True
+    assert res["hardware_isotp"] is True
+    assert "hardware_isotp_fell_back_at" not in res
+    assert not any("software path" in w for w in warnings)
+    assert bytes(api.flashed_app) == app_image
+    bus.shutdown()
+
+
+def test_primed_vnci_switches_filter_for_slave_uds_pairs_during_bus_scan(monkeypatch) -> None:
+    """H4: PRIME_PAIRS includes slave diagnostic pairs (0x714/0x77E, 0x70E/0x778, 0x757/0x7C1) so a primed VNCI
+    re-primes CAN1's RX filter per slave instead of silently dropping slave UDS answers during can_scan_bus."""
+    from contitool.can.ecus import can_scan_bus
+    from test_gateway_bridge_and_bus_scan import FakeMultiEcuBus
+
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.5)
+    assert dpdu.PRIME_PAIRS[0x714] == (0x714, 0x77E)
+    assert dpdu.PRIME_PAIRS[0x70E] == (0x70E, 0x778)
+    assert dpdu.PRIME_PAIRS[0x757] == (0x757, 0x7C1)
+
+    class MultiSlavePrimedApi(UnstartedCan1PduApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gw = FakeMultiEcuBus(has_j533=True, has_fpke=True, has_bcm=True)
+            self.seen_filters: list[int] = []
+
+        def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+            rc = super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+            if hcll in self.uds_links and cop == COPT_STARTCOMM and self.rx_filter is not None:
+                self.seen_filters.append(self.rx_filter)
+            return rc
+
+    api = MultiSlavePrimedApi()
+    # FakeMultiEcuBus needs to answer 3E 00 for _raw_answers_after_prime
+    orig_send = api.gw.send
+
+    def send_with_3e(msg: can.Message, timeout: float | None = None) -> None:
+        if msg.arbitration_id == 0x710 and bytes(msg.data[:3]) == b"\x02\x3e\x00":
+            api.gw._enqueue_isotp(0x77A, b"\x7e\x00")
+            return
+        orig_send(msg, timeout=timeout)
+
+    api.gw.send = send_with_3e  # type: ignore[method-assign]
+    bus = DPduBus(dll=api)
+    try:
+        scan = can_scan_bus("VAS6154", interface="dpdu", targets=("j533", "fpke", "bcm"), bus=bus)
+        assert bus._raw_needs_prime is True
+        assert scan.gateway_bridge_capable is False
+        assert [e.kind for e in scan.ecus] == ["j533", "fpke", "bcm"]
+        assert 0x77A in api.seen_filters and 0x77E in api.seen_filters and 0x778 in api.seen_filters
+        assert not bus.spent
+    finally:
+        bus.shutdown()
+
+
+def test_uds_only_and_nonraw_dpdu_scan_slaves_via_uds_session_and_restore_primary_link(monkeypatch) -> None:
+    """H4: When a D-PDU adapter runs in uds_only or nonraw mode, can_scan_bus opens temporary ISO_15765 uds_session
+    links for slave ECUs and cleanly restores the primary 0x710/0x77A link afterwards."""
+    from contitool.can.ecus import can_scan_bus
+
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.3)
+
+    slave_idents = {
+        0x710: {0xF187: b"3Q0907530AR", 0xF189: b"5388", 0xF197: b"GW MQB High", 0xF19E: b"EV_GatewConti"},
+        0x70E: {0xF187: b"5Q0937084CG", 0xF189: b"0253", 0xF197: b"BCM MQBAB H", 0xF19E: b"EV_BCMMQB"},
+    }
+
+    class MultiSlaveUdsOnlyApi(UdsCapablePduApi):
+        def __init__(self, *, nonraw_ok: bool) -> None:
+            super().__init__()
+            self.nonraw_ok = nonraw_ok
+
+        def _result(self, raw: bytes, flags: bytes, link: int | None = None) -> None:
+            if link is None and not (len(flags) >= 4 and flags[3] & 0x01):
+                return  # RawMode monitor is deaf
+            super()._result(raw, flags, link=link)
+
+        def _start_cop(self, hmod, hcll, cop, size, data, ctrl, tag, hcop) -> int:
+            if hcll in self.uds_links and cop == COPT_SENDRECV and size:
+                tx_id = self.uds_urid.get(hcll, {}).get(0x1A, 0)
+                req = bytes(data[:size])
+                if tx_id not in slave_idents:
+                    # Unconnected slave (e.g. 0x714): time out on 3E 00
+                    cid = self.next_cop
+                    self.next_cop += 1
+                    hcop._obj.value = cid
+                    err = dpdu.ErrorData(dpdu.ERR_EVT_RX_TIMEOUT, 0)
+                    ev = EventItem(IT_ERROR, cid, None, 0, C.cast(C.pointer(err), C.c_void_p))
+                    self.keep += [err, ev]
+                    self.events[hcll].append(ev)
+                    self._queue_uds_done(hcll, cid)
+                    return 0
+                cid = self.next_cop
+                self.next_cop += 1
+                hcop._obj.value = cid
+                if req == b"\x3e\x00":
+                    ans = b"\x7e\x00"
+                elif req == b"\x10\x03":
+                    ans = b"\x50\x03\x00\x32\x01\xf4"
+                elif req[0] == 0x22 and len(req) == 3:
+                    did = int.from_bytes(req[1:3], "big")
+                    dmap = slave_idents[tx_id]
+                    ans = (b"\x62" + req[1:3] + dmap[did]) if did in dmap else b"\x7f\x22\x31"
+                else:
+                    ans = bytes([0x7F, req[0], 0x11])
+                self._queue_uds_result(hcll, cid, ans)
+                self._queue_uds_done(hcll, cid)
+                return 0
+            return super()._start_cop(hmod, hcll, cop, size, data, ctrl, tag, hcop)
+
+    # 1. uds_only mode: discovers J533 + BCM (0x70E), skips absent FPK_E (0x714), restores 0x710/0x77A
+    api_uds = MultiSlaveUdsOnlyApi(nonraw_ok=False)
+    bus_uds = DPduBus(dll=api_uds)
+    try:
+        scan_uds = can_scan_bus("VAS6154", interface="dpdu", targets=("j533", "fpke", "bcm"), bus=bus_uds)
+        assert bus_uds.uds_only is True
+        assert [e.kind for e in scan_uds.ecus] == ["j533", "bcm"]
+        assert scan_uds.find("bcm").part_number == "5Q0937084CG"
+        assert bus_uds._uds_ids == (0x710, 0x77A) and bus_uds._uds_link != 0 and not bus_uds.spent
+        assert scan_uds.gateway_bridge_capable is False
+    finally:
+        bus_uds.shutdown()
+
+    # 2. nonraw mode: discovers J533 + BCM (0x70E) via uds_session and restores nonraw links afterwards
+    api_nr = MultiSlaveUdsOnlyApi(nonraw_ok=True)
+    bus_nr = DPduBus(dll=api_nr)
+    try:
+        scan_nr = can_scan_bus("VAS6154", interface="dpdu", targets=("j533", "bcm"), bus=bus_nr)
+        assert bool(bus_nr.nonraw) is True and not bus_nr.uds_only
+        assert [e.kind for e in scan_nr.ecus] == ["j533", "bcm"]
+        assert scan_nr.find("bcm").part_number == "5Q0937084CG"
+        assert sorted(bus_nr.nonraw) == [0x6F0, 0x710] and not bus_nr.spent
+    finally:
+        bus_nr.shutdown()
+
+
+def test_j533_bridge_checks_dpdu_priming_before_entering_ram_loader(monkeypatch) -> None:
+    """M5a: A fresh D-PDU RawMode session on a VNCI needing CAN1 priming must fail fast BEFORE entering 10 02 /
+    RAM-Loader, without disturbing the gateway."""
+    from contitool.can import workflows
+    from contitool.can.bridge import j533_can_bridge
+
+    set_lang("en")
+    monkeypatch.setattr(dpdu, "NONRAW_VERIFY_WAIT", 0.3)
+    api = UnstartedCan1PduApi()
+    bus = DPduBus(dll=api)
+    monkeypatch.setattr(dpdu, "open_session", lambda *a, **k: bus)
+    monkeypatch.setattr(dpdu, "release_session", lambda *a, **k: None)
+
+    loader_called: list[bool] = []
+    resets: list[bool] = []
+    monkeypatch.setattr(workflows, "enter_ram_loader", lambda *_a, **_k: loader_called.append(True) or {"loader_ready": True})
+    monkeypatch.setattr(workflows, "_reset_to_application", lambda *_a, **_k: resets.append(True))
+
+    bridge = j533_can_bridge("VAS6154", interface="dpdu")
+    try:
+        with pytest.raises(RuntimeError, match="arbitrary raw CAN"):
+            bridge.start()
+        assert bus._raw_needs_prime is True
+        assert loader_called == []  # refused before 10 02 / RAM-Loader was ever attempted
+        assert resets == []  # gateway was never disturbed
+        assert bridge.active is False
+    finally:
+        bus.shutdown()

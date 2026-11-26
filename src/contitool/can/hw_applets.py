@@ -1368,7 +1368,7 @@ J533_BRIDGE_BURST_ID = 0x6F0
 J533_BRIDGE_BURST_DATA = b"BURST-GO"
 J533_BRIDGE_BURST_OK = b"BURST-OK"
 J533_BRIDGE_BURST_FAIL = b"BURST-NA"
-# ponytail: a busy loop, not a timer; ~60 us at 80 MHz, more on a slower clock (frames only get further apart).
+# Note: a busy loop, not a timer; ~60 us at 80 MHz, more on a slower clock (frames only get further apart).
 # Measure the frame spacing on the sub-bus and tune if a target needs an exact pace.
 J533_BRIDGE_BURST_GAP_LOOPS = 2400
 # The gap loop does not kick the watchdog: 100k loops ~2.5 ms at 80 MHz, still ~25 ms at a tenth of that clock,
@@ -1406,6 +1406,7 @@ def build_j533_can_bridge_applet(
     idle_limit: int = 40_000_000,
     burst_frames: list[tuple[int, bytes]] | None = None,
     burst_gap_loops: int = J533_BRIDGE_BURST_GAP_LOOPS,
+    target_rx_filter: list[tuple[int, bool]] | tuple[tuple[int, bool], ...] | None = None,
 ) -> bytes:
     """Build RH850/F1L RAM-loader applet that transparently bridges Diagnosis CAN (`ch3`) <-> `target_channel`.
 
@@ -1414,8 +1415,10 @@ def build_j533_can_bridge_applet(
         the active-low CAN transceiver `STB` pin LOW only for `ch3` (`P8_10`) and `target_channel`
         (`ch0: P11_12`, `ch1: P11_13`, `ch2: P0_6`, `ch4: P0_8`, `ch5: P8_2`).
       - Copies FBL's live 500 kbit/s bit-timing from `C3CFG` (`0xFFD00030`) to `CtargetCFG` without touching `GCFG`.
-      - Sets 2 wildcard `GAFL` receive rules (`GAFLID=0, GAFLM=0`, matching ALL 11-bit and 29-bit frames) into
-        32-deep RX FIFO 0 (`ch3 -> target`) and RX FIFO 1 (`target -> ch3`).
+      - Sets wildcard `GAFL` receive rules (`GAFLID=0, GAFLM=0`, matching ALL 11-bit and 29-bit frames) into
+        32-deep RX FIFO 0 (`ch3 -> target`) and RX FIFO 1 (`target -> ch3`). When `target_rx_filter` is provided
+        (1..15 `(can_id, is_extended)` entries), programs exact hardware `GAFL` accept rules on `target_channel`
+        so cyclic vehicle bus traffic is filtered in RSCAN0 silicon before entering RX FIFO 1.
       - Uses one TX buffer per direction (`TM48` on `ch3`, `TM[16*target]` on `target`) to preserve strict FIFO order.
       - Sends `J533BRDG` on `0x6F1` once both channels are in Communication Mode.
       - Refreshes `WDTA0` / `WDTA1` every loop iteration; aborts stalled sub-bus TX after a short timeout so an
@@ -1423,10 +1426,10 @@ def build_j533_can_bridge_applet(
       - On `0x6F0: STOPBRDG` (or idle timeout), replies `0x6F1: BRDG-END` and triggers `SWRESA` (`0xFFF80A04`)
         with WDTA reset fallback so the gateway boots cleanly back into its normal Application firmware.
 
-    `burst_frames` (opt-in; without it the applet is byte-identical to the verified one) appends a table of
-    `(29-bit can_id, 8 data bytes)` that `0x6F0: BURST-GO` sends on the target channel back to back as extended
-    frames (as the host sends the level-8 stream), each frame waited out and followed by `burst_gap_loops` idle
-    loops — the pace a slow host adapter (VAS 6154 RawMode) cannot reach.
+    `burst_frames` (opt-in; without it and without `target_rx_filter` the applet is byte-identical to the verified one)
+    appends a table of `(29-bit can_id, 8 data bytes)` that `0x6F0: BURST-GO` sends on the target channel back to back
+    as extended frames (as the host sends the level-8 stream), each frame waited out and followed by `burst_gap_loops`
+    idle loops — the pace a slow host adapter (VAS 6154 RawMode) cannot reach.
     """
     if target_channel not in J533_BUS_CHANNELS:
         raise ValueError(
@@ -1434,6 +1437,23 @@ def build_j533_can_bridge_applet(
         )
     if idle_limit <= 0:
         raise ValueError(f"idle_limit must be positive, got {idle_limit}")
+    encoded_tgt_rules: list[tuple[int, int]] | None = None
+    if target_rx_filter is not None:
+        deduped = list(dict.fromkeys((int(cid), bool(ext)) for cid, ext in target_rx_filter))
+        if not 1 <= len(deduped) <= 15:
+            raise ValueError(f"target_rx_filter must have 1..15 rules (GAFL page 0 limit), got {len(deduped)}")
+        encoded_tgt_rules = []
+        for cid, is_ext in deduped:
+            if is_ext:
+                if not 0 <= cid <= 0x1FFFFFFF:
+                    raise ValueError(f"Extended filter CAN ID out of range: 0x{cid:X}")
+                # GAFLID: IDE=1 (bit 31), RTR=0 (bit 30), LB=0 (bit 29); GAFLM: IDEM=1, RTRM=1, IDM=0x1FFFFFFF
+                encoded_tgt_rules.append((cid | 0x80000000, 0xDFFFFFFF))
+            else:
+                if not 0 <= cid <= 0x7FF:
+                    raise ValueError(f"Standard filter CAN ID out of range: 0x{cid:X}")
+                # GAFLID: IDE=0, RTR=0, LB=0; GAFLM: IDEM=1, RTRM=1, IDM=0x7FF
+                encoded_tgt_rules.append((cid, 0xC00007FF))
     burst_table = b""
     if burst_frames is not None:
         if not burst_frames:
@@ -1462,12 +1482,13 @@ def build_j533_can_bridge_applet(
     diag_tmsts_addr = J533_RSCAN0_BASE + 0x0300
 
     # GAFLCFG0 (ch0..ch3 in bytes 3..0) and GAFLCFG1 (ch4..ch5 in bytes 3..2)
+    tgt_rule_count = 1 if encoded_tgt_rules is None else len(encoded_tgt_rules)
     gaflcfg0 = 1 << (8 * (3 - diag_ch))
     gaflcfg1 = 0
     if target_channel < 4:
-        gaflcfg0 |= 1 << (8 * (3 - target_channel))
+        gaflcfg0 |= tgt_rule_count << (8 * (3 - target_channel))
     else:
-        gaflcfg1 |= 1 << (8 * (7 - target_channel))
+        gaflcfg1 |= tgt_rule_count << (8 * (7 - target_channel))
     # Rule order follows channel number 0..5: FIFO 0 = bit 0 (diag->tgt), FIFO 1 = bit 1 (tgt->diag)
     if target_channel < diag_ch:
         rule0_p1, rule1_p1 = 0x00000002, 0x00000001
@@ -1546,7 +1567,7 @@ def build_j533_can_bridge_applet(
     b.st_w(20, 0x0030, 14)
     b.st_w(20, tgt_cfg_off, 14)
 
-    # 5. Program 2 wildcard GAFL receive rules (all 11-bit + all 29-bit frames) -> RX FIFO 0 & RX FIFO 1
+    # 5. Program GAFL receive rules -> RX FIFO 0 (ch3->target) & RX FIFO 1 (target->ch3)
     b.mov_u16(0x0100, 6)
     b.st_w(6, 0x0098, 14)  # GAFLECTR = AFLDAE(1), page 0
     b.mov_imm(gaflcfg0, 6)
@@ -1554,17 +1575,37 @@ def build_j533_can_bridge_applet(
     b.mov_imm(gaflcfg1, 6)
     b.st_w(6, 0x00A0, 14)  # GAFLCFG1
 
-    b.st_w(0, 0x0500, 14)  # GAFLID0 = 0
-    b.st_w(0, 0x0504, 14)  # GAFLM0  = 0 (wildcard: IDE/RTR/ID ignored)
-    b.st_w(0, 0x0508, 14)  # GAFLP0_0 = 0
-    b.mov_imm5(rule0_p1, 6)
-    b.st_w(6, 0x050C, 14)  # GAFLP1_0
+    if encoded_tgt_rules is None:
+        b.st_w(0, 0x0500, 14)  # GAFLID0 = 0
+        b.st_w(0, 0x0504, 14)  # GAFLM0  = 0 (wildcard: IDE/RTR/ID ignored)
+        b.st_w(0, 0x0508, 14)  # GAFLP0_0 = 0
+        b.mov_imm5(rule0_p1, 6)
+        b.st_w(6, 0x050C, 14)  # GAFLP1_0
 
-    b.st_w(0, 0x0510, 14)  # GAFLID1 = 0
-    b.st_w(0, 0x0514, 14)  # GAFLM1  = 0
-    b.st_w(0, 0x0518, 14)  # GAFLP0_1 = 0
-    b.mov_imm5(rule1_p1, 6)
-    b.st_w(6, 0x051C, 14)  # GAFLP1_1
+        b.st_w(0, 0x0510, 14)  # GAFLID1 = 0
+        b.st_w(0, 0x0514, 14)  # GAFLM1  = 0
+        b.st_w(0, 0x0518, 14)  # GAFLP0_1 = 0
+        b.mov_imm5(rule1_p1, 6)
+        b.st_w(6, 0x051C, 14)  # GAFLP1_1
+    else:
+        diag_entry = [(0, 0, 0x00000001)]
+        tgt_entries = [(gid, gm, 0x00000002) for gid, gm in encoded_tgt_rules]
+        ordered_rules = (tgt_entries + diag_entry) if target_channel < diag_ch else (diag_entry + tgt_entries)
+        for idx, (gid, gm, gp1) in enumerate(ordered_rules):
+            base_off = 0x0500 + idx * 0x10
+            if gid == 0:
+                b.st_w(0, base_off, 14)
+            else:
+                b.mov_imm(gid, 6)
+                b.st_w(6, base_off, 14)
+            if gm == 0:
+                b.st_w(0, base_off + 0x04, 14)
+            else:
+                b.mov_imm(gm, 6)
+                b.st_w(6, base_off + 0x04, 14)
+            b.st_w(0, base_off + 0x08, 14)
+            b.mov_imm5(gp1, 6)
+            b.st_w(6, base_off + 0x0C, 14)
 
     b.st_w(0, 0x0098, 14)  # GAFLECTR = 0 (lock rule table)
 

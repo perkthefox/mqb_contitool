@@ -26,6 +26,33 @@ P2_STAR_WAIT = 6.0  # P2*server 5.0 s + 1 s for adapter latency
 FRAME_SEND_TIMEOUT = 1.0
 BLOCK_SEND_TIMEOUT = 5.0  # a whole ISO-TP block in one adapter call, so up to 0x20 frames at once
 TRANSPORT_ERRORS = (TimeoutError, can.CanError)  # the link failed — as opposed to the ECU answering "no"
+# Transient hardware ISO-TP retries for idempotent 0x36 TransferData before giving up on hardware ISO-TP (#44).
+HW_TRANSFER_DATA_RETRIES = 2
+# Factory RAM-Loader (0x0100120E) 5-byte error frames on 0x6F1 (4-byte status + XOR checksum):
+#   03 00 02 00 01 — packet receive timeout / framing abort (inter-frame gap > ~150 ms or dropped TX frame)
+#   03 00 05 00 06 — unexpected frame / protocol desync (frame arrived while loader waited for 84 00 00 00 00)
+LOADER_ERR_TIMEOUT = bytes.fromhex("0300020001")
+LOADER_ERR_UNSYNC = bytes.fromhex("0300050006")
+LOADER_ERR_FRAMES = (LOADER_ERR_TIMEOUT, LOADER_ERR_UNSYNC)
+
+
+def describe_loader_error(raw: bytes) -> str | None:
+    """Explain known 0x6F1 factory RAM-Loader abort frames (`0300020001` / `0300050006`), or None if unknown."""
+    if not raw:
+        return None
+    if raw.startswith(LOADER_ERR_TIMEOUT) or LOADER_ERR_TIMEOUT in raw:
+        return tr(
+            "заводской RAM-Loader прервал приём пакета по таймауту между кадрами (~150 мс) или из-за потери кадра "
+            "адаптером; проверьте USB-кабель / задержки VCI или попробуйте другой порт / адаптер",
+            "factory RAM-Loader aborted the packet due to inter-frame timeout (~150 ms) or a dropped TX frame; "
+            "check USB cable / VCI latency or try another port / adapter",
+        )
+    if raw.startswith(LOADER_ERR_UNSYNC) or LOADER_ERR_UNSYNC in raw:
+        return tr(
+            "заводской RAM-Loader потерял синхронизацию пакета (пропущен кадр отправки адаптером)",
+            "factory RAM-Loader lost packet sync (a TX frame was dropped by the adapter)",
+        )
+    return None
 
 
 class UdsNegativeResponse(RuntimeError):
@@ -167,6 +194,7 @@ class J533CanLink:
 
     UDS_TX_ID = 0x710
     UDS_RX_ID = 0x77A
+    UDS_FC_PAD = 0x00
     LOADER_TX_ID = 0x6F0
     LOADER_RX_ID = 0x6F1
 
@@ -189,6 +217,10 @@ class J533CanLink:
         self._timer_held = False
         self._log_file = None
         self._borrowed: Any = None  # a kept-open bus this link only borrows, handed back in close()
+        self.bus: Any = None
+        self._owns_bus = False
+        self._echo_lines = 0
+        self._echo_owner = False
         self.on_hw_fallback: Any = None  # called with a short reason when hardware ISO-TP gives way to software
         self._recycle_held = 0  # >0 inside a window where no TX link reopen may pause the stream
         self._rx_trace_suspended = 0  # >0 while streaming 200k 0x6F1 memory frames so json.dumps never starves RX
@@ -196,47 +228,50 @@ class J533CanLink:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = log_path.open("a", encoding="utf-8", buffering=1)
 
-        if bus is not None:
-            self.bus = bus
-            self._owns_bus = False
-        else:
-            from contitool.can.fpke import close_active_fpke_link
-
-            close_active_fpke_link()
-            if interface == "dpdu":
-                from contitool.can import dpdu
-
-                # Kept open between operations: reopening re-rolls which D-PDU module the driver hands out.
-                self._borrowed = dpdu.open_session(port or "", bitrate)
-                self.bus = self._borrowed
+        try:
+            if bus is not None:
+                self.bus = bus
                 self._owns_bus = False
-            elif interface == "j2534":
-                from contitool.can.j2534 import J2534Bus
-
-                self.bus = J2534Bus(port, bitrate)
-                self._owns_bus = True
             else:
-                import can
+                from contitool.can.fpke import close_active_fpke_link
 
-                kwargs: dict[str, Any] = {
-                    "interface": interface,
-                    "channel": port,
-                    "bitrate": bitrate,
-                    "timeout": 0.1,
-                }
-                if interface == "slcan":
-                    kwargs["tty_baudrate"] = tty_baudrate
-                    kwargs["listen_only"] = listen_only
-                self.bus = can.interface.Bus(**kwargs)
-                if interface == "slcan":
-                    _tune_slcan_bus(self.bus)
-                self._owns_bus = True
-        self._timer_held = _acquire_win_timer()
-        # D-PDU: what the VCI echoes back for the frames we send, so the trace shows what it put on the bus.
-        self._echo_lines = 0
-        self._echo_owner = self._log_file is not None and "echo_trace" in getattr(self.bus, "__dict__", {})
-        if self._echo_owner:
-            self.bus.echo_trace = collections.deque(maxlen=ECHO_TRACE_QUEUE)
+                close_active_fpke_link()
+                if interface == "dpdu":
+                    from contitool.can import dpdu
+
+                    # Kept open between operations: reopening re-rolls which D-PDU module the driver hands out.
+                    self._borrowed = dpdu.open_session(port or "", bitrate)
+                    self.bus = self._borrowed
+                    self._owns_bus = False
+                elif interface == "j2534":
+                    from contitool.can.j2534 import J2534Bus
+
+                    self.bus = J2534Bus(port, bitrate)
+                    self._owns_bus = True
+                else:
+                    import can
+
+                    kwargs: dict[str, Any] = {
+                        "interface": interface,
+                        "channel": port,
+                        "bitrate": bitrate,
+                        "timeout": 0.1,
+                    }
+                    if interface == "slcan":
+                        kwargs["tty_baudrate"] = tty_baudrate
+                        kwargs["listen_only"] = listen_only
+                    self.bus = can.interface.Bus(**kwargs)
+                    self._owns_bus = True
+                    if interface == "slcan":
+                        _tune_slcan_bus(self.bus)
+            self._timer_held = _acquire_win_timer()
+            # D-PDU: what the VCI echoes back for the frames we send, so the trace shows what it put on the bus.
+            self._echo_owner = self._log_file is not None and "echo_trace" in getattr(self.bus, "__dict__", {})
+            if self._echo_owner:
+                self.bus.echo_trace = collections.deque(maxlen=ECHO_TRACE_QUEUE)
+        except BaseException:
+            self.close()
+            raise
 
     def _flush_echoes(self) -> None:
         """Write the VCI's echoes into `can.jsonl` as `tx_echo` lines (diagnostics, capped per link).
@@ -354,12 +389,13 @@ class J533CanLink:
                 + "\n"
             )
 
-    def drain_rx(self, max_frames: int = 64, *, quick: bool = False) -> int:
+    def drain_rx(self, max_frames: int = 64, *, quick: bool = False, max_time: float | None = None) -> int:
         """Drain any stale buffered frames before starting a fresh handshake.
 
         `quick`: return at once when an slcan port has nothing waiting. python-can's slcan answers recv(timeout=0)
         only after one read at the serial port's own timeout (0.1 s) then; before every UDS request that was 0.1 s
-        per `36` block (3.9 KB/s). The RAM-loader packets keep that read: their pacing on slcan was verified with it."""
+        per `36` block (3.9 KB/s). The RAM-loader packets keep that read: their pacing on slcan was verified with it.
+        Both frame count (`max_frames`) and wall-clock time (`max_time`) bound the loop on busy vehicle buses."""
         def _waiting(ser: Any) -> int:
             try:
                 return int(ser.in_waiting)
@@ -374,8 +410,13 @@ class J533CanLink:
         raw_buf = getattr(self.bus, "_buffer", None)
         drained = 0
         polls = 0
+        overflows = 0
         max_polls = max_frames * 4 + 256
+        time_cap = (0.25 if quick else 1.0) if max_time is None else max(0.0, float(max_time))
+        deadline = time.monotonic() + time_cap
         while drained < max_frames and polls < max_polls:
+            if polls > 0 and time.monotonic() >= deadline:
+                break
             polls += 1
             has_buf_line = isinstance(raw_buf, bytearray) and (13 in raw_buf or 7 in raw_buf)
             if port is not None and not _waiting(port) and not (parsed and parsed.qsize()) and not has_buf_line:
@@ -384,9 +425,19 @@ class J533CanLink:
                 msg = self.bus.recv(timeout=0.0)
             except can.CanOperationError as exc:
                 from contitool.can.dpdu import FrameError
+                from contitool.can.j2534 import J2534BufferOverflowError
 
-                if not isinstance(exc, FrameError):
+                if not isinstance(exc, (FrameError, J2534BufferOverflowError)):
                     raise
+                if isinstance(exc, J2534BufferOverflowError):
+                    clear_rx = getattr(self.bus, "clear_rx_buffer", None)
+                    if callable(clear_rx):
+                        clear_rx()
+                    overflows += 1
+                    drained += 1
+                    if overflows >= 8:
+                        break
+                    continue
                 drained += 1
                 continue  # a result of the stale stream the bus could not interpret: thrown away with the rest
             if msg is None:
@@ -425,9 +476,15 @@ class J533CanLink:
                 msg = self.bus.recv(timeout=wait)
             except can.CanOperationError as exc:
                 from contitool.can.dpdu import FrameError
+                from contitool.can.j2534 import J2534BufferOverflowError
 
-                if not isinstance(exc, FrameError):
+                if not isinstance(exc, (FrameError, J2534BufferOverflowError)):
                     raise
+                if isinstance(exc, J2534BufferOverflowError):
+                    clear_rx = getattr(self.bus, "clear_rx_buffer", None)
+                    if callable(clear_rx):
+                        clear_rx()
+                    time.sleep(0.01)
                 discarded += 1
                 quiet_since = time.monotonic()
                 continue
@@ -445,7 +502,7 @@ class J533CanLink:
         raw = bytes(data)
         if pad is not None and len(raw) < 8:
             raw += bytes([pad]) * (8 - len(raw))
-        message = can.Message(arbitration_id=identifier, data=raw, is_extended_id=False)
+        message = can.Message(arbitration_id=identifier, data=raw, is_extended_id=bool(identifier > 0x7FF))
         self._write_trace("tx", identifier, message.dlc, raw)
         self.bus.send(message, timeout=FRAME_SEND_TIMEOUT)
         self.tx_frames += 1
@@ -475,8 +532,8 @@ class J533CanLink:
                     return msg.data[1], msg.data[2]
                 if fc_status == 1:
                     continue  # FC.Wait
-                raise RuntimeError(f"ISO-TP FlowControl Overflow/Abort from 0x77A: {bytes(msg.data).hex()}")
-        raise TimeoutError("Timed out waiting for ISO-TP FlowControl from 0x77A")
+                raise RuntimeError(f"ISO-TP FlowControl Overflow/Abort from 0x{self.UDS_RX_ID:03X}: {bytes(msg.data).hex()}")
+        raise TimeoutError(f"Timed out waiting for ISO-TP FlowControl from 0x{self.UDS_RX_ID:03X}")
 
     @staticmethod
     def _st_min_seconds(st_min: int) -> float:
@@ -537,7 +594,11 @@ class J533CanLink:
                     raw = bytes([0x20 | seq]) + chunk
                     if len(raw) < 8:
                         raw += b"\x00" * (8 - len(raw))
-                    msg = can.Message(arbitration_id=self.UDS_TX_ID, data=raw, is_extended_id=False)
+                    msg = can.Message(
+                        arbitration_id=self.UDS_TX_ID,
+                        data=raw,
+                        is_extended_id=bool(self.UDS_TX_ID > 0x7FF),
+                    )
                     self._write_trace("tx", self.UDS_TX_ID, msg.dlc, raw)
                     batch.append(msg)
                     seq = (seq + 1) & 0x0F
@@ -557,7 +618,7 @@ class J533CanLink:
                 block_size, st_min = self.receive_flow_control()
                 delay = self._st_min_seconds(st_min)
 
-    def receive_uds(self, timeout: float = 2.0) -> bytes:
+    def receive_uds(self, timeout: float = 2.0, *, fc_pad: int | None = None) -> bytes:
         first = self.receive_frame(self.UDS_RX_ID, timeout=timeout)
         raw0 = bytes(first.data)
         kind = raw0[0] >> 4
@@ -565,15 +626,16 @@ class J533CanLink:
             sf_len = raw0[0] & 0x0F
             return raw0[1 : 1 + sf_len]
         if kind != 1:
-            raise RuntimeError(f"Unexpected ISO-TP frame on 0x77A: {raw0.hex()}")
+            raise RuntimeError(f"Unexpected ISO-TP frame on 0x{self.UDS_RX_ID:03X}: {raw0.hex()}")
         length = ((raw0[0] & 0x0F) << 8) | raw0[1]
         output = bytearray(raw0[2:])
-        self.send_frame(self.UDS_TX_ID, b"\x30\x00\x00", pad=0x00)
+        pad = self.UDS_FC_PAD if fc_pad is None else fc_pad
+        self.send_frame(self.UDS_TX_ID, b"\x30\x00\x00", pad=pad)
         while len(output) < length:
             msg = self.receive_frame(self.UDS_RX_ID, timeout=timeout)
             cf = bytes(msg.data)
             if (cf[0] >> 4) != 2:
-                raise RuntimeError(f"Expected ISO-TP ConsecutiveFrame on 0x77A, got: {cf.hex()}")
+                raise RuntimeError(f"Expected ISO-TP ConsecutiveFrame on 0x{self.UDS_RX_ID:03X}, got: {cf.hex()}")
             output.extend(cf[1:])
         return bytes(output[:length])
 
@@ -624,52 +686,68 @@ class J533CanLink:
         if not req:
             raise ValueError("Empty UDS payload")
         req_sid = req[0]
-        uds_only = bool(getattr(self.bus, "uds_only", False)) and (self.UDS_TX_ID, self.UDS_RX_ID) == (0x710, 0x77A)
+        is_uds_only_bus = bool(getattr(self.bus, "uds_only", False))
+        uds_only = is_uds_only_bus and (self.UDS_TX_ID, self.UDS_RX_ID) == (0x710, 0x77A)
         if self._hw_uds or uds_only:
-            self._write_trace("uds_tx", self.UDS_TX_ID, len(req), req[:16])
-            self.tx_frames += 1
-            try:
-                resp = self.bus.request_uds(req, timeout=timeout, allow_pending=allow_pending)
-            except TRANSPORT_ERRORS as exc:
-                if not resend:
-                    raise
-                # The adapter's ISO-TP failed. Mid-flash the application may already be erased, so this request
-                # goes again on the verified software path instead of ending the operation. The ECU refusing
-                # (a 7F answer) is not caught here: that is its answer, and no transport would change it.
-                self.drop_hw_uds()
-                if not uds_only:
-                    self._write_trace("uds_hw_fallback", self.UDS_TX_ID, len(req), req[:16])
-                if getattr(self.bus, "spent", False):
-                    # The VCI itself is gone (it reboots, #19-#22): the software path would only fail on the next
-                    # frame with "this link no longer works", after promising to carry on.
-                    from contitool.can.dpdu import driver_unstable
+            # TransferData (0x36) with the same sequence counter is idempotent per ISO 14229: on a single-block
+            # ISO-TP glitch (e.g. D-PDU 0x105 / N_Bs timeout, #44) the hardware link is still ONLINE, so retry it
+            # before abandoning hardware ISO-TP for the rest of a 2,975-block flash.
+            hw_attempts = (1 + HW_TRANSFER_DATA_RETRIES) if (req_sid == 0x36 and resend) else 1
+            last_hw_exc: BaseException | None = None
+            for hw_try in range(hw_attempts):
+                self._write_trace("uds_tx", self.UDS_TX_ID, len(req), req[:16])
+                self.tx_frames += 1
+                try:
+                    resp = self.bus.request_uds(req, timeout=timeout, allow_pending=allow_pending)
+                except TRANSPORT_ERRORS as exc:
+                    last_hw_exc = exc
+                    if not resend:
+                        raise
+                    if getattr(self.bus, "spent", False):
+                        break  # the VCI itself is gone: do not retry on a dead link
+                    if hw_try + 1 < hw_attempts:
+                        self._write_trace("uds_hw_retry", self.UDS_TX_ID, len(req), req[:16])
+                        time.sleep(0.2)
+                        continue
+                else:
+                    self._write_trace("uds_rx", self.UDS_RX_ID, len(resp), resp[:16])
+                    self.rx_frames += 1
+                    return _checked_response(req_sid, resp, expected_sid)
+            assert last_hw_exc is not None
+            exc = last_hw_exc
+            # The adapter's ISO-TP failed. Mid-flash the application may already be erased, so this request
+            # goes again on the verified software path instead of ending the operation. The ECU refusing
+            # (a 7F answer) is not caught here: that is its answer, and no transport would change it.
+            self.drop_hw_uds()
+            if not is_uds_only_bus:
+                self._write_trace("uds_hw_fallback", self.UDS_TX_ID, len(req), req[:16])
+            if getattr(self.bus, "spent", False):
+                # The VCI itself is gone (it reboots, #19-#22): the software path would only fail on the next
+                # frame with "this link no longer works", after promising to carry on.
+                from contitool.can.dpdu import driver_unstable
 
-                    # On a 30+ driver the same flash stops at the same place again: the way out is the 27.2 one.
-                    again = tr(
-                        "затем подключитесь через драйвер D-PDU 27.2 (идёт вместе с ContiTool) и запустите ту же "
-                        "прошивку заново: на драйверах 30 и новее обрыв повторится.",
-                        "then connect through D-PDU driver 27.2 (it comes with ContiTool) and run the same flash "
-                        "again: on drivers 30 and newer it breaks off again.",
-                    ) if driver_unstable(getattr(self.bus, "driver_version", "")) else tr(
-                        "затем запустите ту же прошивку заново.", "then run the same flash again.")
-                    raise can.CanOperationError(tr(
-                        f"Связь с VCI потеряна посреди передачи ({req[:3].hex(' ').upper()}: {exc}): адаптер "
-                        "перезагрузился или отключился, продолжить на этом соединении нельзя. Если шла прошивка, блок "
-                        "остался в загрузчике FBL без приложения — это поправимо: выключите и включите питание блока и "
-                        f"VCI, {again}",
-                        f"Lost the VCI mid-transfer ({req[:3].hex(' ').upper()}: {exc}): the adapter rebooted or "
-                        "disconnected, and this connection cannot go on. If a flash was running, the ECU stays in its "
-                        "FBL bootloader without an application — which can be fixed: power-cycle the ECU and the VCI, "
-                        f"{again}",
-                    )) from exc
-                if uds_only:
-                    raise
-                if self.on_hw_fallback is not None:
-                    self.on_hw_fallback(f"{req[:3].hex(' ').upper()}: {exc}")
-            else:
-                self._write_trace("uds_rx", self.UDS_RX_ID, len(resp), resp[:16])
-                self.rx_frames += 1
-                return _checked_response(req_sid, resp, expected_sid)
+                # On a 30+ driver the same flash stops at the same place again: the way out is the 27.2 one.
+                again = tr(
+                    "затем подключитесь через драйвер D-PDU 27.2 (идёт вместе с ContiTool) и запустите ту же "
+                    "прошивку заново: на драйверах 30 и новее обрыв повторится.",
+                    "then connect through D-PDU driver 27.2 (it comes with ContiTool) and run the same flash "
+                    "again: on drivers 30 and newer it breaks off again.",
+                ) if driver_unstable(getattr(self.bus, "driver_version", "")) else tr(
+                    "затем запустите ту же прошивку заново.", "then run the same flash again.")
+                raise can.CanOperationError(tr(
+                    f"Связь с VCI потеряна посреди передачи ({req[:3].hex(' ').upper()}: {exc}): адаптер "
+                    "перезагрузился или отключился, продолжить на этом соединении нельзя. Если шла прошивка, блок "
+                    "остался в загрузчике FBL без приложения — это поправимо: выключите и включите питание блока и "
+                    f"VCI, {again}",
+                    f"Lost the VCI mid-transfer ({req[:3].hex(' ').upper()}: {exc}): the adapter rebooted or "
+                    "disconnected, and this connection cannot go on. If a flash was running, the ECU stays in its "
+                    "FBL bootloader without an application — which can be fixed: power-cycle the ECU and the VCI, "
+                    f"{again}",
+                )) from exc
+            if is_uds_only_bus:
+                raise exc
+            if self.on_hw_fallback is not None:
+                self.on_hw_fallback(f"{req[:3].hex(' ').upper()}: {exc}")
         try:
             self.drain_rx(quick=True)  # a late answer to an earlier request must not be read as the answer to this one
             self.send_uds(req)
@@ -721,18 +799,30 @@ class J533CanLink:
         self._maybe_recycle_tx()
         if self.drain_rx(max_frames=16_384):
             self.drain_until_quiet(self.LOADER_RX_ID, quiet_window=0.06, max_wait=2.0)
-        self.send_frame(self.LOADER_TX_ID, LOADER_SYNC)
-        sync_deadline = time.monotonic() + 2.0
-        sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=2.0).data)
-        while sync_rx != LOADER_SYNC:
-            rem = min(0.15, sync_deadline - time.monotonic())
-            if rem <= 0:
+        sync_rx = b""
+        for sync_attempt in range(2):
+            self.send_frame(self.LOADER_TX_ID, LOADER_SYNC)
+            sync_deadline = time.monotonic() + 2.0
+            sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=2.0).data)
+            while sync_rx != LOADER_SYNC:
+                if sync_rx in LOADER_ERR_FRAMES:
+                    break  # loader aborted an earlier incomplete packet and returned to idle sync state (#51)
+                rem = min(0.15, sync_deadline - time.monotonic())
+                if rem <= 0:
+                    break
+                try:
+                    sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=rem).data)
+                except TimeoutError:
+                    break
+            if sync_rx == LOADER_SYNC:
                 break
-            try:
-                sync_rx = bytes(self.receive_frame(self.LOADER_RX_ID, timeout=rem).data)
-            except TimeoutError:
+            if sync_rx not in LOADER_ERR_FRAMES or sync_attempt == 1:
                 break
+            self.drain_until_quiet(self.LOADER_RX_ID, quiet_window=0.05, max_wait=0.5)
         if sync_rx != LOADER_SYNC:
+            detail = describe_loader_error(sync_rx)
+            if detail:
+                raise RuntimeError(f"Factory loader sync failed: got {sync_rx.hex()} ({detail})")
             raise RuntimeError(f"Factory loader sync failed: got {sync_rx.hex()}")
         total = len(packet)
         for idx, offset in enumerate(range(0, total, 8)):

@@ -1198,7 +1198,7 @@ def test_fpke_can_panel_async_lifecycle_and_human_dtc_dialog(tmp_path: Path, mon
         assert "B103E1B" in txt and "Датчик уровня топлива 1" in txt
         assert "U112100" in txt and "BCM_01" in txt
         dtc_dlg._on_clear()
-        app.processEvents()
+        wait_idle()
         assert bus.dtcs_cleared is True
         assert panel.btn_dtc_details.isVisible() is False
 
@@ -2728,6 +2728,729 @@ def test_fpke_engineering_bootloader_and_fbl_rsa_key(tmp_path: Path, monkeypatch
             dlg.close()
     finally:
         win.close()
+
+
+def test_fpke_smart_write_rollover_into_invalid_vb(tmp_path: Path) -> None:
+    """Critical C3 regression: smart EEL append rolling over into an `invalid` VB must erase old I0/I1 & write new block."""
+    from contitool.can.fpke import close_active_fpke_link
+    from contitool.core.fpke import apply_fpke_dflash_edits, eel_parse_pool, extract_fpke_immo_passport
+
+    close_active_fpke_link()
+    base_df = bytearray(build_synthetic_fpke_dflash())
+    lay = fpke_eel_layout(None, bytes(base_df))
+    vb_sz = lay["vb"]
+    # Fill VB 0 until it cannot hold another 0x68 record, and put an `invalid` VB at VB 1 with old I0/I1 + old DRP/data
+    cur = bytes(base_df)
+    blocks0, _ = eel_parse_pool(lay, cur)
+    head_vb = max((b for b in blocks0 if b["state"] == "active"), key=lambda b: (b["ec"] or 0, b["vb"]))["vb"]
+    # Append 0x60 edits until head_vb has < (size(0x68) + 0x10) bytes free so the next 0x68 edit MUST roll over into next_vb
+    while True:
+        blks, _ = eel_parse_pool(lay, cur)
+        hd = blks[head_vb]
+        free = int(hd.get("next_top", 0)) - (head_vb * vb_sz + int(hd.get("separator", 0x18)))
+        if free < lay["ids"][0x68] + 0x10:
+            break
+        cur = apply_fpke_dflash_edits(cur, odometer_km=10000 + free)
+    # Mark next_vb as `invalid` with old programmed I0, P, A0, A1, EC, RWP, DRP0, an unreferenced stale word, and I1
+    next_vb = (head_vb + 1) % lay["n_vb"]
+    mut = bytearray(cur)
+    nb = next_vb * vb_sz
+    struct.pack_into(
+        "<6I",
+        mut,
+        nb,
+        EEL_MARK,  # I0 (invalidated!)
+        EEL_MARK,  # P
+        EEL_MARK,  # A0
+        EEL_MARK,  # A1
+        eel_cs24(1),
+        eel_cs24(nb + 0x18),
+    )
+    struct.pack_into("<4I", mut, nb + 0x18, EEL_MARK, EEL_MARK, EEL_MARK, 0x60 | ((vb_sz - 8) << 16))
+    struct.pack_into("<I", mut, nb + 0x400, 0xCAFEBABE)  # unreferenced stale word inside invalid VB
+    struct.pack_into("<I", mut, nb + vb_sz - 4, EEL_MARK)  # I1 (invalidated!)
+    live_df = bytes(mut)
+
+    cand_df = apply_fpke_dflash_edits(live_df, vin="WAUZZZ8V9LA999888")
+    bus = FakeFpkeBus()
+    bus.dflash = live_df
+    bus.faci_mask = eel_faci_word_mask(lay, live_df)
+    bus.faci_mask[nb + 0x400 : nb + 0x404] = b"\xff\xff\xff\xff"  # hardware BCST=1 on unreferenced stale word!
+    try:
+        rep = can_fpke_write_dflash(
+            "fake",
+            cand_df,
+            base_dflash=live_df,
+            session_dir=tmp_path / "rollover_invalid_vb",
+            frame_delay=0.0,
+            wake_seconds=0.0,
+            reset_after=False,
+            bus=bus,
+        )
+        assert rep["ok"] is True
+        assert rep["blocks_erased"] > 0
+        # Even the unreferenced stale word at nb + 0x400 MUST have been erased cleanly!
+        assert not any(bus.faci_mask[nb + 0x400 : nb + 0x404])
+        after_blocks, _ = eel_parse_pool(lay, bus.dflash)
+        assert after_blocks[next_vb]["state"] == "active"
+        assert extract_fpke_immo_passport(bus.dflash)["immo"]["vin"] == "WAUZZZ8V9LA999888"
+    finally:
+        close_active_fpke_link()
+
+
+def test_fpke_coil_finish_passes_restore_key_flags_via_gateway(monkeypatch) -> None:
+    """Critical C4 regression: finishing coil learning via gateway must pass restore_key_flags to preserve KESSY."""
+    from contitool.gui.app import create_window
+    from contitool.gui.screens import fpke as fpke_gui_mod
+
+    app, win = create_window()
+    try:
+        captured_kwargs: dict[str, object] = {}
+
+        def _fake_finish(link, **kw):
+            captured_kwargs.update(kw)
+            return {
+                "ok": True,
+                "summary": "ok",
+                "learned_keys": 1,
+                "remaining_keys": 7,
+                "learned_key_ids": ["11223344"],
+                "kessy_restored": True,
+            }
+
+        monkeypatch.setattr(fpke_gui_mod, "fpke_finish_coil_key_learning", _fake_finish)
+        df_info = analyze_fpke_dflash(build_synthetic_fpke_dflash())
+        dlg = fpke_gui_mod.FpkeCoilKeyLearnDialog(
+            win.conn,
+            win.runner,
+            dflash_info=df_info,
+            via_gateway=True,
+            gateway_bridge=True,
+            gateway_channel=0,
+            parent=win,
+        )
+        try:
+            dlg._key_flags = 0x80
+            monkeypatch.setattr(
+                dlg,
+                "_run_l8_task",
+                lambda title, action, on_ok, needs_level8=True: (
+                    captured_kwargs.setdefault("_needs_level8", needs_level8),
+                    action(object(), None),
+                ),
+            )
+            dlg.run_finish_learning()
+            assert captured_kwargs.get("_needs_level8") is True
+            assert captured_kwargs.get("restore_key_flags") == 0x80
+        finally:
+            dlg.close()
+    finally:
+        win.close()
+
+
+def test_fpke_verify_s0_s1_and_fbl_rsa_key_reject_invalid_inputs() -> None:
+    from contitool.core.fpke import apply_fpke_dflash_fbl_rsa_key, fpke_verify_s0_s1
+
+    s0 = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
+    s1 = bytes.fromhex("1112131415161718191a1b1c1d1e1f20")
+    with pytest.raises(ValueError, match="expected_crc_a_le"):
+        fpke_verify_s0_s1(s0, s1, expected_crc_a_le="DEADBE")
+    with pytest.raises(ValueError, match="expected_crc_b_le"):
+        fpke_verify_s0_s1(s0, s1, expected_crc_b_le=b"\xde\xad")
+    assert fpke_verify_s0_s1(s0, s1, expected_crc_a_le="", expected_crc_b_le=None)["valid"] is True
+
+    df = build_synthetic_fpke_dflash()
+    with pytest.raises(ValueError, match="RSA-1024"):
+        apply_fpke_dflash_fbl_rsa_key(df, b"\xff" * 128)
+
+
+def test_fpke_donor_transfer_preserves_target_fields_on_partial_donor() -> None:
+    from contitool.core.fpke import extract_fpke_immo_passport, transfer_fpke_donor_to_target
+
+    target_df = build_synthetic_fpke_dflash()
+    before = extract_fpke_immo_passport(target_df)
+    partial_donor = {
+        "immo": {
+            "vin": None,
+            "cs": None,
+            "crc32_a_le": None,
+            "crc32_b_le": None,
+            "power_class": None,
+            "power_class_int": None,
+            "mode_and_flags": {},
+            "mac_fields": {},
+            "partners": [],
+            "keys": [],
+            "counts": {},
+        },
+        "component_protection_separate": {},
+        "cluster_metadata": {},
+    }
+    updated_df, summary = transfer_fpke_donor_to_target(
+        partial_donor,
+        target_df,
+        copy_immo=True,
+        copy_keys=True,
+        copy_odometer=True,
+        copy_cp=True,
+    )
+    after = extract_fpke_immo_passport(updated_df)
+    assert after["immo"]["vin"] == before["immo"]["vin"]
+    assert after["immo"]["cs"] == before["immo"]["cs"]
+    assert after["immo"]["mac_fields"]["dash"] == before["immo"]["mac_fields"]["dash"]
+    assert after["immo"]["mode_and_flags"]["partners_mask"] == before["immo"]["mode_and_flags"]["partners_mask"]
+    assert after["immo"]["keys"] == before["immo"]["keys"]
+    assert after["component_protection_separate"]["ika_cp3"] == before["component_protection_separate"]["ika_cp3"]
+    assert summary["copied_sections"] == {"immo": False, "keys": False, "odometer": False, "cp": False}
+
+
+def test_fpke_eel_rollover_ec0_and_non_contiguous_ring_start() -> None:
+    from contitool.core.fpke import eel_append_records, eel_parse_pool
+
+    lay = fpke_eel_layout(None, build_synthetic_fpke_dflash())
+    # 1. Non-contiguous active blocks across wrap 27 -> 0 -> 2 (VB 1 missing/prepared)
+    df = bytearray(b"\xff" * FPKE_DFLASH_SIZE)
+    for vb_idx, ec_val, val_u32 in ((27, 10, 10000), (0, 11, 20000), (2, 11, 30000)):
+        b = vb_idx * lay["vb"]
+        struct.pack_into("<6I", df, b, 0xFFFFFFFF, EEL_MARK, EEL_MARK, EEL_MARK, eel_cs24(ec_val), eel_cs24(b + 0x18))
+        rec = bytearray(b"\x00" * lay["ids"][0x60])
+        struct.pack_into("<H", rec, 0, lay["ids"][0x60])
+        struct.pack_into("<I", rec, 4, val_u32)
+        padded = (len(rec) + 3) & ~3
+        top = b + lay["vb"] - 8
+        for i in range(0, padded, 4):
+            df[top - i : top - i + 4] = rec[i : i + 4]
+        struct.pack_into("<4I", df, b + 0x18, EEL_MARK, EEL_MARK, EEL_MARK, 0x60 | ((top - b) << 16))
+    blocks, latest = eel_parse_pool(lay, bytes(df))
+    assert latest[0x60][0] == 2
+
+    # 2. Rollover with head ec=0 into prepared next_vb ec=0 must preserve ec=0 (not bump to 1)
+    df0 = bytearray(b"\xff" * FPKE_DFLASH_SIZE)
+    b0 = 5 * lay["vb"]
+    struct.pack_into("<6I", df0, b0, 0xFFFFFFFF, EEL_MARK, EEL_MARK, EEL_MARK, eel_cs24(0), eel_cs24(b0 + 0x18))
+    # Fill VB 5 so next append rolls over to VB 6 (prepared with ec=0)
+    b1 = 6 * lay["vb"]
+    struct.pack_into("<5I", df0, b1, 0xFFFFFFFF, EEL_MARK, 0xFFFFFFFF, 0xFFFFFFFF, eel_cs24(0))
+    # Leave VB 7 prepared so pool has a free block
+    b2 = 7 * lay["vb"]
+    struct.pack_into("<5I", df0, b2, 0xFFFFFFFF, EEL_MARK, 0xFFFFFFFF, 0xFFFFFFFF, eel_cs24(0))
+    rec_68 = bytearray(b"\x00" * lay["ids"][0x68])
+    struct.pack_into("<H", rec_68, 0, lay["ids"][0x68])
+    cur = bytes(df0)
+    for k in range(15):
+        rec_68[4] = k + 1
+        cur = eel_append_records(cur, {0x68: bytes(rec_68)})
+    blocks_after, latest_after = eel_parse_pool(lay, cur)
+    assert latest_after[0x68][0] == 6
+    assert blocks_after[6]["ec"] == 0
+
+
+def test_fpke_restore_dialog_rejects_fpke_dflash_and_start_screen_hides_restore(tmp_path) -> None:
+    from contitool.gui.app import create_window
+    from contitool.gui.dialogs.restore import RestoreDialog
+
+    _app, win = create_window()
+    try:
+        win.start_screen.set_target_kind("fpke")
+        assert win.start_screen.btn_restore.isVisible() is False
+
+        df_path = tmp_path / "Dflash.bin"
+        df_path.write_bytes(build_synthetic_fpke_dflash())
+        dlg = RestoreDialog(win, str(tmp_path))
+        try:
+            rejected = dlg.add_files([df_path])
+            assert rejected == ["Dflash.bin"]
+            assert "dflash" not in dlg.files
+        finally:
+            dlg.close()
+    finally:
+        win.close()
+
+
+def test_fpke_h7_faci_word_mask_invalid_vb_and_drp_blank_words() -> None:
+    """H7 regression: invalid VBs never resurrect as active or degrade to prepared, and blank DRP words stay BCST 0."""
+    from contitool.core.fpke import eel_parse_pool
+
+    lay = fpke_eel_layout()
+    vb_sz = lay["vb"]
+
+    def _make_r60(val_u32: int) -> bytes:
+        rec = bytearray(b"\xff" * lay["ids"][0x60])
+        rec[:2] = struct.pack("<H", len(rec))
+        struct.pack_into("<3I", rec, 4, val_u32, val_u32, val_u32)
+        return bytes(rec)
+
+    def _write_rec_top(buf: bytearray, b: int, top_off: int, rec: bytes) -> None:
+        padded = rec + b"\xff" * (((len(rec) + 3) & ~3) - len(rec))
+        for i in range(0, len(padded), 4):
+            buf[b + top_off - i : b + top_off - i + 4] = padded[i : i + 4]
+
+    # (a) Noisy dump with RWP-linked invalid chain (VB 14 inv -> VB 15 inv), active VB 16, invalid VB 17 (RWP-linked!)
+    df = bytearray(b"\x57\x55\x54\x55" * (FPKE_DFLASH_SIZE // 4))
+    r60_a = _make_r60(1000)
+    r60_b = _make_r60(2000)
+    r60_c = _make_r60(3000)
+    r60_d = _make_r60(4000)
+    top0 = vb_sz - 8
+    drp0 = 0x60 | (top0 << 16)
+
+    for vb_idx, is_inv, rwp_target, rec in (
+        (14, True, 13 * vb_sz + 0x18, r60_a),
+        (15, True, 14 * vb_sz + 0x28, r60_b),
+        (16, False, 15 * vb_sz + 0x28, r60_c),
+        (17, True, 16 * vb_sz + 0x28, r60_d),
+    ):
+        b = vb_idx * vb_sz
+        struct.pack_into(
+            "<6I",
+            df,
+            b,
+            EEL_MARK if is_inv else 0x57555455,
+            EEL_MARK,
+            EEL_MARK,
+            EEL_MARK,
+            eel_cs24(10),
+            eel_cs24(rwp_target),
+        )
+        struct.pack_into("<I", df, b + vb_sz - 4, EEL_MARK if is_inv else 0x57555455)
+        _write_rec_top(df, b, top0, rec)
+        struct.pack_into("<4I", df, b + 0x18, EEL_MARK, EEL_MARK, EEL_MARK, drp0)
+
+    mask = eel_faci_word_mask(lay, bytes(df))
+    blocks, latest = eel_parse_pool(lay, bytes(df), mask)
+    assert blocks[14]["state"] == "invalid"
+    assert blocks[15]["state"] == "invalid"
+    assert blocks[16]["state"] == "active"
+    assert blocks[17]["state"] == "invalid"
+    assert latest[0x60][0] == 16
+
+    # (a2) RWP-linked invalid pair (VB 14 inv -> VB 15 inv) + standalone active VB 20 (exercises len(best_chain) <= 1)
+    df2 = bytearray(b"\x57\x55\x54\x55" * (FPKE_DFLASH_SIZE // 4))
+    for vb_idx, is_inv, rwp_target, rec in (
+        (14, True, 13 * vb_sz + 0x18, r60_a),
+        (15, True, 14 * vb_sz + 0x28, r60_b),
+        (20, False, 19 * vb_sz + 0x18, r60_c),
+    ):
+        b = vb_idx * vb_sz
+        struct.pack_into(
+            "<6I",
+            df2,
+            b,
+            EEL_MARK if is_inv else 0x57555455,
+            EEL_MARK,
+            EEL_MARK,
+            EEL_MARK,
+            eel_cs24(10),
+            eel_cs24(rwp_target),
+        )
+        struct.pack_into("<I", df2, b + vb_sz - 4, EEL_MARK if is_inv else 0x57555455)
+        _write_rec_top(df2, b, top0, rec)
+        struct.pack_into("<4I", df2, b + 0x18, EEL_MARK, EEL_MARK, EEL_MARK, drp0)
+
+    mask2 = eel_faci_word_mask(lay, bytes(df2))
+    blocks2, _ = eel_parse_pool(lay, bytes(df2), mask2)
+    assert blocks2[14]["state"] == "invalid"
+    assert blocks2[15]["state"] == "invalid"
+    assert blocks2[20]["state"] == "active"
+
+    # (b) Invalid VBs from the CURRENT erase cycle (ec == current_ec) must NOT degrade to prepared in has_fg_noise
+    df3 = bytearray(b"\x57\x55\x54\x55" * (FPKE_DFLASH_SIZE // 4))
+    # Active VB 5 at EC=12
+    b5 = 5 * vb_sz
+    struct.pack_into("<6I", df3, b5, 0x57555455, EEL_MARK, EEL_MARK, EEL_MARK, eel_cs24(12), eel_cs24(4 * vb_sz + 0x18))
+    _write_rec_top(df3, b5, top0, r60_a)
+    struct.pack_into("<4I", df3, b5 + 0x18, EEL_MARK, EEL_MARK, EEL_MARK, drp0)
+    # Invalid VB 3 at EC=12 (before active VB 5, no succ, no RWP)
+    b3 = 3 * vb_sz
+    struct.pack_into("<5I", df3, b3, EEL_MARK, EEL_MARK, EEL_MARK, EEL_MARK, eel_cs24(12))
+    struct.pack_into("<I", df3, b3 + vb_sz - 4, EEL_MARK)
+    # Invalid VB 10 at EC=12 (with valid RWP, no succ)
+    b10 = 10 * vb_sz
+    struct.pack_into("<6I", df3, b10, EEL_MARK, EEL_MARK, EEL_MARK, EEL_MARK, eel_cs24(12), eel_cs24(9 * vb_sz + 0x18))
+    struct.pack_into("<I", df3, b10 + vb_sz - 4, EEL_MARK)
+    # Prepared VB 6 at EC=12 (ahead of active VB 5, ghost A0, no RWP, no valid DRP)
+    b6 = 6 * vb_sz
+    struct.pack_into("<5I", df3, b6, 0x57555455, EEL_MARK, EEL_MARK, 0x57555455, eel_cs24(12))
+
+    mask3 = eel_faci_word_mask(lay, bytes(df3))
+    blocks3, _ = eel_parse_pool(lay, bytes(df3), mask3)
+    assert blocks3[3]["state"] == "invalid"
+    assert blocks3[5]["state"] == "active"
+    assert blocks3[6]["state"] == "prepared"
+    assert blocks3[10]["state"] == "invalid"
+
+    # (c) Blank/unprogrammed 0xFFFFFFFF word at DRP a+4 or a+8 must remain BCST 0 (0x00*4)
+    df4 = bytearray(b"\xff" * FPKE_DFLASH_SIZE)
+    b2 = 2 * vb_sz
+    struct.pack_into("<6I", df4, b2, 0xFFFFFFFF, EEL_MARK, EEL_MARK, EEL_MARK, eel_cs24(10), eel_cs24(1 * vb_sz + 0x18))
+    rec_sz_pad = (lay["ids"][0x60] + 3) & ~3
+    top1 = top0 - rec_sz_pad
+    _write_rec_top(df4, b2, top0, r60_a)
+    _write_rec_top(df4, b2, top1, r60_b)
+    # DRP 0: a+4 is unprogrammed 0xFFFFFFFF, a+8 is EEL_MARK
+    ref0 = b2 + 0x18
+    struct.pack_into("<4I", df4, ref0, EEL_MARK, 0xFFFFFFFF, EEL_MARK, 0x60 | (top0 << 16))
+    # DRP 1: a+4 is EEL_MARK, a+8 is unprogrammed 0xFFFFFFFF
+    ref1 = b2 + 0x28
+    struct.pack_into("<4I", df4, ref1, EEL_MARK, EEL_MARK, 0xFFFFFFFF, 0x60 | (top1 << 16))
+
+    mask4 = eel_faci_word_mask(lay, bytes(df4))
+    assert mask4[ref0 : ref0 + 4] == b"\xff\xff\xff\xff"
+    assert mask4[ref0 + 4 : ref0 + 8] == b"\x00\x00\x00\x00"
+    assert mask4[ref0 + 8 : ref0 + 12] == b"\xff\xff\xff\xff"
+    assert mask4[ref0 + 12 : ref0 + 16] == b"\xff\xff\xff\xff"
+    assert mask4[ref1 : ref1 + 4] == b"\xff\xff\xff\xff"
+    assert mask4[ref1 + 4 : ref1 + 8] == b"\xff\xff\xff\xff"
+    assert mask4[ref1 + 8 : ref1 + 12] == b"\x00\x00\x00\x00"
+    assert mask4[ref1 + 12 : ref1 + 16] == b"\xff\xff\xff\xff"
+    blocks4, latest4 = eel_parse_pool(lay, bytes(df4), mask4)
+    assert blocks4[2]["refs"] == 2
+    assert latest4[0x60][1] == b2 + top1
+
+
+def test_fpke_h9_cflash_rsa_patch_rejects_custom_state() -> None:
+    """H9 regression: apply_fpke_cflash_rsa_patch refuses to blindly overwrite state=='custom' unless allow_custom=True."""
+    from contitool.core.fpke import (
+        FPKE_CFLASH_MEMCHECK_APP_OFFSET,
+        analyze_fpke_cflash_bootloader,
+        apply_fpke_cflash_rsa_patch,
+        fpke_crc32_app,
+    )
+
+    cf_stock = build_synthetic_fpke_cflash()
+    info_stock = analyze_fpke_cflash_bootloader(cf_stock)
+    assert info_stock["state"] == "stock"
+
+    # Mutate one of the 4 BOLO RSA check literal bytes to a custom instruction and update MemCheckCrcTblApp[0]
+    cf_custom = bytearray(cf_stock)
+    cf_custom[info_stock["patch_cflash_offsets_int"][0]] ^= 0x0F
+    s1, _s2, length, _old_crc, _flag = struct.unpack_from("<5I", cf_custom, FPKE_CFLASH_MEMCHECK_APP_OFFSET)
+    struct.pack_into(
+        "<I",
+        cf_custom,
+        FPKE_CFLASH_MEMCHECK_APP_OFFSET + 12,
+        fpke_crc32_app(bytes(cf_custom[s1 : s1 + length])),
+    )
+    cf_custom_bytes = bytes(cf_custom)
+    assert analyze_fpke_cflash_bootloader(cf_custom_bytes)["state"] == "custom"
+
+    set_lang("en")
+    with pytest.raises(ValueError, match="custom"):
+        apply_fpke_cflash_rsa_patch(cf_custom_bytes, restore_stock=False)
+    set_lang("ru")
+    with pytest.raises(ValueError, match="custom"):
+        apply_fpke_cflash_rsa_patch(cf_custom_bytes, restore_stock=True)
+
+    # Explicit opt-in allow_custom=True permits patching/restoring
+    cf_eng, after_eng = apply_fpke_cflash_rsa_patch(cf_custom_bytes, restore_stock=False, allow_custom=True)
+    assert after_eng["state"] == "engineering"
+    assert after_eng["memcheck_bolo_entry"]["valid"] is True
+    _cf_rest, after_stock = apply_fpke_cflash_rsa_patch(cf_custom_bytes, restore_stock=True, allow_custom=True)
+    assert after_stock["state"] == "stock"
+    assert after_stock["memcheck_bolo_entry"]["valid"] is True
+    assert cf_eng != cf_custom_bytes
+
+
+def test_fpke_h10_dflash_edits_s0_s1_flag_and_eel67_sync() -> None:
+    """H10 regression: EEL 0x69 edits sync r68[0x44] bit 0, and EEL 0x67 edits align queue_count/learned/blank slots."""
+    from contitool.core.fpke import (
+        apply_fpke_dflash_edits,
+        eel_append_records,
+        eel_read_record_any,
+        extract_fpke_immo_passport,
+    )
+
+    lay = fpke_eel_layout()
+    base_df = build_synthetic_fpke_dflash()
+
+    # Set cp_deferred (bit 1 = 0x02) in r68[0x44] to confirm bit 0 sync preserves unrelated flag bits
+    r68_orig, _ = eel_read_record_any(lay, base_df, 0x68)
+    r68_mut = bytearray(r68_orig)
+    r68_mut[0x44] = 0x02
+    df_flags = eel_append_records(base_df, {0x68: bytes(r68_mut)})
+
+    # 1. Writing S0/S1 in EEL 0x69 must set r68[0x44] bit 0 (s0_s1_stored_in_0x69 == True) while keeping bit 1
+    df_s0_s1 = apply_fpke_dflash_edits(df_flags, slot_s0_hex="11" * 16, slot_s1_hex="22" * 16)
+    p_set = extract_fpke_immo_passport(df_s0_s1)
+    assert p_set["immo"]["s0_s1"]["state"] == "present"
+    assert p_set["immo"]["mode_and_flags"]["s0_s1_stored_in_0x69"] is True
+    assert p_set["immo"]["mode_and_flags"]["cp_deferred"] is True
+    r68_after_set, _ = eel_read_record_any(lay, df_s0_s1, 0x68)
+    assert r68_after_set[0x44] == 0x03
+
+    # 2. Clearing S0/S1 back to FF*16 must clear r68[0x44] bit 0 while preserving bit 1
+    df_cleared = apply_fpke_dflash_edits(df_s0_s1, slot_s0_hex="FF" * 16, slot_s1_hex="FF" * 16)
+    p_clr = extract_fpke_immo_passport(df_cleared)
+    assert p_clr["immo"]["s0_s1"]["state"] == "empty_expected_in_mode_1"
+    assert p_clr["immo"]["mode_and_flags"]["s0_s1_stored_in_0x69"] is False
+    assert p_clr["immo"]["mode_and_flags"]["cp_deferred"] is True
+    r68_after_clr, _ = eel_read_record_any(lay, df_cleared, 0x68)
+    assert r68_after_clr[0x44] == 0x02
+
+    # 3. EEL 0x67 sync from blank 0xFF record: byte +0x24 is queue_count (0, NOT learned_keys!), compact keys & blank tail
+    r67_blank = bytearray(b"\xff" * lay["ids"][0x67])
+    r67_blank[:2] = struct.pack("<H", len(r67_blank))
+    df_blank_67 = eel_append_records(base_df, {0x67: bytes(r67_blank)})
+
+    df_k2 = apply_fpke_dflash_edits(df_blank_67, key_display_ids=["11223344", None, "55667788"])
+    info_k2 = analyze_fpke_dflash(df_k2)
+    tp2 = info_k2["transponder_records"]
+    assert tp2["learned_keys"] == 2
+    assert tp2["allowed_keys"] == 2
+    assert tp2["queue_count"] == 0
+    assert tp2["queue_pending_mask"] == 0
+    assert tp2["queue_flags"] == 0
+    assert tp2["display_ids"] == ["11223344", "55667788"] + [None] * 6
+    assert [k["state"] for k in tp2["key_ids"]] == ["active", "active"] + ["empty"] * 6
+
+    # 4. Reducing learned_keys clears trailing slots >= learned_keys to 0xFFFFFFFF (no outside_learned_count)
+    df_k1 = apply_fpke_dflash_edits(df_k2, learned_keys=1)
+    tp1 = analyze_fpke_dflash(df_k1)["transponder_records"]
+    assert tp1["learned_keys"] == 1
+    assert tp1["display_ids"] == ["11223344"] + [None] * 7
+    assert [k["state"] for k in tp1["key_ids"]] == ["active"] + ["empty"] * 7
+
+    # 5. Requesting learned_keys > populated keys clamps to populated count
+    df_clamp = apply_fpke_dflash_edits(df_k1, learned_keys=5)
+    assert analyze_fpke_dflash(df_clamp)["transponder_records"]["learned_keys"] == 1
+
+
+def test_fpke_m6a_layout_early_magic_dflash_validation_02f7_secondary_macs_and_pool_exhausted() -> None:
+    """M6a regression: early magic search, DFlash size/power_class/odo checks, 02F7 guards, secondary MACs, pool exhaustion."""
+    from contitool.core.fpke import (
+        FDL_POOL_MAGIC_120MHZ,
+        FPKE_CFLASH_SIZE,
+        apply_fpke_dflash_edits,
+        build_fpke_02f7_payload,
+        compare_fpke_immo_passports,
+        eel_append_records,
+    )
+
+    # 1. fpke_eel_layout must NOT abort when FDL_POOL_MAGIC appears at offset < 0x10
+    cf = bytearray(b"\xff" * FPKE_CFLASH_SIZE)
+    cf[0x04 : 0x04 + len(FDL_POOL_MAGIC_120MHZ)] = FDL_POOL_MAGIC_120MHZ
+    idl_off = 0x100000
+    custom_ids = [(1, 16), (2, 32), (3, 64)]
+    for idx, (eid, esz) in enumerate(custom_ids):
+        struct.pack_into("<HH", cf, idl_off + 4 * idx, eid, esz)
+    desc_off = 0x180000
+    struct.pack_into("<HHIIH", cf, desc_off, 32, 8, idl_off, 0, len(custom_ids))
+    cf[desc_off + 0x10 : desc_off + 0x18] = FDL_POOL_MAGIC_120MHZ
+    lay_found = fpke_eel_layout(bytes(cf))
+    assert lay_found["ids"] == {1: 16, 2: 32, 3: 64}
+
+    # 2. apply_fpke_dflash_edits upfront size check, power_class="-"/"—"/"", and odd odometer_km validation
+    base_df = build_synthetic_fpke_dflash()
+    with pytest.raises(ValueError):
+        apply_fpke_dflash_edits(b"\xff" * 128)
+    for dash_pc in ("-", "—", "", "  -  "):
+        df_pc = apply_fpke_dflash_edits(base_df, power_class=dash_pc)
+        r68_pc, _ = __import__("contitool.core.fpke", fromlist=["eel_read_record_any"]).eel_read_record_any(
+            fpke_eel_layout(), df_pc, 0x68
+        )
+        assert r68_pc[0x40] == 0xFF
+    with pytest.raises(ValueError):
+        apply_fpke_dflash_edits(base_df, power_class="ZZ")
+    with pytest.raises(ValueError):
+        apply_fpke_dflash_edits(base_df, odometer_km=12345)
+
+    # 3. build_fpke_02f7_payload rejects 0xAA*16 / 0xFF*16 / 0x00*16 / empty for S0, S1, current_kc, new_kc
+    good_s0 = bytes(range(1, 17))
+    good_s1 = bytes(range(17, 33))
+    good_kc = bytes(range(33, 49))
+    req, plain = build_fpke_02f7_payload(
+        vin="TESTVIN0123456789",
+        s0=good_s0,
+        s1=good_s1,
+        current_kc=good_kc,
+        power_class=0x4C,
+        allowed_keys=2,
+    )
+    assert len(req) == 87 and len(plain) == 80
+    for bad_key in (b"\xaa" * 16, b"\xff" * 16, b"\x00" * 16, b""):
+        with pytest.raises(ValueError):
+            build_fpke_02f7_payload(
+                vin="TESTVIN0123456789",
+                s0=good_s0,
+                s1=good_s1,
+                current_kc=good_kc,
+                new_kc=bad_key,
+                power_class=0x4C,
+                allowed_keys=2,
+            )
+    with pytest.raises(ValueError):
+        build_fpke_02f7_payload(
+            vin="TESTVIN0123456789",
+            s0=b"\xaa" * 16,
+            s1=good_s1,
+            current_kc=good_kc,
+            power_class=0x4C,
+            allowed_keys=2,
+        )
+    with pytest.raises(ValueError):
+        build_fpke_02f7_payload(
+            vin="TESTVIN0123456789",
+            s0=good_s0,
+            s1=good_s1,
+            current_kc=b"\xaa" * 16,
+            power_class=0x4C,
+            allowed_keys=2,
+        )
+
+    # 4. compare_fpke_immo_passports must compare secondary partner MACs (MSG_2, MSG_3, MSG_4, OCU, VTS)
+    df_sec_a = apply_fpke_dflash_edits(base_df, partner_macs={"MSG_2": "1234", "OCU": "ABCD"})
+    df_sec_b = apply_fpke_dflash_edits(base_df, partner_macs={"MSG_2": "1234", "OCU": "BEEF"})
+    cmp_diff = compare_fpke_immo_passports(df_sec_a, df_sec_b)
+    assert cmp_diff["field_checks"]["mac_fields"] is True
+    assert cmp_diff["field_checks"]["partner_macs"] is False
+    assert cmp_diff["semantic_match"] is False
+    assert "partner_macs" in cmp_diff["mismatched_fields"]
+    assert compare_fpke_immo_passports(df_sec_a, df_sec_a)["semantic_match"] is True
+
+    # 5. Bilingual EEL pool exhausted error matches in both RU and EN
+    lay = fpke_eel_layout()
+    exhausted = bytearray(b"\xff" * FPKE_DFLASH_SIZE)
+    for n in range(28):
+        b = n * 0x800
+        ec = 11 if n < 27 else 10
+        struct.pack_into("<5I", exhausted, b, 0xFFFFFFFF, EEL_MARK, 0xFFFFFFFF, 0xFFFFFFFF, eel_cs24(ec))
+    for n in range(26):
+        b = n * 0x800
+        struct.pack_into("<I", exhausted, b + 0x08, EEL_MARK)
+        struct.pack_into("<I", exhausted, b + 0x14, eel_cs24(((n - 1) % 28) * 0x800 + 0x18))
+        struct.pack_into("<I", exhausted, b + 0x0C, EEL_MARK)
+    b27 = 27 * 0x800
+    struct.pack_into("<I", exhausted, b27 + 0x08, EEL_MARK)
+    struct.pack_into("<I", exhausted, b27 + 0x14, eel_cs24(26 * 0x800 + 0x18))
+    struct.pack_into("<I", exhausted, b27 + 0x0C, EEL_MARK)
+    for lang in ("en", "ru"):
+        set_lang(lang)
+        cur = bytes(exhausted)
+        with pytest.raises(RuntimeError, match="EEL pool"):
+            for seq in range(10):
+                cur = eel_append_records(cur, {1: struct.pack("<H", 252) + bytes([seq]) * 250})
+
+
+def test_fpke_h25_m3_gateway_guards_log_lock_and_superseded_link_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """H25 + M3a/b regression: via_gateway refuses KL15/drive-sim, _log_lock prevents close race, open_or_reuse closes superseded link."""
+    import threading
+    from contitool.can import fpke as can_fpke_mod
+    from contitool.can.fpke import close_active_fpke_link, open_or_reuse_fpke_link
+
+    # 1. H25: via_gateway=True refuses set_kl15 and start_drive_simulation without sending any Komfort CAN frames
+    gw_bus = FakeFpkeBus()
+    gw_link = FpkeCanLink("fake-gw", interface="slcan", bus=gw_bus, via_gateway=True)
+    try:
+        set_lang("en")
+        with pytest.raises(RuntimeError, match="gateway"):
+            gw_link.set_kl15(True)
+        with pytest.raises(RuntimeError, match="gateway"):
+            gw_link.set_kl15(False)
+        with pytest.raises(RuntimeError, match="gateway"):
+            gw_link.start_drive_simulation()
+        assert gw_link.tx_frames == 0
+        assert gw_link.is_keepalive_running() is False
+        assert gw_link.is_drive_simulation_running() is False
+    finally:
+        gw_link.close()
+
+    # 2. M3a: concurrent _record_frame and close() with log file must not raise ValueError on closed file
+    log_file = tmp_path / "race.jsonl"
+    race_link = FpkeCanLink("fake-race", interface="slcan", bus=FakeFpkeBus(), log_path=log_file)
+    errors: list[Exception] = []
+    stop_evt = threading.Event()
+
+    def _writer() -> None:
+        while not stop_evt.is_set():
+            try:
+                race_link._record_frame("tx", 0x3C0, False, b"\x00\x00\x03\x00")
+            except Exception as exc:
+                errors.append(exc)
+                break
+
+    t = threading.Thread(target=_writer, daemon=True)
+    t.start()
+    try:
+        for _ in range(20):
+            race_link._record_frame("tx", 0x663, False, b"\x00" * 8)
+        race_link.close()
+        stop_evt.set()
+        t.join(timeout=2.0)
+    finally:
+        stop_evt.set()
+        t.join(timeout=2.0)
+    assert errors == []
+
+    # 3. M3b: open_or_reuse_fpke_link closes any link installed concurrently while a new link is being constructed
+    close_active_fpke_link()
+    first_bus = FakeFpkeBus()
+    second_bus = FakeFpkeBus()
+    raced_link = FpkeCanLink("port-a", interface="slcan", bus=first_bus)
+    orig_cls = can_fpke_mod.FpkeCanLink
+
+    def _racing_ctor(*args, **kwargs):
+        # Simulate another thread registering `raced_link` into `_ACTIVE_LINK` mid-construction
+        with can_fpke_mod._ACTIVE_LINK_LOCK:
+            can_fpke_mod._ACTIVE_LINK = raced_link
+        return orig_cls(*args, **kwargs)
+
+    monkeypatch.setattr(can_fpke_mod, "FpkeCanLink", _racing_ctor)
+    try:
+        winner = open_or_reuse_fpke_link("port-b", interface="slcan", bus=second_bus)
+        assert raced_link.is_closed is True
+        assert winner.is_closed is False
+        assert can_fpke_mod.get_active_fpke_link("port-b", "slcan") is winner
+    finally:
+        monkeypatch.setattr(can_fpke_mod, "FpkeCanLink", orig_cls)
+        close_active_fpke_link()
+
+
+def test_gui_and_cli_remaining_high_guards(monkeypatch) -> None:
+    """Regressions for H22 tail (MRR _xcp_available dynamic j2534), H25 (FPK_E gateway disables raw CAN), H26 (CLI --yes & dpdu)."""
+    from contitool.cli.main import build_arg_parser, main as cli_main
+    from contitool.gui.app import create_window
+
+    set_lang("en")
+    app, win = create_window()
+    try:
+        # H25 GUI: via_gateway disables raw Komfort CAN sender & presets
+        win.fpke_screen.open_from_ident(
+            {"ecu_kind": "fpke", "via_gateway": True, "gateway_bridge": True, "gateway_channel": 0, "ident": []}
+        )
+        win.fpke_screen.select("can_ctrl")
+        app.processEvents()
+        panel = win.fpke_screen._active_can_panel
+        assert panel is not None
+        assert panel.btn_send_pkt.isEnabled() is False
+        assert panel.cmb_preset.isEnabled() is False
+
+        # H22 tail: MRR _xcp_available() re-evaluates conn.interface dynamically on switch to j2534
+        win.conn.interface = "slcan"
+        win.mrr_screen.set_routing(via_gateway=False, gateway_bridge=False, gateway_channel=2)
+        assert win.mrr_screen._xcp_available() is True
+        win.conn.interface = "j2534"
+        assert win.mrr_screen._xcp_available() is False
+    finally:
+        win.close()
+
+    # H26 CLI: destructive BCM/MRR commands refuse without --yes, and dpdu/j2534 allow omitting --port
+    parser = build_arg_parser()
+    args_bcm_no_port = parser.parse_args(["bcm", "status", "--interface", "dpdu", "--via-gateway"])
+    assert not args_bcm_no_port.port
+    args_mrr_no_port = parser.parse_args(["mrr", "status", "--interface", "j2534", "--via-gateway"])
+    assert not args_mrr_no_port.port
+
+    rc_bcm = cli_main(["bcm", "write-keys", "--interface", "slcan", "--port", "fake", "--new-gfa", "11" * 16])
+    assert rc_bcm != 0
+    rc_mrr_wk = cli_main(["mrr", "write-keys", "--interface", "slcan", "--port", "fake", "--new-gfa", "11" * 16])
+    assert rc_mrr_wk != 0
+    rc_mrr_rst = cli_main(["mrr", "reset-cp-counter", "--interface", "slcan", "--port", "fake"])
+    assert rc_mrr_rst != 0
+    # fpke --interface dpdu without --via-gateway must fail cleanly
+    rc_fpke_dpdu = cli_main(["fpke", "read", "--interface", "dpdu"])
+    assert rc_fpke_dpdu != 0
+
+
 
 
 

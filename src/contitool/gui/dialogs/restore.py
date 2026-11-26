@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QCheckBox, QFileDialog, QGridLayout, QLabel, QWidg
 from contitool.can import backup_identity
 from contitool.core.analyzer import detect_dump_file
 from contitool.gui.widgets.page import Callout, Dialog, button, hint
-from contitool.gui.workspace import KINDS, NAMES, kind_of
+from contitool.gui.workspace import KINDS, NAMES, kind_of, other_ecu_dflash_label
 from contitool.i18n import tr
 
 
@@ -51,18 +51,12 @@ class RestoreDialog(Dialog):
         note = Callout("warn")
         note.label.setText(
             tr(
-                "Сначала ContiTool прочитает из блока <b>FAZIT</b> и <b>VCRN</b> и сравнит их с бэкапом. Бэкап "
-                "другого блока не запишется: отказ будет до первой команды записи.<br><br>Дальше как при "
-                "«Записать в блок»: каждая область перед записью читается из блока, пишутся только отличающиеся "
-                "блоки памяти, после записи — проверка чтением. CodeFlash пишется через инженерный загрузчик, "
-                "потом возвращается загрузчик из бэкапа, а если Uflash не выбран — тот, что был в "
-                "блоке.<br><br>Не отключайте питание +12 В (Pin 1 и 14) до конца.",
-                "ContiTool first reads <b>FAZIT</b> and <b>VCRN</b> from the ECU and compares them with the "
-                "backup. A backup of another ECU is refused before the first write command.<br><br>Then it works "
-                "like “Write to ECU”: each area is read from the ECU first, only differing memory blocks are "
-                "written, and the result is read back. CodeFlash goes in through the engineering bootloader; then"
-                " the backup's bootloader is written back, or, if Uflash is not selected, the one the ECU "
-                "had.<br><br>Keep the +12 V supply (Pin 1 and 14) on until the end.",
+                "• Перед записью проверяются <b>FAZIT</b> и <b>VCRN</b> — бэкап чужого блока будет отклонён.<br>"
+                "• Записываются только отличающиеся блоки памяти, после чего выполняется проверка чтением.<br>"
+                "• Не отключайте питание +12 В (Pin 1 и 14) до завершения операции.",
+                "• <b>FAZIT</b> and <b>VCRN</b> are verified first — a backup from another ECU is rejected.<br>"
+                "• Only changed blocks are written, followed by readback verification.<br>"
+                "• Keep +12 V power (Pin 1 and 14) stable until finished.",
             )
         )
         self.body.addWidget(note)
@@ -80,6 +74,12 @@ class RestoreDialog(Dialog):
         rejected = []
         for p in paths:
             kind = kind_of(detect_dump_file(p))
+            if kind in ("dflash", "uflash"):
+                try:
+                    if other_ecu_dflash_label(p.read_bytes()) is not None:
+                        kind = None
+                except OSError:
+                    kind = None
             if kind is None:
                 rejected.append(p.name)
                 continue

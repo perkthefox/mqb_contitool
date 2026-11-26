@@ -233,35 +233,29 @@ class ConnectionDialog(Dialog):
         self.chk_120ohm.toggled.connect(self._term_toggled)
         self.body.addWidget(self.chk_120ohm)
         self.lbl_term_help = hint(tr(
-            "На каждом конце шины CAN нужен резистор 120 Ом: без него сигнал отражается и кадры теряются. На "
-            "столе шина состоит только из блока и адаптера, поэтому включите терминатор в адаптере (обычно "
-            "это перемычка или переключатель) или поставьте резистор 120 Ом между CAN-H и "
-            "CAN-L.<br><b>Галочка — только напоминание: ContiTool ничего не измеряет.</b>",
-            "Each end of a CAN bus needs a 120 Ω resistor: without it the signal reflects and frames get "
-            "lost. On the bench the bus is just the ECU and the adapter, so switch on the adapter's "
-            "terminator (usually a jumper or a switch) or fit a 120 Ω resistor between CAN-H and "
-            "CAN-L.<br><b>The checkbox is only a reminder: ContiTool measures nothing.</b>",
+            "<b>На стенде</b> включите терминатор в адаптере (перемычка/переключатель) или поставьте 120 Ом между CAN-H и CAN-L.<br>"
+            "<b>В автомобиле (через OBD-II)</b> терминатор адаптера должен быть <b>ВЫКЛЮЧЕН</b> — шина машины уже терминирована.<br>"
+            "<b>Галочка — только напоминание: ContiTool ничего не измеряет.</b>",
+            "<b>On the bench</b>, enable the adapter's terminator (jumper/switch) or fit 120 Ω between CAN-H and CAN-L.<br>"
+            "<b>In a vehicle (via OBD-II)</b>, keep the adapter's 120 Ω terminator <b>OFF</b> — the car bus is already terminated.<br>"
+            "<b>The checkbox is only a reminder: ContiTool measures nothing.</b>",
         ))
         self.body.addWidget(self.lbl_term_help)
         self.chk_driver = WrapCheckBox()  # a D-PDU driver version ContiTool was not checked with
         self.chk_driver.toggled.connect(lambda *_a: self._sync())
         self.body.addWidget(self.chk_driver)
         self.lbl_vnci = hint(tr(
-            "<b>Драйвер перепрошьёт адаптер под свою версию.</b> При подключении драйвер D-PDU сам записывает в "
-            "VAS 6154 / VNCI прошивку своей версии (около 30 секунд); не отключайте адаптер до конца. Это безопасно: "
-            "ODIS при следующем подключении так же запишет в адаптер свою версию.<br>"
-            "<b>Закройте ODIS и VCTool.</b> Пока работает ContiTool, они должны быть закрыты.",
-            "<b>The driver reflashes the adapter to its own version.</b> On connect the D-PDU driver itself writes "
-            "firmware of its version into the VAS 6154 / VNCI (about 30 seconds); do not unplug the adapter until it "
-            "finishes. This is safe: ODIS writes its own version back into the adapter the next time it connects.<br>"
-            "<b>Close ODIS and VCTool.</b> They must stay closed while ContiTool is working.",
+            "<b>Драйвер D-PDU обновит прошивку VCI (~30 с)</b> — не отключайте адаптер. Это безопасно: ODIS позже вернёт свою версию.<br>"
+            "<b>Закройте ODIS и VCTool</b> перед работой в ContiTool.",
+            "<b>The D-PDU driver reflashes the VCI (~30 s)</b> — do not unplug. This is safe: ODIS writes its own version back later.<br>"
+            "<b>Close ODIS and VCTool</b> while ContiTool is running.",
         ))
         self.body.addWidget(self.lbl_vnci)
         self.btn_help = _link(tr("Справка", "Help"), self._open_help)
         self.btn_help.setToolTip(
             tr(
-                "Открыть справку со схемами подключения к разъёму T20 шлюза J533 и к разъёму T18 приборной панели Kombi",
-                "Open help with bench wiring diagrams for the J533 gateway (T20) and Kombi cluster (T18)",
+                "Схемы подключения на стенде: J533 (T20) и Kombi FPK_E (T18)",
+                "Bench wiring diagrams: J533 (T20) and Kombi FPK_E (T18)",
             )
         )
         self.body.addLayout(row(self.btn_help))
@@ -270,7 +264,7 @@ class ConnectionDialog(Dialog):
         self.lbl_outdir = PathLabel()
         self.lbl_outdir.setObjectName("Hint")
         self.body.addWidget(group_label(tr("Папка с дампами и сессиями", "Dumps and sessions folder")))
-        out_row = row(self.lbl_outdir, button(tr("Открыть", "Open"), "GhostBtn", slot=self._open_outdir), 0)
+        out_row = row(self.lbl_outdir, button(tr("Открыть", "Open"), "InlineBtn", slot=self._open_outdir), 0)
         out_row.setStretchFactor(self.lbl_outdir, 1)
         self.body.addLayout(out_row)
         self.body.addStretch(1)  # the dialog keeps its size: spare room goes below, not between the rows
@@ -396,10 +390,8 @@ class ConnectionDialog(Dialog):
         iface, port, _title = self.selection()
         builtin = iface in BUILTIN_TERMINATION  # VAS 6154 / VNCI and J2534 terminate the bus themselves: nothing to ask
         self.chk_120ohm.setText(tr(
-            "Терминатор CAN включён (в адаптере или резистор 120 Ом между CAN-H и CAN-L), "
-            "питание +12 В стабильное",
-            "CAN termination is on (in the adapter or a 120 Ω resistor between CAN-H and CAN-L),"
-            " +12 V supply is stable",
+            "На стенде установлен резистор 120 Ом между CAN-H и CAN-L (в авто через OBD-II — выкл.), питание +12 В стабильное",
+            "120 Ω resistor between CAN-H and CAN-L on bench (OFF via in-vehicle OBD-II), +12 V supply is stable",
         ))
         self.chk_120ohm.setVisible(not builtin)
         self.lbl_term_help.setVisible(not builtin)
@@ -411,19 +403,15 @@ class ConnectionDialog(Dialog):
         self.chk_driver.setVisible(drv is not None)
         if dpdu.driver_unstable(drv or ""):
             self.chk_driver.setText(tr(
-                f"Всё равно работать на драйвере D-PDU {drv}. На версиях 30 и новее работа сейчас нестабильна: "
-                "адаптер зависает посреди прошивки по UDS. Надёжнее выбрать в списке драйвер 27.2 — он идёт вместе "
-                "с ContiTool",
-                f"Use D-PDU driver {drv} anyway. On versions 30 and newer work is unstable at the moment: the "
-                "adapter hangs partway through a UDS flash. The reliable choice is driver 27.2 in the list — it "
-                "comes with ContiTool",
+                f"Использовать драйвер D-PDU {drv} (версии 30+ нестабильны и могут зависать при прошивке; "
+                "надёжнее выбрать встроенный драйвер 27.2)",
+                f"Use D-PDU driver {drv} anyway (versions 30+ are unstable and may hang during flash; "
+                "prefer the bundled driver 27.2)",
             ))
         else:
             self.chk_driver.setText(tr(
-                f"Разрешить непроверенный драйвер D-PDU {drv or '?'}: при подключении он перепрошьёт VCI под свою "
-                "версию",
-                f"Allow the unverified D-PDU driver {drv or '?'}: on connect it reflashes the VCI to its own "
-                "version",
+                f"Разрешить непроверенный драйвер D-PDU {drv or '?'} (обновит прошивку VCI)",
+                f"Allow unverified D-PDU driver {drv or '?'} (reflashes VCI firmware)",
             ))
         self.chk_driver.setToolTip(tr(f"Проверены: {', '.join(dpdu.SUPPORTED_DRIVERS)}",
                                       f"Verified: {', '.join(dpdu.SUPPORTED_DRIVERS)}"))
@@ -470,7 +458,7 @@ class ConnectionDialog(Dialog):
         found = ", ".join(filter(None, (values.get("F187"), values.get("F197"), values.get("F189") and f"SW {values['F189']}")))
         ecu_kind = str(res.get("ecu_kind") or "")
         unsupported = res.get("unsupported") or (
-            "" if ecu_kind in ("fpke", "bcm") else unsupported_ecu_reason(res.get("ident", []))
+            "" if ecu_kind in ("fpke", "bcm", "mrr") else unsupported_ecu_reason(res.get("ident", []))
         )
         if unsupported:
             msg = "⚠ " + tr("Блок отвечает, но не поддерживается", "ECU answers, but is not supported")
@@ -484,7 +472,11 @@ class ConnectionDialog(Dialog):
             msg = "✓ " + tr("Блок отвечает (в режиме загрузчика FBL)", "ECU answers (in FBL bootloader mode)")
             self._check_done(msg + (f": {found}" if found else ""), "warn")
             return
-        tag = " [09 BCM]" if ecu_kind == "bcm" else (" [17 FPK_E]" if ecu_kind == "fpke" else "")
+        tag = (
+            " [09 BCM]"
+            if ecu_kind == "bcm"
+            else (" [17 FPK_E]" if ecu_kind == "fpke" else (" [13 ACC]" if ecu_kind == "mrr" else ""))
+        )
         self._check_done("✓ " + tr("Блок отвечает", "ECU answers") + tag + (f": {found}" if found else ""), "ok")
 
     def _check_done(self, text: str, tone: str) -> None:

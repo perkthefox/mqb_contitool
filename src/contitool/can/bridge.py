@@ -29,7 +29,7 @@ from contitool.can.hw_applets import (
     J533_BUS_CHANNELS,
     build_j533_can_bridge_applet,
 )
-from contitool.can.transport import J533CanLink
+from contitool.can.transport import J533CanLink, UdsNegativeResponse, UnexpectedUdsResponse
 from contitool.i18n import tr
 from contitool.progress import NULL_REPORTER, OperationReporter
 
@@ -81,6 +81,7 @@ class J533CanBridge:
         reset_wait: float | None = None,
         verify_app_return: bool = True,
         burst_frames: list[tuple[int, bytes]] | None = None,
+        target_rx_filter: list[tuple[int, bool]] | tuple[tuple[int, bool], ...] | None = None,
         reporter: OperationReporter = NULL_REPORTER,
     ) -> None:
         if target_channel not in J533_BUS_CHANNELS:
@@ -99,9 +100,11 @@ class J533CanBridge:
         self.reset_wait = (0.05 if bus is not None else 1.4) if reset_wait is None else reset_wait
         self.verify_app_return = verify_app_return
         self.burst_frames = list(burst_frames) if burst_frames else None
+        self.target_rx_filter = tuple((int(cid), bool(ext)) for cid, ext in target_rx_filter) if target_rx_filter else None
         self.reporter = reporter
 
         self._link: J533CanLink | None = None
+        self._applet_sent: bool = False
         self.active: bool = False
         self.loader_info: dict[str, Any] = {}
         self.stop_info: dict[str, Any] = {}
@@ -155,19 +158,37 @@ class J533CanBridge:
         try:
             if self._injected_bus is None and not bridge_bus_ok(self.interface, link.bus):
                 raise _no_bridge_adapter(self.interface)
+            # On a fresh D-PDU session whose RawMode monitor has not yet seen a live bus frame, send one read-only
+            # `10 03` check BEFORE entering `10 02` / RAM-Loader so a VNCI that needs CAN1 priming or falls back to
+            # fixed-ID / UDS-only fails fast without disturbing the gateway.
+            if (
+                self._injected_bus is None
+                and self.interface == "dpdu"
+                and not getattr(link.bus, "_raw_rx_verified", False)
+                and callable(getattr(link.bus, "fallback_from_silent_raw", None))
+            ):
+                with contextlib.suppress(TimeoutError, UdsNegativeResponse, UnexpectedUdsResponse):
+                    link.request_uds(b"\x10\x03", 0x50, timeout=1.0)
+                if not bridge_bus_ok(self.interface, link.bus):
+                    raise _no_bridge_adapter(self.interface)
             self.loader_info = enter_ram_loader(link, reporter=self.reporter)
-            # A VNCI may first turn out to need CAN1 primed while entering the loader (its monitor then filters ids)
+            # A VNCI may still turn out to need CAN1 primed while entering the loader (its monitor then filters ids)
             if self._injected_bus is None and not bridge_bus_ok(self.interface, link.bus):
                 raise _no_bridge_adapter(self.interface)
             applet = build_j533_can_bridge_applet(
-                self.target_channel, idle_limit=self.idle_limit, burst_frames=self.burst_frames
+                self.target_channel,
+                idle_limit=self.idle_limit,
+                burst_frames=self.burst_frames,
+                target_rx_filter=self.target_rx_filter,
             )
+            filter_note = f", GAFL={len(self.target_rx_filter)} ID" if self.target_rx_filter else ""
             self.reporter.can_log(
                 tr(
-                    f"Загрузка RAM-апплета CAN-моста ({len(applet)} Б, ch3 ↔ ch{self.target_channel})…",
-                    f"Uploading CAN-bridge RAM applet ({len(applet)} B, ch3 ↔ ch{self.target_channel})…",
+                    f"Загрузка RAM-апплета CAN-моста ({len(applet)} Б, ch3 ↔ ch{self.target_channel}{filter_note})…",
+                    f"Uploading CAN-bridge RAM applet ({len(applet)} B, ch3 ↔ ch{self.target_channel}{filter_note})…",
                 )
             )
+            self._applet_sent = True
             link.send_loader_payload(
                 applet,
                 inter_frame_delay=0.0 if self._injected_bus is not None else 0.003,
@@ -189,7 +210,7 @@ class J533CanBridge:
                 )
             )
             return self
-        except Exception:
+        except BaseException:
             self._close_safely(had_error=True)
             raise
 
@@ -243,49 +264,78 @@ class J533CanBridge:
             return info
 
         try:
-            if self.active:
-                self.reporter.info(
-                    tr(
-                        "Закрытие CAN-моста и возврат шлюза J533 в штатный режим…",
-                        "Closing CAN bridge and returning J533 gateway to Application mode…",
+            if self.active or (had_error and self._applet_sent):
+                was_active = self.active
+                if was_active:
+                    self.reporter.info(
+                        tr(
+                            "Закрытие CAN-моста и возврат шлюза J533 в штатный режим…",
+                            "Closing CAN bridge and returning J533 gateway to Application mode…",
+                        )
                     )
-                )
                 with contextlib.suppress(*LINK_ERRORS):
                     link.drain_rx(max_frames=256, quick=True)
                 ack = False
                 for _attempt in range(3):
+                    if getattr(getattr(link, "bus", None), "spent", False):
+                        break
                     with contextlib.suppress(*LINK_ERRORS):
                         link.send_frame(J533_BRIDGE_STOP_ID, J533_BRIDGE_STOP_DATA)
-                    if self._wait_beacon(J533_BRIDGE_END_ID, J533_BRIDGE_END_DATA, 0.5):
-                        ack = True
-                        break
+                    try:
+                        if self._wait_beacon(J533_BRIDGE_END_ID, J533_BRIDGE_END_DATA, 0.5):
+                            ack = True
+                            break
+                    except LINK_ERRORS:
+                        if getattr(getattr(link, "bus", None), "spent", False):
+                            break
                 info["end_ack"] = ack
                 self.active = False
 
-                if self.reset_wait > 0:
-                    time.sleep(self.reset_wait)
+                if was_active or ack:
+                    if self.reset_wait > 0:
+                        time.sleep(self.reset_wait)
 
-                if self.verify_app_return:
-                    try:
-                        sess, in_fbl = _probe_app_or_fbl(link, attempts=8, allow_fbl=True)
-                        info["session_after"] = sess
-                        info["in_fbl"] = in_fbl
-                        info["returned_to_app"] = not in_fbl
-                        if not in_fbl:
-                            self.reporter.can_log(
+                    if self.verify_app_return:
+                        try:
+                            sess, in_fbl = _probe_app_or_fbl(link, attempts=8, allow_fbl=True)
+                            info["session_after"] = sess
+                            info["in_fbl"] = in_fbl
+                            info["returned_to_app"] = not in_fbl
+                            if not in_fbl:
+                                self.reporter.can_log(
+                                    tr(
+                                        "Шлюз J533 вернулся в штатное приложение.",
+                                        "J533 gateway returned to Application mode.",
+                                    )
+                                )
+                            else:
+                                self.reporter.warning(
+                                    tr(
+                                        "Внимание: шлюз J533 после выхода из CAN-моста остался в загрузчике FBL.",
+                                        "Warning: J533 gateway remained in FBL bootloader after exiting the CAN bridge.",
+                                    )
+                                )
+                        except LINK_ERRORS as exc:
+                            info["return_error"] = str(exc)
+                            self.reporter.warning(
                                 tr(
-                                    "Шлюз J533 вернулся в штатное приложение.",
-                                    "J533 gateway returned to Application mode.",
+                                    f"Не удалось подтвердить возврат шлюза J533 в штатное приложение ({exc}). "
+                                    "При необходимости выключите и включите зажигание (или перезапустите питание).",
+                                    f"Could not verify that the J533 gateway returned to Application mode ({exc}). "
+                                    "Cycle ignition (or bench power) if needed.",
                                 )
                             )
-                    except LINK_ERRORS as exc:
-                        info["return_error"] = str(exc)
+                elif had_error and self.loader_info.get("loader_ready"):
+                    # Applet was sent but did not acknowledge STOPBRDG — try factory RAM-Loader reset as fallback
+                    with contextlib.suppress(*LINK_ERRORS, can.CanError):
+                        _reset_to_application(link, reporter=self.reporter, allow_fbl=True)
             elif had_error and self.loader_info.get("loader_ready"):
                 # Failed before bridge became active while J533 was already in RAM-Loader: return it cleanly
                 with contextlib.suppress(*LINK_ERRORS, can.CanError):
                     _reset_to_application(link, reporter=self.reporter, allow_fbl=True)
         finally:
             self.active = False
+            self._applet_sent = False
             self._link = None
             with contextlib.suppress(Exception):
                 link.close()
@@ -311,6 +361,7 @@ def j533_can_bridge(
     reset_wait: float | None = None,
     verify_app_return: bool = True,
     burst_frames: list[tuple[int, bytes]] | None = None,
+    target_rx_filter: list[tuple[int, bool]] | tuple[tuple[int, bool], ...] | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> J533CanBridge:
     """Create a `J533CanBridge` context manager bridging Diagnosis CAN (`ch3`) <-> `target_channel`."""
@@ -325,5 +376,6 @@ def j533_can_bridge(
         reset_wait=reset_wait,
         verify_app_return=verify_app_return,
         burst_frames=burst_frames,
+        target_rx_filter=target_rx_filter,
         reporter=reporter,
     )

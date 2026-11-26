@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import sys
 import traceback
 
@@ -26,6 +25,25 @@ from contitool.can import (
     can_health_check,
     can_identify,
     can_learn_mfl_button,
+    can_mrr_activate_swap,
+    can_mrr_deactivate_cp,
+    can_mrr_flash_frf,
+    can_mrr_read_keys,
+    can_mrr_read_memory,
+    can_mrr_reset_cp_counter,
+    can_mrr_restore_cp_stock,
+    can_mrr_restore_swap_stock,
+    can_mrr_status,
+    can_mrr_swap_status,
+    can_mrr_write_keys,
+    can_elv_adapt,
+    can_elv_adapt_from_cluster,
+    can_elv_check_bootloader,
+    can_elv_clear_dtc,
+    can_elv_read_dflash,
+    can_elv_reset_idac,
+    can_elv_status,
+    can_elv_virginize,
     can_read_eeprom,
     can_read_memory,
     can_read_opbt,
@@ -98,6 +116,16 @@ from contitool.core import (
     generate_rsa1024_e3_keypair,
     import_zdc_block,
     inject_bem_preset,
+    mrr_apply_cp_disable_patch,
+    mrr_apply_swap_patch,
+    mrr_inspect_cflash_cp_state,
+    mrr_inspect_cflash_swap_state,
+    mrr_parse_dflash_fee,
+    mrr_read_frf,
+    elv_adapt_dflash,
+    elv_extract_cluster_material,
+    elv_parse_dflash,
+    elv_virginize_dflash,
     inject_mke_preset,
     inject_ssa_preset,
     load_rsa1024_key_material,
@@ -141,6 +169,33 @@ def _u32_timestamp(ts: int | None) -> int | None:
     if ts is not None and not 0 <= ts <= 0xFFFFFFFF:
         raise ValueError(tr(f"--timestamp вне диапазона 0..0xFFFFFFFF: {ts}", f"--timestamp out of range 0..0xFFFFFFFF: {ts}"))
     return ts
+
+
+def _parse_u8_hex(val: str) -> int:
+    """Parse one hex byte (`80`, `01`, `6F`, or `0x80`), rejecting values outside `0x00..0xFF`."""
+    s = str(val).strip()
+    if not s:
+        raise argparse.ArgumentTypeError(
+            tr("Ожидается байт в hex (00..FF), получена пустая строка", "Expected hex byte (00..FF), got empty string")
+        )
+    if s.lower().startswith("0x"):
+        body = s[2:]
+    elif s.startswith(("+", "-")):
+        raise argparse.ArgumentTypeError(
+            tr(f"Недопустимое значение байта в hex: {val!r} (ожидается 00..FF)", f"Invalid hex byte value: {val!r} (expected 00..FF)")
+        )
+    else:
+        body = s
+    if not body or not all(c in "0123456789abcdefABCDEF" for c in body):
+        raise argparse.ArgumentTypeError(
+            tr(f"Недопустимое значение байта в hex: {val!r} (ожидается 00..FF)", f"Invalid hex byte value: {val!r} (expected 00..FF)")
+        )
+    parsed = int(body, 16)
+    if not (0 <= parsed <= 0xFF):
+        raise argparse.ArgumentTypeError(
+            tr(f"Байт вне диапазона 0x00..0xFF: {val!r}", f"Byte value out of range 0x00..0xFF: {val!r}")
+        )
+    return parsed
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
@@ -1170,22 +1225,32 @@ def cmd_fpke(args: argparse.Namespace) -> int:
             print(tr(f"\n✓ План переноса сохранён: {out_p}", f"\n✓ Transfer plan saved: {out_p}"))
         return 0
 
-    if not args.port:
+    via_gw = bool(getattr(args, "via_gateway", False))
+    allowed_ifaces = (*FPKE_NATIVE_INTERFACES, "dpdu") if via_gw else FPKE_NATIVE_INTERFACES
+    if args.interface not in allowed_ifaces:
+        if args.interface == "dpdu":
+            raise ValueError(
+                tr(
+                    "Интерфейс «dpdu» (VAS 6154 / VNCI) для приборной панели FPK_E поддерживается только с флагом --via-gateway.",
+                    "Interface “dpdu” (VAS 6154 / VNCI) for FPK_E is only supported together with --via-gateway.",
+                )
+            )
+        raise ValueError(
+            tr(
+                f"Приборная панель FPK_E поддерживает только нативные CAN-адаптеры ({', '.join(FPKE_NATIVE_INTERFACES)}) "
+                f"или «dpdu» с --via-gateway. Интерфейс «{args.interface}» не поддерживается.",
+                f"FPK_E instrument cluster only supports native CAN adapters ({', '.join(FPKE_NATIVE_INTERFACES)}) "
+                f"or “dpdu” with --via-gateway. Interface “{args.interface}” is not supported.",
+            )
+        )
+    if not args.port and args.interface != "dpdu":
         raise ValueError(
             tr(
                 "Укажите порт нативного CAN-адаптера через --port (список портов: contitool can ports)",
                 "Specify native CAN adapter port via --port (list available ports with: contitool can ports)",
             )
         )
-    if args.interface not in FPKE_NATIVE_INTERFACES:
-        raise ValueError(
-            tr(
-                f"Приборная панель FPK_E поддерживает только нативные CAN-адаптеры ({', '.join(FPKE_NATIVE_INTERFACES)}). "
-                f"Интерфейс «{args.interface}» не поддерживается.",
-                f"FPK_E instrument cluster only supports native CAN adapters ({', '.join(FPKE_NATIVE_INTERFACES)}). "
-                f"Interface “{args.interface}” is not supported.",
-            )
-        )
+    port = args.port or ""
 
     base_out = clean_user_path(args.output_dir) if args.output_dir else None
     out_file = clean_user_path(args.output) if args.output else None
@@ -1212,10 +1277,9 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 )
             sdir = default_session_dir(base_out, "fpke_write")
             base_df = clean_user_path(args.base_dflash) if getattr(args, "base_dflash", None) else None
-            via_gw = bool(getattr(args, "via_gateway", False))
             gw_ch = int(getattr(args, "gateway_channel", 0) or 0)
             res = can_fpke_write_dflash(
-                args.port,
+                port,
                 clean_user_path(args.dflash),
                 interface=args.interface,
                 base_dflash=base_df,
@@ -1237,12 +1301,11 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 f"| Session: {res['session_dir']}"
             )
             return 0
-        via_gw = bool(getattr(args, "via_gateway", False))
         gw_ch = int(getattr(args, "gateway_channel", 0) or 0)
         if args.mode == "report":
             sdir = out_file.parent if out_file is not None else default_session_dir(base_out, "fpke_read")
             res = can_fpke_full_read(
-                args.port,
+                port,
                 interface=args.interface,
                 session_dir=sdir,
                 frame_delay=args.frame_delay,
@@ -1269,7 +1332,7 @@ def cmd_fpke(args: argparse.Namespace) -> int:
         else:
             sdir = out_file.parent if out_file is not None else default_session_dir(base_out, f"fpke_{args.mode}")
             res = can_fpke_read_region(
-                args.port,
+                port,
                 mode=args.mode,
                 interface=args.interface,
                 source=args.source,
@@ -1305,6 +1368,28 @@ def cmd_bcm(args: argparse.Namespace) -> int:
     import json
 
     action = args.bcm_action
+    if action in ("write-keys", "adapt-ffb") and not bool(getattr(args, "yes", False)):
+        raise ValueError(
+            tr(
+                f"Команда bcm {action} записывает ключи/адаптацию в NvM блока 09 BCM. Для подтверждения добавьте флаг --yes.",
+                f"bcm {action} writes keys/adaptation to 09 BCM NvM. Pass --yes to confirm.",
+            )
+        )
+    if action == "write-keys" and not getattr(args, "current_ika", None):
+        raise ValueError(
+            tr(
+                "Для bcm write-keys требуется указать --current-ika.",
+                "--current-ika is required for bcm write-keys.",
+            )
+        )
+    if not args.port and args.interface not in ("j2534", "dpdu"):
+        raise ValueError(
+            tr(
+                "Укажите порт CAN-адаптера через --port (список портов: contitool can ports)",
+                "Specify CAN adapter port via --port (list available ports with: contitool can ports)",
+            )
+        )
+    port = args.port or ""
     via_gw = bool(getattr(args, "via_gateway", False))
     gw_ch = int(getattr(args, "gateway_channel", 0) or 0)
     sw_prof = getattr(args, "profile", None)
@@ -1313,7 +1398,7 @@ def cmd_bcm(args: argparse.Namespace) -> int:
     try:
         if action == "status":
             res = can_bcm_status(
-                args.port,
+                port,
                 interface=args.interface,
                 via_gateway=via_gw,
                 gateway_bridge=via_gw,
@@ -1324,7 +1409,7 @@ def cmd_bcm(args: argparse.Namespace) -> int:
             )
         elif action == "read-gfa":
             res = can_bcm_read_gfa(
-                args.port,
+                port,
                 interface=args.interface,
                 via_gateway=via_gw,
                 gateway_bridge=via_gw,
@@ -1334,7 +1419,7 @@ def cmd_bcm(args: argparse.Namespace) -> int:
             )
         elif action == "read-keys":
             res = can_bcm_read_keys(
-                args.port,
+                port,
                 interface=args.interface,
                 via_gateway=via_gw,
                 gateway_bridge=via_gw,
@@ -1343,10 +1428,8 @@ def cmd_bcm(args: argparse.Namespace) -> int:
                 reporter=rep,
             )
         elif action == "write-keys":
-            if not getattr(args, "current_ika", None):
-                raise ValueError("--current-ika is required for bcm write-keys")
             res = can_bcm_write_keys(
-                args.port,
+                port,
                 current_ika=args.current_ika,
                 new_ika=getattr(args, "new_ika", None),
                 new_gfa=getattr(args, "new_gfa", None),
@@ -1366,7 +1449,7 @@ def cmd_bcm(args: argparse.Namespace) -> int:
                     else None
                 )
                 res = can_bcm_adapt_ffb_from_cluster(
-                    args.port,
+                    port,
                     fpke_dflash=df_bytes,
                     gfa_override=getattr(args, "new_gfa", None),
                     sync_bcm_gfa_to_cluster=bool(getattr(args, "sync_gfa", False)),
@@ -1392,7 +1475,7 @@ def cmd_bcm(args: argparse.Namespace) -> int:
                         }
                     )
                 res = can_bcm_adapt_ffb(
-                    args.port,
+                    port,
                     gfa=getattr(args, "new_gfa", None),
                     kc=getattr(args, "kc", None),
                     k_ffb=getattr(args, "k_ffb", None),
@@ -1407,7 +1490,9 @@ def cmd_bcm(args: argparse.Namespace) -> int:
                     reporter=rep,
                 )
         else:
-            raise ValueError(f"Unsupported bcm action: {action}")
+            raise ValueError(
+                tr(f"Неподдерживаемое действие bcm: {action}", f"Unsupported bcm action: {action}")
+            )
     finally:
         disp.finish()
 
@@ -1417,6 +1502,616 @@ def cmd_bcm(args: argparse.Namespace) -> int:
         out_path = clean_user_path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(out_txt + "\n", encoding="utf-8")
+    return 0
+
+
+def _parse_mrr_swap_groups(raw: str | None) -> tuple[int, int, int, int]:
+    if not raw:
+        return (8, 3, 4, 7)
+    parts = [p.strip() for p in str(raw).replace(":", ",").replace(" ", ",").split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError(
+            tr(
+                f"Ожидались 4 варианта групп SWaP Gen 2 (g0,g1,g2,g3), получено: {raw!r}",
+                f"Expected 4 Gen 2 SWaP group variants (g0,g1,g2,g3), got: {raw!r}",
+            )
+        )
+    return (int(parts[0], 0), int(parts[1], 0), int(parts[2], 0), int(parts[3], 0))
+
+
+def cmd_mrr(args: argparse.Namespace) -> int:
+    import json
+
+    action = args.mrr_action
+    if action == "inspect":
+        frf_arg = getattr(args, "frf", None)
+        if not args.dflash and not args.cflash and not frf_arg:
+            raise ValueError(
+                tr(
+                    "Для mrr inspect укажите --dflash, --cflash и/или --frf",
+                    "mrr inspect requires --dflash, --cflash and/or --frf",
+                )
+            )
+        cf_bytes = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+        report: dict[str, object] = {}
+        if frf_arg:
+            frf_p = clean_user_path(frf_arg)
+            report["frf"] = mrr_read_frf(frf_p.read_bytes(), frf_p.name).summary()
+        if args.dflash:
+            df_bytes = clean_user_path(args.dflash).read_bytes()
+            report["dflash_fee"] = mrr_parse_dflash_fee(df_bytes, cflash_or_boot_bytes=cf_bytes)
+        if cf_bytes is not None:
+            if args.dflash and len(cf_bytes) < 0x150000:
+                report["bootloader_size"] = len(cf_bytes)
+            else:
+                prof_arg = getattr(args, "profile", None)
+                report["cflash_cp"] = mrr_inspect_cflash_cp_state(cf_bytes, profile=prof_arg)
+                report["cflash_swap"] = mrr_inspect_cflash_swap_state(cf_bytes, profile=prof_arg)
+        out_txt = json.dumps(report, ensure_ascii=False, indent=2)
+        print(out_txt)
+        if getattr(args, "output", None):
+            out_p = clean_user_path(args.output)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(out_txt + "\n", encoding="utf-8")
+        return 0
+
+    if action == "patch-cp":
+        if not args.cflash or not args.output:
+            raise ValueError(
+                tr(
+                    "Для mrr patch-cp укажите --cflash ВХОДНОЙ.bin и -o / --output ВЫХОДНОЙ.bin",
+                    "mrr patch-cp requires --cflash INPUT.bin and -o / --output OUTPUT.bin",
+                )
+            )
+        src_p = clean_user_path(args.cflash)
+        out_p = clean_user_path(args.output)
+        if src_p.resolve() == out_p.resolve():
+            raise ValueError(tr("Отказ перезаписывать исходный дамп", "Refusing to overwrite input dump"))
+        patched, manifest = mrr_apply_cp_disable_patch(
+            src_p.read_bytes(),
+            restore_stock=bool(getattr(args, "restore_stock", False)),
+            profile=getattr(args, "profile", None),
+        )
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_bytes(patched)
+        manifest["input_file"] = str(src_p)
+        manifest["output_file"] = str(out_p)
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return 0
+
+    if action == "patch-swap":
+        if not args.cflash or not args.output:
+            raise ValueError(
+                tr(
+                    "Для mrr patch-swap укажите --cflash ВХОДНОЙ.bin и -o / --output ВЫХОДНОЙ.bin",
+                    "mrr patch-swap requires --cflash INPUT.bin and -o / --output OUTPUT.bin",
+                )
+            )
+        src_p = clean_user_path(args.cflash)
+        out_p = clean_user_path(args.output)
+        if src_p.resolve() == out_p.resolve():
+            raise ValueError(tr("Отказ перезаписывать исходный дамп", "Refusing to overwrite input dump"))
+        pkg_idx = 6 if getattr(args, "swap_package", None) is None else int(args.swap_package)
+        grp_tuple = _parse_mrr_swap_groups(getattr(args, "swap_groups", None))
+        patched, manifest = mrr_apply_swap_patch(
+            src_p.read_bytes(),
+            restore_stock=bool(getattr(args, "restore_stock", False)),
+            profile=getattr(args, "profile", None),
+            package_index=pkg_idx,
+            groups=grp_tuple,
+        )
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_bytes(patched)
+        manifest["input_file"] = str(src_p)
+        manifest["output_file"] = str(out_p)
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return 0
+
+    if action in ("cp-off", "cp-restore", "swap-on", "swap-restore", "flash-frf") and not bool(getattr(args, "yes", False)):
+        raise ValueError(
+            tr(
+                f"Команда mrr {action} стирает и перепрошивает Code Flash радара. Для подтверждения добавьте флаг --yes.",
+                f"mrr {action} erases and reprograms live Code Flash on the radar. Pass --yes to confirm.",
+            )
+        )
+    if action == "flash-frf" and not getattr(args, "frf", None):
+        raise ValueError(
+            tr(
+                "Для mrr flash-frf укажите путь к файлу через --frf ПУТЬ_К_ФАЙЛУ.frf (или .odx)",
+                "mrr flash-frf requires --frf PATH_TO_FILE.frf (or .odx)",
+            )
+        )
+    if action in ("write-keys", "reset-cp-counter") and not bool(getattr(args, "yes", False)):
+        raise ValueError(
+            tr(
+                f"Команда mrr {action} изменяет ключи / состояние CP радара 13 ACC. Для подтверждения добавьте флаг --yes.",
+                f"mrr {action} modifies live CP / keys state on the 13 ACC radar. Pass --yes to confirm.",
+            )
+        )
+
+    if action == "read-mem":
+        addr_arg = getattr(args, "address", None)
+        len_arg = getattr(args, "length", None)
+        if (addr_arg is None) != (len_arg is None):
+            raise ValueError(
+                tr(
+                    "Для произвольного диапазона mrr read-mem укажите оба параметра: --address и --length.",
+                    "Custom range for mrr read-mem requires both --address and --length.",
+                )
+            )
+        reg_arg = (getattr(args, "region", "dflash") or "dflash").strip().lower()
+        if getattr(args, "output", None) and reg_arg == "all" and addr_arg is None:
+            raise ValueError(
+                tr(
+                    "Флаг -o/--output нельзя использовать вместе с --region all; укажите --output-dir.",
+                    "-o/--output cannot be combined with --region all; use --output-dir instead.",
+                )
+            )
+
+    if not args.port and args.interface not in ("j2534", "dpdu"):
+        raise ValueError(
+            tr(
+                "Укажите порт CAN-адаптера через --port (список портов: contitool can ports)",
+                "Specify CAN adapter port via --port (list available ports with: contitool can ports)",
+            )
+        )
+    port = args.port or ""
+
+    disp = _make_cli_display(args)
+    rep = disp.create_reporter()
+    via_gw = bool(getattr(args, "via_gateway", False))
+    gw_ch = 2 if getattr(args, "gateway_channel", None) is None else int(args.gateway_channel)
+    sw_prof = getattr(args, "profile", None)
+    base_out = clean_user_path(args.output_dir) if getattr(args, "output_dir", None) else None
+
+    try:
+        if action == "status":
+            res = can_mrr_status(
+                port,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=False,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                reporter=rep,
+            )
+        elif action == "swap-status":
+            res = can_mrr_swap_status(
+                port,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=False,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                reporter=rep,
+            )
+        elif action == "read-keys":
+            s_dir = default_session_dir(base_out, "mrr_keys") if base_out else None
+            res = can_mrr_read_keys(
+                port,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                session_dir=s_dir,
+                reporter=rep,
+            )
+        elif action == "write-keys":
+            res = can_mrr_write_keys(
+                port,
+                current_ika=getattr(args, "current_ika", None),
+                new_ika=getattr(args, "new_ika", None),
+                new_gfa=getattr(args, "new_gfa", None),
+                reset_after=not bool(getattr(args, "no_reset", False)),
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                reporter=rep,
+            )
+        elif action == "read-mem":
+            s_dir = default_session_dir(base_out, "mrr_read")
+            out_p = clean_user_path(args.output) if getattr(args, "output", None) else None
+            res = can_mrr_read_memory(
+                port,
+                region=getattr(args, "region", "dflash") or "dflash",
+                address=getattr(args, "address", None),
+                length=getattr(args, "length", None),
+                fast=not bool(getattr(args, "slow", False)),
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                session_dir=s_dir,
+                output_path=out_p,
+                reporter=rep,
+            )
+        elif action in ("cp-off", "cp-restore"):
+            app_p = clean_user_path(args.cflash) if getattr(args, "cflash", None) else None
+            s_dir = default_session_dir(base_out, "mrr_cp")
+            fn = can_mrr_restore_cp_stock if action == "cp-restore" else can_mrr_deactivate_cp
+            res = fn(
+                port,
+                app_image=app_p,
+                force=bool(getattr(args, "force", False)),
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                session_dir=s_dir,
+                reporter=rep,
+            )
+        elif action in ("swap-on", "swap-restore"):
+            app_p = clean_user_path(args.cflash) if getattr(args, "cflash", None) else None
+            s_dir = default_session_dir(base_out, "mrr_swap")
+            if action == "swap-restore":
+                res = can_mrr_restore_swap_stock(
+                    port,
+                    app_image=app_p,
+                    force=bool(getattr(args, "force", False)),
+                    interface=args.interface,
+                    via_gateway=via_gw,
+                    gateway_bridge=via_gw,
+                    gateway_channel=gw_ch,
+                    sw_profile=sw_prof,
+                    session_dir=s_dir,
+                    reporter=rep,
+                )
+            else:
+                pkg_idx = 6 if getattr(args, "swap_package", None) is None else int(args.swap_package)
+                grp_tuple = _parse_mrr_swap_groups(getattr(args, "swap_groups", None))
+                res = can_mrr_activate_swap(
+                    port,
+                    package_index=pkg_idx,
+                    groups=grp_tuple,
+                    app_image=app_p,
+                    force=bool(getattr(args, "force", False)),
+                    interface=args.interface,
+                    via_gateway=via_gw,
+                    gateway_bridge=via_gw,
+                    gateway_channel=gw_ch,
+                    sw_profile=sw_prof,
+                    session_dir=s_dir,
+                    reporter=rep,
+                )
+        elif action == "reset-cp-counter":
+            res = can_mrr_reset_cp_counter(
+                port,
+                reset_after=not bool(getattr(args, "no_reset", False)),
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                sw_profile=sw_prof,
+                reporter=rep,
+            )
+        elif action == "flash-frf":
+            frf_p = clean_user_path(args.frf)
+            s_dir = default_session_dir(base_out, "mrr_frf")
+            res = can_mrr_flash_frf(
+                port,
+                frf_p,
+                allow_mismatch=bool(getattr(args, "allow_mismatch", False)),
+                recovery_mode=bool(getattr(args, "recovery", False)),
+                interface=args.interface,
+                via_gateway=via_gw,
+                sw_profile=sw_prof,
+                session_dir=s_dir,
+                reporter=rep,
+            )
+        else:
+            raise ValueError(
+                tr(f"Неподдерживаемое действие mrr: {action}", f"Unsupported mrr action: {action}")
+            )
+    finally:
+        disp.finish()
+
+    out_txt = json.dumps(res, ensure_ascii=False, indent=2)
+    print(out_txt)
+    if getattr(args, "output", None) and action != "read-mem":
+        out_path = clean_user_path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(out_txt + "\n", encoding="utf-8")
+    return 0
+
+
+def cmd_elv(args: argparse.Namespace) -> int:
+    """Offline and live CAN workflows for VAG MQB 2B ELV / J764 (Marquardt 3Q0 905 861)."""
+    import json
+
+    action = args.elv_action
+
+    # ── Offline DFLASH workflows ──
+    if action == "inspect":
+        if not args.dflash:
+            raise ValueError(tr("Для elv inspect укажите --dflash ПУТЬ_К_ДАМПУ.bin", "elv inspect requires --dflash PATH.bin"))
+        df_p = clean_user_path(args.dflash)
+        info = elv_parse_dflash(df_p.read_bytes())
+        if not getattr(args, "records", False):
+            info = {k: v for k, v in info.items() if k != "records"}
+        out_txt = json.dumps(info, ensure_ascii=False, indent=2)
+        print(out_txt)
+        if getattr(args, "output", None):
+            out_p = clean_user_path(args.output)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(out_txt + "\n", encoding="utf-8")
+        return 0
+
+    if action == "virginize-dflash":
+        if not (args.dflash and args.output):
+            raise ValueError(
+                tr(
+                    "Для elv virginize-dflash укажите --dflash ВХОДНОЙ.bin и -o / --output ВЫХОДНОЙ.bin",
+                    "elv virginize-dflash requires --dflash INPUT.bin and -o / --output OUTPUT.bin",
+                )
+            )
+        in_p = clean_user_path(args.dflash)
+        out_p = clean_user_path(args.output)
+        new_raw = elv_virginize_dflash(in_p.read_bytes(), virgin_k5=getattr(args, "virgin_k5", None))
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_bytes(new_raw)
+        summary = elv_parse_dflash(new_raw)
+        summary = {k: v for k, v in summary.items() if k != "records"}
+        summary["output_path"] = str(out_p)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+
+    if action == "adapt-dflash":
+        if not (args.dflash and args.output):
+            raise ValueError(
+                tr(
+                    "Для elv adapt-dflash укажите --dflash ВХОДНОЙ.bin и -o / --output ВЫХОДНОЙ.bin",
+                    "elv adapt-dflash requires --dflash INPUT.bin and -o / --output OUTPUT.bin",
+                )
+            )
+        in_p = clean_user_path(args.dflash)
+        out_p = clean_user_path(args.output)
+        vin = getattr(args, "vin", None)
+        k5 = getattr(args, "k5", None)
+        pc = getattr(args, "power_class", None)
+        idac = getattr(args, "idac", None)
+        if getattr(args, "cluster_dflash", None):
+            cl_df = clean_user_path(args.cluster_dflash).read_bytes()
+            cl_cf = clean_user_path(args.cluster_cflash).read_bytes() if getattr(args, "cluster_cflash", None) else None
+            mat = elv_extract_cluster_material(cl_df, cl_cf)
+            if mat.get("slot_a_crc_ok") is False:
+                raise ValueError(
+                    tr(
+                        "Контрольная сумма CRC-32 ключа Slot A (K_5) в дампе приборной панели FPK_E не совпадает с EEL 0x68 — "
+                        "адаптация дампа ELV отменена во избежание записи повреждённого ключа.",
+                        "Slot A (K_5) key in the FPK_E cluster dump failed CRC-32 verification against EEL 0x68 — "
+                        "ELV dump adaptation aborted to avoid writing a corrupted key.",
+                    )
+                )
+            vin = vin or mat["vin"]
+            k5 = k5 or mat["slot_a_hex"]
+            if pc is None:
+                pc = mat["power_class"]
+            if idac is None and getattr(args, "lock_cluster_idac", False):
+                idac = mat["cluster_mac_id"] or None
+        if not (vin and k5 and pc is not None):
+            raise ValueError(
+                tr(
+                    "Укажите --cluster-dflash или все три параметра: --vin, --k5 и --power-class",
+                    "Specify --cluster-dflash or all three parameters: --vin, --k5, and --power-class",
+                )
+            )
+        new_raw = elv_adapt_dflash(
+            in_p.read_bytes(),
+            vin=vin,
+            k5=k5,
+            power_class=int(pc),
+            idac=idac,
+            config_byte=getattr(args, "cfg", None),
+            brand_byte=getattr(args, "brand", None),
+        )
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_bytes(new_raw)
+        summary = elv_parse_dflash(new_raw)
+        summary = {k: v for k, v in summary.items() if k != "records"}
+        summary["output_path"] = str(out_p)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+
+    # ── Online CAN workflows ──
+    from contitool.core.elv import _norm_hex_bytes, _norm_vin17, _validate_u8
+
+    needs_confirm = action in ("adapt", "virginize", "reset-idac", "clear-dtc") or (
+        action == "check-bootloader" and bool(getattr(args, "enter_programming", False))
+    )
+    if needs_confirm and not getattr(args, "yes", False):
+        if action == "check-bootloader":
+            raise ValueError(
+                tr(
+                    "Команда elv check-bootloader --enter-programming переводит 2B ELV в загрузчик (10 02) "
+                    "и выполняет сброс (11 01). Для подтверждения добавьте флаг --yes.",
+                    "elv check-bootloader --enter-programming switches 2B ELV into bootloader mode (10 02) "
+                    "and resets it (11 01). Pass --yes to confirm.",
+                )
+            )
+        raise ValueError(
+            tr(
+                f"Команда elv {action} изменяет данные в блоке 2B ELV. Для подтверждения добавьте флаг --yes.",
+                f"elv {action} modifies live state in the 2B ELV module. Pass --yes to confirm.",
+            )
+        )
+
+    if not args.port and args.interface not in ("j2534", "dpdu"):
+        raise ValueError(
+            tr(
+                "Укажите порт CAN-адаптера через --port (список портов: contitool can ports)",
+                "Specify CAN adapter port via --port (list available ports with: contitool can ports)",
+            )
+        )
+
+    # Validate ELV parameters BEFORE calling default_session_dir() so invalid arguments never create empty folders
+    if getattr(args, "current_k5", None) is not None:
+        _norm_hex_bytes(args.current_k5, 16, "--current-k5")
+    if getattr(args, "virgin_k5", None) is not None:
+        _norm_hex_bytes(args.virgin_k5, 16, "--virgin-k5")
+    if getattr(args, "cfg", None) is not None:
+        _validate_u8(int(args.cfg), "--cfg")
+    if getattr(args, "brand", None) is not None:
+        _validate_u8(int(args.brand), "--brand")
+    if getattr(args, "power_class", None) is not None:
+        _validate_u8(int(args.power_class), "--power-class")
+    if getattr(args, "idac", None) is not None:
+        _norm_hex_bytes(args.idac, 2, "--idac")
+
+    cl_df_bytes: bytes | None = None
+    cl_cf_bytes: bytes | None = None
+    if action == "adapt":
+        if getattr(args, "cluster_dflash", None):
+            cl_df_bytes = clean_user_path(args.cluster_dflash).read_bytes()
+            cl_cf_bytes = clean_user_path(args.cluster_cflash).read_bytes() if getattr(args, "cluster_cflash", None) else None
+            mat = elv_extract_cluster_material(cl_df_bytes, cl_cf_bytes)
+            if mat.get("slot_a_crc_ok") is False:
+                raise RuntimeError(
+                    tr(
+                        "Контрольная сумма CRC-32 ключа Slot A (K_5) в дампе приборной панели FPK_E не совпадает с EEL 0x68 — "
+                        "адаптация ELV отменена во избежание записи повреждённого ключа.",
+                        "Slot A (K_5) key in the FPK_E cluster dump failed CRC-32 verification against EEL 0x68 — "
+                        "ELV adaptation aborted to avoid writing a corrupted key.",
+                    )
+                )
+        else:
+            if not (args.vin and args.k5 and args.power_class is not None):
+                raise ValueError(
+                    tr(
+                        "Для elv adapt укажите --cluster-dflash или --vin, --k5 и --power-class",
+                        "elv adapt requires --cluster-dflash or --vin, --k5, and --power-class",
+                    )
+                )
+            _norm_vin17(args.vin)
+            _norm_hex_bytes(args.k5, 16, "--k5")
+            _validate_u8(int(args.power_class), "--power-class")
+
+    port = args.port or ""
+    via_gw = bool(getattr(args, "via_gateway", False))
+    gw_ch = 0 if getattr(args, "gateway_channel", None) is None else int(args.gateway_channel)
+    base_out = clean_user_path(args.output_dir) if getattr(args, "output_dir", None) else None
+    disp = _make_cli_display(args)
+    rep = disp.create_reporter()
+    try:
+        if action == "status":
+            res = can_elv_status(
+                port,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                reporter=rep,
+            )
+        elif action == "read-dflash":
+            s_dir = default_session_dir(base_out, "elv_dflash")
+            res = can_elv_read_dflash(
+                port,
+                out_dir=s_dir,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                verify_02f9=not bool(getattr(args, "no_verify_02f9", False)),
+                reporter=rep,
+            )
+            res = {k: v for k, v in res.items() if k != "dflash_bytes"}
+            if "dflash_parsed" in res and not getattr(args, "records", False):
+                res["dflash_parsed"] = {k: v for k, v in res["dflash_parsed"].items() if k != "records"}
+        elif action == "adapt":
+            s_dir = default_session_dir(base_out, "elv_adapt")
+            if cl_df_bytes is not None:
+                res = can_elv_adapt_from_cluster(
+                    port,
+                    cl_df_bytes,
+                    fpke_cflash=cl_cf_bytes,
+                    current_k5=getattr(args, "current_k5", None),
+                    cfg_byte=0x80 if getattr(args, "cfg", None) is None else int(args.cfg),
+                    brand_byte=0x01 if getattr(args, "brand", None) is None else int(args.brand),
+                    backup_dir=s_dir,
+                    interface=args.interface,
+                    via_gateway=via_gw,
+                    gateway_bridge=via_gw,
+                    gateway_channel=gw_ch,
+                    reporter=rep,
+                )
+            else:
+                res = can_elv_adapt(
+                    port,
+                    new_vin=args.vin,
+                    new_k5=args.k5,
+                    new_power_class=int(args.power_class),
+                    current_k5=getattr(args, "current_k5", None),
+                    cfg_byte=0x80 if getattr(args, "cfg", None) is None else int(args.cfg),
+                    brand_byte=0x01 if getattr(args, "brand", None) is None else int(args.brand),
+                    backup_dir=s_dir,
+                    interface=args.interface,
+                    via_gateway=via_gw,
+                    gateway_bridge=via_gw,
+                    gateway_channel=gw_ch,
+                    reporter=rep,
+                )
+        elif action == "virginize":
+            s_dir = default_session_dir(base_out, "elv_virginize")
+            res = can_elv_virginize(
+                port,
+                current_k5=getattr(args, "current_k5", None),
+                virgin_k5=getattr(args, "virgin_k5", None),
+                backup_dir=s_dir,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                reporter=rep,
+            )
+        elif action == "reset-idac":
+            s_dir = default_session_dir(base_out, "elv_reset_idac")
+            res = can_elv_reset_idac(
+                port,
+                current_k5=getattr(args, "current_k5", None),
+                backup_dir=s_dir,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                reporter=rep,
+            )
+        elif action == "check-bootloader":
+            res = can_elv_check_bootloader(
+                port,
+                current_k5=getattr(args, "current_k5", None),
+                power_class=getattr(args, "power_class", None),
+                idac=getattr(args, "idac", None),
+                enter_programming=bool(getattr(args, "enter_programming", False)),
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                reporter=rep,
+            )
+        elif action == "clear-dtc":
+            res = can_elv_clear_dtc(
+                port,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                reporter=rep,
+            )
+        else:
+            raise ValueError(tr(f"Неподдерживаемое действие elv: {action}", f"Unsupported elv action: {action}"))
+    finally:
+        disp.finish()
+
+    out_txt = json.dumps(res, ensure_ascii=False, indent=2)
+    print(out_txt)
+    if getattr(args, "output", None):
+        out_p = clean_user_path(args.output)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(out_txt + "\n", encoding="utf-8")
     return 0
 
 
@@ -1642,9 +2337,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_can.add_argument("--interface", choices=iface_choices, default="slcan")
     p_can.add_argument(
         "--target",
-        choices=("all", "j533", "fpke", "bcm"),
+        choices=("all", "j533", "fpke", "bcm", "mrr", "elv"),
         default="all",
-        help=tr("Целевой блок для can scan (all, j533, fpke, bcm)", "Target ECU for can scan (all, j533, fpke, bcm)"),
+        help=tr("Целевой блок для can scan (all, j533, fpke, bcm, mrr, elv)", "Target ECU for can scan (all, j533, fpke, bcm, mrr, elv)"),
     )
     p_can.add_argument(
         "-i",
@@ -1698,8 +2393,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Action: check, inspect, read, write-dflash, export-immo, compare-immo, plan-transfer",
         ),
     )
-    p_fpke.add_argument("--port", help=tr("Порт нативного CAN-адаптера (CANable / SLCAN / candleLight)", "Native CAN adapter port (CANable / SLCAN / candleLight)"))
-    p_fpke.add_argument("--interface", choices=FPKE_NATIVE_INTERFACES, default="slcan")
+    p_fpke.add_argument("--port", help=tr("Порт CAN-адаптера (CANable / SLCAN / candleLight; для dpdu с --via-gateway можно не указывать)", "CAN adapter port (CANable / SLCAN / candleLight; optional for dpdu with --via-gateway)"))
+    p_fpke.add_argument("--interface", choices=(*FPKE_NATIVE_INTERFACES, "dpdu"), default="slcan")
     p_fpke.add_argument(
         "--mode",
         choices=("report", "dflash", "cflash", "extra", "uflash", "bflash", "direct", "known-key"),
@@ -1711,7 +2406,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_fpke.add_argument("--full-rewrite", action="store_true", help=tr("Полная перезапись всех изменённых блоков 64 КБ DataFlash", "Full differential rewrite of all 64 KB DataFlash blocks"))
     p_fpke.add_argument("--allow-foreign", action="store_true", help=tr("Разрешить запись дампа с отличающимся идентификатором FD11", "Allow writing a dump with a different FD11 identifier"))
     p_fpke.add_argument("--no-reset", action="store_true", help=tr("Не выполнять аппаратный сброс SWRESA после записи", "Skip SWRESA hardware reset after write"))
-    p_fpke.add_argument("--yes", action="store_true", help=tr("Подтвердить запись в DataFlash по CAN", "Confirm CAN DataFlash write"))
+    p_fpke.add_argument("-y", "--yes", action="store_true", help=tr("Подтвердить запись в DataFlash по CAN", "Confirm CAN DataFlash write"))
     p_fpke.add_argument("--dflash-b", "--recipient-dflash", dest="dflash_b", help=tr("Второй дамп Dflash.bin / Реципиент B (для compare-immo / plan-transfer)", "Second Dflash.bin / Recipient B (for compare-immo / plan-transfer)"))
     p_fpke.add_argument("--extra", help=tr("Путь к ExtraArea.bin (256 Б) для inspect", "Path to ExtraArea.bin (256 B) for inspect"))
     p_fpke.add_argument("--cflash", "--donor-cflash", dest="cflash", help=tr("Опциональный путь к Cflash.bin (2 МБ) / Донор A", "Optional Cflash.bin (2 MB) / Donor A"))
@@ -1748,7 +2443,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Action: status, read-gfa, read-keys, write-keys, adapt-ffb",
         ),
     )
-    p_bcm.add_argument("--port", required=True, help=tr("Порт CAN-адаптера", "CAN adapter port"))
+    p_bcm.add_argument("--port", help=tr("Порт CAN-адаптера (для dpdu / j2534 можно не указывать)", "CAN adapter port (optional for dpdu / j2534)"))
     p_bcm.add_argument("--interface", choices=iface_choices, default="slcan")
     p_bcm.add_argument("--via-gateway", action="store_true", help=tr("Работать через диагностический CAN шлюза J533 (RAM-мост ch3 ↔ ch0 для XCP/WFS)", "Access BCM through J533 gateway Diagnosis CAN (RAM-Bridge ch3 ↔ ch0 for XCP/WFS)"))
     p_bcm.add_argument("--gateway-channel", type=int, default=0, help=tr("Канал RSCAN0 шлюза J533 (по умолчанию 0 — Komfort CAN)", "J533 RSCAN0 sub-bus channel (default 0 — Komfort CAN)"))
@@ -1763,10 +2458,118 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_bcm.add_argument("--from-live-cluster", action="store_true", help=tr("Считать панель приборов 17 FPK_E по CAN и адаптировать радиоключи FFB в 09 BCM", "Read 17 FPK_E cluster over CAN and adapt FFB remote keys in 09 BCM"))
     p_bcm.add_argument("--sync-gfa", action="store_true", help=tr("Записать GFA (/1) панели приборов в 09 BCM (2E 00BD) перед адаптацией FFB", "Write cluster GFA (/1) to 09 BCM (2E 00BD) before FFB adaptation"))
     p_bcm.add_argument("--key", dest="ffb_keys", action="append", metavar="SERIAL[:COUNTER]", help=tr("Серийный ID радиоключа 8 hex (опционально :COUNTER) для adapt-ffb", "FFB key Serial ID 8 hex (optionally :COUNTER) for adapt-ffb"))
-    p_bcm.add_argument("--freq", type=lambda x: int(x, 0), help=tr("Код частоты DID 0x0A65 (0x01=315MHz, 0x02=433.92MHz, 0x04=868MHz)", "DID 0x0A65 frequency code (0x01=315MHz, 0x02=433.92MHz, 0x04=868MHz)"))
+    p_bcm.add_argument("--freq", type=lambda x: int(x, 0), help=tr("Код частоты DID 0x0A65 (0x00=нет, 0x01=315 МГц, 0x02=433.92 МГц, 0x03=434.42 МГц)", "DID 0x0A65 frequency code (0x00=No RF, 0x01=315MHz, 0x02=433.92MHz, 0x03=434.42MHz)"))
     p_bcm.add_argument("--clear-all", action="store_true", help=tr("Очистить все слоты радиоключей FFB (80 02 00)", "Clear all FFB remote key slots (80 02 00)"))
+    p_bcm.add_argument("-y", "--yes", action="store_true", help=tr("Подтвердить запись в NvM блока 09 BCM (write-keys / adapt-ffb)", "Confirm live 09 BCM NvM write (write-keys / adapt-ffb)"))
     p_bcm.add_argument("-o", "--output", help=tr("Путь к выходному JSON-файлу", "Output JSON file path"))
     p_bcm.set_defaults(func=cmd_bcm)
+
+    p_mrr = _add(
+        "mrr",
+        tr(
+            "Работа с радаром 13 ACC / MRR1Plus & MRRevo14F (3Q0 / 5Q0 / 3QF, MPC5674K/MPC5675K): чтение памяти по XCP/0x77E, деактивация CP, активация SWaP/FSC, чтение и запись IKA/GFA",
+            "13 ACC Radar / MRR1Plus & MRRevo14F (3Q0 / 5Q0 / 3QF, MPC5674K/MPC5675K): XCP/0x77E memory read, CP deactivation, SWaP/FSC activation, read/write IKA & GFA",
+        ),
+    )
+    p_mrr.add_argument(
+        "mrr_action",
+        choices=(
+            "status",
+            "swap-status",
+            "read-keys",
+            "write-keys",
+            "read-mem",
+            "flash-frf",
+            "cp-off",
+            "cp-restore",
+            "swap-on",
+            "swap-restore",
+            "reset-cp-counter",
+            "inspect",
+            "patch-cp",
+            "patch-swap",
+        ),
+        help=tr(
+            "Действие: status, swap-status, read-keys, write-keys, read-mem, flash-frf, cp-off, cp-restore, swap-on, swap-restore, reset-cp-counter, inspect, patch-cp, patch-swap",
+            "Action: status, swap-status, read-keys, write-keys, read-mem, flash-frf, cp-off, cp-restore, swap-on, swap-restore, reset-cp-counter, inspect, patch-cp, patch-swap",
+        ),
+    )
+    p_mrr.add_argument("--port", help=tr("Порт CAN-адаптера", "CAN adapter port"))
+    p_mrr.add_argument("--interface", choices=iface_choices, default="slcan")
+    p_mrr.add_argument("--via-gateway", action="store_true", help=tr("Работать через диагностический CAN шлюза J533 (RAM-мост ch3 ↔ ch2 Extended CAN)", "Access MRR through J533 gateway Diagnosis CAN (RAM-Bridge ch3 ↔ ch2 Extended CAN)"))
+    p_mrr.add_argument("--gateway-channel", type=int, default=2, help=tr("Канал RSCAN0 шлюза J533 (по умолчанию 2 — Extended CAN)", "J533 RSCAN0 sub-bus channel (default 2 — Extended CAN)"))
+    p_mrr.add_argument("--profile", type=str.upper, choices=("0130", "0192", "0194", "0196", "0682", "X720", "0771", "0780"), help=tr("Явный профиль ПО радара", "Explicit radar firmware profile"))
+    p_mrr.add_argument("--region", choices=("dflash", "boot", "app", "cflash", "sram", "all"), default="dflash", help=tr("Область памяти для read-mem", "Memory region for read-mem"))
+    p_mrr.add_argument("--address", type=lambda x: int(x, 0), help=tr("Произвольный адрес для read-mem", "Custom start address for read-mem"))
+    p_mrr.add_argument("--length", type=lambda x: int(x, 0), help=tr("Произвольная длина в байтах для read-mem", "Custom byte length for read-mem"))
+    p_mrr.add_argument("--slow", action="store_true", help=tr("Использовать стандартный XCP SHORT_UPLOAD вместо быстрого драйвера 0x77E", "Use standard XCP SHORT_UPLOAD instead of fast 0x77E burst driver"))
+    p_mrr.add_argument("--current-ika", help=tr("Текущий 16-байтный IKA радара (32 hex) для write-keys (если не указан — считывается по XCP)", "Current 16-byte radar IKA (32 hex) for write-keys (auto-read via XCP if omitted)"))
+    p_mrr.add_argument("--new-ika", help=tr("Новый 16-байтный IKA (32 hex) для записи в DID 0x00BE", "New 16-byte IKA (32 hex) to write to DID 0x00BE"))
+    p_mrr.add_argument("--new-gfa", "--gfa", dest="new_gfa", help=tr("16-байтный групповой ключ GFA (32 hex) для записи в DID 0x00BD", "16-byte vehicle group key GFA (32 hex) to write to DID 0x00BD"))
+    p_mrr.add_argument("--no-reset", action="store_true", help=tr("Не отправлять 11 02 Reset после операции", "Skip 11 02 Reset after operation"))
+    p_mrr.add_argument("--dflash", help=tr("Путь к Dflash.bin (64 КБ) для inspect", "Path to Dflash.bin (64 KB) for inspect"))
+    p_mrr.add_argument("--cflash", "--app", dest="cflash", help=tr("Путь к CodeFlash.bin / Application.bin для inspect, patch-cp, patch-swap, cp-off, cp-restore, swap-on, swap-restore", "Path to CodeFlash.bin / Application.bin for inspect, patch-cp, patch-swap, cp-off, cp-restore, swap-on, swap-restore"))
+    p_mrr.add_argument("--frf", "--odx", dest="frf", help=tr("Путь к заводскому файлу ODIS .frf / .odx для flash-frf или inspect", "Path to factory ODIS .frf / .odx container for flash-frf or inspect"))
+    p_mrr.add_argument("--allow-mismatch", action="store_true", help=tr("Разрешить кросс-прошивку другого номера детали того же МК (flash-frf)", "Allow cross-flashing a different part number on the same MCU (flash-frf)"))
+    p_mrr.add_argument("--recovery", action="store_true", help=tr("Режим восстановления из загрузчика FBLv (если приложение уже стёрто)", "Bootloader recovery mode from FBLv (if application is already erased)"))
+    p_mrr.add_argument("--restore-stock", action="store_true", help=tr("Вернуть заводскую проверку CP / SWaP в patch-cp / patch-swap", "Restore stock CP / SWaP check in patch-cp / patch-swap"))
+    p_mrr.add_argument("--swap-package", type=int, default=6, choices=(0, 1, 2, 4, 5, 6), help=tr("Индекс пакета SWaP Поколения 1 (0130..0196: 6=0x10003800 ACC High Stop&Go, 5=0x10003700 ACC High FTS, 4=0x10003600 ACC High Basis, 2=0x10003300 ACC Low Stop&Go, 1=0x10003200 ACC Low FTS, 0=0x10003100 ACC Low Basis)", "Gen 1 SWaP package index (0130..0196: 6=0x10003800 ACC High Stop&Go, 5=0x10003700 ACC High FTS, 4=0x10003600 ACC High Basis, 2=0x10003300 ACC Low Stop&Go, 1=0x10003200 ACC Low FTS, 0=0x10003100 ACC Low Basis)"))
+    p_mrr.add_argument("--swap-groups", default="8,3,4,7", help=tr("Варианты 4 групп SWaP Поколения 2 g0,g1,g2,g3 (0682/X720/0771/0780; по умолчанию 8,3,4,7)", "Gen 2 SWaP 4-group variants g0,g1,g2,g3 (0682/X720/0771/0780; default 8,3,4,7)"))
+    p_mrr.add_argument("--force", action="store_true", help=tr("Принудительно перепрошить секторы даже при совпадении SHA-256", "Force sector reflash even if SHA-256 already matches"))
+    p_mrr.add_argument("-y", "--yes", action="store_true", help=tr("Подтвердить запись во Flash / NvM (cp-off / cp-restore / swap-on / swap-restore / write-keys / reset-cp-counter)", "Confirm live Flash / NvM write (cp-off / cp-restore / swap-on / swap-restore / write-keys / reset-cp-counter)"))
+    p_mrr.add_argument("-o", "--output", help=tr("Путь к выходному файлу (.bin или .json)", "Output file path (.bin or .json)"))
+    p_mrr.add_argument("--output-dir", help=tr("Базовая папка сессии", "Base session output directory"))
+    p_mrr.set_defaults(func=cmd_mrr)
+
+    p_elv = _add(
+        "elv",
+        tr(
+            "Работа с блокиратором руля 2B ELV / J764 (Marquardt 3Q0 905 861): чтение 32 КБ Data Flash по CAN, адаптация WFS5 (2E 02E2), сброс в Virgin, сброс IDac (2E 02E1), офлайн-правка DFLASH 32/64 КБ",
+            "2B ELV / J764 Steering Column Lock (Marquardt 3Q0 905 861): CAN 32 KB Data Flash read, WFS5 adaptation (2E 02E2), Virgin reset, IDac reset (2E 02E1), offline 32/64 KB DFLASH tools",
+        ),
+    )
+    p_elv.add_argument(
+        "elv_action",
+        choices=(
+            "status",
+            "read-dflash",
+            "adapt",
+            "virginize",
+            "reset-idac",
+            "check-bootloader",
+            "clear-dtc",
+            "inspect",
+            "virginize-dflash",
+            "adapt-dflash",
+        ),
+        help=tr(
+            "Действие: status, read-dflash, adapt, virginize, reset-idac, check-bootloader, clear-dtc, inspect, virginize-dflash, adapt-dflash",
+            "Action: status, read-dflash, adapt, virginize, reset-idac, check-bootloader, clear-dtc, inspect, virginize-dflash, adapt-dflash",
+        ),
+    )
+    p_elv.add_argument("--port", help=tr("Порт CAN-адаптера", "CAN adapter port"))
+    p_elv.add_argument("--interface", choices=iface_choices, default="slcan")
+    p_elv.add_argument("--via-gateway", action="store_true", help=tr("Работать через диагностический CAN шлюза J533 (RAM-мост ch3 ↔ ch0 Komfort CAN)", "Access ELV through J533 gateway Diagnosis CAN (RAM-Bridge ch3 ↔ ch0 Komfort CAN)"))
+    p_elv.add_argument("--gateway-channel", type=int, default=0, help=tr("Канал RSCAN0 шлюза J533 (по умолчанию 0 — Komfort CAN)", "J533 RSCAN0 sub-bus channel (default 0 — Komfort CAN)"))
+    p_elv.add_argument("--dflash", help=tr("Путь к дампу Data Flash ELV (32 КБ или 64 КБ) для inspect / virginize-dflash / adapt-dflash", "Path to ELV Data Flash dump (32 KB or 64 KB) for inspect / virginize-dflash / adapt-dflash"))
+    p_elv.add_argument("--cluster-dflash", help=tr("Путь к Dflash.bin (64 КБ) панели приборов 17 FPK_E для автозаполнения VIN / Slot A / PowerClass", "Path to 17 FPK_E cluster Dflash.bin (64 KB) to extract VIN / Slot A / PowerClass"))
+    p_elv.add_argument("--cluster-cflash", help=tr("Опциональный Cflash.bin панели приборов 17 FPK_E", "Optional 17 FPK_E cluster Cflash.bin"))
+    p_elv.add_argument("--vin", help=tr("Целевой 17-символьный VIN автомобиля", "Target 17-character vehicle VIN"))
+    p_elv.add_argument("--k5", "--slot-a", dest="k5", help=tr("Новый 16-байтный ключ WFS5 K_5 / Slot A (32 hex)", "New 16-byte WFS5 K_5 / Slot A key (32 hex)"))
+    p_elv.add_argument("--current-k5", help=tr("Текущий 16-байтный ключ K_5 защёлки (32 hex; если не указан — считывается автоматически из Data Flash по CAN)", "Current 16-byte ELV K_5 key (32 hex; auto-read from CAN Data Flash if omitted)"))
+    p_elv.add_argument("--virgin-k5", help=tr("Опциональный 16-байтный транспортный ключ K_5 для Virgin (по умолчанию сохраняется текущий)", "Optional 16-byte Virgin transport K_5 key (keeps current key by default)"))
+    p_elv.add_argument("--power-class", type=_parse_u8_hex, help=tr("Байт PowerClass автомобиля в hex (например 6F или 0x76)", "Vehicle PowerClass byte in hex (e.g. 6F or 0x76)"))
+    p_elv.add_argument("--idac", help=tr("Опциональный 2-байтный IDac приборной панели (4 hex; для adapt-dflash без указания — автообучение 0x00)", "Optional 2-byte instrument cluster IDac (4 hex; omit in adapt-dflash for auto-learn 0x00)"))
+    p_elv.add_argument("--lock-cluster-idac", action="store_true", help=tr("В adapt-dflash сразу прописать и залочить (0xAA) IDac из --cluster-dflash", "In adapt-dflash immediately lock (0xAA) cluster IDac from --cluster-dflash"))
+    p_elv.add_argument("--cfg", type=_parse_u8_hex, help=tr("Байт конфигурации WFS5 в hex (например 80 или 0x80, по умолчанию 0x80)", "WFS5 config byte in hex (e.g. 80 or 0x80, default 0x80)"))
+    p_elv.add_argument("--brand", type=_parse_u8_hex, help=tr("Байт бренда WFS5 в hex (например 01 или 0x01, по умолчанию 0x01)", "WFS5 brand byte in hex (e.g. 01 or 0x01, default 0x01)"))
+    p_elv.add_argument("--no-verify-02f9", action="store_true", help=tr("Пропустить онлайн-проверку криптоподписи 22 02F9 после read-dflash", "Skip live 22 02F9 MAC check after read-dflash"))
+    p_elv.add_argument("--enter-programming", action="store_true", help=tr("В check-bootloader войти в 10 02 и проверить SecurityAccess 27 11/12 (затем 11 02 Reset)", "In check-bootloader enter 10 02 and test SecurityAccess 27 11/12 (then 11 02 Reset)"))
+    p_elv.add_argument("--records", action="store_true", help=tr("Включить полный список всех 47 записей EEELib в вывод JSON", "Include full list of all 47 EEELib records in JSON output"))
+    p_elv.add_argument("-y", "--yes", action="store_true", help=tr("Подтвердить запись/сброс в блоке 2B ELV (adapt / virginize / reset-idac / clear-dtc / check-bootloader --enter-programming)", "Confirm live write/reset on 2B ELV (adapt / virginize / reset-idac / clear-dtc / check-bootloader --enter-programming)"))
+    p_elv.add_argument("-o", "--output", help=tr("Путь к выходному файлу (.bin или .json)", "Output file path (.bin or .json)"))
+    p_elv.add_argument("--output-dir", help=tr("Базовая папка сессии", "Base session output directory"))
+    p_elv.set_defaults(func=cmd_elv)
 
     return ap
 

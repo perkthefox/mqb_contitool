@@ -38,29 +38,22 @@ class ProblemReportDialog(Dialog):
             set_tone(err, "err")
             self.body.addWidget(err)
         self.body.addWidget(hint(tr(
-            "Если причина непонятна, сообщите о проблеме на GitHub. ContiTool соберёт архив: журнал программы, файлы "
-            "этой операции (без дампов памяти), журналы драйвера D-PDU и описание системы, — и откроет страницу нового "
-            "issue с уже заполненным текстом. Останется перетащить архив в описание и дописать, что вы делали.",
-            "If the cause is unclear, report it on GitHub. ContiTool collects an archive — the program log, the files of "
-            "this operation (no memory dumps), the D-PDU driver logs and a system summary — and opens a new issue with "
-            "the text filled in. Drag the archive into the description and add what you were doing.",
+            "ContiTool соберёт архив с логами операции и системы (без дампов) и откроет страницу GitHub Issue — "
+            "перетащите архив в описание и кратко опишите шаги.",
+            "ContiTool builds a log archive (no memory dumps) and opens a GitHub Issue — drag the archive in and describe your steps.",
         )))
         note = Callout("warn")
         note.label.setText(tr(
-            "Сырые журналы в архиве могут содержать идентификаторы блока и автомобиля — просмотрите архив перед "
-            "публикацией.<br>Автору в личные сообщения не пишите: только Issues на GitHub.",
-            "Raw logs in the archive may contain ECU and vehicle identifiers — review it before publishing.<br>"
-            "Please do not message the author directly: use GitHub Issues only.",
+            "Логи могут содержать идентификаторы блока — проверьте архив перед публикацией. "
+            "Только GitHub Issues (без личных сообщений автору).",
+            "Logs may include ECU identifiers — review the archive before posting. Use GitHub Issues only.",
         ))
         self.body.addWidget(note)
         self.chk_dumps = QCheckBox(tr("Приложить дампы памяти", "Attach the memory dumps"))
         self.body.addWidget(self.chk_dumps)
         dumps_note = hint(tr(
-            "Загруженные в программе дампы и дампы этой операции (бэкапы перед записью, сверки). В них VIN, FAZIT, "
-            "VCRN и данные SWaP — в публичном issue их увидит любой. Прикладывайте, только если без них не разобраться.",
-            "The dumps loaded in the program and this operation's dumps (backups before a write, readbacks). They "
-            "carry VIN, FAZIT, VCRN and SWaP data — anyone can see them in a public issue. Attach them only when the "
-            "problem cannot be understood without.",
+            "В дампах содержатся VIN, FAZIT и VCRN — прикладывайте только если без них проблему не воспроизвести.",
+            "Dumps contain VIN, FAZIT, and VCRN — attach only if needed to diagnose the issue.",
         ))
         dumps_note.setWordWrap(True)
         self.body.addWidget(dumps_note)

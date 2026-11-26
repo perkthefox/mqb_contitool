@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
-    QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -56,7 +55,6 @@ from contitool.gui.widgets.page import (
     Callout,
     Dialog,
     Section,
-    TextResultDialog,
     button,
     clear_layout,
     divider,
@@ -84,6 +82,7 @@ class BcmReadKeysDialog(Dialog):
         self,
         *,
         include_ika: bool = True,
+        via_gateway: bool = False,
         status: dict[str, Any] | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -93,10 +92,11 @@ class BcmReadKeysDialog(Dialog):
             else tr("Чтение группового ключа GFA", "Read GFA group key")
         )
         subtitle = tr(
-            "Чтение ключей защиты компонентов через канал 3 WFS (0x17F8140E) и агент XCP (0x17FE5600).",
-            "Reading Component Protection keys via WFS Channel 3 (0x17F8140E) and the XCP agent (0x17FE5600).",
+            "Чтение ключей CP через WFS Ch 3 (0x17F8140E / 0x17FA0E14) и XCP (0x1BFC7600 / 0x1BFC6C00).",
+            "Reading CP keys via WFS Ch 3 (0x17F8140E / 0x17FA0E14) and XCP (0x1BFC7600 / 0x1BFC6C00).",
         )
         super().__init__(parent, title, subtitle, width=620)
+        self.body.setSpacing(8)
 
         st = status or {}
         slots = st.get("ffb_slots") or []
@@ -104,25 +104,15 @@ class BcmReadKeysDialog(Dialog):
 
         if include_ika:
             what_text = tr(
-                "<b>Что будет делать программа:</b><br>"
-                "• Подключится к агенту XCP и каналу 3 WFS в оперативной памяти блока 09 BCM.<br>"
-                "• Запустит <code>Crypto Job 5</code> и двухпроходную очередь <code>Crypto Job 3</code> в SRAM для извлечения "
-                "ключей <b>GFA</b> и <b>IKA</b> без их перезаписи во Flash.<br>"
-                "• Выполнит аппаратный перезапуск блока (<code>UDS 11 01</code> HardReset) для полной очистки ОЗУ.",
-                "<b>What ContiTool will do:</b><br>"
-                "• Connect to the XCP agent and WFS Channel 3 in 09 BCM SRAM.<br>"
-                "• Run <code>Crypto Job 5</code> and a two-pass <code>Crypto Job 3</code> queue in SRAM to extract "
-                "<b>GFA</b> and <b>IKA</b> without altering them in Flash.<br>"
-                "• Perform a hardware reset (<code>UDS 11 01</code> HardReset) to restore clean SRAM.",
+                "<b>Что сделает программа:</b> извлечёт ключи <b>GFA</b> и <b>IKA</b> из SRAM (<code>Crypto Job 5</code> + <code>Job 3</code>, "
+                "без записи во Flash) и выполнит <code>HardReset</code>.",
+                "<b>What ContiTool will do:</b> extract <b>GFA</b> and <b>IKA</b> from SRAM (<code>Crypto Job 5</code> + <code>Job 3</code>, "
+                "zero flash writes) and run <code>HardReset</code>.",
             )
         else:
             what_text = tr(
-                "<b>Что будет делать программа:</b><br>"
-                "• Подключится к агенту XCP и запустит задачу <code>Crypto Job 5</code> на канале 3 WFS (<code>80 01</code>) "
-                "для чтения группового ключа <b>GFA</b> из ОЗУ блока.",
-                "<b>What ContiTool will do:</b><br>"
-                "• Connect to the XCP agent and trigger <code>Crypto Job 5</code> on WFS Channel 3 (<code>80 01</code>) "
-                "to read the vehicle group key <b>GFA</b> from SRAM.",
+                "<b>Что сделает программа:</b> извлечёт групповой ключ <b>GFA</b> из SRAM через <code>Crypto Job 5</code> (<code>80 01</code>).",
+                "<b>What ContiTool will do:</b> extract vehicle group key <b>GFA</b> from SRAM via <code>Crypto Job 5</code> (<code>80 01</code>).",
             )
         what_lbl = hint(what_text)
         what_lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -131,16 +121,12 @@ class BcmReadKeysDialog(Dialog):
         cp_warn = Callout("warn")
         cp_warn.label.setText(
             tr(
-                "<b>Защита компонентов (SAFE CP):</b> во время процедуры и перезапуска на стенде (без активного обмена со "
-                "шлюзом <code>19 J533</code>) блок перейдёт в состояние активной защиты компонентов "
-                "(<code>SAFE CP</code>, ошибка <code>U110100</code> / <code>DID 0x03DE</code>).<br>"
-                "Сами ключи <b>IKA</b> и <b>GFA</b> в памяти блока <b>не изменяются</b> — после подключения к шлюзу и первого "
-                "валидного KS-хендшейка от гейтвея защита компонентов CP будет автоматически снята.",
-                "<b>Component Protection (SAFE CP):</b> during this procedure and reset on the bench (without an active "
-                "<code>19 J533</code> gateway on the bus), the BCM will enter active Component Protection "
-                "(<code>SAFE CP</code>, DTC <code>U110100</code> / <code>DID 0x03DE</code>).<br>"
-                "The <b>IKA</b> and <b>GFA</b> keys in memory are <b>not modified</b> — Component Protection clears "
-                "automatically after the first valid KS handshake from the gateway.",
+                "<b>Защита компонентов (SAFE CP):</b> на стенде без шлюза <code>19 J533</code> блок перейдёт в "
+                "<code>SAFE CP</code> (<code>U110100</code>). Ключи <b>IKA/GFA</b> не меняются — CP снимется сама "
+                "после первого KS-хендшейка со шлюзом.",
+                "<b>Component Protection (SAFE CP):</b> on the bench without a <code>19 J533</code> gateway, BCM enters "
+                "<code>SAFE CP</code> (<code>U110100</code>). <b>IKA/GFA</b> keys stay intact — CP clears automatically "
+                "after the first valid KS handshake with the gateway.",
             )
         )
         self.body.addWidget(cp_warn)
@@ -149,30 +135,37 @@ class BcmReadKeysDialog(Dialog):
         if pop_count > 0:
             ffb_info.label.setText(
                 tr(
-                    f"<b>Радиоключи FFB (обнаружено ключей: {pop_count}):</b> команда <code>80 01</code> в прошивке BCM временно "
-                    "сбрасывает секрет радиоканала <code>K_ffb</code> (<code>NvM 0x02</code>) и слоты радиоключей "
-                    "(<code>NvM 0x13..0x19</code>, <code>0x05..0x0B</code>). Программа предварительно извлечёт текущий "
-                    "<code>K_ffb</code> и данные всех слотов, а в конце операции <b>автоматически запишет их обратно "
-                    "(<code>80 01</code> + <code>80 02</code>)</b>.",
-                    f"<b>FFB remote keys ({pop_count} learned):</b> BCM command <code>80 01</code> temporarily clears "
-                    "the radio secret <code>K_ffb</code> (<code>NvM 0x02</code>) and key slots "
-                    "(<code>NvM 0x13..0x19</code>, <code>0x05..0x0B</code>). ContiTool backs up <code>K_ffb</code> and all "
-                    "learned slots first and <b>automatically restores them (<code>80 01</code> + <code>80 02</code>)</b> "
-                    "at the end of the read.",
+                    f"<b>Радиоключи FFB (обучено: {pop_count}):</b> команда <code>80 01</code> временно очищает "
+                    "<code>K_ffb</code> и слоты ключей. Программа сохранит их заранее и <b>автоматически восстановит</b> в конце.",
+                    f"<b>FFB remote keys ({pop_count} learned):</b> command <code>80 01</code> temporarily clears "
+                    "<code>K_ffb</code> and key slots. ContiTool backs them up first and <b>automatically restores them</b> at the end.",
                 )
             )
         else:
             ffb_info.label.setText(
                 tr(
-                    "<b>Радиоключи FFB:</b> вызов <code>80 01</code> затрагивает область радиоканала (<code>NvM 0x02</code> и "
-                    "слоты <code>NvM 0x13..0x19</code>, <code>0x05..0x0B</code>). Если в блоке есть обученные радиоключи, "
-                    "программа предварительно сохраняет <code>K_ffb</code> и слоты и автоматически восстанавливает их в конце чтения.",
-                    "<b>FFB remote keys:</b> calling <code>80 01</code> touches the FFB area (<code>NvM 0x02</code> and "
-                    "slots <code>NvM 0x13..0x19</code>, <code>0x05..0x0B</code>). If any FFB keys are stored in the BCM, "
-                    "ContiTool backs up <code>K_ffb</code> and all slots beforehand and restores them automatically.",
+                    "<b>Радиоключи FFB:</b> при наличии обученных радиоключей программа автоматически сохранит "
+                    "<code>K_ffb</code> и слоты перед чтением и восстановит их обратно.",
+                    "<b>FFB remote keys:</b> if any remote keys are learned, ContiTool backs up <code>K_ffb</code> "
+                    "and all slots beforehand and restores them automatically.",
                 )
             )
         self.body.addWidget(ffb_info)
+
+        if via_gateway:
+            gw_warn = Callout("warn")
+            gw_warn.label.setText(
+                tr(
+                    "<b>Работа в автомобиле через RAM-мост шлюза J533:</b> заглушите двигатель и включите зажигание "
+                    "(<b>KL15 ON</b>). На время работы моста временно приостановится обмен на других шинах автомобиля "
+                    "и появятся предупреждения на приборной панели. После завершения очистите ошибки "
+                    "<code>U112100</code> / <code>U0146</code>.",
+                    "<b>In-vehicle operation via J533 gateway RAM-Bridge:</b> turn the engine OFF and switch ignition "
+                    "ON (<b>KL15 ON</b>). While the bridge is active, other vehicle buses are temporarily paused and "
+                    "dashboard warnings will appear. Clear <code>U112100</code> / <code>U0146</code> DTCs afterwards.",
+                )
+            )
+            self.body.addWidget(gw_warn)
 
         ok_lbl = tr("Считать IKA + GFA", "Read IKA + GFA") if include_ika else tr("Считать GFA", "Read GFA")
         self.btn_ok = button(ok_lbl, "PrimaryBtn", slot=self.accept)
@@ -239,6 +232,8 @@ class BcmScreen(QWidget):
         self._ika_hex: str = ""
         self._gfa_hex: str = ""
         self._cluster_material: dict[str, Any] | None = None
+        self._cluster_source_manual: bool = False
+        self._ffb_drafts_dirty: bool = False
         self._dtcs: list[dict[str, Any]] | None = None
         self._key = "cp_keys"
 
@@ -335,6 +330,8 @@ class BcmScreen(QWidget):
             self._via_gateway = bool(via_gateway)
             self._gateway_bridge = bool(gateway_bridge)
             self._gateway_channel = int(gateway_channel)
+        self._cluster_source_manual = False
+        self._ffb_drafts_dirty = False
         self._sync_cluster_material_if_available(silent=True)
         self.select(self._key)
         self.refresh()
@@ -360,6 +357,8 @@ class BcmScreen(QWidget):
         self._passport = {}
         self._status = {}
         self._dtcs = None
+        self._cluster_source_manual = False
+        self._ffb_drafts_dirty = False
         self._key = "cp_keys"
         self.select("cp_keys")
         self._sync_cluster_material_if_available(silent=True)
@@ -372,10 +371,25 @@ class BcmScreen(QWidget):
         self._dtcs = None
         self._ika_hex = ""
         self._gfa_hex = ""
+        self._profile_override = ""
+        self._via_gateway = False
+        self._gateway_bridge = False
+        self._gateway_channel = 0
+        self._cluster_material = None
+        self._cluster_source_manual = False
+        self._ffb_drafts_dirty = False
         self._draft_cur_ika = ""
         self._draft_new_ika = ""
         self._draft_new_gfa = ""
         self._draft_ffb_gfa = ""
+        self._draft_ffb_kc = ""
+        self._draft_ffb_kffb = ""
+        self._draft_ffb_freq = 0x03
+        self._draft_sync_gfa = False
+        self._draft_ffb_rows = [
+            {"enabled": idx == 1, "serial": "", "counter": 0, "source": "manual"}
+            for idx in range(1, 8)
+        ]
         self.changed.emit()
 
     def set_routing(self, *, via_gateway: bool, gateway_bridge: bool, gateway_channel: int = 0) -> None:
@@ -393,14 +407,14 @@ class BcmScreen(QWidget):
         self.sec_id = QFrame()
         self.sec_id.setObjectName("IdentityBar")
         body = QVBoxLayout(self.sec_id)
-        body.setContentsMargins(24, 12, 24, 12)
-        body.setSpacing(10)
+        body.setContentsMargins(24, 10, 24, 10)
+        body.setSpacing(8)
 
         head = QHBoxLayout()
         head.setSpacing(10)
         self.lbl_pn = QLabel()
         self.lbl_pn.setObjectName("PartNumber")
-        self.lbl_pn.setFont(mono_font(20, bold=True))
+        self.lbl_pn.setFont(mono_font(18, bold=True))
         self.lbl_pn.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         self.lbl_sys = QLabel()
@@ -429,7 +443,7 @@ class BcmScreen(QWidget):
         body.addWidget(divider())
 
         self.grid_id = QGridLayout()
-        self.grid_id.setHorizontalSpacing(22)
+        self.grid_id.setHorizontalSpacing(20)
         self.grid_id.setVerticalSpacing(2)
         body.addLayout(self.grid_id)
         return self.sec_id
@@ -437,7 +451,7 @@ class BcmScreen(QWidget):
     def _build_nav(self) -> QWidget:
         pane = QFrame()
         pane.setObjectName("NavPane")
-        pane.setFixedWidth(306)
+        pane.setFixedWidth(284)
         lay = QVBoxLayout(pane)
         lay.setContentsMargins(6, 6, 6, 0)
         lay.setSpacing(0)
@@ -450,9 +464,9 @@ class BcmScreen(QWidget):
         for group, keys in BCM_GROUPS:
             head = QListWidgetItem(self.nav)
             head.setFlags(Qt.ItemFlag.NoItemFlags)
-            head.setSizeHint(QSize(0, 26))
+            head.setSizeHint(QSize(0, 24))
             lbl = group_label()
-            lbl.setContentsMargins(12, 8, 0, 0)
+            lbl.setContentsMargins(12, 7, 0, 0)
             self.nav.setItemWidget(head, lbl)
             self._group_labels[group] = lbl
             for key in keys:
@@ -549,7 +563,8 @@ class BcmScreen(QWidget):
         lbl_badge = QLabel(badge_text)
         lbl_badge.setFont(mono_font(10))
         set_tone(lbl_badge, badge_tone)
-        lbl_badge.setVisible(bool(badge_text))
+        if not badge_text:
+            lbl_badge.hide()
         top.addWidget(lbl_cap, 1)
         top.addWidget(lbl_badge, 0)
         vlay.addLayout(top)
@@ -702,7 +717,7 @@ class BcmScreen(QWidget):
         elif self._gfa_hex:
             set_pill(self.nav_rows["cp_keys"].pill, "GFA", "info")
         elif self._status.get("ika_virgin"):
-            set_pill(self.nav_rows["cp_keys"].pill, "virgin", "warn")
+            set_pill(self.nav_rows["cp_keys"].pill, tr("заводской", "virgin"), "warn")
         else:
             set_pill(self.nav_rows["cp_keys"].pill, "—", "muted")
 
@@ -802,19 +817,15 @@ class BcmScreen(QWidget):
         head_row.addWidget(title)
         head_row.addStretch(1)
 
-        if self._key == "cp_keys":
-            btn_exp = button(tr("Экспорт JSON…", "Export JSON…"), "GhostBtn", slot=self.action_export_keys_json)
-            btn_exp.setEnabled(bool(self._ika_hex or self._gfa_hex))
-            head_row.addWidget(btn_exp)
-        elif self._key == "ffb":
+        if self._key == "ffb":
             btn_open_17 = button(
-                tr("Взять из открытой 17 FPK_E", "From open 17 FPK_E"),
-                "GhostBtn",
-                slot=lambda: self._sync_cluster_material_if_available(silent=False),
+                tr("Из открытой 17 FPK_E", "From open 17 FPK_E"),
+                "InlineBtn",
+                slot=lambda: self._sync_cluster_material_if_available(silent=False, force=True),
             )
             btn_file_17 = button(
                 tr("Загрузить Dflash.bin…", "Load Dflash.bin…"),
-                "GhostBtn",
+                "InlineBtn",
                 slot=self.action_load_cluster_dflash_file,
             )
             head_row.addWidget(btn_open_17)
@@ -848,7 +859,12 @@ class BcmScreen(QWidget):
         lay.addStretch(1)
         outer.addWidget(column, 1)
         outer.addStretch(0)
+        old_page = self.page_area.takeWidget()
         self.page_area.setWidget(page)
+        if old_page is not None:
+            old_page.hide()
+            old_page.setParent(self)
+            old_page.deleteLater()
 
     def _on_profile_changed(self, _idx: int) -> None:
         val = str(self.cmb_profile.currentData() or "")
@@ -858,18 +874,23 @@ class BcmScreen(QWidget):
 
     # ────────────────────────────── Page 1: Component Protection (IKA / GFA) ──────────────────────────────
 
+    def _bridge_blocked_tip(self) -> str:
+        return tr(
+            "Требуется прямое подключение к Komfort CAN или RAM-мост шлюза Continental 3Q0 907 530 (29-бит XCP / WFS Ch 3 недоступны через этот шлюз).",
+            "Requires a direct Komfort CAN connection or a Continental 3Q0 907 530 gateway RAM-Bridge (29-bit XCP / WFS Ch 3 are unavailable through this gateway).",
+        )
+
     def _build_cp_keys_page(self, lay: QVBoxLayout) -> None:
         busy = self.runner.is_busy
+        bridge_blocked = self._via_gateway and not self._gateway_bridge
 
         # Card 1: Read keys via WFS Ch 3 + XCP (zero flash writes)
         sec_read = self._compact_section(Section())
         sec_read.set_text(
             tr("Чтение ключей IKA и GFA (WFS Ch 3 + XCP)", "Read IKA & GFA keys (WFS Ch 3 + XCP)"),
             tr(
-                "Извлечение группового ключа GFA (Crypto Job 5) и индивидуального ключа IKA (двухпроходная очередь Crypto Job 3 "
-                "на 0x17F8140E + XCP SHORT_UPLOAD) без записи во Flash.",
-                "Extracts vehicle group key GFA (Crypto Job 5) and individual key IKA (two-pass Crypto Job 3 queue on "
-                "0x17F8140E + XCP SHORT_UPLOAD) with zero flash writes.",
+                "Извлечение ключей GFA и IKA из ОЗУ блока без записи во Flash.",
+                "Extracts GFA and IKA keys from BCM SRAM with zero flash writes.",
             ),
         )
         cp_cnt = self._status.get("cp_mismatch_counter")
@@ -886,10 +907,11 @@ class BcmScreen(QWidget):
         self.ed_read_ika = QLineEdit(self._ika_hex.upper())
         self.ed_read_ika.setFont(mono_font(12, bold=True))
         self.ed_read_ika.setReadOnly(True)
+        self.ed_read_ika.setCursorPosition(0)
         self.ed_read_ika.setPlaceholderText(tr("Нажмите «Считать IKA + GFA»…", "Click “Read IKA + GFA”…"))
-        btn_cp_ika = button(tr("Копировать", "Copy"), "GhostBtn", slot=lambda: self._copy_hex(self.ed_read_ika.text(), "IKA"))
+        btn_cp_ika = button(tr("Копировать", "Copy"), "InlineBtn", slot=lambda: self._copy_hex(self.ed_read_ika.text(), "IKA"))
         c_ika, _ = self._field_box(
-            tr("ИНДИВИДУАЛЬНЫЙ КЛЮЧ IKA (16 БАЙТ, DID 0x00BE)", "INDIVIDUAL KEY IKA (16 BYTES, DID 0x00BE)"),
+            tr("ИНДИВИДУАЛЬНЫЙ КЛЮЧ IKA (16 Б, DID 0x00BE)", "INDIVIDUAL KEY IKA (16 B, DID 0x00BE)"),
             self.ed_read_ika,
             badge_text="16 B" if self._ika_hex else "",
             badge_tone="ok" if self._ika_hex else "muted",
@@ -901,10 +923,11 @@ class BcmScreen(QWidget):
         self.ed_read_gfa = QLineEdit(self._gfa_hex.upper())
         self.ed_read_gfa.setFont(mono_font(12))
         self.ed_read_gfa.setReadOnly(True)
+        self.ed_read_gfa.setCursorPosition(0)
         self.ed_read_gfa.setPlaceholderText(tr("Нажмите «Считать IKA + GFA» или «Только GFA»…", "Click “Read IKA + GFA” or “GFA only”…"))
-        btn_cp_gfa = button(tr("Копировать", "Copy"), "GhostBtn", slot=lambda: self._copy_hex(self.ed_read_gfa.text(), "GFA"))
+        btn_cp_gfa = button(tr("Копировать", "Copy"), "InlineBtn", slot=lambda: self._copy_hex(self.ed_read_gfa.text(), "GFA"))
         c_gfa, _ = self._field_box(
-            tr("ГРУППОВОЙ КЛЮЧ АВТОМОБИЛЯ GFA (16 БАЙТ, DID 0x00BD)", "VEHICLE GROUP KEY GFA (16 BYTES, DID 0x00BD)"),
+            tr("ГРУППОВОЙ КЛЮЧ GFA (16 Б, DID 0x00BD)", "VEHICLE GROUP KEY GFA (16 B, DID 0x00BD)"),
             self.ed_read_gfa,
             badge_text="16 B" if self._gfa_hex else "",
             badge_tone="ok" if self._gfa_hex else "muted",
@@ -915,8 +938,10 @@ class BcmScreen(QWidget):
 
         btn_read_both = button(tr("Считать IKA + GFA", "Read IKA + GFA"), "PrimaryBtn", slot=self.action_read_keys)
         btn_read_gfa = button(tr("Только GFA (Job 5)", "GFA only (Job 5)"), slot=self.action_read_gfa)
+        bridge_tip = self._bridge_blocked_tip() if bridge_blocked else ""
         for b in (btn_read_both, btn_read_gfa):
-            b.setEnabled(not busy)
+            b.setEnabled(not busy and not bridge_blocked)
+            b.setToolTip(bridge_tip)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
         sec_read.add_footer(btn_read_both, btn_read_gfa)
         lay.addWidget(sec_read)
@@ -926,8 +951,8 @@ class BcmScreen(QWidget):
         sec_write.set_text(
             tr("Запись ключей по UDS (2E 00BE / 2E 00BD)", "Write keys over UDS (2E 00BE / 2E 00BD)"),
             tr(
-                "Штатный 34-байтный контейнер ODIS после вызова 22 02F9. Работает по обычному UDS 0x70E/0x778 напрямую и через любой шлюз без RAM-моста.",
-                "Standard 34-byte ODIS container after 22 02F9 challenge. Works over standard UDS 0x70E/0x778 directly and through any gateway without RAM bridge.",
+                "Штатный контейнер ODIS по UDS 0x70E/0x778 (напрямую и через любой шлюз).",
+                "Standard ODIS container over UDS 0x70E/0x778 (direct or via any gateway).",
             ),
         )
 
@@ -939,7 +964,10 @@ class BcmScreen(QWidget):
         c_cur, b_cur = self._field_box(
             tr("ТЕКУЩИЙ IKA БЛОКА (ШИФРУЕТ КОНТЕЙНЕР)", "CURRENT BCM IKA (ENCRYPTS CONTAINER)"),
             self.ed_write_cur_ika,
-            tip="Текущий рабочий IKA этого BCM, под которым проверяется контейнер 2E 00BE / 2E 00BD",
+            tip=tr(
+                "Текущий рабочий IKA этого BCM, под которым проверяется контейнер 2E 00BE / 2E 00BD",
+                "Current working IKA of this BCM used to authenticate the 2E 00BE / 2E 00BD container",
+            ),
         )
         self._bind_hex_validator(self.ed_write_cur_ika, b_cur, 16, allow_empty=False)
         sec_write.body.addWidget(c_cur)
@@ -950,19 +978,22 @@ class BcmScreen(QWidget):
         self.ed_write_new_ika.textChanged.connect(lambda t: setattr(self, "_draft_new_ika", t))
         btn_gen_ika = button(
             tr("Сгенерировать", "Generate"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: self.ed_write_new_ika.setText(_py_secrets.token_hex(16).upper()),
         )
         btn_same_ika = button(
             tr("Текущий IKA", "Current IKA"),
-            "GhostBtn",
+            "InlineBtn",
             slot=lambda: self.ed_write_new_ika.setText(self.ed_write_cur_ika.text().strip()),
         )
         c_new_ika, b_new_ika = self._field_box(
             tr("НОВЫЙ IKA (DID 0x00BE, ОПЦИОНАЛЬНО)", "NEW IKA (DID 0x00BE, OPTIONAL)"),
             self.ed_write_new_ika,
             trailing=(btn_gen_ika, btn_same_ika),
-            tip="При записи 2E 00BE прошивка BCM стирает GFA в FF×16, поэтому следом записывается 2E 00BD",
+            tip=tr(
+                "При записи 2E 00BE прошивка BCM стирает GFA в FF×16, поэтому следом записывается 2E 00BD",
+                "Writing 2E 00BE erases GFA to FF×16 in BCM firmware, so 2E 00BD is written immediately afterwards",
+            ),
         )
         self._bind_hex_validator(self.ed_write_new_ika, b_new_ika, 16, allow_empty=True)
         sec_write.body.addWidget(c_new_ika)
@@ -974,14 +1005,17 @@ class BcmScreen(QWidget):
         self.ed_write_new_gfa.textChanged.connect(lambda t: setattr(self, "_draft_new_gfa", t))
         btn_gfa_17 = button(
             tr("Из 17 FPK_E (/1)", "From 17 FPK_E (/1)"),
-            "GhostBtn",
+            "InlineBtn",
             slot=self._fill_gfa_from_cluster,
         )
         c_new_gfa, b_new_gfa = self._field_box(
             tr("ЦЕЛЕВОЙ GFA АВТОМОБИЛЯ (DID 0x00BD)", "TARGET VEHICLE GFA (DID 0x00BD)"),
             self.ed_write_new_gfa,
             trailing=(btn_gfa_17,),
-            tip="Групповой ключ автомобиля GFA (совпадает со слотом /1 в панели приборов 17 FPK_E)",
+            tip=tr(
+                "Групповой ключ автомобиля GFA (совпадает со слотом /1 в панели приборов 17 FPK_E)",
+                "Vehicle group key GFA (matches slot /1 in the 17 FPK_E instrument cluster)",
+            ),
         )
         self._bind_hex_validator(self.ed_write_new_gfa, b_new_gfa, 16, allow_empty=True)
         sec_write.body.addWidget(c_new_gfa)
@@ -996,10 +1030,8 @@ class BcmScreen(QWidget):
         note = Callout("info")
         note.label.setText(
             tr(
-                "Запись нового <b>IKA (2E 00BE)</b> в прошивке BCM автоматически обнуляет <b>GFA</b> в <code>FF×16</code> "
-                "— при выборе «Записать IKA + GFA» программа последовательно пишет <code>00BE</code>, затем <code>00BD</code> на новом IKA.",
-                "Writing a new <b>IKA (2E 00BE)</b> in BCM firmware erases <b>GFA</b> to <code>FF×16</code> — "
-                "“Write IKA + GFA” writes <code>00BE</code> first and immediately restores <code>00BD</code> under the new IKA.",
+                "Запись нового <b>IKA (00BE)</b> обнуляет <b>GFA</b> — «Записать IKA + GFA» сразу восстанавливает <code>00BD</code> на новом IKA.",
+                "Writing a new <b>IKA (00BE)</b> clears <b>GFA</b> — “Write IKA + GFA” immediately restores <code>00BD</code> under the new IKA.",
             )
         )
         sec_write.body.addWidget(note)
@@ -1016,7 +1048,10 @@ class BcmScreen(QWidget):
 
     def _build_ffb_page(self, lay: QVBoxLayout) -> None:
         busy = self.runner.is_busy
-        self._sync_cluster_material_if_available(silent=True)
+        bridge_blocked = self._via_gateway and not self._gateway_bridge
+        bridge_tip = self._bridge_blocked_tip() if bridge_blocked else ""
+        if not self._cluster_source_manual and not self._ffb_drafts_dirty and self._cluster_material is None:
+            self._sync_cluster_material_if_available(silent=True)
         cm = self._cluster_material or {}
         st = self._status
         slots = st.get("ffb_slots") or []
@@ -1028,12 +1063,10 @@ class BcmScreen(QWidget):
         # Card 1: Unified pre-populated Channel 3 parameters & 7 FFB remote key slots
         sec_cfg = self._compact_section(Section())
         sec_cfg.set_text(
-            tr("Параметры канала 3 и радиоключи FFB (слоты 1..7)", "Channel 3 parameters & FFB remote key slots (1..7)"),
+            tr("Радиоключи FFB (слоты 1..7)", "FFB remote key slots (1..7)"),
             tr(
-                "Слоты, частота DID 0x0A65 и ключ GFA автоматически заполняются при подключении к 09 BCM "
-                "(или из открытого дампа панели приборов 17 FPK_E).",
-                "Key slots, DID 0x0A65 frequency, and GFA are populated automatically on 09 BCM connect "
-                "(or from an open 17 FPK_E cluster dump).",
+                "Заполняются автоматически из 09 BCM или из открытого дампа панели 17 FPK_E.",
+                "Populated automatically from 09 BCM or an open 17 FPK_E cluster dump.",
             ),
         )
         if not st:
@@ -1056,7 +1089,7 @@ class BcmScreen(QWidget):
         self.ed_ffb_gfa = QLineEdit(gfa_val)
         self.ed_ffb_gfa.setFont(mono_font(12))
         self.ed_ffb_gfa.setPlaceholderText(tr("Пусто = авто-чтение GFA из BCM по XCP", "Blank = auto-read GFA via XCP"))
-        self.ed_ffb_gfa.textChanged.connect(lambda t: setattr(self, "_draft_ffb_gfa", t))
+        self.ed_ffb_gfa.textChanged.connect(self._on_ffb_gfa_changed)
         c_fgfa, b_fgfa = self._field_box(tr("GFA БЛОКА 09 BCM (16 Б)", "09 BCM GFA (16 B)"), self.ed_ffb_gfa)
         self._bind_hex_validator(self.ed_ffb_gfa, b_fgfa, 16, allow_empty=True)
 
@@ -1071,9 +1104,7 @@ class BcmScreen(QWidget):
         if idx_f >= 0:
             self.cmb_ffb_freq.setCurrentIndex(idx_f)
         self._draft_ffb_freq = int(self.cmb_ffb_freq.currentData() if self.cmb_ffb_freq.currentData() is not None else 0x03)
-        self.cmb_ffb_freq.currentIndexChanged.connect(
-            lambda _i: setattr(self, "_draft_ffb_freq", int(self.cmb_ffb_freq.currentData() if self.cmb_ffb_freq.currentData() is not None else 0x03))
-        )
+        self.cmb_ffb_freq.currentIndexChanged.connect(self._on_ffb_freq_changed)
         c_freq, _ = self._field_box(tr("ЧАСТОТА DID 0x0A65", "FREQUENCY DID 0x0A65"), self.cmb_ffb_freq)
         r1.addWidget(c_fgfa, 3)
         r1.addWidget(c_freq, 1)
@@ -1094,7 +1125,7 @@ class BcmScreen(QWidget):
         self.ed_ffb_kffb = QLineEdit(kffb_val)
         self.ed_ffb_kffb.setFont(mono_font(12))
         self.ed_ffb_kffb.setPlaceholderText("AES_Kc(C16)")
-        self.ed_ffb_kffb.textChanged.connect(lambda t: setattr(self, "_draft_ffb_kffb", t))
+        self.ed_ffb_kffb.textChanged.connect(self._on_ffb_kffb_changed)
         c_kffb, b_kffb = self._field_box(tr("СЕКРЕТ РАДИОКАНАЛА K_ffb", "FFB SECRET K_ffb"), self.ed_ffb_kffb)
         self._bind_hex_validator(self.ed_ffb_kffb, b_kffb, 16, allow_empty=True)
         r2.addWidget(c_kc, 1)
@@ -1119,8 +1150,8 @@ class BcmScreen(QWidget):
 
         # 7 key slot rows
         k_grid = QGridLayout()
-        k_grid.setHorizontalSpacing(12)
-        k_grid.setVerticalSpacing(5)
+        k_grid.setHorizontalSpacing(10)
+        k_grid.setVerticalSpacing(4)
         cnt_tip = tr(
             "Скользящий 24-битный счётчик радиокода (Rolling Counter, NvM 0x05..0x0B) — защита от перехвата/повтора.\n"
             "Увеличивается в брелоке на +1 при каждом нажатии кнопки. Для нового ключа оставляйте 0.",
@@ -1130,7 +1161,7 @@ class BcmScreen(QWidget):
         for col, h_txt in enumerate(
             (
                 tr("СЛОТ", "SLOT"),
-                tr("СЕРИЙНЫЙ ID КЛЮЧА (8 HEX, EEL 0x67 / NvM 0x13..0x19)", "KEY SERIAL ID (8 HEX, EEL 0x67 / NvM 0x13..0x19)"),
+                tr("СЕРИЙНЫЙ ID КЛЮЧА (8 HEX)", "KEY SERIAL ID (8 HEX)"),
                 tr("СЧЁТЧИК НАЖАТИЙ", "ROLLING COUNTER"),
                 tr("СОСТОЯНИЕ / ИСТОЧНИК", "STATE / SOURCE"),
             )
@@ -1149,19 +1180,19 @@ class BcmScreen(QWidget):
             chk = QCheckBox(f"#{slot_num}")
             chk.setFont(mono_font(11))
             chk.setChecked(bool(row_data["enabled"]))
-            chk.toggled.connect(lambda v, i=idx: self._draft_ffb_rows[i].__setitem__("enabled", bool(v)))
+            chk.toggled.connect(lambda v, i=idx: self._set_ffb_row_field(i, "enabled", bool(v)))
 
             ed_ser = QLineEdit(str(row_data["serial"]))
             ed_ser.setFont(mono_font(12))
-            ed_ser.setPlaceholderText("8 HEX (e.g. 532B3512)")
-            ed_ser.textChanged.connect(lambda t, i=idx: self._draft_ffb_rows[i].__setitem__("serial", t))
+            ed_ser.setPlaceholderText(tr("8 HEX (напр. 532B3512)", "8 HEX (e.g. 532B3512)"))
+            ed_ser.textChanged.connect(lambda t, i=idx: self._set_ffb_row_field(i, "serial", t))
 
             sp_cnt = QSpinBox()
             sp_cnt.setRange(0, 0x00FFFFFF)
             sp_cnt.setValue(int(row_data["counter"]))
             sp_cnt.setFont(mono_font(11))
             sp_cnt.setToolTip(cnt_tip)
-            sp_cnt.valueChanged.connect(lambda v, i=idx: self._draft_ffb_rows[i].__setitem__("counter", int(v)))
+            sp_cnt.valueChanged.connect(lambda v, i=idx: self._set_ffb_row_field(i, "counter", int(v)))
 
             src_kind = row_data.get("source") or ("cluster" if row_data.get("from_cluster") else "manual")
             if src_kind == "cluster":
@@ -1185,7 +1216,7 @@ class BcmScreen(QWidget):
             k_grid.addWidget(chk, slot_num, 0)
             k_grid.addWidget(ed_ser, slot_num, 1)
             k_grid.addWidget(sp_cnt, slot_num, 2)
-            k_grid.addWidget(src_lbl, slot_num, 3)
+            k_grid.addWidget(src_lbl, slot_num, 3, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self._key_row_widgets.append((chk, ed_ser, sp_cnt))
         k_grid.setColumnStretch(1, 2)
         sec_cfg.body.addLayout(k_grid)
@@ -1193,11 +1224,8 @@ class BcmScreen(QWidget):
         cnt_note = Callout("info")
         cnt_note.label.setText(
             tr(
-                "<b>Счётчик нажатий (Rolling Counter)</b> — скользящий 24-битный счётчик радиопосылок брелока (защита от перехвата). "
-                "Увеличивается на +1 при каждом нажатии кнопки. Для нового ключа оставляйте <b>0</b> — после записи BCM синхронизирует "
-                "счётчик по первому нажатию (рабочее окно +1..359, двойное нажатие до +11 159).",
-                "<b>Rolling Counter</b> — 24-bit anti-replay radio frame counter inside the key fob (+1 on each button press). "
-                "Leave at <b>0</b> for fresh adaptation — BCM synchronizes the counter on button press (normal window +1..359, double-press resync up to +11,159).",
+                "<b>Счётчик нажатий (Rolling Counter):</b> для нового ключа оставляйте <b>0</b> — BCM синхронизирует его по первому нажатию кнопки брелока.",
+                "<b>Rolling Counter:</b> leave at <b>0</b> for fresh adaptation — BCM syncs it on the first key fob button press.",
             )
         )
         sec_cfg.body.addWidget(cnt_note)
@@ -1205,7 +1233,8 @@ class BcmScreen(QWidget):
         btn_adapt = button(tr("Адаптировать ключи (80 01 + 80 02)", "Adapt keys (80 01 + 80 02)"), "PrimaryBtn", slot=self.action_adapt_selected_ffb)
         btn_clr = button(tr("Очистить слоты (80 02 00)", "Clear slots (80 02 00)"), "GhostBtn", slot=self.action_clear_all_ffb)
         for b in (btn_adapt, btn_clr):
-            b.setEnabled(not busy)
+            b.setEnabled(not busy and not bridge_blocked)
+            b.setToolTip(bridge_tip)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
         sec_cfg.add_footer(btn_adapt, btn_clr)
         lay.addWidget(sec_cfg)
@@ -1213,10 +1242,10 @@ class BcmScreen(QWidget):
         # Card 2: One-click cluster-driven stock protocol sync over CAN
         sec_auto = self._compact_section(Section())
         sec_auto.set_text(
-            tr("Адаптация по данным панели приборов 17 FPK_E", "Adaptation from 17 FPK_E instrument cluster data"),
+            tr("Адаптация по данным панели 17 FPK_E", "Adaptation from 17 FPK_E cluster"),
             tr(
-                "Штатный протокол канала 3 WFS (0x17F8140E → 0x17FA0E14): 80 01 || AES_GFA(K_ffb) → C0 01, затем 80 02 || ключи с проверкой DID 0x0A65 и CRC-32 → C0 02.",
-                "Stock WFS Channel 3 protocol (0x17F8140E → 0x17FA0E14): 80 01 || AES_GFA(K_ffb) → C0 01, then 80 02 || key records verified against DID 0x0A65 and CRC-32 → C0 02.",
+                "Штатный протокол канала 3 WFS (80 01 + 80 02) с проверкой частоты DID 0x0A65 и CRC-32.",
+                "Stock WFS Channel 3 protocol (80 01 + 80 02) with DID 0x0A65 frequency and CRC-32 check.",
             ),
         )
         if cm.get("kc_hex"):
@@ -1247,7 +1276,8 @@ class BcmScreen(QWidget):
             "PrimaryBtn",
             slot=self.action_read_cluster_and_adapt_ffb,
         )
-        btn_auto_can.setEnabled(not busy)
+        btn_auto_can.setEnabled(not busy and not bridge_blocked)
+        btn_auto_can.setToolTip(bridge_tip)
         btn_auto_can.setCursor(Qt.CursorShape.PointingHandCursor)
         sec_auto.add_footer(btn_auto_can)
         lay.addWidget(sec_auto)
@@ -1259,10 +1289,10 @@ class BcmScreen(QWidget):
 
         sec_st = self._compact_section(Section())
         sec_st.set_text(
-            tr("Диагностика Komponentenschutz (KS) и радиоканала FFB", "Komponentenschutz (KS) & FFB diagnostics"),
+            tr("Защита компонентов (KS) и радиоканал FFB", "Component Protection (KS) & FFB status"),
             tr(
-                "Текущее состояние защиты компонентов (DID 0x03DE / 0x0440 / 0x02F9) и УВЧ-приёмника (DID 0x0A65 / 0x1983 / 0x24A6).",
-                "Current Component Protection state (DID 0x03DE / 0x0440 / 0x02F9) and UHF receiver diagnostics (DID 0x0A65 / 0x1983 / 0x24A6).",
+                "Диагностические параметры CP (0x03DE / 0x0440 / 0x02F9) и УВЧ-приёмника (0x0A65 / 0x1983 / 0x24A6).",
+                "Component Protection diagnostics (0x03DE / 0x0440 / 0x02F9) and UHF receiver (0x0A65 / 0x1983 / 0x24A6).",
             ),
         )
         cp_cnt = self._status.get("cp_mismatch_counter")
@@ -1347,10 +1377,10 @@ class BcmScreen(QWidget):
         # Learned FFB slots from NvM 0x05..0x19
         sec_slots = self._compact_section(Section())
         sec_slots.set_text(
-            tr("Слоты радиоключей FFB в NvM (0x05..0x19)", "FFB remote key slots in NvM (0x05..0x19)"),
+            tr("Слоты радиоключей FFB в NvM (0x05..0x19)", "FFB key slots in NvM (0x05..0x19)"),
             tr(
-                "Считываются в сессии разработки (10 4F → 23 12 <NvM_ID> 00 00): серийные номера (0x13..0x19) и скользящие счётчики (0x05..0x0B).",
-                "Read in Development Session (10 4F → 23 12 <NvM_ID> 00 00): Serial IDs (0x13..0x19) and rolling counters (0x05..0x0B).",
+                "Серийные номера ключей (0x13..0x19) и скользящие счётчики (0x05..0x0B) из сессии разработки.",
+                "Key Serial IDs (0x13..0x19) and rolling counters (0x05..0x0B) from Development Session.",
             ),
         )
         slots = self._status.get("ffb_slots") or []
@@ -1378,10 +1408,10 @@ class BcmScreen(QWidget):
                     st_lbl = status_readout(tr("обучен", "learned"), "info")
                 else:
                     st_lbl = status_readout(tr("пусто", "empty"), "muted")
-                s_grid.addWidget(c0, r_idx, 0)
-                s_grid.addWidget(c1, r_idx, 1)
-                s_grid.addWidget(c2, r_idx, 2)
-                s_grid.addWidget(st_lbl, r_idx, 3)
+                s_grid.addWidget(c0, r_idx, 0, Qt.AlignmentFlag.AlignVCenter)
+                s_grid.addWidget(c1, r_idx, 1, Qt.AlignmentFlag.AlignVCenter)
+                s_grid.addWidget(c2, r_idx, 2, Qt.AlignmentFlag.AlignVCenter)
+                s_grid.addWidget(st_lbl, r_idx, 3, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             s_grid.setColumnStretch(3, 1)
             sec_slots.body.addLayout(s_grid)
         else:
@@ -1398,10 +1428,10 @@ class BcmScreen(QWidget):
         busy = self.runner.is_busy
         sec = self._compact_section(Section())
         sec.set_text(
-            tr("Ошибки блока 09 BCM (UDS 19 02 / 14 FF FF FF)", "09 BCM fault codes (UDS 19 02 / 14 FF FF FF)"),
+            tr("Ошибки 09 BCM (UDS 19 02 / 14 FF FF FF)", "09 BCM fault codes (UDS 19 02 / 14 FF FF FF)"),
             tr(
-                "Расшифровка неисправностей по базе ODIS BV_CentrElectUDS (VW37X / SK37X), включая коды защиты компонентов U110100 (0xEA6400) и U110000 (0xD10000).",
-                "Decoded from ODIS BV_CentrElectUDS (VW37X / SK37X), including Component Protection DTCs U110100 (0xEA6400) and U110000 (0xD10000).",
+                "Расшифровка по базе ODIS BV_CentrElectUDS, включая коды защиты компонентов U110100 и U110000.",
+                "Decoded via ODIS BV_CentrElectUDS, including Component Protection DTCs U110100 and U110000.",
             ),
         )
         if self._dtcs is None:
@@ -1482,8 +1512,28 @@ class BcmScreen(QWidget):
 
     # ────────────────────────────── Cluster Material Sync ──────────────────────────────
 
+    def _on_ffb_gfa_changed(self, txt: str) -> None:
+        self._draft_ffb_gfa = txt
+        self._ffb_drafts_dirty = True
+
+    def _on_ffb_freq_changed(self, _idx: int) -> None:
+        if hasattr(self, "cmb_ffb_freq") and _qt_valid(self.cmb_ffb_freq):
+            val = self.cmb_ffb_freq.currentData()
+            self._draft_ffb_freq = int(val if val is not None else 0x03)
+            self._ffb_drafts_dirty = True
+
+    def _on_ffb_kffb_changed(self, txt: str) -> None:
+        self._draft_ffb_kffb = txt
+        self._ffb_drafts_dirty = True
+
+    def _set_ffb_row_field(self, idx: int, field: str, value: Any) -> None:
+        if 0 <= idx < len(self._draft_ffb_rows):
+            self._draft_ffb_rows[idx][field] = value
+            self._ffb_drafts_dirty = True
+
     def _on_kc_text_changed(self, txt: str) -> None:
         self._draft_ffb_kc = txt
+        self._ffb_drafts_dirty = True
         cleaned = "".join(txt.split()).replace("0x", "").replace("0X", "")
         if len(cleaned) == 32:
             try:
@@ -1563,13 +1613,17 @@ class BcmScreen(QWidget):
 
     def _sync_ffb_drafts_from_state(self) -> None:
         """Auto-populate FFB key slots directly from BCM NvM (or merge with open 17 FPK_E cluster material)."""
+        if self._ffb_drafts_dirty:
+            return
         if self._cluster_material and self._cluster_material.get("kc_hex"):
             self._apply_cluster_material_to_drafts(self._cluster_material)
         elif self._status.get("ffb_slots"):
             self._apply_bcm_slots_to_drafts(refresh_ui=False)
 
-    def _sync_cluster_material_if_available(self, *, silent: bool = True) -> None:
+    def _sync_cluster_material_if_available(self, *, silent: bool = True, force: bool = False) -> None:
         if self._cluster_provider is None:
+            return
+        if not force and (self._cluster_source_manual or self._ffb_drafts_dirty):
             return
         cluster_info = self._cluster_provider()
         if not cluster_info or not cluster_info.get("dflash_bytes"):
@@ -1583,6 +1637,9 @@ class BcmScreen(QWidget):
                     ),
                 )
             return
+        if force:
+            self._cluster_source_manual = False
+            self._ffb_drafts_dirty = False
         freq = int(self._status.get("freq_code", self._draft_ffb_freq))
         mat = bcm_extract_cluster_ffb_material(
             cluster_info["dflash_bytes"],
@@ -1594,8 +1651,17 @@ class BcmScreen(QWidget):
             self.refresh()
 
     def _fill_gfa_from_cluster(self) -> None:
-        self._sync_cluster_material_if_available(silent=True)
         gfa_hex = (self._cluster_material or {}).get("gfa_hex", "")
+        if not gfa_hex and self._cluster_provider is not None:
+            cluster_info = self._cluster_provider()
+            if cluster_info and cluster_info.get("dflash_bytes"):
+                freq = int(self._status.get("freq_code", self._draft_ffb_freq))
+                mat = bcm_extract_cluster_ffb_material(
+                    cluster_info["dflash_bytes"],
+                    cluster_info.get("cflash_bytes"),
+                    freq_code=freq,
+                )
+                gfa_hex = str(mat.get("gfa_hex") or "")
         if not gfa_hex:
             QMessageBox.information(
                 self,
@@ -1623,6 +1689,8 @@ class BcmScreen(QWidget):
             raw = Path(path_str).read_bytes()
             freq = int(self._status.get("freq_code", self._draft_ffb_freq))
             mat = bcm_extract_cluster_ffb_material(raw, freq_code=freq)
+            self._cluster_source_manual = True
+            self._ffb_drafts_dirty = False
             self._apply_cluster_material_to_drafts(mat)
             self.refresh()
         except Exception as exc:
@@ -1635,14 +1703,15 @@ class BcmScreen(QWidget):
             return
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
+        via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
         self.runner.run_task(
             tr("Опрос 09 BCM (паспорт, статус, радиоключи FFB, ошибки)", "Polling 09 BCM (passport, status, FFB keys, DTCs)"),
             lambda rep: can_bcm_read_all(
                 port,
                 interface=iface,
-                via_gateway=self._via_gateway,
-                gateway_bridge=self._gateway_bridge,
-                gateway_channel=self._gateway_channel,
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
                 sw_profile=sw_prof,
                 include_keys=False,
                 reporter=rep,
@@ -1668,8 +1737,9 @@ class BcmScreen(QWidget):
             self._gfa_hex = str(res["gfa_working_hex"])
             if not self._draft_new_gfa:
                 self._draft_new_gfa = self._gfa_hex.upper()
-            self._draft_ffb_gfa = self._gfa_hex.upper()
-        if res.get("k_ffb_hex"):
+            if not self._ffb_drafts_dirty:
+                self._draft_ffb_gfa = self._gfa_hex.upper()
+        if res.get("k_ffb_hex") and not self._ffb_drafts_dirty:
             self._draft_ffb_kffb = str(res["k_ffb_hex"]).upper()
         self._sync_ffb_drafts_from_state()
         self.refresh()
@@ -1680,14 +1750,15 @@ class BcmScreen(QWidget):
             return
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
+        via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
         self.runner.run_task(
             tr("Опрос паспорта и статуса 09 BCM (UDS 0x70E)", "Polling 09 BCM passport & status (UDS 0x70E)"),
             lambda rep: can_bcm_status(
                 port,
                 interface=iface,
-                via_gateway=self._via_gateway,
-                gateway_bridge=self._gateway_bridge,
-                gateway_channel=self._gateway_channel,
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
                 sw_profile=sw_prof,
                 include_nvm_slots=True,
                 reporter=rep,
@@ -1700,7 +1771,7 @@ class BcmScreen(QWidget):
             self._passport.update(res["passport"])
         if isinstance(res.get("status"), dict):
             self._status = res["status"]
-            if self._status.get("rf_0a65_hex") and "freq_code" in self._status:
+            if self._status.get("rf_0a65_hex") and "freq_code" in self._status and not self._ffb_drafts_dirty:
                 self._draft_ffb_freq = int(self._status["freq_code"])
         if isinstance(res.get("profile"), dict):
             self._profile = res["profile"]
@@ -1711,18 +1782,19 @@ class BcmScreen(QWidget):
     def action_read_gfa(self) -> None:
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
-        if not run_dialog(BcmReadKeysDialog(include_ika=False, status=self._status, parent=self)):
+        if not run_dialog(BcmReadKeysDialog(include_ika=False, via_gateway=self._via_gateway, status=self._status, parent=self)):
             return
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
+        via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
         self.runner.run_task(
             tr("Чтение GFA из 09 BCM (WFS Job 5 + XCP)", "Reading GFA from 09 BCM (WFS Job 5 + XCP)"),
             lambda rep: can_bcm_read_gfa(
                 port,
                 interface=iface,
-                via_gateway=self._via_gateway,
-                gateway_bridge=self._gateway_bridge,
-                gateway_channel=self._gateway_channel,
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
@@ -1732,18 +1804,19 @@ class BcmScreen(QWidget):
     def action_read_keys(self) -> None:
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
-        if not run_dialog(BcmReadKeysDialog(include_ika=True, status=self._status, parent=self)):
+        if not run_dialog(BcmReadKeysDialog(include_ika=True, via_gateway=self._via_gateway, status=self._status, parent=self)):
             return
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
+        via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
         self.runner.run_task(
             tr("Чтение IKA + GFA из 09 BCM (WFS Ch 3 + XCP)", "Reading IKA + GFA from 09 BCM (WFS Ch 3 + XCP)"),
             lambda rep: can_bcm_read_keys(
                 port,
                 interface=iface,
-                via_gateway=self._via_gateway,
-                gateway_bridge=self._gateway_bridge,
-                gateway_channel=self._gateway_channel,
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
@@ -1755,7 +1828,7 @@ class BcmScreen(QWidget):
             self._passport.update(res["passport"])
         if isinstance(res.get("status"), dict):
             self._status = res["status"]
-            if self._status.get("rf_0a65_hex") and "freq_code" in self._status:
+            if self._status.get("rf_0a65_hex") and "freq_code" in self._status and not self._ffb_drafts_dirty:
                 self._draft_ffb_freq = int(self._status["freq_code"])
         if isinstance(res.get("profile"), dict):
             self._profile = res["profile"]
@@ -1766,8 +1839,9 @@ class BcmScreen(QWidget):
             self._gfa_hex = str(res["gfa_working_hex"])
             if not self._draft_new_gfa:
                 self._draft_new_gfa = self._gfa_hex.upper()
-            self._draft_ffb_gfa = self._gfa_hex.upper()
-        if res.get("k_ffb_hex"):
+            if not self._ffb_drafts_dirty:
+                self._draft_ffb_gfa = self._gfa_hex.upper()
+        if res.get("k_ffb_hex") and not self._ffb_drafts_dirty:
             self._draft_ffb_kffb = str(res["k_ffb_hex"]).upper()
         self._sync_ffb_drafts_from_state()
         self.refresh()
@@ -1790,15 +1864,35 @@ class BcmScreen(QWidget):
             "gfa_working_hex": self._gfa_hex,
             "status": self._status,
         }
-        Path(path_str).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            Path(path_str).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка сохранения", "Save error"), str(exc))
+            return
         self.note.emit(tr(f"Данные 09 BCM сохранены: {path_str}", f"09 BCM data saved: {path_str}"))
 
     def action_write_keys(self, *, include_ika: bool) -> None:
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
-        cur_ika = (self.ed_write_cur_ika.text() if hasattr(self, "ed_write_cur_ika") else self._draft_cur_ika).strip()
-        new_ika = ((self.ed_write_new_ika.text() if hasattr(self, "ed_write_new_ika") else self._draft_new_ika).strip() if include_ika else "")
-        new_gfa = (self.ed_write_new_gfa.text() if hasattr(self, "ed_write_new_gfa") else self._draft_new_gfa).strip()
+        cur_ika = (
+            self.ed_write_cur_ika.text()
+            if hasattr(self, "ed_write_cur_ika") and _qt_valid(self.ed_write_cur_ika)
+            else self._draft_cur_ika
+        ).strip()
+        new_ika = (
+            (
+                self.ed_write_new_ika.text()
+                if hasattr(self, "ed_write_new_ika") and _qt_valid(self.ed_write_new_ika)
+                else self._draft_new_ika
+            ).strip()
+            if include_ika
+            else ""
+        )
+        new_gfa = (
+            self.ed_write_new_gfa.text()
+            if hasattr(self, "ed_write_new_gfa") and _qt_valid(self.ed_write_new_gfa)
+            else self._draft_new_gfa
+        ).strip()
         hard_reset = self._draft_write_reset
 
         if not cur_ika:
@@ -1815,16 +1909,38 @@ class BcmScreen(QWidget):
                 tr("Укажите новый IKA (32 hex) для DID 0x00BE.", "Enter the new IKA (32 hex) for DID 0x00BE."),
             )
             return
-        if not include_ika and not new_gfa:
+        if not new_gfa:
             QMessageBox.warning(
                 self,
                 "ContiTool",
-                tr("Укажите целевой GFA (32 hex) для DID 0x00BD.", "Enter the target GFA (32 hex) for DID 0x00BD."),
+                tr(
+                    "Укажите целевой GFA (32 hex) для DID 0x00BD. Запись нового IKA (00BE) автоматически стирает GFA в BCM, поэтому GFA обязателен.",
+                    "Enter the target GFA (32 hex) for DID 0x00BD. Writing a new IKA (00BE) automatically erases GFA in BCM, so GFA is required.",
+                ),
             )
+            return
+
+        confirm_body = (
+            tr(
+                f"Записать новый IKA (2E 00BE) и групповой ключ GFA (2E 00BD) в NvM блока 09 BCM?\n\n"
+                f"Новый IKA: {new_ika.upper()}\nНовый GFA: {new_gfa.upper()}\n\n"
+                "Запись 00BE изменяет активный ключ шифрования BCM — обязательно сохраните новый IKA!",
+                f"Write new IKA (2E 00BE) and group key GFA (2E 00BD) to 09 BCM NvM?\n\n"
+                f"New IKA: {new_ika.upper()}\nNew GFA: {new_gfa.upper()}\n\n"
+                "Writing 00BE changes the BCM's active encryption key — make sure you save the new IKA!",
+            )
+            if include_ika
+            else tr(
+                f"Записать групповой ключ GFA (2E 00BD) в NvM блока 09 BCM?\n\nНовый GFA: {new_gfa.upper()}",
+                f"Write group key GFA (2E 00BD) to 09 BCM NvM?\n\nNew GFA: {new_gfa.upper()}",
+            )
+        )
+        if QMessageBox.question(self, tr("Подтверждение записи в 09 BCM", "Confirm 09 BCM NvM Write"), confirm_body) != QMessageBox.StandardButton.Yes:
             return
 
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
+        via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
         self.runner.run_task(
             tr("Запись ключей CP (2E 00BE / 00BD) в 09 BCM", "Writing CP keys (2E 00BE / 00BD) to 09 BCM"),
             lambda rep: can_bcm_write_keys(
@@ -1834,9 +1950,9 @@ class BcmScreen(QWidget):
                 new_gfa=new_gfa or None,
                 hard_reset=hard_reset,
                 interface=iface,
-                via_gateway=self._via_gateway,
-                gateway_bridge=self._gateway_bridge,
-                gateway_channel=self._gateway_channel,
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
@@ -1910,6 +2026,7 @@ class BcmScreen(QWidget):
 
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
+        via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
         self.runner.run_task(
             tr("Адаптация радиоключей FFB (WFS Ch 3: 80 01 + 80 02)", "Adapting FFB remote keys (WFS Ch 3: 80 01 + 80 02)"),
             lambda rep: can_bcm_adapt_ffb(
@@ -1921,9 +2038,9 @@ class BcmScreen(QWidget):
                 freq_code=freq_code,
                 verify_after=True,
                 interface=iface,
-                via_gateway=self._via_gateway,
-                gateway_bridge=self._gateway_bridge,
-                gateway_channel=self._gateway_channel,
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
@@ -1933,24 +2050,52 @@ class BcmScreen(QWidget):
     def action_clear_all_ffb(self) -> None:
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
-        gfa_txt = self._draft_ffb_gfa.strip()
-        kc_txt = self._draft_ffb_kc.strip()
-        kffb_txt = self._draft_ffb_kffb.strip() or ("00" * 16)
+        if (
+            QMessageBox.question(
+                self,
+                tr("Очистка всех радиоключей FFB", "Clear All FFB Remote Keys"),
+                tr(
+                    "Очистить ВСЕ обученные радиоключи FFB в DFLASH блока 09 BCM (команда WFS 80 02 00)?\n"
+                    "После этого кнопки на пультах перестанут открывать/закрывать автомобиль до повторной адаптации.",
+                    "Erase ALL learned FFB remote keys in 09 BCM DFLASH (WFS 80 02 00)?\n"
+                    "Key fob buttons will stop locking/unlocking the car until re-adapted.",
+                ),
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        gfa_txt = (
+            self.ed_ffb_gfa.text()
+            if hasattr(self, "ed_ffb_gfa") and _qt_valid(self.ed_ffb_gfa)
+            else self._draft_ffb_gfa
+        ).strip()
+        kc_txt = (
+            self.ed_ffb_kc.text()
+            if hasattr(self, "ed_ffb_kc") and _qt_valid(self.ed_ffb_kc)
+            else self._draft_ffb_kc
+        ).strip()
+        kffb_raw = (
+            self.ed_ffb_kffb.text()
+            if hasattr(self, "ed_ffb_kffb") and _qt_valid(self.ed_ffb_kffb)
+            else self._draft_ffb_kffb
+        ).strip()
+        kffb_txt = kffb_raw or ("" if kc_txt else ("00" * 16))
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
+        via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
         self.runner.run_task(
             tr("Очистка всех слотов радиоключей FFB (80 02 00)", "Clearing all FFB remote key slots (80 02 00)"),
             lambda rep: can_bcm_adapt_ffb(
                 port,
                 gfa=gfa_txt or None,
                 kc=kc_txt or None,
-                k_ffb=kffb_txt,
+                k_ffb=kffb_txt or None,
                 clear_all=True,
                 verify_after=True,
                 interface=iface,
-                via_gateway=self._via_gateway,
-                gateway_bridge=self._gateway_bridge,
-                gateway_channel=self._gateway_channel,
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
@@ -1963,17 +2108,19 @@ class BcmScreen(QWidget):
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
         sync_gfa = self._draft_sync_gfa
+        cur_ika = self._ika_hex or None
+        via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
         self.runner.run_task(
             tr("Чтение 17 FPK_E по CAN и адаптация FFB в 09 BCM", "Reading 17 FPK_E over CAN and adapting FFB in 09 BCM"),
             lambda rep: can_bcm_adapt_ffb_from_cluster(
                 port,
                 fpke_dflash=None,
                 sync_bcm_gfa_to_cluster=sync_gfa,
-                current_bcm_ika=self._ika_hex or None,
+                current_bcm_ika=cur_ika,
                 interface=iface,
-                via_gateway=self._via_gateway,
-                gateway_bridge=self._gateway_bridge,
-                gateway_channel=self._gateway_channel,
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
@@ -1981,6 +2128,7 @@ class BcmScreen(QWidget):
         )
 
     def _on_ffb_adapted(self, res: dict[str, Any]) -> None:
+        self._ffb_drafts_dirty = False
         if res.get("gfa_hex"):
             self._gfa_hex = str(res["gfa_hex"])
             self._draft_ffb_gfa = self._gfa_hex.upper()
@@ -1997,6 +2145,7 @@ class BcmScreen(QWidget):
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
         port, iface = self.conn.port, self.conn.interface
+        via_gw = self._via_gateway
         self.runner.run_task(
             tr("Чтение ошибок 09 BCM (19 02)", "Reading 09 BCM fault codes (19 02)"),
             lambda rep: can_uds_read_dtc(
@@ -2004,7 +2153,7 @@ class BcmScreen(QWidget):
                 tx_id=BCM_UDS_TX_ID,
                 rx_id=BCM_UDS_RX_ID,
                 ecu_kind="bcm",
-                via_gateway=self._via_gateway,
+                via_gateway=via_gw,
                 interface=iface,
                 reporter=rep,
             ),
@@ -2015,6 +2164,7 @@ class BcmScreen(QWidget):
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
         port, iface = self.conn.port, self.conn.interface
+        via_gw = self._via_gateway
         self.runner.run_task(
             tr("Сброс ошибок 09 BCM (14 FF FF FF)", "Clearing 09 BCM fault codes (14 FF FF FF)"),
             lambda rep: can_uds_clear_dtc(
@@ -2022,7 +2172,7 @@ class BcmScreen(QWidget):
                 tx_id=BCM_UDS_TX_ID,
                 rx_id=BCM_UDS_RX_ID,
                 ecu_kind="bcm",
-                via_gateway=self._via_gateway,
+                via_gateway=via_gw,
                 interface=iface,
                 reporter=rep,
             ),

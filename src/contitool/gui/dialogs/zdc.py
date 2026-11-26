@@ -65,7 +65,7 @@ from contitool.core import (
 from contitool.gui import theme
 from contitool.gui.connection import CanConnection, ensure_ready
 from contitool.gui.theme import mono_font
-from contitool.gui.widgets.page import Callout, Dialog, Section, button, divider, group_label, hint, row
+from contitool.gui.widgets.page import Callout, Dialog, Section, button, divider, hint, row
 from contitool.gui.worker import OperationRunner
 from contitool.i18n import get_lang, tr
 
@@ -141,12 +141,10 @@ class FpaEditorDialog(Dialog):
             parent,
             tr("Профили вождения и кнопки переключения", "Driving Profiles & Mode Buttons"),
             tr(
-                "Доступные режимы движения, память режима после выключения зажигания, переключение кнопкой MODE и"
-                " кнопкой на руле.",
-                "Available driving modes, keeping the mode after the ignition is switched off, switching with the"
-                " MODE button and a wheel button.",
+                "Режимы движения, память после выключения зажигания, кнопки MODE и руля, кодировка.",
+                "Driving modes, ignition-off memory, console MODE & steering-wheel buttons, and coding.",
             ),
-            width=1020,
+            width=960,
         )
         self._df = bytes(df)
         self._conn = conn
@@ -164,6 +162,8 @@ class FpaEditorDialog(Dialog):
         self.fpa = FpaDataset(bytes(self._orig_loaded.buf))
 
         self.cmb_preset = QComboBox()
+        self.cmb_preset.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_preset.setMinimumContentsLength(18)
         if self._needs_onboarding:
             self.cmb_preset.addItem(
                 tr(
@@ -251,11 +251,11 @@ class FpaEditorDialog(Dialog):
             self.body.addWidget(self.pnl_reset_preset)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_tab_profiles(), tr("Профили и память", "Profiles & Memory"))
-        self.tabs.addTab(self._build_tab_buttons(), tr("Кнопки MODE и руль", "MODE & Wheel Buttons"))
-        self.tabs.addTab(self._build_tab_matrix(), tr("Режимы агрегатов", "Subsystem Modes"))
-        self.tabs.addTab(self._build_tab_individual(), tr("Меню Individual", "Individual Menu"))
-        self.tabs.addTab(self._build_tab_coding(), tr("Кодировка блока", "ECU Coding"))
+        self.tabs.addTab(self._build_tab_profiles(), tr("Профили", "Profiles"))
+        self.tabs.addTab(self._build_tab_buttons(), tr("Кнопки и руль", "MODE & Wheel"))
+        self.tabs.addTab(self._build_tab_matrix(), tr("Агрегаты", "Subsystems"))
+        self.tabs.addTab(self._build_tab_individual(), tr("Individual", "Individual"))
+        self.tabs.addTab(self._build_tab_coding(), tr("Кодировка", "Coding"))
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.body.addWidget(self.tabs, 1)
 
@@ -276,16 +276,12 @@ class FpaEditorDialog(Dialog):
 
         sec_mem = Section()
         sec_mem.set_text(
-            tr("Профиль после выключения зажигания и режимы систем", "Profile after ignition off, and system modes"),
+            tr("Память профиля и режимы систем", "Profile memory & system modes"),
             tr(
-                "Первая галочка: после включения зажигания остаётся выбранный профиль, а не Normal (S029). Вторая: "
-                "силовой агрегат и Старт-Стоп получают и режимы Comfort, Sport и Offroad. С завода шлюз передаёт им "
-                "только те режимы, которые эти блоки принимают (S075), остальные заменяет на «без запроса». Примут "
-                "ли блоки остальные режимы, не проверено.",
-                "First option: after the ignition is switched on the selected profile stays instead of Normal (S029). "
-                "Second: the powertrain and Start-Stop also get the Comfort, Sport and Offroad modes. From the factory "
-                "the gateway passes them only the modes these ECUs accept (S075) and replaces the rest with “no "
-                "request”. Whether the ECUs accept the other modes is not verified.",
+                "S029 — сохранять выбранный профиль после выключения зажигания вместо сброса в Normal; "
+                "S075 — передавать Comfort/Sport/Offroad силовому агрегату и Старт-Стоп.",
+                "S029 — keep the active profile after ignition off instead of resetting to Normal; "
+                "S075 — forward Comfort/Sport/Offroad to powertrain and Start-Stop.",
             ),
         )
         self.chk_kl15_profiles = QCheckBox(
@@ -376,14 +372,10 @@ class FpaEditorDialog(Dialog):
         sec_knob.set_text(
             tr("Шайба 4MOTION Active Control", "4MOTION Active Control knob"),
             tr(
-                "Как в заводском датасете Tiguan 2019 (OZ00): положения шайбы Snow, On-road, Offroad и Offroad "
-                "Individual; профиль On-road выбирается в меню магнитолы. Шайба заменяет кнопку MODE на консоли, "
-                "кнопка на руле остаётся. Нужны сама шайба (модуль консоли с LIN-кадром 0x0B) и FEC 10001400, "
-                "10001800 и 10001900.",
-                "As in the factory dataset of a 2019 Tiguan (OZ00): knob positions Snow, On-road, Offroad and Offroad "
-                "Individual; the on-road profile is picked in the head-unit menu. The knob replaces the console MODE "
-                "button; a wheel button stays. It needs the knob itself (the console module sending LIN frame 0x0B) "
-                "and FECs 10001400, 10001800 and 10001900.",
+                "Положения Snow, On-road, Offroad, Offroad Individual (как в Tiguan OZ00). Заменяет кнопку MODE; "
+                "требует шайбу LIN 0x0B и FEC 10001400 / 10001800 / 10001900.",
+                "Positions Snow, On-road, Offroad, Offroad Individual (Tiguan OZ00). Replaces MODE button; "
+                "requires LIN 0x0B knob and FECs 10001400 / 10001800 / 10001900.",
             ),
         )
         self.chk_knob = QCheckBox(tr("Добавить шайбу в датасет", "Add the knob to the dataset"))
@@ -1329,10 +1321,16 @@ class FpaEditorDialog(Dialog):
                 )
             )
             tone = theme.OK if (g.consistent and g.coding_enabled is not None) else (theme.WARN if not g.consistent else theme.TEXT_MUTED)
-            rows_data.append((g.code, f"Byte {g.byte_idx}, Bit {g.bit_idx}", st_txt, tone))
+            rows_data.append(
+                (g.code, tr(f"Байт {g.byte_idx}, бит {g.bit_idx}", f"Byte {g.byte_idx}, Bit {g.bit_idx}"), st_txt, tone)
+            )
 
         for p in rep.paco_ecus:
-            bit_txt = f"Byte {p.coding_byte}, Bit {p.coding_bit}" if p.coding_byte is not None else tr("Постоянно", "Always")
+            bit_txt = (
+                tr(f"Байт {p.coding_byte}, бит {p.coding_bit}", f"Byte {p.coding_byte}, Bit {p.coding_bit}")
+                if p.coding_byte is not None
+                else tr("Постоянно", "Always")
+            )
             st_txt = (
                 tr("Включён в кодировке", "Enabled in coding")
                 if p.coding_enabled is True
@@ -1679,12 +1677,10 @@ class BemEditorDialog(Dialog):
             parent,
             tr("Генератор 14В и умная зарядка (BEM)", "14V Alternator & Smart Charging (BEM)"),
             tr(
-                "После замены генератора (например, на 180 или 250 А вместо 140 А) выберите его модель из "
-                "заводского каталога: по ней шлюз рассчитывает нагрузку и рекуперацию.",
-                "After an alternator change (to 180 or 250 A instead of 140 A, say) pick its model from the "
-                "factory catalogue: the gateway works out load and recuperation from it.",
+                "Выберите модель генератора из заводского каталога для корректного расчёта нагрузки и рекуперации.",
+                "Pick the alternator model from the factory catalogue for accurate load and recuperation control.",
             ),
-            width=820,
+            width=800,
         )
         self._df = bytes(df)
         cur = parse_bem_block(self._df)
@@ -1829,7 +1825,7 @@ class BemEditorDialog(Dialog):
                 f"  #{s.slot_idx + 1}",
                 "—" if s.empty else s.supplier_name,
                 tr("— свободна —", "— empty —") if s.empty else s.matched_label,
-                "—" if s.empty else f"{s.p_max_w} W",
+                "—" if s.empty else tr(f"{s.p_max_w} Вт", f"{s.p_max_w} W"),
             )
             for c, txt in enumerate(vals):
                 it = QTableWidgetItem(txt)
@@ -1856,12 +1852,10 @@ class ZdcPassportBlocksDialog(Dialog):
             parent,
             tr("Паспорт датасета и перенос разделов", "Dataset Passport & Section Transfer"),
             tr(
-                "Номер и версия датасета, которые показывают ODIS и VCDS, а также сохранение и перенос отдельных "
-                "разделов параметрии из другого дампа. Ключи CP и SWaP не затрагиваются.",
-                "The dataset number and version that ODIS and VCDS show, and saving or transferring single "
-                "dataset sections from another dump. The CP and SWaP keys are not touched.",
+                "Номер и версия датасета (ODIS/VCDS) и импорт/экспорт отдельных разделов. Ключи CP и SWaP не затрагиваются.",
+                "Dataset number/version (ODIS/VCDS) and section import/export. CP and SWaP keys stay untouched.",
             ),
-            width=820,
+            width=800,
         )
         self._df = bytes(df)
         pp = parse_zdc_passport(self._df)
@@ -1960,7 +1954,7 @@ class ZdcPassportBlocksDialog(Dialog):
             cells = (
                 f"  ZDC #{b.idx}",
                 b.label,
-                f"{b.size} B",
+                tr(f"{b.size} Б", f"{b.size} B"),
                 st,
             )
             for c, txt in enumerate(cells):
@@ -1979,10 +1973,13 @@ class ZdcPassportBlocksDialog(Dialog):
             self,
             tr(f"Сохранить раздел ZDC #{idx}", f"Save section ZDC #{idx}"),
             f"ZDC_block_{idx}.bin",
-            "Binary (*.bin);;All files (*)",
+            tr("Бинарные файлы (*.bin);;Все файлы (*)", "Binary (*.bin);;All files (*)"),
         )
         if dest:
-            Path(dest).write_bytes(raw)
+            try:
+                Path(dest).write_bytes(raw)
+            except OSError as exc:
+                QMessageBox.critical(self, tr("Ошибка экспорта", "Export error"), str(exc))
 
     def _import_selected(self) -> None:
         idx = self._selected_idx()
@@ -1993,7 +1990,7 @@ class ZdcPassportBlocksDialog(Dialog):
                 f"Choose ZDC #{idx} block (.bin) or a 64 KB donor DataFlash dump",
             ),
             "",
-            "Binary (*.bin);;All files (*)",
+            tr("Бинарные файлы (*.bin);;Все файлы (*)", "Binary (*.bin);;All files (*)"),
         )
         if not src:
             return

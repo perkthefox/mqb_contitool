@@ -47,12 +47,10 @@ class CpBindDialog(Dialog):
             parent,
             tr("Адаптация модулей", "Module adaptation"),
             tr(
-                "Отметьте модули, которые нужно адаптировать к этому шлюзу, и укажите ключ IKA каждого — его нужно "
-                "знать заранее (из дампа модуля) или сгенерировать и записать в модуль. Заводские модули не меняются.",
-                "Tick the modules to adapt to this gateway and enter each one's IKA key — known in advance (from the "
-                "module's dump) or generated and written into the module. The factory modules do not change.",
+                "Отметьте модули для привязки и укажите их 16-байтный ключ IKA. Заводские модули не затрагиваются.",
+                "Tick modules to bind and enter their 16-byte IKA key. Factory modules stay untouched.",
             ),
-            width=760,
+            width=740,
         )
         self.action = ""
         self.banks: list[SlotSpec] = []
@@ -100,17 +98,17 @@ class CpBindDialog(Dialog):
         # 2. Key
         self.body.addWidget(group_label(tr("2. КЛЮЧ IKA", "2. IKA KEY")))
         self.ed_key = QLineEdit()
-        self.ed_key.setFont(mono_font(14))
+        self.ed_key.setFont(mono_font(13))
         self.ed_key.setPlaceholderText("A1B2C3D4E5F60718293A4B5C6D7E8F90")
         self.ed_key.textChanged.connect(lambda _t: self._sync())
-        btn_gen = button(tr("Сгенерировать", "Generate"), slot=self._generate)
+        btn_gen = button(tr("Сгенерировать", "Generate"), "InlineBtn", slot=self._generate)
         btn_gen.setToolTip(
             tr(
                 "Случайный ключ: тот же ключ нужно записать в слот IKA адаптируемого модуля.",
                 "Random key: the same key must be written into the IKA slot of the bound ECU.",
             )
         )
-        btn_copy = button(tr("Копировать", "Copy"), "GhostBtn", slot=self._copy)
+        btn_copy = button(tr("Копировать", "Copy"), "InlineBtn", slot=self._copy)
         key_row = QHBoxLayout()
         key_row.setSpacing(6)
         key_row.addWidget(self.ed_key, 1)
@@ -123,10 +121,8 @@ class CpBindDialog(Dialog):
         self.body.addWidget(
             hint(
                 tr(
-                    "16 байт (32 hex-символа). Это открытый ключ из слота IKA адаптируемого модуля — "
-                    "из его дампа или сгенерированный и записанный в оба блока.",
-                    "16 bytes (32 hex characters). The plaintext key from the bound ECU's IKA slot — "
-                    "read from its dump, or generated and written into both ECUs.",
+                    "16 байт (32 hex) из дампа модуля, либо сгенерируйте ключ и запишите в оба блока.",
+                    "16 bytes (32 hex) from the module dump, or generate a key and write it to both units.",
                 )
             )
         )

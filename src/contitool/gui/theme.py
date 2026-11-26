@@ -16,7 +16,15 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
 )
-from PySide6.QtWidgets import QApplication, QComboBox, QProxyStyle, QStyle, QStyleFactory, QWidget
+from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QComboBox,
+    QProxyStyle,
+    QStyle,
+    QStyleFactory,
+    QWidget,
+)
 
 # Neutral architectural carbon-zinc ramp (inspired by Linear, Raycast, Saleae Logic 2, Xcode Dark)
 BG_INPUT = "#101114"     # recessed viewports: log console, CAN trace table, text/hex inputs, segmented tracks
@@ -136,14 +144,39 @@ class _Style(QProxyStyle):
         sz = super().sizeFromContents(ct, option, size, widget)
         if ct == QStyle.ContentsType.CT_PushButton and widget is not None:
             name = widget.objectName()
-            if name != "LinkBtn":
-                extra = 8 if name in ("SegBtn", "TabBtn") else 12
+            if name not in ("LinkBtn", "IconBtn"):
+                extra = 4 if name in ("SegBtn", "TabBtn") else (6 if name in ("InlineBtn", "Chip") else 10)
                 sz.setWidth(sz.width() + extra)
         return sz
 
     def drawPrimitive(self, element, option, painter, widget=None) -> None:  # noqa: N802 (Qt override)
         if element == QStyle.PrimitiveElement.PE_IndicatorRadioButton:
             self._draw_radio(option, painter)
+            return
+        if element in (
+            QStyle.PrimitiveElement.PE_IndicatorSpinUp,
+            QStyle.PrimitiveElement.PE_IndicatorSpinDown,
+        ) and isinstance(widget, QAbstractSpinBox):
+            r = QRectF(option.rect)
+            c = r.center()
+            up = element == QStyle.PrimitiveElement.PE_IndicatorSpinUp
+            enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+            hover = bool(option.state & QStyle.StateFlag.State_MouseOver)
+            col = TEXT if (enabled and hover) else (TEXT_SECONDARY if enabled else TEXT_MUTED)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(
+                QPen(QColor(col), 1.45, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            )
+            if up:
+                painter.drawPolyline(
+                    [QPointF(c.x() - 3.0, c.y() + 1.3), QPointF(c.x(), c.y() - 1.7), QPointF(c.x() + 3.0, c.y() + 1.3)]
+                )
+            else:
+                painter.drawPolyline(
+                    [QPointF(c.x() - 3.0, c.y() - 1.3), QPointF(c.x(), c.y() + 1.7), QPointF(c.x() + 3.0, c.y() - 1.3)]
+                )
+            painter.restore()
             return
         if element == QStyle.PrimitiveElement.PE_IndicatorArrowDown and isinstance(widget, QComboBox):
             r = QRectF(option.rect)
@@ -187,30 +220,6 @@ class _Style(QProxyStyle):
                 [QPointF(x + s * 0.24, y + s * 0.52), QPointF(x + s * 0.43, y + s * 0.70), QPointF(x + s * 0.76, y + s * 0.32)]
             )
         painter.restore()
-
-    def drawComplexControl(self, control, option, painter, widget=None) -> None:  # noqa: N802 (Qt override)
-        super().drawComplexControl(control, option, painter, widget)
-        if control == QStyle.ComplexControl.CC_ComboBox and isinstance(widget, QComboBox):
-            r = QRectF(widget.rect())
-            dd_w = 28.0
-            dd_rect = QRectF(r.right() - dd_w, r.top() + 1.0, dd_w - 1.0, r.height() - 2.0)
-            painter.save()
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            if widget.isEditable():
-                path = QPainterPath()
-                path.addRoundedRect(dd_rect.adjusted(0.0, 1.0, -1.0, -1.0), 5.0, 5.0)
-                painter.fillPath(path, QColor(BG_CONTROL if widget.isEnabled() else BG_INPUT))
-                painter.setPen(QPen(QColor("#2F3440"), 1.0))
-                painter.drawLine(QPointF(dd_rect.left(), r.top() + 4.0), QPointF(dd_rect.left(), r.bottom() - 4.0))
-            c = dd_rect.center()
-            col = TEXT if (widget.isEnabled() and widget.underMouse()) else (TEXT_SECONDARY if widget.isEnabled() else TEXT_MUTED)
-            painter.setPen(
-                QPen(QColor(col), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-            )
-            painter.drawPolyline(
-                [QPointF(c.x() - 4.2, c.y() - 1.8), QPointF(c.x(), c.y() + 2.4), QPointF(c.x() + 4.2, c.y() - 1.8)]
-            )
-            painter.restore()
 
     @staticmethod
     def _draw_radio(option, painter) -> None:  # noqa: ANN001 (Qt option types)
@@ -385,12 +394,17 @@ def build_stylesheet() -> str:
     /* ── Unified Single-Surface Cards & Inspector Tables ── */
     QFrame#Section, QFrame#Step, QFrame#RecentBox {{
         background-color: {BG_SECTION};
-        border: 1px solid {BORDER};
-        border-radius: 8px;
+        border: 1px solid #2B2F39;
+        border-radius: 9px;
+    }}
+    QFrame#MetaStrip {{
+        background-color: #14161B;
+        border: 1px solid #252832;
+        border-radius: 6px;
     }}
     QFrame#TableHead {{
         background-color: transparent;
-        border-bottom: 1px solid {BORDER_SUBTLE};
+        border-bottom: 1px solid #282C36;
     }}
     QFrame#TableRow {{
         background-color: transparent;
@@ -400,19 +414,41 @@ def build_stylesheet() -> str:
         border-bottom: none;
     }}
 
-    /* ── Pure Typographic Status Readout (Zero Pills, Zero Glowing Dots) ── */
+    /* ── Semantic Status Badge (Crisp Tinted Tag, Never Looks Like a Link) ── */
     QLabel#StatusReadout {{
-        background: transparent;
-        border: none;
-        padding: 0;
-        font-size: 12px;
+        background-color: #20232B;
+        border: 1px solid #2D323E;
+        border-radius: 5px;
+        padding: 2px 8px;
+        font-size: 11px;
         font-weight: bold;
+        color: {TEXT_SECONDARY};
+    }}
+    QLabel#StatusReadout[tone="ok"] {{
+        background-color: #152820;
+        border-color: #224637;
+        color: #54CC98;
+    }}
+    QLabel#StatusReadout[tone="info"] {{
+        background-color: #172336;
+        border-color: #273D63;
+        color: #77AEFC;
+    }}
+    QLabel#StatusReadout[tone="warn"] {{
+        background-color: #292114;
+        border-color: #4D3B1E;
+        color: #F0B44C;
+    }}
+    QLabel#StatusReadout[tone="err"] {{
+        background-color: #2B181B;
+        border-color: #572A31;
+        color: #F27979;
+    }}
+    QLabel#StatusReadout[tone="muted"] {{
+        background-color: #1C1F26;
+        border-color: #2A2E38;
         color: {TEXT_MUTED};
     }}
-    QLabel#StatusReadout[tone="ok"] {{ color: {OK}; }}
-    QLabel#StatusReadout[tone="info"] {{ color: {INFO}; }}
-    QLabel#StatusReadout[tone="warn"] {{ color: {WARN}; }}
-    QLabel#StatusReadout[tone="err"] {{ color: {ERR}; }}
 
     /* ── Collapsible Console Drawer ── */
     QFrame#Console {{
@@ -434,8 +470,8 @@ def build_stylesheet() -> str:
     QFrame#Divider {{ background-color: {BORDER_SUBTLE}; max-height: 1px; min-height: 1px; border: none; }}
     QFrame#VDivider {{ background-color: #23262E; max-width: 1px; min-width: 1px; border: none; }}
     QFrame#WriteBar {{
-        background-color: #181E2B;
-        border-top: 1px solid #2B3B59;
+        background-color: #171E2C;
+        border-top: 1px solid #2B3E61;
     }}
     QLabel#StepNum {{
         background-color: #272B35; color: {TEXT_SECONDARY};
@@ -445,13 +481,14 @@ def build_stylesheet() -> str:
     /* ── Calm Navigation Rail ── */
     QListWidget#Nav {{ background: transparent; border: none; outline: 0; }}
     QListWidget#Nav::item {{
-        border-radius: 6px; margin: 1px 6px; border: none;
+        border-radius: 6px; margin: 1px 6px; border: 1px solid transparent;
     }}
     QListWidget#Nav::item:selected {{
-        background-color: {BG_SELECTED};
+        background-color: #222631;
+        border: 1px solid #303645;
     }}
     QListWidget#Nav::item:hover:!selected {{
-        background-color: #1A1C22;
+        background-color: #1A1D24;
     }}
 
     QListWidget#Adapters {{
@@ -507,13 +544,13 @@ def build_stylesheet() -> str:
     /* ── Typography ── */
     QLabel {{ background: transparent; }}
     QLabel#AppName {{ font-size: 13px; font-weight: bold; color: {TEXT}; }}
-    QLabel#PageTitle {{ font-size: 20px; font-weight: bold; color: {TEXT}; }}
-    QLabel#PartNumber {{ font-size: 20px; font-weight: bold; color: {TEXT}; }}
-    QLabel#SectionTitle {{ font-size: 14px; font-weight: bold; color: {TEXT}; }}
-    QLabel#GroupLabel {{ font-size: 10px; font-weight: bold; color: {TEXT_MUTED}; letter-spacing: 0.4px; }}
-    QLabel#Eyebrow {{ font-size: 11px; font-weight: bold; color: {TEXT_MUTED}; }}
+    QLabel#PageTitle {{ font-size: 19px; font-weight: bold; color: {TEXT}; }}
+    QLabel#PartNumber {{ font-size: 18px; font-weight: bold; color: {TEXT}; }}
+    QLabel#SectionTitle {{ font-size: 13px; font-weight: bold; color: {TEXT}; }}
+    QLabel#GroupLabel {{ font-size: 10px; font-weight: bold; color: {TEXT_MUTED}; letter-spacing: 0.45px; }}
     QLabel#FieldLabel {{ font-weight: bold; color: {TEXT}; }}
-    QLabel#Hint {{ color: {TEXT_SECONDARY}; }}
+    QLabel#FieldKey {{ color: {TEXT_SECONDARY}; font-size: 12px; }}
+    QLabel#Hint {{ color: {TEXT_SECONDARY}; font-size: 12px; }}
     QLabel[tone="ok"], QLabel#Hint[tone="ok"], QLabel#FieldLabel[tone="ok"] {{ color: {OK}; }}
     QLabel[tone="warn"], QLabel#Hint[tone="warn"], QLabel#FieldLabel[tone="warn"] {{ color: {WARN}; }}
     QLabel[tone="err"], QLabel#Hint[tone="err"], QLabel#FieldLabel[tone="err"] {{ color: {ERR}; }}
@@ -626,6 +663,30 @@ def build_stylesheet() -> str:
     QPushButton#LinkBtn {{ background: transparent; border: none; padding: 0; min-height: 0; color: {INFO}; }}
     QPushButton#LinkBtn:hover {{ color: #82B4FA; text-decoration: underline; }}
 
+    QPushButton#InlineBtn {{
+        background-color: #1F222A;
+        border: 1px solid #2E333F;
+        border-radius: 6px;
+        color: #C7CDD8;
+        padding: 4px 10px;
+        min-height: 20px;
+        font-size: 12px;
+    }}
+    QPushButton#InlineBtn:hover {{
+        background-color: #272B35;
+        border-color: #3F4555;
+        color: {TEXT};
+    }}
+    QPushButton#InlineBtn:pressed {{
+        background-color: #1B1E25;
+        border-color: #2E333F;
+    }}
+    QPushButton#InlineBtn:disabled {{
+        background-color: #17191E;
+        border-color: #23262E;
+        color: {TEXT_MUTED};
+    }}
+
     QPushButton#Chip {{
         background-color: #1A1C22; border: 1px solid #2A2E38; border-radius: 6px;
         padding: 3px 10px; min-height: 17px; color: {TEXT_SECONDARY}; font-size: 12px;
@@ -647,7 +708,7 @@ def build_stylesheet() -> str:
 
     QPushButton#TabBtn {{
         background: transparent; border: 1px solid transparent; border-radius: 5px;
-        color: {TEXT_SECONDARY}; padding: 3px 12px; min-height: 20px; font-size: 12px; font-weight: bold;
+        color: {TEXT_SECONDARY}; padding: 3px 9px; min-height: 20px; font-size: 12px; font-weight: bold;
     }}
     QPushButton#TabBtn:hover:!checked {{ color: {TEXT}; }}
     QPushButton#TabBtn:checked {{
@@ -669,9 +730,16 @@ def build_stylesheet() -> str:
     /* ── Inputs ── */
     QLineEdit, QComboBox, QSpinBox {{
         background-color: {BG_INPUT}; color: {TEXT}; border: 1px solid #2C303A;
-        border-radius: 6px; padding: 5px 10px; min-height: 21px; selection-background-color: {ACCENT};
+        border-radius: 6px; padding: 5px 10px; min-height: 20px; selection-background-color: {ACCENT};
     }}
     QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{ border-color: #3D4250; }}
+    QLineEdit[readOnly="true"] {{
+        background-color: #14161B;
+        border: 1px solid #242730;
+        color: #D8DDE6;
+    }}
+    QLineEdit[readOnly="true"]:hover {{ border-color: #313643; }}
+    QLineEdit[readOnly="true"]:focus {{ border-color: #3E4556; }}
     QPlainTextEdit, QTextEdit {{
         background-color: {BG_INPUT}; color: {TEXT}; border: 1px solid #282B34;
         border-radius: 6px; padding: 7px; selection-background-color: {ACCENT};
@@ -798,6 +866,16 @@ def build_stylesheet() -> str:
         color: #B9A5FA;
         border-color: #3F3466;
     }}
+    QLabel#AddrBadge[tone="warn"] {{
+        background-color: #2D2213;
+        color: #F0B44C;
+        border-color: #543D1D;
+    }}
+    QLabel#AddrBadge[tone="info"] {{
+        background-color: #172638;
+        color: #77AEFC;
+        border-color: #2A4366;
+    }}
     QLabel#DumpTag {{
         background-color: #14161B;
         color: {TEXT_SECONDARY};
@@ -812,7 +890,7 @@ def build_stylesheet() -> str:
     }}
     QTabBar::tab {{
         background-color: transparent; color: {TEXT_SECONDARY}; border: 1px solid transparent;
-        border-bottom: 2px solid transparent; padding: 7px 14px; min-height: 20px; font-weight: bold;
+        border-bottom: 2px solid transparent; padding: 6px 11px; min-height: 19px; font-size: 12px; font-weight: bold;
         margin-right: 2px;
     }}
     QTabBar::tab:hover:!selected {{
@@ -832,17 +910,17 @@ def build_stylesheet() -> str:
     /* ── Tables ── */
     QTableView {{
         background-color: {BG_INPUT}; alternate-background-color: #14161A; gridline-color: #20232A;
-        border: 1px solid {BORDER}; border-radius: 6px; color: {TEXT};
+        border: 1px solid {BORDER}; border-radius: 7px; color: {TEXT};
         selection-background-color: {BG_SELECTED}; selection-color: {TEXT};
     }}
-    QTableView::item {{ padding: 2px 8px; }}
+    QTableView::item {{ padding: 3px 10px; }}
     QTableView QComboBox {{
         background-color: transparent; border: none; border-radius: 0; padding: 2px 8px; min-height: 24px;
     }}
     QTableView QComboBox:hover {{ background-color: #1F2229; }}
     QHeaderView::section {{
         background-color: #16181D; color: {TEXT_MUTED}; border: none;
-        border-bottom: 1px solid {BORDER}; padding: 6px 8px; font-size: 11px; font-weight: bold;
+        border-bottom: 1px solid {BORDER}; padding: 6px 10px; font-size: 11px; font-weight: bold;
     }}
 
     /* ── Scrollbars ── */
