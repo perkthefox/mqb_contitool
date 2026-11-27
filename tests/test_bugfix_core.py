@@ -175,3 +175,73 @@ def test_odis_export_escapes_the_dataset_number(synth_dflash: bytes) -> None:
     df = apply_zdc_passport(df, dataset_pn='A&B<"C>', dataset_ver="0002")
     parsed = parse_odis_zdc_file(build_odis_zdc_file(df, 4))
     assert (parsed.dataset_pn, parsed.dataset_ver) == ('A&B<"C>', "0002")
+
+
+# 9. analyze_dflash_swap strips 0xFF/non-printable VIN and analyze_dflash falls back to intact mirror / non-erased bank
+def test_dflash_swap_vin_sanitization_and_dflash_mirror_fallback(synth_dflash: bytes) -> None:
+    from contitool.core.analyzer import analyze_dflash, analyze_dflash_swap
+    from contitool.core.constants import DFLASH_FSC_BASE_OFF, DFLASH_FSC_PAY_SIZE
+    from contitool.core.patcher import parse_slot_selector, write_dflash_slots
+
+    # 1) FSC slot with 0xFF-filled VIN must NOT leak U+FFFD into detected_vin
+    df_bad_vin = bytearray(synth_dflash)
+    off0 = DFLASH_FSC_BASE_OFF
+    spay = bytearray(DFLASH_FSC_PAY_SIZE)
+    spay[0:2] = b"\x11\x02"
+    struct.pack_into(">I", spay, 2, 0x10000100)
+    spay[6] = 0x03
+    spay[7:12] = bytes.fromhex("1122334455")  # matches synth_dflash VCRN
+    spay[12:29] = b"\xff" * 17
+    struct.pack_into("<I", df_bad_vin, off0, 0x55555555)
+    df_bad_vin[off0 + 4 : off0 + 4 + DFLASH_FSC_PAY_SIZE] = spay
+    struct.pack_into("<I", df_bad_vin, off0 + 0xB0, zlib.crc32(spay) & 0xFFFFFFFF)
+    sw_res = analyze_dflash_swap(bytes(df_bad_vin))
+    assert sw_res.vin == ""
+    assert len(sw_res.active_fscs) == 1 and sw_res.active_fscs[0].vin == ""
+
+    # 2) Primary bank corrupted CRC-32 falls back to intact mirror off2
+    spec_5f = parse_slot_selector("5F")
+    ika = bytes.fromhex("A1B2C3D4E5F60718293A4B5C6D7E8F90")
+    df_keyed, _ = write_dflash_slots(synth_dflash, [(spec_5f, ika)])
+    corrupted_primary = bytearray(df_keyed)
+    corrupted_primary[spec_5f.off1 + 4] ^= 0xFF  # keep magic 0x55555555, break primary CRC
+    st_5f = next(s for s in analyze_dflash(bytes(corrupted_primary)) if s.spec.ecu_addr == "5F")
+    assert st_5f.crc_ok is True
+    assert st_5f.mirrored is False
+    assert st_5f.first16_hex == ika.hex()
+
+    # 3) Primary bank has partial magic while mirror is erased -> reports non-erased bank off1, not erased off2
+    partial_df = bytearray(synth_dflash)
+    struct.pack_into("<I", partial_df, spec_5f.off1, 0x12345678)
+    partial_df[spec_5f.off1 + 4 : spec_5f.off1 + 20] = bytes.fromhex("0102030405060708090A0B0C0D0E0F10")
+    st_part = next(s for s in analyze_dflash(bytes(partial_df)) if s.spec.ecu_addr == "5F")
+    assert st_part.kind == "PARTIAL"
+    assert st_part.crc_ok is False
+    assert st_part.first16_hex == "0102030405060708090a0b0c0d0e0f10"
+
+
+def test_barrel_all_exports_are_complete_and_valid() -> None:
+    import importlib
+    import pkgutil
+
+    for pkg_name in ("contitool.core", "contitool.can"):
+        pkg = importlib.import_module(pkg_name)
+        pkg_all = set(getattr(pkg, "__all__", []))
+        assert pkg_all
+        for sym in pkg_all:
+            assert hasattr(pkg, sym), f"{pkg_name}.__all__ references missing symbol {sym!r}"
+        for mod_info in pkgutil.iter_modules(pkg.__path__):
+            mod = importlib.import_module(f"{pkg_name}.{mod_info.name}")
+            sub_all = getattr(mod, "__all__", None)
+            if sub_all is None:
+                continue
+            for sym in sub_all:
+                assert hasattr(mod, sym), f"{pkg_name}.{mod_info.name}.__all__ references missing {sym!r}"
+                assert sym in pkg_all, f"{pkg_name}.{mod_info.name}.{sym!r} not re-exported in {pkg_name}.__all__"
+
+    fpke_mod = importlib.import_module("contitool.fpke")
+    for sym in fpke_mod.__all__:
+        assert hasattr(fpke_mod, sym), f"contitool.fpke.__all__ references missing symbol {sym!r}"
+    assert "fpke_support_info" in fpke_mod.__all__
+    assert "FPKE_VERIFIED_SW_VERSIONS" in fpke_mod.__all__
+

@@ -40,7 +40,7 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def visible_len(text: str) -> str | int:
+def visible_len(text: str) -> int:
     return len(strip_ansi(text))
 
 

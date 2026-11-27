@@ -30,6 +30,7 @@ from contitool.i18n import tr
 
 APP_SIZE_FRF = 0x180000 - 0xC200
 FRF_MAX_BYTES = 8 * 1024 * 1024
+ODX_MAX_UNCOMPRESSED = 32 * 1024 * 1024
 # EXPECTED-IDENT short name -> the gateway DID it is checked against
 IDENT_DIDS = {
     "EI_VWSparePartNumbe": "F187",
@@ -76,9 +77,18 @@ def read_frf(data: bytes) -> FrfImage:
         ))
     plain = bytes(a ^ b for a, b in zip(data, ks))
     try:
-        zf = zipfile.ZipFile(io.BytesIO(plain))
-        odx_name = next(n for n in zf.namelist() if n.lower().endswith(".odx"))
-        root = ET.fromstring(zf.read(odx_name))  # noqa: S314 - a file the user picked; no entities are resolved
+        with zipfile.ZipFile(io.BytesIO(plain)) as zf:
+            odx_name = next(n for n in zf.namelist() if n.lower().endswith(".odx"))
+            odx_info = zf.getinfo(odx_name)
+            if odx_info.file_size > ODX_MAX_UNCOMPRESSED:
+                raise ValueError(
+                    tr(
+                        f"Распакованный ODX внутри FRF слишком велик: {odx_info.file_size:,} Б",
+                        f"Uncompressed ODX inside FRF is too large: {odx_info.file_size:,} B",
+                    )
+                )
+            odx_bytes = zf.read(odx_name)
+        root = ET.fromstring(odx_bytes.lstrip(_XML_LEAD))  # noqa: S314 - a file the user picked; no entities are resolved
     except (zipfile.BadZipFile, StopIteration, ET.ParseError, KeyError, zlib.error) as exc:
         raise ValueError(tr("Это не FRF ODIS или он повреждён", "Not an ODIS FRF, or it is damaged")) from exc
     return _from_odx(root, odx_name.rsplit("/", 1)[-1].rsplit(".", 1)[0], "FRF")
@@ -102,13 +112,96 @@ def read_flash_file(data: bytes, name: str = "") -> FrfImage:
     return read_odx(data, name) if head.startswith((b"<?xml", b"<ODX")) else read_frf(data)
 
 
+def _parse_security_sig(sec_el: ET.Element) -> bytes | None:
+    method = next((c.text or "" for c in sec_el if _local(c.tag) == "SECURITY-METHOD"), "")
+    if not method.strip().startswith("SIG_"):
+        return None
+    sig = next((c.text or "" for c in sec_el if _local(c.tag) == "FW-SIGNATURE"), "")
+    try:
+        return bytes.fromhex("".join(sig.split()))
+    except ValueError:
+        return b""  # reported below as a missing signature
+
+
+def _matches_fd_0data(ref: str, fd_id: str, matched_db_ids: set[str]) -> bool:
+    r = ref.strip()
+    if not r:
+        return False
+    if fd_id and r == fd_id:
+        return True
+    if r.endswith("FD_0DATA"):
+        return True
+    return r in matched_db_ids
+
+
+def _extract_odx_signature(root: ET.Element, fd_id: str) -> bytes | None:
+    parent_map: dict[ET.Element, ET.Element] = {child: par for par in root.iter() for child in par}
+
+    def _enclosing_datablock(el: ET.Element) -> ET.Element | None:
+        cur = parent_map.get(el)
+        while cur is not None:
+            if _local(cur.tag) == "DATABLOCK":
+                return cur
+            cur = parent_map.get(cur)
+        return None
+
+    matched_dbs: set[ET.Element] = set()
+    matched_db_ids: set[str] = set()
+    for db in root.iter():
+        if _local(db.tag) != "DATABLOCK":
+            continue
+        refs = [
+            (el.get("ID-REF") or "").strip()
+            for el in db.iter()
+            if _local(el.tag) == "FLASHDATA-REF"
+        ]
+        db_id = (db.get("ID") or "").strip()
+        db_sn = next((c.text.strip() for c in db if _local(c.tag) == "SHORT-NAME" and c.text), "")
+        if any((fd_id and r == fd_id) or r.endswith("FD_0DATA") for r in refs) or (
+            not refs and (db_id.endswith("FD_0DATA") or db_sn.endswith("FD_0DATA"))
+        ):
+            matched_dbs.add(db)
+            if db_id:
+                matched_db_ids.add(db_id)
+            if db_sn:
+                matched_db_ids.add(db_sn)
+
+    for db in matched_dbs:
+        for el in db.iter():
+            if _local(el.tag) == "SECURITY":
+                sig = _parse_security_sig(el)
+                if sig is not None:
+                    return sig
+
+    fallback_sig: bytes | None = None
+    for el in root.iter():
+        if _local(el.tag) != "SECURITY":
+            continue
+        sig = _parse_security_sig(el)
+        if sig is None:
+            continue
+        validity = next((c.text.strip() for c in el if _local(c.tag) == "VALIDITY-FOR" and c.text), "")
+        if validity:
+            if _matches_fd_0data(validity, fd_id, matched_db_ids):
+                return sig
+            continue
+        db = _enclosing_datablock(el)
+        if db is not None and db not in matched_dbs:
+            continue
+        if fallback_sig is None:
+            fallback_sig = sig
+
+    return fallback_sig
+
+
 def _from_odx(root: ET.Element, name: str, kind: str) -> FrfImage:
-    app, signature, idents, mem = None, None, {}, ""
+    app, fd_id, idents, mem = None, "", {}, ""
     for el in root.iter():
         tag = _local(el.tag)
         if tag == "ECU-MEM" and not mem:
             mem = next((c.text or "" for c in el if _local(c.tag) == "SHORT-NAME"), "")
         elif tag == "FLASHDATA" and (el.get("ID") or "").endswith("FD_0DATA"):
+            fd_id = (el.get("ID") or "").strip()
             method = next((c.text for c in el if _local(c.tag) == "ENCRYPT-COMPRESS-METHOD"), "00")
             if (method or "00").strip() != "00":
                 raise ValueError(tr(f"Данные {kind} сжаты или зашифрованы (метод {method}) — не поддерживается",
@@ -118,20 +211,14 @@ def _from_odx(root: ET.Element, name: str, kind: str) -> FrfImage:
                 app = bytes.fromhex("".join(hex_text.split()))
             except ValueError as exc:
                 raise ValueError(tr(f"Данные приложения в {kind} повреждены", f"The {kind} application data is damaged")) from exc
-        elif tag == "SECURITY":
-            method = next((c.text or "" for c in el if _local(c.tag) == "SECURITY-METHOD"), "")
-            sig = next((c.text or "" for c in el if _local(c.tag) == "FW-SIGNATURE"), "")
-            if method.strip().startswith("SIG_") and signature is None:
-                try:
-                    signature = bytes.fromhex("".join(sig.split()))
-                except ValueError:
-                    signature = b""  # reported below as a missing signature
         elif tag == "EXPECTED-IDENT":
             ident = next((c.text or "" for c in el if _local(c.tag) == "SHORT-NAME"), "")
             did = IDENT_DIDS.get(ident.strip())
             if did:
                 vals = tuple(v.text.strip() for v in el.iter() if _local(v.tag) == "IDENT-VALUE" and v.text)
                 idents[did] = idents.get(did, ()) + vals
+
+    signature = _extract_odx_signature(root, fd_id)
 
     if app is None or len(app) != APP_SIZE_FRF:
         raise ValueError(tr(f"В {kind} нет приложения шлюза J533 (FD_0DATA, 1 523 200 Б с 0xC200)",
@@ -188,4 +275,4 @@ def frf_ident_problems(frf: FrfImage, ecu: dict[str, str]) -> tuple[list[str], l
     return hard, soft
 
 
-__all__ = ["APP_BASE", "FrfImage", "frf_ident_problems", "frf_signature_problem", "read_flash_file", "read_frf", "read_odx"]
+__all__ = ["APP_BASE", "FrfImage", "frf_ident_problems", "frf_signature_ok", "frf_signature_problem", "read_flash_file", "read_frf", "read_odx"]

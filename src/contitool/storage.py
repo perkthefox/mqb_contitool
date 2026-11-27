@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sys
 import time
@@ -27,6 +29,8 @@ RUNS = "contitool_runs"
 DUMPS, WRITES, BASE_READ = "dumps", "writes", "base_read"
 AREA_FILES = ("Cflash.bin", "Dflash.bin", "Uflash.bin")
 OPTIONAL_AREA_FILES = ("Eeprom.bin", "Opbt.bin")
+AREA_SIZES = {"Cflash.bin": 0x180000, "Dflash.bin": 0x10000, "Uflash.bin": 0x8000}
+OPTIONAL_AREA_SIZES: dict[str, tuple[int, ...]] = {"Eeprom.bin": (0x2000,), "Opbt.bin": (32, 36)}
 FAZIT_OFFSET, HW_PN_OFFSET = 0xA240, 0xA25A  # in CodeFlash: 23 ASCII, 11 ASCII
 
 
@@ -48,7 +52,7 @@ def runs_root() -> Path:
     for root in (app_dir() / RUNS, Path.home() / "Documents" / "ContiTool" / RUNS):
         try:
             root.mkdir(parents=True, exist_ok=True)
-            probe = root / ".write_test"
+            probe = root / f".write_test_{os.getpid()}_{secrets.token_hex(4)}"
             probe.write_bytes(b"")
             probe.unlink()
             return root
@@ -104,18 +108,25 @@ def _repath(obj: Any, old: str, new: str) -> Any:
 def keep_as_base(read_dir: Path) -> Path:
     """A complete read becomes the gateway's base_read if it has none yet; returns where the read now is."""
     base = read_dir.parent / BASE_READ
-    if base.exists() or not all((read_dir / name).is_file() for name in AREA_FILES):
+    if base.exists() or not all(
+        (read_dir / name).is_file() and (read_dir / name).stat().st_size == expected_sz
+        for name, expected_sz in AREA_SIZES.items()
+    ):
         return read_dir
     read_dir.rename(base)
     manifest = base / "manifest.json"
     if manifest.is_file():  # it names its own files by absolute path
-        data = _repath(json.loads(manifest.read_text(encoding="utf-8")), str(read_dir), str(base))
-        manifest.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            data = _repath(json.loads(manifest.read_text(encoding="utf-8")), str(read_dir), str(base))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return base
+        tmp = manifest.with_name(f".manifest_{os.getpid()}_{secrets.token_hex(4)}.tmp")
+        try:
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, manifest)
+        except OSError:
+            tmp.unlink(missing_ok=True)
     return base
-
-
-AREA_SIZES = {"Cflash.bin": 0x180000, "Dflash.bin": 0x10000, "Uflash.bin": 0x8000}
-OPTIONAL_AREA_SIZES = {"Eeprom.bin": 0x2000, "Opbt.bin": 36}
 
 
 def has_full_read(unit_dir: Path) -> bool:
@@ -136,12 +147,18 @@ def latest_area(unit_dir: Path, name: str) -> Path | None:
     """The newest full-size copy of one area (Cflash.bin, ...) the gateway is known to hold: base_read, then the later
     reads and writes (dumps/<date>_read, <date>_flashed) by date. None for an unidentified gateway or without one."""
     dumps = unit_dir / DUMPS
-    expected_sz = AREA_SIZES.get(name) or OPTIONAL_AREA_SIZES.get(name)
-    if unit_dir.name == "unknown" or expected_sz is None or not dumps.is_dir():
+    if name in AREA_SIZES:
+        expected_sizes: tuple[int, ...] = (AREA_SIZES[name],)
+    elif name in OPTIONAL_AREA_SIZES:
+        val = OPTIONAL_AREA_SIZES[name]
+        expected_sizes = (val,) if isinstance(val, int) else tuple(val)
+    else:
+        return None
+    if unit_dir.name == "unknown" or not dumps.is_dir():
         return None
     dirs = sorted((d for d in dumps.iterdir() if d.is_dir() and (d.name == BASE_READ or re.search(r"_(read|flashed)(_\d+)?$", d.name))),
                   key=lambda d: "" if d.name == BASE_READ else d.name)
-    hits = [d / name for d in dirs if (d / name).is_file() and (d / name).stat().st_size == expected_sz]
+    hits = [d / name for d in dirs if (d / name).is_file() and (d / name).stat().st_size in expected_sizes]
     return hits[-1] if hits else None
 
 

@@ -82,7 +82,17 @@ def apply_engineering_patch(
 
     _, range_cnt = struct.unpack_from("<HH", app, 0x1C)
     if range_cnt == 0:
-        struct.pack_into("<H", app, 0x1E, 1)
+        if ignore_input_crc:
+            struct.pack_into("<H", app, 0x1E, 1)
+        else:
+            raise RuntimeError(
+                tr(
+                    "Поле [0x0000C21E] == 0 (счётчик диапазонов CRC-16 занулён — FBL FF 01 отвергает такой образ). "
+                    "Включите игнорирование/ремонт входного CRC-16.",
+                    "Header field [0x0000C21E] == 0 (CRC-16 range count zeroed — rejected by FBL FF 01). "
+                    "Enable ignore/repair input CRC-16.",
+                )
+            )
     elif not ignore_input_crc:
         stored_crc, calc_crc = app_crc(app)
         if stored_crc != calc_crc:
@@ -911,6 +921,7 @@ def bind_cp_turnkey(
         bypass_eeprom_mask=need_mask_bypass,
         preserve_existing_mask_bypass=True,
         ignore_input_crc=ignore_input_crc,
+        reporter=reporter,
     )
     reporter.info(f"{cf_desc} (CRC-16: 0x{new_crc:04X})")
     reporter.progress(65, 100)

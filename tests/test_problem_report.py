@@ -253,3 +253,130 @@ def test_session_archive_paths_and_json_contents_mask_fazit_vin_and_escaped_home
         body = z.read(manifest_entry).decode("utf-8")
         assert FAZIT not in body and VIN not in body and "SecretTech" not in body
         assert "~" in body and "WVWZZZAUZNW******" in body
+
+
+def test_mask_ids_redacts_lowercase_vin_and_vehicle_secrets_but_keeps_sha256() -> None:
+    secret_32 = "0123456789ABCDEF0123456789ABCDEF"
+    secret_low = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    sha64 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    sample = (
+        f"lowercase vin wvwzzzauznw000001 and plain word backscatteredness and dump_0123456789abcdef0\n"
+        f'{{"cs": "{secret_32}", "kc": "{secret_low}", "k_ffb": "{secret_32}", "k_ffb_hex": "{secret_32}", '
+        f'"ika_cp3": "{secret_32}", "ika_hex": "{secret_32}", "gfa_hex": "{secret_32}", '
+        f'"gfa_working_hex": "{secret_32}", "gfa_raw_hex": "{secret_32}", "cp1_gfa": "{secret_32}", '
+        f'"S0": "{secret_32}", "S1": "{secret_32}", "slot_a_hex": "{secret_32}", "slot_b_hex": "{secret_32}", '
+        f'"k5_hex": "{secret_32}", "idcode": "{secret_32}", "candidate_idcode": "{secret_32}", '
+        f'"ecu_boot_sum_hex": "{secret_32}", "last_round_key_hex": "{secret_32}", '
+        f'"job3_output_hex": "{secret_32}", "encrypted_ika_final_hex": "{secret_32}", '
+        f'"hex": "{secret_32}", "short_hex_obj": {{"hex": "0A65"}}, "sha256": "{sha64}"}}\n'
+        f"IKA={secret_32} GFA: {secret_low} K_ffb={secret_32} K_c: {secret_low} "
+        f"K_5 {secret_32} S0={secret_32} S1: {secret_low} IDCODE (0xAB00): {secret_32}\n"
+    )
+    masked = report.mask_ids(sample)
+    assert "wvwzzzauznw000001" not in masked and "wvwzzzauznw******" in masked
+    assert "backscatteredness" in masked
+    assert "dump_0123456789abcdef0" in masked
+    assert secret_32 not in masked and secret_low not in masked
+    assert sha64 in masked
+    assert '"hex": "0A65"' in masked
+
+
+def test_secret_session_artifacts_excluded_driver_logs_masked_and_dumps_sanitized(tmp_path: Path, monkeypatch) -> None:
+    set_lang("en")
+    started = time.time() - 1
+    out_dir = tmp_path / "runs" / "sess"
+    out_dir.mkdir(parents=True)
+    secret_hex = "DEADBEEF00112233445566778899AABB"
+    for fname in (
+        "immo_passport.json",
+        "mrr_keys.json",
+        "bcm_keys.json",
+        "bcm_ffb_backup.json",
+        "elv_backup_report.json",
+        "mrr_read.can.log",
+    ):
+        (out_dir / fname).write_text(f'{{"ika_hex": "{secret_hex}"}}', encoding="utf-8")
+    (out_dir / "fpke_read_report.json").write_text(f'{{"cs": "{secret_hex}", "ok": true}}', encoding="utf-8")
+
+    drv = tmp_path / "ProgramData/Volkswagen/VW_D_PDU_API_OE/logs"
+    drv.mkdir(parents=True)
+    (drv / "small.log").write_text(f"VIN={VIN} IKA={secret_hex}\n", encoding="utf-8")
+    monkeypatch.setattr(report, "DRIVER_LOG_TAIL", 128)
+    (drv / "big.log").write_text(("pad " * 80) + f"\nVIN={VIN} GFA={secret_hex}\n", encoding="utf-8")
+
+    loaded = tmp_path / "Cflash.bin"
+    loaded.write_bytes(b"\x11" * 16)
+    failure = report.Failure("Read", "err", "tb", started)
+    env = report.environment("dpdu", "VW_D_PDU_API_OE", "VNCI")
+
+    plain = report.build_report_zip(tmp_path / "plain.zip", failure, env, "log\n", tmp_path / "runs", driver_dirs=[drv])
+    with zipfile.ZipFile(plain) as z:
+        names = set(z.namelist())
+        for fname in (
+            "immo_passport.json",
+            "mrr_keys.json",
+            "bcm_keys.json",
+            "bcm_ffb_backup.json",
+            "elv_backup_report.json",
+            "mrr_read.can.log",
+        ):
+            assert not any(n.endswith(f"/{fname}") for n in names), fname
+        rep_body = z.read("sessions/sess/fpke_read_report.json").decode("utf-8")
+        assert secret_hex not in rep_body and "[REDACTED]" in rep_body
+        for drv_name in ("driver_logs/VW_D_PDU_API_OE/small.log", "driver_logs/VW_D_PDU_API_OE/big.log"):
+            body = z.read(drv_name).decode("utf-8")
+            assert VIN not in body and secret_hex not in body and "[REDACTED]" in body
+
+    full = report.build_report_zip(
+        tmp_path / "full.zip",
+        failure,
+        env,
+        "log\n",
+        tmp_path / "runs",
+        driver_dirs=[],
+        dumps={"../../escape.bin": loaded, "loaded/Cflash.bin": loaded},
+    )
+    with zipfile.ZipFile(full) as z:
+        names = set(z.namelist())
+        assert "dumps/escape.bin" in names and "dumps/loaded/Cflash.bin" in names
+        assert not any(".." in n for n in names)
+
+
+def test_can_log_excerpt_streams_oversized_and_survives_disappearing_files(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(report, "CAN_LOG_STREAM_LIMIT", 2048)
+    monkeypatch.setattr(report, "CAN_LOG_TAIL_BYTES", 512)
+    monkeypatch.setattr(report, "CAN_LOG_HEAD", 5)
+    monkeypatch.setattr(report, "CAN_LOG_TAIL", 5)
+    p = tmp_path / "can.jsonl"
+    p.write_text("".join(f'{{"n": {i:06d}}}\n' for i in range(500)), encoding="utf-8")
+    excerpt = report._can_log_excerpt(p).splitlines()
+    assert excerpt[0] == '{"n": 000000}'
+    assert any("skipped_bytes" in ln for ln in excerpt)
+    assert excerpt[-1] == '{"n": 000499}'
+
+    # TOCTOU: a file whose stat() raises OSError is skipped cleanly rather than aborting report creation
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    good = runs / "ok.txt"
+    vanished = runs / "vanished.txt"
+    good.write_text("hello\n", encoding="utf-8")
+    vanished.write_text("bye\n", encoding="utf-8")
+    orig_stat = Path.stat
+
+    def flaky_stat(self: Path, *a, **k):
+        if self.name == "vanished.txt":
+            raise FileNotFoundError(self)
+        return orig_stat(self, *a, **k)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    out_zip = report.build_report_zip(
+        tmp_path / "toctou.zip",
+        report.Failure("Op", "err", started=time.time() - 5),
+        {"OS": "x"},
+        "log\n",
+        runs,
+        driver_dirs=[],
+    )
+    with zipfile.ZipFile(out_zip) as z:
+        assert "sessions/ok.txt" in z.namelist()
+        assert "sessions/vanished.txt" not in z.namelist()

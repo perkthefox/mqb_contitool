@@ -30,3 +30,43 @@ def test_only_a_newer_release_is_offered_with_this_os_archive() -> None:
     assert newer_release(_release("v2.0.3"), "2.0.2", platform="linux").download.endswith("linux-x86_64.tar.gz")
     bare = newer_release({"tag_name": "v2.0.3", "html_url": "https://page"}, "2.0.2e", platform="win32")
     assert bare is not None and bare.download == "https://page"  # no archive for this OS: the release page
+
+
+def test_unparseable_current_version_never_prompts_update() -> None:
+    assert newer_release(_release("v2.0.3"), "2.0.3-dev", platform="win32") is None
+    assert newer_release(_release("v2.0.3"), "2.0.3rc1", platform="darwin") is None
+    assert newer_release(_release("v2.0.3"), "nightly", platform="linux") is None
+
+
+def test_download_prefers_matching_machine_architecture() -> None:
+    rel = {
+        "tag_name": "v2.1.0",
+        "html_url": "https://github.com/x/y/releases/tag/v2.1.0",
+        "assets": [
+            {"name": "ContiTool-v2.1.0-macos-x86_64.dmg", "browser_download_url": "https://dl/macos-x86_64.dmg"},
+            {"name": "ContiTool-v2.1.0-macos-arm64.dmg", "browser_download_url": "https://dl/macos-arm64.dmg"},
+            {"name": "ContiTool-v2.1.0-linux-x86_64.tar.gz", "browser_download_url": "https://dl/linux-x86_64.tar.gz"},
+            {"name": "ContiTool-v2.1.0-linux-aarch64.tar.gz", "browser_download_url": "https://dl/linux-aarch64.tar.gz"},
+        ],
+    }
+    assert newer_release(rel, "2.0.0", platform="darwin", machine="arm64").download.endswith("macos-arm64.dmg")
+    assert newer_release(rel, "2.0.0", platform="darwin", machine="x86_64").download.endswith("macos-x86_64.dmg")
+    assert newer_release(rel, "2.0.0", platform="linux", machine="aarch64").download.endswith("linux-aarch64.tar.gz")
+    assert newer_release(rel, "2.0.0", platform="linux", machine="amd64").download.endswith("linux-x86_64.tar.gz")
+
+
+def test_non_https_release_urls_fall_back_to_releases_page() -> None:
+    from contitool.updates import RELEASES_PAGE
+
+    evil = {
+        "tag_name": "v2.2.0",
+        "html_url": "http://evil.example/release",
+        "assets": [
+            {"name": "ContiTool-v2.2.0-windows-amd64.zip", "browser_download_url": "javascript:alert(1)"},
+            {"name": "ContiTool-v2.2.0-macos-arm64.dmg", "browser_download_url": "http://evil.example/a.dmg"},
+        ],
+    }
+    res_win = newer_release(evil, "2.0.0", platform="win32", machine="amd64")
+    res_mac = newer_release(evil, "2.0.0", platform="darwin", machine="arm64")
+    assert res_win is not None and res_win.page == RELEASES_PAGE and res_win.download == RELEASES_PAGE
+    assert res_mac is not None and res_mac.page == RELEASES_PAGE and res_mac.download == RELEASES_PAGE

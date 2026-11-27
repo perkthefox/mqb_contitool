@@ -201,3 +201,253 @@ def test_a_full_read_named_read_2_counts(tmp_path: Path) -> None:
         (read / name).write_bytes(bytes(size))
     assert storage.has_full_read(unit)
     assert storage.latest_area(unit, "Dflash.bin") == read / "Dflash.bin"
+
+
+# 9. CLI & formatting code-review fixes
+
+
+def test_visible_len_annotation_and_parser_flags() -> None:
+    import importlib
+    from typing import get_type_hints
+
+    from contitool.cli import formatting
+
+    cli_mod = importlib.import_module("contitool.cli.main")
+
+    assert get_type_hints(formatting.visible_len)["return"] is int
+    assert not hasattr(cli_mod, "normalize_kombi_dflash_input")
+
+    ap = cli_mod.build_arg_parser()
+    # --vin and --no-vin are mutually exclusive on activate-swap and sign-fsc
+    with pytest.raises(SystemExit):
+        ap.parse_args(["activate-swap", "-i", "a.bin", "-o", "b.bin", "--vin", VIN, "--no-vin"])
+    with pytest.raises(SystemExit):
+        ap.parse_args(["sign-fsc", "-k", "k.json", "--fec", "10000100", "--vin", VIN, "--no-vin"])
+
+    # --allow-dpdu-driver exists on all ECU subcommands
+    for cmd_argv in (
+        ["fpke", "read", "--interface", "dpdu", "--via-gateway", "--allow-dpdu-driver"],
+        ["kombi", "read", "--interface", "dpdu", "--allow-dpdu-driver"],
+        ["bcm", "status", "--interface", "dpdu", "--allow-dpdu-driver"],
+        ["mrr", "status", "--interface", "dpdu", "--allow-dpdu-driver"],
+        ["elv", "status", "--interface", "dpdu", "--allow-dpdu-driver"],
+    ):
+        ns = ap.parse_args(cmd_argv)
+        assert ns.allow_dpdu_driver is True
+
+    # elv --enter-programming help mentions 11 01, not 11 02
+    sub_actions = next(a for a in ap._actions if a.dest == "cmd").choices
+    elv_help = sub_actions["elv"].format_help()
+    assert "11 01" in elv_help and "11 02" not in elv_help
+
+
+def test_cli_sign_fsc_vcrn_separators_and_parameterize_rejects_fpa_schema(
+    tmp_path: Path, synth_dflash: bytes
+) -> None:
+    out = tmp_path / "x.fsc"
+    assert main(["-l", "en", "sign-fsc", "-k", str(_key(tmp_path)), "--fec", "10000100",
+                 "--vcrn", "0x11-22-33-44-55", "--no-vin", "-o", str(out)]) == 0
+    assert out.read_bytes()[7:12] == bytes.fromhex("1122334455")
+
+    df = tmp_path / "df.bin"
+    df_out = tmp_path / "df_out.bin"
+    df.write_bytes(synth_dflash)
+    rc = main(["-l", "en", "parameterize", "-i", str(df), "-o", str(df_out), "--fpa-preset", "fwd", "--fpa-schema", "JC00"])
+    assert rc == 1 and not df_out.exists()
+
+
+def test_cli_kombi_and_fpke_read_out_file_use_session_dir_and_copy_primary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import importlib
+    import json
+
+    cli_mod = importlib.import_module("contitool.cli.main")
+
+    sessions_seen: list[Path] = []
+
+    def fake_kombi_read(port, *, session_dir, **kw):
+        sessions_seen.append(session_dir)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        rep_p = session_dir / "kombi_read_report.json"
+        df_p = session_dir / "Dflash.bin"
+        rep_p.write_text(json.dumps({"ok": "kombi"}), encoding="utf-8")
+        df_p.write_bytes(b"KOMBI_DF")
+        return {"session_dir": str(session_dir), "report_path": str(rep_p), "dflash": {"output": str(df_p)}}
+
+    def fake_fpke_read(port, *, session_dir, **kw):
+        sessions_seen.append(session_dir)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        rep_p = session_dir / "fpke_read_report.json"
+        df_p = session_dir / "Dflash.bin"
+        rep_p.write_text(json.dumps({"ok": "fpke"}), encoding="utf-8")
+        df_p.write_bytes(b"FPKE_DF")
+        return {"session_dir": str(session_dir), "report_path": str(rep_p), "dflash": {"output": str(df_p)}}
+
+    monkeypatch.setattr(cli_mod, "can_kombi_full_read", fake_kombi_read)
+    monkeypatch.setattr(cli_mod, "can_fpke_full_read", fake_fpke_read)
+    monkeypatch.setattr(cli_mod, "format_kombi_report", lambda **_k: "ok")
+    monkeypatch.setattr(cli_mod, "format_fpke_report", lambda **_k: "ok")
+
+    out_dir = tmp_path / "runs"
+    work = tmp_path / "work"
+    work.mkdir()
+    kombi_json = work / "foo.json"
+    fpke_bin = work / "bar.bin"
+
+    assert main(["-l", "en", "kombi", "read", "--port", "fake", "--output-dir", str(out_dir), "-o", str(kombi_json)]) == 0
+    assert main(["-l", "en", "fpke", "read", "--mode", "report", "--port", "fake", "--output-dir", str(out_dir), "-o", str(fpke_bin)]) == 0
+    assert len(sessions_seen) == 2
+    assert all(s.parent == out_dir for s in sessions_seen)
+    assert sorted(p.name for p in work.iterdir()) == ["bar.bin", "foo.json"]  # work dir NOT polluted!
+    assert json.loads(kombi_json.read_text(encoding="utf-8")) == {"ok": "kombi"}
+    assert fpke_bin.read_bytes() == b"FPKE_DF"
+
+
+def test_cli_elv_in_place_guard_and_adapt_cluster_overrides_and_validation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import importlib
+
+    cli_mod = importlib.import_module("contitool.cli.main")
+
+    same_file = tmp_path / "elv.bin"
+    same_file.write_bytes(b"\xff" * 64)
+    assert main(["-l", "en", "elv", "virginize-dflash", "--dflash", str(same_file), "-o", str(same_file)]) == 1
+    assert main(["-l", "en", "elv", "adapt-dflash", "--dflash", str(same_file), "-o", str(same_file),
+                 "--vin", VIN, "--k5", "11" * 16, "--power-class", "6F"]) == 1
+
+    # Cluster dump with missing/invalid VIN overridden by --vin, merged before session dir creation
+    cl_file = tmp_path / "cluster.bin"
+    cl_file.write_bytes(b"\x00" * 64)
+    monkeypatch.setattr(
+        cli_mod,
+        "elv_extract_cluster_material",
+        lambda _df, _cf=None: {"vin": "", "slot_a_hex": "22" * 16, "slot_a_crc_ok": True, "power_class": 0x6F},
+    )
+    out_dir = tmp_path / "elv_runs"
+    # Without --vin override, cluster has empty VIN -> must fail BEFORE creating session dir!
+    rc_bad = main(["-l", "en", "elv", "adapt", "--port", "fake", "--yes", "--output-dir", str(out_dir),
+                   "--cluster-dflash", str(cl_file)])
+    assert rc_bad == 1 and not out_dir.exists()
+
+    captured: list[dict] = []
+    monkeypatch.setattr(cli_mod, "can_elv_adapt", lambda port, **kw: captured.append(kw) or {"ok": True})
+    rc_ok = main(["-l", "en", "elv", "adapt", "--port", "fake", "--yes", "--output-dir", str(out_dir),
+                  "--cluster-dflash", str(cl_file), "--vin", VIN, "--power-class", "76"])
+    assert rc_ok == 0 and len(captured) == 1
+    assert captured[0]["new_vin"] == VIN
+    assert captured[0]["new_k5"] == "22" * 16
+    assert captured[0]["new_power_class"] == 0x76
+
+
+def test_cli_plan_transfer_json_and_cross_family(tmp_path: Path) -> None:
+    import json
+
+    passport_a = {
+        "schema": "contitool.immo_passport.v1",
+        "platform": "kombi_v850e2",
+        "dflash_sha256": "aa" * 32,
+        "cluster_metadata": {"part_number": "5NA920740B", "odometer_km": 12345},
+        "component_protection_separate": {"ika_cp3": "11" * 16},
+        "immo": {
+            "personalized": True,
+            "vin": VIN,
+            "vin_state": "present",
+            "cs": "33" * 16,
+            "k_ffb": "44" * 16,
+            "vdo_cs_plus": "",
+            "crc32_a_le": "01020304",
+            "crc32_b_le": "05060708",
+            "power_class": 0x6F,
+            "power_class_hex": "0x6F",
+            "mac_fields": {"dash": "1122", "ecu": "3344", "tcu": "5566", "elv": "7788"},
+            "mac4": "11223344",
+            "keys": ["AABBCCDD"],
+            "counts": {"learned_keys": 1, "allowed_keys": 2, "session_xor_flags": 0},
+            "mode_and_flags": {"partners_mask_hex": "0x07", "adapted_partner_codes": ["ECU"], "immo_mode": 6,
+                               "key_over_can": False, "lf_reader_config": 1},
+            "s0_s1": {"state": "present"},
+            "key_queue_0x6a": {"usable_key_data": True},
+        },
+    }
+    passport_b = {**passport_a, "platform": "fpke_rh850", "dflash_sha256": "bb" * 32,
+                  "cluster_metadata": {"part_number": "5E0920790A", "odometer_km": 99999}}
+    pa = tmp_path / "donor.json"
+    pb = tmp_path / "recip.json"
+    pa.write_text(json.dumps(passport_a), encoding="utf-8")
+    pb.write_text(json.dumps(passport_b), encoding="utf-8")
+
+    out_k = tmp_path / "plan_kombi.json"
+    out_f = tmp_path / "plan_fpke.json"
+    assert main(["-l", "en", "kombi", "plan-transfer", "--dflash", str(pa), "--dflash-b", str(pb), "-o", str(out_k)]) == 0
+    assert json.loads(out_k.read_text(encoding="utf-8"))["transfer_from_a"]["vin"] == VIN
+    assert main(["-l", "en", "fpke", "plan-transfer", "--dflash", str(pa), "--dflash-b", str(pb), "-o", str(out_f)]) == 0
+    plan_f = json.loads(out_f.read_text(encoding="utf-8"))
+    assert plan_f["transfer_from_a"]["vin"] == VIN and plan_f["donor_a"]["platform"] == "kombi_v850e2"
+
+
+def test_cli_mrr_bootloader_inspect_force_and_lazy_sessions_and_bcm_adapt_ffb(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    import importlib
+    import json
+
+    from contitool.can import dpdu
+    from contitool.core.mrr import mrr_compute_ecu_boot_sum
+
+    cli_mod = importlib.import_module("contitool.cli.main")
+
+    # 1. mrr inspect --cflash Bootloader.bin without --dflash prints bootloader_size + ecu_boot_sum_hex
+    boot = tmp_path / "Bootloader.bin"
+    boot_bytes = bytes((i & 0xFF) for i in range(0x10000))
+    boot.write_bytes(boot_bytes)
+    assert main(["-l", "en", "mrr", "inspect", "--cflash", str(boot)]) == 0
+    rep_boot = json.loads(capsys.readouterr().out)
+    assert rep_boot["bootloader_size"] == 0x10000
+    assert rep_boot["ecu_boot_sum_hex"] == mrr_compute_ecu_boot_sum(boot_bytes).hex()
+
+    # 2. mrr write-keys & reset-cp-counter forward force=True + honor --allow-dpdu-driver
+    monkeypatch.setattr(dpdu, "accepted_drivers", set())
+    monkeypatch.setattr(dpdu, "discover_dpdu", lambda: [{"name": "VW", "version": "30.3.0"}])
+    wk_calls: list[dict] = []
+    rc_calls: list[dict] = []
+    monkeypatch.setattr(cli_mod, "can_mrr_write_keys", lambda port, **kw: wk_calls.append(kw) or {"ok": True})
+    monkeypatch.setattr(cli_mod, "can_mrr_reset_cp_counter", lambda port, **kw: rc_calls.append(kw) or {"ok": True})
+    assert main(["-l", "en", "mrr", "write-keys", "--interface", "dpdu", "--allow-dpdu-driver", "--yes", "--force"]) == 0
+    assert main(["-l", "en", "mrr", "reset-cp-counter", "--interface", "dpdu", "--yes", "--force"]) == 0
+    assert wk_calls[0]["force"] is True and rc_calls[0]["force"] is True
+    assert "30.3.0" in dpdu.accepted_drivers
+
+    # 3. Lazy session directories: invalid mrr swap-on --swap-groups and invalid can read-mem leave NO folder
+    mrr_out = tmp_path / "mrr_runs"
+    can_out = tmp_path / "can_runs"
+    assert main(["-l", "en", "mrr", "swap-on", "--port", "fake", "--yes", "--output-dir", str(mrr_out),
+                 "--swap-groups", "1,2"]) == 1
+    assert not mrr_out.exists()
+    assert main(["-l", "en", "can", "read-mem", "--port", "fake", "--output-dir", str(can_out)]) == 1
+    assert not can_out.exists()
+    monkeypatch.setattr(cli_mod, "can_learn_mfl_button", lambda port, **kw: {"captured": False})
+    assert main(["-l", "en", "can", "learn-mfl", "--port", "fake", "--output-dir", str(can_out)]) == 0
+    assert not can_out.exists()
+
+    # 4. bcm adapt-ffb: validates manual inputs before touching CAN, parses leading-zero counter "0012", handles --freq
+    bcm_calls: list[dict] = []
+    monkeypatch.setattr(cli_mod, "can_bcm_adapt_ffb", lambda port, **kw: bcm_calls.append(kw) or {"ok": True})
+    assert main(["-l", "en", "bcm", "adapt-ffb", "--port", "fake", "--yes"]) == 1
+    assert bcm_calls == []
+    assert main(["-l", "en", "bcm", "adapt-ffb", "--port", "fake", "--yes", "--kc", "11" * 16]) == 1
+    assert bcm_calls == []
+    assert main(["-l", "en", "bcm", "adapt-ffb", "--port", "fake", "--yes",
+                 "--kc", "11" * 16, "--key", "AABBCCDD:0012", "--key", "11223344:0x20"]) == 0
+    assert len(bcm_calls) == 1
+    assert bcm_calls[0]["keys"][0]["rolling_counter"] == 12
+    assert bcm_calls[0]["keys"][1]["rolling_counter"] == 0x20
+
+    # Cluster adapt-ffb with --freq warns cleanly when helper doesn't take freq_code
+    cl_calls: list[dict] = []
+    monkeypatch.setattr(cli_mod, "can_bcm_adapt_ffb_from_cluster", lambda port, **kw: cl_calls.append(kw) or {"ok": True})
+    capsys.readouterr()
+    assert main(["-l", "en", "bcm", "adapt-ffb", "--port", "fake", "--yes", "--from-live-cluster", "--freq", "2"]) == 0
+    err_txt = capsys.readouterr().err
+    assert "--freq" in err_txt and len(cl_calls) == 1

@@ -160,3 +160,53 @@ def test_frf_flash_checks_the_ecu_then_programs_with_the_frf_signature(synth_cfl
     with pytest.raises(RuntimeError, match="5Q0907530"):
         workflows.can_flash_frf("fake", frf, session_dir=tmp_path / "c", allow_unlisted=True)
     assert programmed == [SIG]
+
+
+def test_frf_bom_size_limit_and_fd_0data_security_matching(synth_cflash: bytes, monkeypatch) -> None:
+    set_lang("en")
+    app = bytes(split_cflash_or_app(synth_cflash)[1])
+    other_sig = bytes([0xAA] * 128)
+
+    # 1. Enclosing <DATABLOCK>: picks FD_0DATA's signature, NOT the earlier FD_0ERASEDATA signature
+    odx_db = (
+        '<?xml version="1.0" encoding="UTF-8"?><ODX><FLASH><ECU-MEMS><ECU-MEM>'
+        '<SHORT-NAME>EMEM_3Q0907530AC5388_S</SHORT-NAME><MEM>'
+        '<SESSIONS><SESSION><DATABLOCKS>'
+        '<DATABLOCK ID="DB_ERASE"><FLASHDATA-REF ID-REF="EMEM_X.FD_0ERASEDATA"/>'
+        f'<SECURITYS><SECURITY><SECURITY-METHOD>SIG_SHA1-RSA1024_S</SECURITY-METHOD><FW-SIGNATURE>{other_sig.hex()}</FW-SIGNATURE></SECURITY></SECURITYS>'
+        '</DATABLOCK>'
+        '<DATABLOCK ID="DB_APP"><FLASHDATA-REF ID-REF="EMEM_X.FD_0DATA"/>'
+        f'<SECURITYS><SECURITY><SECURITY-METHOD>SIG_SHA1-RSA1024_S</SECURITY-METHOD><FW-SIGNATURE>{SIG.hex()}</FW-SIGNATURE></SECURITY></SECURITYS>'
+        '</DATABLOCK>'
+        '</DATABLOCKS></SESSION></SESSIONS>'
+        '<FLASHDATAS>'
+        '<FLASHDATA ID="EMEM_X.FD_0ERASEDATA"><ENCRYPT-COMPRESS-METHOD>00</ENCRYPT-COMPRESS-METHOD><DATA>01</DATA></FLASHDATA>'
+        f'<FLASHDATA ID="EMEM_X.FD_0DATA"><ENCRYPT-COMPRESS-METHOD>00</ENCRYPT-COMPRESS-METHOD><DATA>{app.hex().upper()}</DATA></FLASHDATA>'
+        '</FLASHDATAS></MEM></ECU-MEM></ECU-MEMS></FLASH></ODX>'
+    )
+    assert read_odx(odx_db.encode("utf-8")).signature == SIG
+
+    # 2. <VALIDITY-FOR>: picks FD_0DATA's signature over earlier FD_0ERASEDATA signature
+    odx_val = (
+        '<?xml version="1.0" encoding="UTF-8"?><ODX><FLASH><ECU-MEMS><ECU-MEM>'
+        '<SHORT-NAME>EMEM_3Q0907530AC5388_S</SHORT-NAME><MEM><FLASHDATAS>'
+        f'<FLASHDATA ID="EMEM_X.FD_0DATA"><ENCRYPT-COMPRESS-METHOD>00</ENCRYPT-COMPRESS-METHOD><DATA>{app.hex().upper()}</DATA></FLASHDATA>'
+        '</FLASHDATAS></MEM><SECURITYS>'
+        f'<SECURITY><SECURITY-METHOD>SIG_SHA1-RSA1024_S</SECURITY-METHOD><FW-SIGNATURE>{other_sig.hex()}</FW-SIGNATURE><VALIDITY-FOR>FD_0ERASEDATA</VALIDITY-FOR></SECURITY>'
+        f'<SECURITY><SECURITY-METHOD>SIG_SHA1-RSA1024_S</SECURITY-METHOD><FW-SIGNATURE>{SIG.hex()}</FW-SIGNATURE><VALIDITY-FOR>FD_0DATA</VALIDITY-FOR></SECURITY>'
+        '</SECURITYS></ECU-MEM></ECU-MEMS></FLASH></ODX>'
+    )
+    assert read_odx(odx_val.encode("utf-8")).signature == SIG
+
+    # 3. BOM + leading whitespace inside FRF ZIP entry is stripped cleanly
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("FL_3Q0907530AC_5388_S.odx", b"\xef\xbb\xbf\r\n" + odx_db.encode("utf-8"))
+    plain = buf.getvalue()
+    frf_bytes = bytes(a ^ b for a, b in zip(plain, _keystream()))
+    assert read_frf(frf_bytes).signature == SIG
+
+    # 4. Decompressed ODX size cap enforced before zf.read()
+    monkeypatch.setattr(frf_mod, "ODX_MAX_UNCOMPRESSED", 1024)
+    with pytest.raises(ValueError, match="too large"):
+        read_frf(frf_bytes)

@@ -357,7 +357,7 @@ def parse_odis_zdc_file(data: bytes | str) -> OdisZdcFile:
             )
         )
     try:
-        root = ET.fromstring(raw)  # noqa: S314 - a local file the user picked; no entities are resolved
+        root = ET.fromstring(raw.lstrip(b"\xef\xbb\xbf \t\r\n"))  # noqa: S314 - a local file the user picked; no entities are resolved
     except ET.ParseError as exc:
         raise ValueError(tr(f"Это не XML-файл параметризации ODIS: {exc}", f"Not an ODIS parameterization XML file: {exc}")) from exc
 
@@ -382,18 +382,21 @@ def parse_odis_zdc_file(data: bytes | str) -> OdisZdcFile:
         except ValueError:
             return -1
 
+    start_txt = (node.get("START_ADDRESS") or "").strip()
     start = _addr("START_ADDRESS")
     diag_txt = (node.get("DIAGNOSTIC_ADDRESS") or "").strip()
     diag = _addr("DIAGNOSTIC_ADDRESS") if diag_txt else 0x19  # no address given: the file is the gateway's
     known = _ODIS_ADDR_TO_IDX.get(start)
     if known is None or known[1] != len(payload):
-        expect = ", ".join(f"0x{a:04X}/{s} Б" for a, (_i, s) in sorted(_ODIS_ADDR_TO_IDX.items()))
+        addr_lbl = f"0x{start:04X}" if start >= 0 else (start_txt or "?")
+        expect_ru = ", ".join(f"0x{a:04X}/{s} Б" for a, (_i, s) in sorted(_ODIS_ADDR_TO_IDX.items()))
+        expect_en = ", ".join(f"0x{a:04X}/{s} B" for a, (_i, s) in sorted(_ODIS_ADDR_TO_IDX.items()))
         raise ValueError(
             tr(
-                f"Файл не для шлюза J533: адрес 0x{start:04X} и длина {len(payload)} Б не совпадают ни с одним "
-                f"блоком ZDC ({expect}).",
-                f"Not a J533 gateway file: address 0x{start:04X} with {len(payload)} B matches no ZDC block "
-                f"({expect}).",
+                f"Файл не для шлюза J533: адрес {addr_lbl} и длина {len(payload)} Б не совпадают ни с одним "
+                f"блоком ZDC ({expect_ru}).",
+                f"Not a J533 gateway file: address {addr_lbl} with {len(payload)} B matches no ZDC block "
+                f"({expect_en}).",
             )
         )
     idx = known[0]
@@ -510,16 +513,6 @@ def import_zdc_block(
     donor_is_full_df = len(blob_or_donor_df) == len(df) and uds_len != len(df)
     if donor_is_full_df:
         raw_blk = bytearray(blob_or_donor_df[off : off + alloc])
-        if copy_donor_passport:
-            dp = parse_zdc_passport(blob_or_donor_df)
-            if not dp.empty:
-                out[:] = apply_zdc_passport(
-                    bytes(out),
-                    dataset_pn=dp.dataset_pn or "V03935256AA",
-                    dataset_ver=dp.dataset_ver if zdc_ver_ok(dp.dataset_ver) else "0001",
-                    equip=dp.equip_bytes,
-                    clean_pads=True,
-                )
     elif len(blob_or_donor_df) == alloc:
         raw_blk = bytearray(blob_or_donor_df)
     elif len(blob_or_donor_df) == uds_len:
@@ -541,6 +534,17 @@ def import_zdc_block(
         out[off : off + alloc] = b"\xff" * alloc
         reporter.info(tr(f"Блок ZDC #{idx} ({code}) пуст в источнике -> очищен в FF..FF", f"Source ZDC #{idx} ({code}) is empty -> erased to FF..FF"))
         return bytes(out)
+
+    if donor_is_full_df and copy_donor_passport:
+        dp = parse_zdc_passport(blob_or_donor_df)
+        if not dp.empty:
+            out[:] = apply_zdc_passport(
+                bytes(out),
+                dataset_pn=dp.dataset_pn or "V03935256AA",
+                dataset_ver=dp.dataset_ver if zdc_ver_ok(dp.dataset_ver) else "0001",
+                equip=dp.equip_bytes,
+                clean_pads=True,
+            )
 
     if fix_crc:
         sealed = seal_zdc_block_crc(raw_blk, uds_len=uds_len)
@@ -1381,10 +1385,12 @@ class FpaDataset:
         s029, s031, s071, s074, s033 = (self.sec_bytes(29), self.sec_bytes(31), self.sec_bytes(71),
                                         self.sec_u16_be(74), self.sec_u16_be(33))
         o029, o031, o071, o074, o033 = oz.sec_bytes(29), oz.sec_bytes(31), oz.sec_bytes(71), oz.sec_u16_be(74), oz.sec_u16_be(33)
+        s030 = self.selectable_mask | 0x0001
         for slot in (4, 8, 9):
             if s028[slot]:
                 continue
             s028[slot], s029[slot - 1], s071[slot], s074[slot] = oz.sec_bytes(28)[slot], o029[slot - 1], o071[slot], o074[slot]
+            s030 |= 1 << slot
             for j, gid in enumerate(g_self):
                 if not gid:
                     continue
@@ -1393,6 +1399,7 @@ class FpaDataset:
                 s033[(slot - 1) * 30 + j] = o033[(slot - 1) * 30 + i] if i is not None else 1 << 2
         self.set_sec_bytes(28, s028)
         self.set_sec_bytes(29, s029)
+        self.selectable_mask = s030
         self.set_sec_bytes(31, s031)
         self.set_sec_u16_be(33, s033)
         self.set_sec_bytes(71, s071)
@@ -1514,7 +1521,7 @@ class FpaDataset:
             mode=mode,
             mfl_keycode=keycode,
             mfl_long_press=long_press,
-            console_ring=self._read_switch_ring(con_sw),
+            console_ring=self._read_switch_ring(con_sw) if console_inps else [],
             mfl_ring=self._read_switch_ring(mfl_sw) if mfl_inp >= 0 else [],
             normal_led_off=normal_led_off,
             led_pwm=self.buf[FPA_SEC_OFFS[11]],
@@ -2255,8 +2262,8 @@ def parameterize_dflash_for_fecs(
 
             out = apply_fpa_dataset(out, fpa, reporter=reporter)
             actions_done.append(f"ZDC #4 (FPA {fpa.schema_tag})")
-        elif need_gra and cur_fpa.empty:
-            # GRA only on a completely empty ZDC #4 -> inject passive JC00 base
+        elif need_gra and (cur_fpa.empty or not cur_fpa.crc_ok):
+            # GRA only on an empty or corrupt ZDC #4 -> inject passive JC00 base
             out_arr = bytearray(out)
             out_arr[0x1340:0x2440] = get_zdc_template_bytes("FPA_JC00_BASE")
             out = bytes(out_arr)
@@ -2321,6 +2328,7 @@ __all__ = [
     "inject_ssa_preset",
     "parameterize_dflash_for_fecs",
     "parse_bem_block",
+    "parse_cflash_zdc_upload_map",
     "parse_mke_block",
     "parse_ssa_block",
     "parse_odis_zdc_file",
@@ -2334,4 +2342,5 @@ __all__ = [
     "sync_gateway_coding_for_zdc",
     "zdc6_record_be_to_rom_le",
     "zdc_crc32_le",
+    "zdc_ver_ok",
 ]

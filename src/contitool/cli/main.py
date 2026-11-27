@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
+from pathlib import Path
+import re
+import shutil
 import sys
 import traceback
+from typing import Any
 
 from contitool import __version__
 from contitool.can import (
@@ -39,7 +44,6 @@ from contitool.can import (
     can_mrr_swap_status,
     can_mrr_write_keys,
     can_elv_adapt,
-    can_elv_adapt_from_cluster,
     can_elv_check_bootloader,
     can_elv_clear_dtc,
     can_elv_read_dflash,
@@ -99,7 +103,6 @@ from contitool.core import (
     format_fpke_transfer_plan,
     format_kombi_report,
     format_kombi_transfer_plan,
-    normalize_kombi_dflash_input,
     plan_fpke_a_to_b_transfer,
     plan_kombi_a_to_b_transfer,
     apply_cflash_patch,
@@ -204,6 +207,182 @@ def _parse_u8_hex(val: str) -> int:
             tr(f"Байт вне диапазона 0x00..0xFF: {val!r}", f"Byte value out of range 0x00..0xFF: {val!r}")
         )
     return parsed
+
+
+def _apply_allow_dpdu_driver(args: argparse.Namespace) -> None:
+    """Honor --allow-dpdu-driver for any CLI subcommand talking to a D-PDU adapter."""
+    if getattr(args, "interface", None) == "dpdu" and getattr(args, "allow_dpdu_driver", False):
+        from contitool.can import dpdu
+
+        allow_fn = getattr(dpdu, "allow_untested_driver", None)
+        if callable(allow_fn):
+            allow_fn(True)
+        dpdu.accepted_drivers.update(api["version"] for api in dpdu.discover_dpdu())
+
+
+def _copy_primary_read_artifact(res: dict[str, Any], out_file: Path) -> None:
+    """Copy the requested primary artifact (JSON report or Dflash.bin) from a session folder to `out_file`."""
+    import json
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    if out_file.suffix.lower() == ".json":
+        rep_str = res.get("report_path")
+        src = Path(rep_str) if rep_str else None
+        if src is not None and src.is_file():
+            if src.resolve() != out_file.resolve():
+                shutil.copy2(src, out_file)
+        else:
+            out_file.write_text(json.dumps(res, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return
+
+    df_meta = res.get("dflash") if isinstance(res.get("dflash"), dict) else {}
+    df_str = df_meta.get("output")
+    src = Path(df_str) if df_str else (Path(res["session_dir"]) / "Dflash.bin" if res.get("session_dir") else None)
+    if src is None or not src.is_file():
+        raise FileNotFoundError(
+            tr(
+                f"Не найден основной файл Dflash.bin в сессии для копирования в {out_file}",
+                f"Primary Dflash.bin artifact not found in session to copy to {out_file}",
+            )
+        )
+    if src.resolve() != out_file.resolve():
+        shutil.copy2(src, out_file)
+
+
+def _load_cluster_immo_passport(
+    path: Path,
+    cflash: bytes | None = None,
+    *,
+    default_family: str = "fpke",
+) -> dict[str, Any]:
+    """Load an Immo passport from a `.json` file or auto-detected Kombi/FPK_E DataFlash dump."""
+    import json
+
+    from contitool.core.fpke import is_fpke_dflash
+    from contitool.core.kombi import is_kombi_dflash
+
+    if path.suffix.lower() == ".json":
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict) or "immo" not in obj:
+            raise ValueError(
+                tr(
+                    f"Файл {path.name} не является Immo-паспортом JSON (отсутствует ключ 'immo').",
+                    f"File {path.name} is not an Immo passport JSON (missing 'immo' key).",
+                )
+            )
+        return obj
+    raw = path.read_bytes()
+    if is_kombi_dflash(raw):
+        return extract_kombi_immo_passport(raw, cflash)
+    if is_fpke_dflash(raw):
+        return extract_fpke_immo_passport(raw, cflash)
+    if default_family == "kombi":
+        return extract_kombi_immo_passport(raw, cflash)
+    return extract_fpke_immo_passport(raw, cflash)
+
+
+def _plan_fpke_transfer_from_passports(donor: dict[str, Any], recipient: dict[str, Any]) -> dict[str, Any]:
+    """Build a static FPK_E Donor A -> Recipient B transfer plan directly from two Immo passport dicts."""
+    im_a = donor.get("immo") or {}
+    im_b = recipient.get("immo") or {}
+    meta_a = donor.get("cluster_metadata") or {}
+    meta_b = recipient.get("cluster_metadata") or {}
+    mf_a = im_a.get("mode_and_flags") or {}
+    s0_s1_a = im_a.get("s0_s1") or {}
+    q6a_a = im_a.get("key_queue_0x6a") or {}
+
+    warnings: list[str] = []
+    if not im_a.get("personalized"):
+        warnings.append(
+            tr(
+                "Донор A не персонализирован (CS пустой: FF×16).",
+                "Donor A is not personalized (CS is empty FF*16).",
+            )
+        )
+    if im_a.get("vin_state") != "present":
+        warnings.append(
+            tr(
+                f"Состояние VIN Донора A: {im_a.get('vin_state')}.",
+                f"Donor A VIN state is {im_a.get('vin_state')}.",
+            )
+        )
+    if s0_s1_a.get("state") != "present":
+        warnings.append(
+            tr(
+                "Слоты S0/S1 (0x69) Донора A пусты (норма для режима 1): не вызывайте UDS 02F7 с заглушкой/FF S0/S1.",
+                "Donor A S0/S1 (0x69) is empty (normal in mode 1): do not invoke UDS 02F7 with stub/FF S0/S1.",
+            )
+        )
+    if donor.get("platform") and recipient.get("platform") and donor.get("platform") != recipient.get("platform"):
+        warnings.append(
+            tr(
+                f"Межплатформенный перенос ({donor.get('platform')} → {recipient.get('platform')}): "
+                "переносятся только семантические поля WFS5/CP/пробега.",
+                f"Cross-platform transfer ({donor.get('platform')} → {recipient.get('platform')}): "
+                "only semantic WFS5/CP/odometer fields are mapped.",
+            )
+        )
+
+    return {
+        "schema": "contitool.fpke.transfer_plan.v1",
+        "read_only": True,
+        "raw_dflash_clone_prohibited": True,
+        "donor_a": {
+            "dflash_sha256": str(donor.get("dflash_sha256") or ""),
+            "platform": donor.get("platform") or "unknown",
+            "part_number": meta_a.get("part_number"),
+            "personalized": bool(im_a.get("personalized")),
+        },
+        "recipient_b": {
+            "dflash_sha256": str(recipient.get("dflash_sha256") or ""),
+            "platform": recipient.get("platform") or "unknown",
+            "part_number": meta_b.get("part_number"),
+            "personalized": bool(im_b.get("personalized")),
+            "current_kc_on_b": im_b.get("cs"),
+        },
+        "transfer_from_a": {
+            "vin": im_a.get("vin"),
+            "cs": im_a.get("cs"),
+            "k_ffb": im_a.get("k_ffb"),
+            "vdo_cs_plus": im_a.get("vdo_cs_plus"),
+            "crc32_a_le": im_a.get("crc32_a_le"),
+            "crc32_b_le": im_a.get("crc32_b_le"),
+            "power_class": im_a.get("power_class"),
+            "power_class_hex": im_a.get("power_class_hex"),
+            "mac_fields": dict(im_a.get("mac_fields") or {}),
+            "mac4": im_a.get("mac4"),
+            "keys": list(im_a.get("keys") or []),
+            "counts": dict(im_a.get("counts") or {}),
+            "partners_mask_hex": mf_a.get("partners_mask_hex"),
+            "adapted_partner_codes": list(mf_a.get("adapted_partner_codes") or []),
+            "immo_mode": mf_a.get("immo_mode"),
+            "key_over_can": mf_a.get("key_over_can"),
+            "lf_reader_config": mf_a.get("lf_reader_config"),
+        },
+        "preserve_on_b": {
+            "part_number": meta_b.get("part_number"),
+            "sw_version_eel": meta_b.get("sw_version_eel"),
+            "dataset_pn": meta_b.get("dataset_pn"),
+            "coding_hex": meta_b.get("coding_hex"),
+            "odometer_km_on_b": meta_b.get("odometer_km"),
+            "current_kc_on_b": im_b.get("cs"),
+        },
+        "odometer_sync": {
+            "donor_a_km": meta_a.get("odometer_km"),
+            "recipient_b_km": meta_b.get("odometer_km"),
+            "eel_id": "0x60",
+        },
+        "component_protection_separate": {
+            "donor_a": donor.get("component_protection_separate") or {},
+            "recipient_b": recipient.get("component_protection_separate") or {},
+        },
+        "s0_s1_and_0x6a_policy": {
+            "donor_s0_s1_state": s0_s1_a.get("state"),
+            "donor_0x6a_usable": q6a_a.get("usable_key_data"),
+            "allow_02f7_with_stub_s0_s1": False,
+        },
+        "warnings": warnings,
+    }
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
@@ -511,6 +690,15 @@ def cmd_activate_swap(args: argparse.Namespace) -> int:
 
 
 def cmd_parameterize(args: argparse.Namespace) -> int:
+    if getattr(args, "fpa_schema", None) is not None:
+        raise ValueError(
+            tr(
+                "Флаг --fpa-schema игнорируется и больше не поддерживается: встроенные пресеты FPA всегда сохраняют "
+                "собственный тег датасета (PC00/NC00).",
+                "--fpa-schema is ignored and no longer supported: built-in FPA presets always keep their own "
+                "dataset tag (PC00/NC00).",
+            )
+        )
     if not args.button_mode:
         _only_with("--button-mode", [o for o, v in (
             ("--mfl-key", args.mfl_key), ("--mfl-long-press", args.mfl_long_press or None),
@@ -783,7 +971,8 @@ def cmd_sign_fsc(args: argparse.Namespace) -> int:
         vcrn_5b = sw.vcrn
         vin_str = sw.vin
     if args.vcrn:
-        vcrn_clean = args.vcrn.strip().replace(" ", "").replace(":", "")
+        vcrn_clean = re.sub(r"0x", "", args.vcrn.strip(), flags=re.IGNORECASE)
+        vcrn_clean = re.sub(r"[\s:\-_]+", "", vcrn_clean)
         vcrn_5b = bytes.fromhex(vcrn_clean)
     if args.no_vin:
         vin_str = ""
@@ -911,10 +1100,7 @@ def cmd_can(args: argparse.Namespace) -> int:
             )
         )
 
-    if args.interface == "dpdu" and args.allow_dpdu_driver:
-        from contitool.can import dpdu
-
-        dpdu.accepted_drivers.update(api["version"] for api in dpdu.discover_dpdu())
+    _apply_allow_dpdu_driver(args)
 
     write_actions = ("write-uflash", "write-dflash", "write-cflash", "turnkey", "zdc-upload")
     if action in write_actions and not args.yes:
@@ -928,7 +1114,10 @@ def cmd_can(args: argparse.Namespace) -> int:
         )
 
     base_out = clean_user_path(args.output_dir) if args.output_dir else None
-    session_dir = None if action == "scan" else default_session_dir(base_out, action.replace("-", "_"))
+
+    def _make_session_dir() -> Path:
+        return default_session_dir(base_out, action.replace("-", "_"))
+
     disp = _make_cli_display(args)
     rep = disp.create_reporter()
 
@@ -958,6 +1147,7 @@ def cmd_can(args: argparse.Namespace) -> int:
                 )
             return 0
         if action == "verify":
+            session_dir = _make_session_dir()
             res = can_verify(args.port, interface=args.interface, session_dir=session_dir, reporter=rep)
             print(f"✓ RSA status: {res['rsa_status']} | Session: {res['session_dir']}")
         elif action == "backup":
@@ -970,6 +1160,7 @@ def cmd_can(args: argparse.Namespace) -> int:
                 if answer not in ("y", "yes", "д", "да"):
                     print(tr("Отменено.", "Cancelled."))
                     return 1
+            session_dir = _make_session_dir()
             res = can_backup(
                 args.port,
                 interface=args.interface,
@@ -981,8 +1172,9 @@ def cmd_can(args: argparse.Namespace) -> int:
             for w_msg in res.get("warnings") or []:
                 print(f"⚠ {w_msg}", file=sys.stderr)
         elif action == "read-eeprom":
-            out_bin = clean_user_path(args.out_file) if args.out_file else (session_dir / "Eeprom.bin")
             cf_bytes = clean_user_path(args.input).read_bytes() if args.input else None
+            session_dir = _make_session_dir()
+            out_bin = clean_user_path(args.out_file) if args.out_file else (session_dir / "Eeprom.bin")
             res = can_read_eeprom(
                 args.port,
                 out_bin,
@@ -994,6 +1186,7 @@ def cmd_can(args: argparse.Namespace) -> int:
             print(format_eeprom_report(analyze_eeprom(out_bin.read_bytes(), cf_bytes), _out_style(args), str(out_bin)))
             print(f"✓ Eeprom.bin -> {out_bin} | Session: {res['session_dir']}")
         elif action == "read-opbt":
+            session_dir = _make_session_dir()
             out_bin = clean_user_path(args.out_file) if args.out_file else (session_dir / "Opbt.bin")
             res = can_read_opbt(
                 args.port,
@@ -1023,6 +1216,7 @@ def cmd_can(args: argparse.Namespace) -> int:
                         "read-mem requires --address 0x... and --length BYTE_COUNT",
                     )
                 )
+            session_dir = _make_session_dir()
             out_bin = (
                 clean_user_path(args.out_file)
                 if args.out_file
@@ -1040,6 +1234,7 @@ def cmd_can(args: argparse.Namespace) -> int:
             print(tr(f"✓ Дамп памяти ({res['bytes']:,} Б) -> {out_bin} | Сессия: {res['session_dir']}",
                      f"✓ Memory dump ({res['bytes']:,} B) -> {out_bin} | Session: {res['session_dir']}"))
         elif action == "health":
+            session_dir = _make_session_dir()
             res = can_health_check(
                 args.port,
                 interface=args.interface,
@@ -1051,6 +1246,9 @@ def cmd_can(args: argparse.Namespace) -> int:
             print_dtc_report(res.get("dtc_records") or [])
         elif action == "write-uflash":
             in_uf = clean_user_path(args.input) if args.input else None
+            if in_uf is not None and not in_uf.is_file():
+                raise FileNotFoundError(str(in_uf))
+            session_dir = _make_session_dir()
             res = can_write_uflash(
                 args.port,
                 input_uflash=in_uf,
@@ -1069,9 +1267,13 @@ def cmd_can(args: argparse.Namespace) -> int:
                         "write-dflash requires -i / --input PATH_TO_DFLASH.bin",
                     )
                 )
+            in_df = clean_user_path(args.input)
+            if not in_df.is_file():
+                raise FileNotFoundError(str(in_df))
+            session_dir = _make_session_dir()
             res = can_write_dflash(
                 args.port,
-                clean_user_path(args.input),
+                in_df,
                 full_rewrite=args.full_rewrite,
                 allow_icus_tail=args.allow_icus_tail,
                 interface=args.interface,
@@ -1084,9 +1286,13 @@ def cmd_can(args: argparse.Namespace) -> int:
         elif action == "write-cflash":
             if not args.input:
                 raise ValueError(tr("Для write-cflash укажите -i / --input ПУТЬ_К_CFLASH.bin", "write-cflash requires -i / --input PATH_TO_CFLASH.bin"))
+            in_cf = clean_user_path(args.input)
+            if not in_cf.is_file():
+                raise FileNotFoundError(str(in_cf))
+            session_dir = _make_session_dir()
             res = can_write_cflash(
                 args.port,
-                clean_user_path(args.input),
+                in_cf,
                 ignore_input_crc=args.ignore_input_crc,
                 raw_faci=args.raw_faci,
                 preserve_selfid=not args.overwrite_selfid,
@@ -1105,6 +1311,7 @@ def cmd_can(args: argparse.Namespace) -> int:
                     force_master=args.force_master,
                     allow_suspicious=args.allow_suspicious_key,
                 )
+            session_dir = _make_session_dir()
             res = can_turnkey_read_patch_flash(
                 args.port,
                 patch_cp_hybrid=not args.no_cp_patch,
@@ -1126,9 +1333,11 @@ def cmd_can(args: argparse.Namespace) -> int:
                         "zdc-upload requires -i / --input PATH_TO_DFLASH.bin",
                     )
                 )
+            zdc_df_bytes = clean_user_path(args.input).read_bytes()
+            session_dir = _make_session_dir()
             res = can_upload_zdc_datasets(
                 args.port,
-                clean_user_path(args.input).read_bytes(),
+                zdc_df_bytes,
                 interface=args.interface,
                 session_dir=session_dir,
                 reporter=rep,
@@ -1210,6 +1419,8 @@ def cmd_fpke(args: argparse.Namespace) -> int:
     if action == "plan-transfer":
         import json
 
+        from contitool.core.kombi import is_kombi_dflash
+
         if not args.dflash or not args.dflash_b:
             raise ValueError(
                 tr(
@@ -1217,14 +1428,29 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                     "fpke plan-transfer requires --dflash DONOR_A.bin and --dflash-b RECIPIENT_B.bin",
                 )
             )
+        p_a = clean_user_path(args.dflash)
+        p_b = clean_user_path(args.dflash_b)
         cf_a = clean_user_path(args.cflash).read_bytes() if args.cflash else None
         cf_b = clean_user_path(args.cflash_b).read_bytes() if args.cflash_b else None
-        plan = plan_fpke_a_to_b_transfer(
-            clean_user_path(args.dflash).read_bytes(),
-            clean_user_path(args.dflash_b).read_bytes(),
-            donor_cflash=cf_a,
-            recipient_cflash=cf_b,
-        )
+        is_json_pair = p_a.suffix.lower() == ".json" or p_b.suffix.lower() == ".json"
+        if is_json_pair:
+            pass_a = _load_cluster_immo_passport(p_a, cf_a, default_family="fpke")
+            pass_b = _load_cluster_immo_passport(p_b, cf_b, default_family="fpke")
+            plan = _plan_fpke_transfer_from_passports(pass_a, pass_b)
+        else:
+            raw_a = p_a.read_bytes()
+            raw_b = p_b.read_bytes()
+            if is_kombi_dflash(raw_a) or is_kombi_dflash(raw_b):
+                pass_a = extract_kombi_immo_passport(raw_a, cf_a) if is_kombi_dflash(raw_a) else extract_fpke_immo_passport(raw_a, cf_a)
+                pass_b = extract_kombi_immo_passport(raw_b, cf_b) if is_kombi_dflash(raw_b) else extract_fpke_immo_passport(raw_b, cf_b)
+                plan = _plan_fpke_transfer_from_passports(pass_a, pass_b)
+            else:
+                plan = plan_fpke_a_to_b_transfer(
+                    raw_a,
+                    raw_b,
+                    donor_cflash=cf_a,
+                    recipient_cflash=cf_b,
+                )
         print(format_fpke_transfer_plan(plan))
         if args.output:
             out_p = clean_user_path(args.output)
@@ -1258,6 +1484,7 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 "Specify native CAN adapter port via --port (list available ports with: contitool can ports)",
             )
         )
+    _apply_allow_dpdu_driver(args)
     port = args.port or ""
 
     base_out = clean_user_path(args.output_dir) if args.output_dir else None
@@ -1310,8 +1537,9 @@ def cmd_fpke(args: argparse.Namespace) -> int:
             )
             return 0
         gw_ch = int(getattr(args, "gateway_channel", 0) or 0)
+        do_blank_check = not bool(getattr(args, "no_blank_check", False))
         if args.mode == "report":
-            sdir = out_file.parent if out_file is not None else default_session_dir(base_out, "fpke_read")
+            sdir = default_session_dir(base_out, "fpke_read")
             res = can_fpke_full_read(
                 port,
                 interface=args.interface,
@@ -1320,6 +1548,7 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 wake_seconds=args.wake_seconds,
                 dflash_chunk=args.chunk,
                 use_stream=args.stream,
+                blank_check_dflash=do_blank_check,
                 read_uflash=args.read_uflash,
                 read_bflash=args.read_bflash,
                 read_cflash=args.read_cflash,
@@ -1329,6 +1558,8 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 gateway_channel=gw_ch,
                 reporter=rep,
             )
+            if out_file is not None:
+                _copy_primary_read_artifact(res, out_file)
             print(
                 format_fpke_report(
                     dflash_info=res.get("secrets"),
@@ -1336,7 +1567,8 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                     idauth_info=res.get("idauth"),
                 )
             )
-            print(f"\n✓ Session: {res['session_dir']} | Report: {res['report_path']}")
+            extra_out = f" | Output: {out_file}" if out_file is not None else ""
+            print(f"\n✓ Session: {res['session_dir']} | Report: {res['report_path']}{extra_out}")
         else:
             sdir = out_file.parent if out_file is not None else default_session_dir(base_out, f"fpke_{args.mode}")
             res = can_fpke_read_region(
@@ -1349,6 +1581,7 @@ def cmd_fpke(args: argparse.Namespace) -> int:
                 frame_delay=args.frame_delay,
                 wake_seconds=args.wake_seconds,
                 use_stream=args.stream,
+                blank_check_dflash=(args.mode == "dflash" and do_blank_check),
                 idcode_hex=args.idcode,
                 fd11_key_hex=args.fd11_key,
                 output_path=out_file,
@@ -1433,8 +1666,8 @@ def cmd_kombi(args: argparse.Namespace) -> int:
             )
         cf_a = clean_user_path(args.cflash).read_bytes() if args.cflash else None
         cf_b = clean_user_path(args.cflash_b).read_bytes() if args.cflash_b else None
-        pass_a = extract_kombi_immo_passport(clean_user_path(args.dflash).read_bytes(), cf_a)
-        pass_b = extract_kombi_immo_passport(clean_user_path(args.dflash_b).read_bytes(), cf_b)
+        pass_a = _load_cluster_immo_passport(clean_user_path(args.dflash), cf_a, default_family="kombi")
+        pass_b = _load_cluster_immo_passport(clean_user_path(args.dflash_b), cf_b, default_family="kombi")
         plan = plan_kombi_a_to_b_transfer(pass_a, pass_b)
         print(format_kombi_transfer_plan(plan))
         if args.output:
@@ -1451,6 +1684,7 @@ def cmd_kombi(args: argparse.Namespace) -> int:
                 "Specify CAN adapter port via --port (list available ports with: contitool can ports)",
             )
         )
+    _apply_allow_dpdu_driver(args)
     port = args.port or ""
     via_gw = bool(getattr(args, "via_gateway", False))
     gw_ch = int(getattr(args, "gateway_channel", 0) or 0)
@@ -1500,7 +1734,7 @@ def cmd_kombi(args: argparse.Namespace) -> int:
                 f"| Session: {res['session_dir']}"
             )
             return 0
-        sdir = out_file.parent if out_file is not None else default_session_dir(base_out, "kombi_read")
+        sdir = default_session_dir(base_out, "kombi_read")
         res = can_kombi_full_read(
             port,
             interface=args.interface,
@@ -1512,13 +1746,16 @@ def cmd_kombi(args: argparse.Namespace) -> int:
             gateway_channel=gw_ch,
             reporter=rep,
         )
+        if out_file is not None:
+            _copy_primary_read_artifact(res, out_file)
         print(
             format_kombi_report(
                 dflash_info=res.get("secrets"),
                 ident=res.get("ident"),
             )
         )
-        print(f"\n✓ Session: {res['session_dir']} | Report: {res['report_path']}")
+        extra_out = f" | Output: {out_file}" if out_file is not None else ""
+        print(f"\n✓ Session: {res['session_dir']} | Report: {res['report_path']}{extra_out}")
     finally:
         disp.finish()
     return 0
@@ -1549,6 +1786,65 @@ def cmd_bcm(args: argparse.Namespace) -> int:
                 "Specify CAN adapter port via --port (list available ports with: contitool can ports)",
             )
         )
+    # Validate manual adapt-ffb parameters BEFORE touching CAN
+    manual_ffb_keys: list[dict[str, object]] = []
+    is_cluster_ffb = bool(getattr(args, "from_live_cluster", False) or getattr(args, "cluster_dflash", None))
+    if action == "adapt-ffb" and not is_cluster_ffb:
+        kc_arg = getattr(args, "kc", None)
+        k_ffb_arg = getattr(args, "k_ffb", None)
+        if not (kc_arg or k_ffb_arg):
+            raise ValueError(
+                tr(
+                    "Для ручной адаптации bcm adapt-ffb укажите --kc или --k-ffb (либо --cluster-dflash / --from-live-cluster).",
+                    "Manual bcm adapt-ffb requires --kc or --k-ffb (or --cluster-dflash / --from-live-cluster).",
+                )
+            )
+        if kc_arg:
+            parse_hex_key(kc_arg)
+        if k_ffb_arg:
+            parse_hex_key(k_ffb_arg)
+        if getattr(args, "new_gfa", None):
+            parse_hex_key(args.new_gfa)
+        raw_ffb_keys = getattr(args, "ffb_keys", None) or []
+        if not getattr(args, "clear_all", False) and not raw_ffb_keys:
+            raise ValueError(
+                tr(
+                    "Для ручной адаптации bcm adapt-ffb укажите хотя бы один ключ --key SERIAL[:COUNTER] или флаг --clear-all.",
+                    "Manual bcm adapt-ffb requires at least one --key SERIAL[:COUNTER] or --clear-all.",
+                )
+            )
+        for idx, k_spec in enumerate(raw_ffb_keys, start=1):
+            parts = str(k_spec).split(":", 1)
+            ser_hex = parts[0].strip()
+            ser_clean = "".join(ser_hex.split()).replace("0x", "").replace("0X", "")
+            if len(ser_clean) != 8 or not all(c in "0123456789abcdefABCDEF" for c in ser_clean):
+                raise ValueError(
+                    tr(
+                        f"Серийный ID ключа #{idx} должен быть 8 hex-символов, получено: {ser_hex!r}",
+                        f"FFB key #{idx} serial_id must be 8 hex digits, got {ser_hex!r}",
+                    )
+                )
+            cnt_str = parts[1].strip() if len(parts) > 1 else ""
+            if cnt_str:
+                cnt_val = int(cnt_str, 16) if cnt_str.lower().startswith("0x") else int(cnt_str, 10)
+            else:
+                cnt_val = 0
+            if not (0 <= cnt_val <= 0xFFFFFFFF):
+                raise ValueError(
+                    tr(
+                        f"Счётчик ключа #{idx} вне диапазона 0..0xFFFFFFFF: {cnt_val}",
+                        f"FFB key #{idx} rolling counter out of range 0..0xFFFFFFFF: {cnt_val}",
+                    )
+                )
+            manual_ffb_keys.append(
+                {
+                    "slot_number": idx,
+                    "serial_id": ser_hex,
+                    "rolling_counter": cnt_val,
+                }
+            )
+
+    _apply_allow_dpdu_driver(args)
     port = args.port or ""
     via_gw = bool(getattr(args, "via_gateway", False))
     gw_ch = int(getattr(args, "gateway_channel", 0) or 0)
@@ -1602,12 +1898,27 @@ def cmd_bcm(args: argparse.Namespace) -> int:
                 reporter=rep,
             )
         elif action == "adapt-ffb":
-            if getattr(args, "from_live_cluster", False) or getattr(args, "cluster_dflash", None):
+            if is_cluster_ffb:
                 df_bytes = (
                     clean_user_path(args.cluster_dflash).read_bytes()
                     if getattr(args, "cluster_dflash", None)
                     else None
                 )
+                extra_cluster_kw: dict[str, Any] = {}
+                freq_arg = getattr(args, "freq", None)
+                if freq_arg is not None:
+                    if "freq_code" in inspect.signature(can_bcm_adapt_ffb_from_cluster).parameters:
+                        extra_cluster_kw["freq_code"] = freq_arg
+                    else:
+                        print(
+                            tr(
+                                "⚠ Параметр --freq игнорируется в режиме --from-live-cluster / --cluster-dflash "
+                                "(частота берётся из DID 0x0A65 блока 09 BCM).",
+                                "⚠ --freq is ignored with --from-live-cluster / --cluster-dflash "
+                                "(frequency is read from 09 BCM DID 0x0A65).",
+                            ),
+                            file=sys.stderr,
+                        )
                 res = can_bcm_adapt_ffb_from_cluster(
                     port,
                     fpke_dflash=df_bytes,
@@ -1620,26 +1931,15 @@ def cmd_bcm(args: argparse.Namespace) -> int:
                     gateway_channel=gw_ch,
                     sw_profile=sw_prof,
                     reporter=rep,
+                    **extra_cluster_kw,
                 )
             else:
-                keys_arg: list[dict[str, object]] = []
-                for idx, k_spec in enumerate(getattr(args, "ffb_keys", None) or [], start=1):
-                    parts = str(k_spec).split(":", 1)
-                    ser_hex = parts[0].strip()
-                    cnt_val = int(parts[1], 0) if len(parts) > 1 and parts[1].strip() else 0
-                    keys_arg.append(
-                        {
-                            "slot_number": idx,
-                            "serial_id": ser_hex,
-                            "rolling_counter": cnt_val,
-                        }
-                    )
                 res = can_bcm_adapt_ffb(
                     port,
                     gfa=getattr(args, "new_gfa", None),
                     kc=getattr(args, "kc", None),
                     k_ffb=getattr(args, "k_ffb", None),
-                    keys=keys_arg or None,
+                    keys=manual_ffb_keys or None,
                     freq_code=getattr(args, "freq", None),
                     clear_all=bool(getattr(args, "clear_all", False)),
                     interface=args.interface,
@@ -1701,8 +2001,14 @@ def cmd_mrr(args: argparse.Namespace) -> int:
             df_bytes = clean_user_path(args.dflash).read_bytes()
             report["dflash_fee"] = mrr_parse_dflash_fee(df_bytes, cflash_or_boot_bytes=cf_bytes)
         if cf_bytes is not None:
-            if args.dflash and len(cf_bytes) < 0x150000:
+            if len(cf_bytes) < 0x150000:
+                from contitool.core.mrr import mrr_compute_ecu_boot_sum
+
                 report["bootloader_size"] = len(cf_bytes)
+                if len(cf_bytes) >= 0xA000:
+                    report["ecu_boot_sum_hex"] = mrr_compute_ecu_boot_sum(cf_bytes).hex()
+                else:
+                    report["ecu_boot_sum_hex"] = None
             else:
                 prof_arg = getattr(args, "profile", None)
                 report["cflash_cp"] = mrr_inspect_cflash_cp_state(cf_bytes, profile=prof_arg)
@@ -1815,6 +2121,7 @@ def cmd_mrr(args: argparse.Namespace) -> int:
                 "Specify CAN adapter port via --port (list available ports with: contitool can ports)",
             )
         )
+    _apply_allow_dpdu_driver(args)
     port = args.port or ""
 
     disp = _make_cli_display(args)
@@ -1863,6 +2170,7 @@ def cmd_mrr(args: argparse.Namespace) -> int:
                 current_ika=getattr(args, "current_ika", None),
                 new_ika=getattr(args, "new_ika", None),
                 new_gfa=getattr(args, "new_gfa", None),
+                force=bool(getattr(args, "force", False)),
                 reset_after=not bool(getattr(args, "no_reset", False)),
                 interface=args.interface,
                 via_gateway=via_gw,
@@ -1872,8 +2180,8 @@ def cmd_mrr(args: argparse.Namespace) -> int:
                 reporter=rep,
             )
         elif action == "read-mem":
-            s_dir = default_session_dir(base_out, "mrr_read")
             out_p = clean_user_path(args.output) if getattr(args, "output", None) else None
+            s_dir = default_session_dir(base_out, "mrr_read")
             res = can_mrr_read_memory(
                 port,
                 region=getattr(args, "region", "dflash") or "dflash",
@@ -1891,6 +2199,8 @@ def cmd_mrr(args: argparse.Namespace) -> int:
             )
         elif action in ("cp-off", "cp-restore"):
             app_p = clean_user_path(args.cflash) if getattr(args, "cflash", None) else None
+            if app_p is not None and not app_p.is_file():
+                raise FileNotFoundError(str(app_p))
             s_dir = default_session_dir(base_out, "mrr_cp")
             fn = can_mrr_restore_cp_stock if action == "cp-restore" else can_mrr_deactivate_cp
             res = fn(
@@ -1907,8 +2217,10 @@ def cmd_mrr(args: argparse.Namespace) -> int:
             )
         elif action in ("swap-on", "swap-restore"):
             app_p = clean_user_path(args.cflash) if getattr(args, "cflash", None) else None
-            s_dir = default_session_dir(base_out, "mrr_swap")
+            if app_p is not None and not app_p.is_file():
+                raise FileNotFoundError(str(app_p))
             if action == "swap-restore":
+                s_dir = default_session_dir(base_out, "mrr_swap")
                 res = can_mrr_restore_swap_stock(
                     port,
                     app_image=app_p,
@@ -1924,6 +2236,7 @@ def cmd_mrr(args: argparse.Namespace) -> int:
             else:
                 pkg_idx = 6 if getattr(args, "swap_package", None) is None else int(args.swap_package)
                 grp_tuple = _parse_mrr_swap_groups(getattr(args, "swap_groups", None))
+                s_dir = default_session_dir(base_out, "mrr_swap")
                 res = can_mrr_activate_swap(
                     port,
                     package_index=pkg_idx,
@@ -1941,6 +2254,7 @@ def cmd_mrr(args: argparse.Namespace) -> int:
         elif action == "reset-cp-counter":
             res = can_mrr_reset_cp_counter(
                 port,
+                force=bool(getattr(args, "force", False)),
                 reset_after=not bool(getattr(args, "no_reset", False)),
                 interface=args.interface,
                 via_gateway=via_gw,
@@ -1951,6 +2265,8 @@ def cmd_mrr(args: argparse.Namespace) -> int:
             )
         elif action == "flash-frf":
             frf_p = clean_user_path(args.frf)
+            if not frf_p.is_file():
+                raise FileNotFoundError(str(frf_p))
             s_dir = default_session_dir(base_out, "mrr_frf")
             res = can_mrr_flash_frf(
                 port,
@@ -2011,6 +2327,8 @@ def cmd_elv(args: argparse.Namespace) -> int:
             )
         in_p = clean_user_path(args.dflash)
         out_p = clean_user_path(args.output)
+        if in_p.resolve() == out_p.resolve():
+            raise ValueError(tr("Отказ перезаписывать исходный дамп", "Refusing to overwrite input dump"))
         new_raw = elv_virginize_dflash(in_p.read_bytes(), virgin_k5=getattr(args, "virgin_k5", None))
         out_p.parent.mkdir(parents=True, exist_ok=True)
         out_p.write_bytes(new_raw)
@@ -2030,6 +2348,8 @@ def cmd_elv(args: argparse.Namespace) -> int:
             )
         in_p = clean_user_path(args.dflash)
         out_p = clean_user_path(args.output)
+        if in_p.resolve() == out_p.resolve():
+            raise ValueError(tr("Отказ перезаписывать исходный дамп", "Refusing to overwrite input dump"))
         vin = getattr(args, "vin", None)
         k5 = getattr(args, "k5", None)
         pc = getattr(args, "power_class", None)
@@ -2122,14 +2442,19 @@ def cmd_elv(args: argparse.Namespace) -> int:
     if getattr(args, "idac", None) is not None:
         _norm_hex_bytes(args.idac, 2, "--idac")
 
-    cl_df_bytes: bytes | None = None
-    cl_cf_bytes: bytes | None = None
+    adapt_vin: str | None = None
+    adapt_k5: str | None = None
+    adapt_pc: int | None = None
+    adapt_cluster_mat: dict[str, Any] | None = None
     if action == "adapt":
+        adapt_vin = getattr(args, "vin", None)
+        adapt_k5 = getattr(args, "k5", None)
+        adapt_pc = getattr(args, "power_class", None)
         if getattr(args, "cluster_dflash", None):
             cl_df_bytes = clean_user_path(args.cluster_dflash).read_bytes()
             cl_cf_bytes = clean_user_path(args.cluster_cflash).read_bytes() if getattr(args, "cluster_cflash", None) else None
-            mat = elv_extract_cluster_material(cl_df_bytes, cl_cf_bytes)
-            if mat.get("slot_a_crc_ok") is False:
+            adapt_cluster_mat = elv_extract_cluster_material(cl_df_bytes, cl_cf_bytes)
+            if adapt_cluster_mat.get("slot_a_crc_ok") is False and not adapt_k5:
                 raise RuntimeError(
                     tr(
                         "Контрольная сумма CRC-32 ключа Slot A (K_5) в дампе приборной панели FPK_E не совпадает с EEL 0x68 — "
@@ -2138,18 +2463,22 @@ def cmd_elv(args: argparse.Namespace) -> int:
                         "ELV adaptation aborted to avoid writing a corrupted key.",
                     )
                 )
-        else:
-            if not (args.vin and args.k5 and args.power_class is not None):
-                raise ValueError(
-                    tr(
-                        "Для elv adapt укажите --cluster-dflash или --vin, --k5 и --power-class",
-                        "elv adapt requires --cluster-dflash or --vin, --k5, and --power-class",
-                    )
+            adapt_vin = adapt_vin or adapt_cluster_mat.get("vin") or None
+            adapt_k5 = adapt_k5 or adapt_cluster_mat.get("slot_a_hex") or None
+            if adapt_pc is None:
+                adapt_pc = adapt_cluster_mat.get("power_class")
+        if not (adapt_vin and adapt_k5 and adapt_pc is not None):
+            raise ValueError(
+                tr(
+                    "Для elv adapt укажите --cluster-dflash или --vin, --k5 и --power-class",
+                    "elv adapt requires --cluster-dflash or --vin, --k5, and --power-class",
                 )
-            _norm_vin17(args.vin)
-            _norm_hex_bytes(args.k5, 16, "--k5")
-            _validate_u8(int(args.power_class), "--power-class")
+            )
+        _norm_vin17(adapt_vin)
+        _norm_hex_bytes(adapt_k5, 16, "--k5")
+        _validate_u8(int(adapt_pc), "--power-class")
 
+    _apply_allow_dpdu_driver(args)
     port = args.port or ""
     via_gw = bool(getattr(args, "via_gateway", False))
     gw_ch = 0 if getattr(args, "gateway_channel", None) is None else int(args.gateway_channel)
@@ -2182,38 +2511,25 @@ def cmd_elv(args: argparse.Namespace) -> int:
             if "dflash_parsed" in res and not getattr(args, "records", False):
                 res["dflash_parsed"] = {k: v for k, v in res["dflash_parsed"].items() if k != "records"}
         elif action == "adapt":
+            assert adapt_vin is not None and adapt_k5 is not None and adapt_pc is not None
             s_dir = default_session_dir(base_out, "elv_adapt")
-            if cl_df_bytes is not None:
-                res = can_elv_adapt_from_cluster(
-                    port,
-                    cl_df_bytes,
-                    fpke_cflash=cl_cf_bytes,
-                    current_k5=getattr(args, "current_k5", None),
-                    cfg_byte=0x80 if getattr(args, "cfg", None) is None else int(args.cfg),
-                    brand_byte=0x01 if getattr(args, "brand", None) is None else int(args.brand),
-                    backup_dir=s_dir,
-                    interface=args.interface,
-                    via_gateway=via_gw,
-                    gateway_bridge=via_gw,
-                    gateway_channel=gw_ch,
-                    reporter=rep,
-                )
-            else:
-                res = can_elv_adapt(
-                    port,
-                    new_vin=args.vin,
-                    new_k5=args.k5,
-                    new_power_class=int(args.power_class),
-                    current_k5=getattr(args, "current_k5", None),
-                    cfg_byte=0x80 if getattr(args, "cfg", None) is None else int(args.cfg),
-                    brand_byte=0x01 if getattr(args, "brand", None) is None else int(args.brand),
-                    backup_dir=s_dir,
-                    interface=args.interface,
-                    via_gateway=via_gw,
-                    gateway_bridge=via_gw,
-                    gateway_channel=gw_ch,
-                    reporter=rep,
-                )
+            res = can_elv_adapt(
+                port,
+                new_vin=adapt_vin,
+                new_k5=adapt_k5,
+                new_power_class=int(adapt_pc),
+                current_k5=getattr(args, "current_k5", None),
+                cfg_byte=0x80 if getattr(args, "cfg", None) is None else int(args.cfg),
+                brand_byte=0x01 if getattr(args, "brand", None) is None else int(args.brand),
+                backup_dir=s_dir,
+                interface=args.interface,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                reporter=rep,
+            )
+            if adapt_cluster_mat is not None:
+                res["cluster_material"] = adapt_cluster_mat
         elif action == "virginize":
             s_dir = default_session_dir(base_out, "elv_virginize")
             res = can_elv_virginize(
@@ -2405,8 +2721,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=tr("Отключить ранее активные FeC, не вошедшие в список включения", "Deactivate previously active FeCs not in the enabled set"),
     )
-    p_asw.add_argument("--vin", help=tr("Переопределить 17-символьный VIN в слотах FSC", "Override 17-char VIN in FSC slots"))
-    p_asw.add_argument("--no-vin", action="store_true", help=tr("Не привязывать слоты FSC к VIN (00..00)", "Leave VIN empty (00..00) in FSC slots"))
+    vin_asw = p_asw.add_mutually_exclusive_group()
+    vin_asw.add_argument("--vin", help=tr("Переопределить 17-символьный VIN в слотах FSC", "Override 17-char VIN in FSC slots"))
+    vin_asw.add_argument("--no-vin", action="store_true", help=tr("Не привязывать слоты FSC к VIN (00..00)", "Leave VIN empty (00..00) in FSC slots"))
     p_asw.add_argument("--timestamp", type=lambda x: int(x, 0), default=None, help=tr("Unix-время для слотов FSC", "Unix timestamp for FSC slots"))
     p_asw.add_argument(
         "--auto-parameterize",
@@ -2474,8 +2791,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_fsc.add_argument("--fec", required=True)
     p_fsc.add_argument("--dflash")
     p_fsc.add_argument("--vcrn")
-    p_fsc.add_argument("--vin")
-    p_fsc.add_argument("--no-vin", action="store_true")
+    vin_fsc = p_fsc.add_mutually_exclusive_group()
+    vin_fsc.add_argument("--vin")
+    vin_fsc.add_argument("--no-vin", action="store_true")
     p_fsc.add_argument("--timestamp", type=lambda x: int(x, 0), default=None)
     p_fsc.add_argument("-o", "--output")
     p_fsc.set_defaults(func=cmd_sign_fsc)
@@ -2577,6 +2895,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_fpke.add_argument("--frame-delay", type=float, default=FPKE_DEFAULT_FRAME_DELAY, help=tr("Пауза между кадрами потока (с, по умолчанию 0.00035)", "Inter-frame delay for block stream (s, default 0.00035)"))
     p_fpke.add_argument("--wake-seconds", type=float, default=4.0, help=tr("Время пробуждения панели приборов CAN-посылками (по умолчанию 4.0 с)", "CAN keepalive wake duration (default 4.0 s)"))
     p_fpke.add_argument("--stream", action="store_true", help=tr("Использовать быстрый поток RSCAN0 TM17 (0x6F1) с авто-откатом на UDS 0x23", "Use fast RSCAN0 TM17 (0x6F1) stream with auto-fallback to UDS 0x23"))
+    p_fpke.add_argument("--no-blank-check", action="store_true", help=tr("Пропустить аппаратный FACI Blank-Check (0x71) при чтении DataFlash (сохранит сырой CPU-дамп с шумом в стёртых ячейках)", "Skip hardware FACI Blank-Check (0x71) when reading DataFlash (saves raw CPU dump with noise in erased cells)"))
     p_fpke.add_argument("--read-uflash", action="store_true", help=tr("В режиме report также считать UFlash (32 КБ)", "Also read UFlash (32 KB) in report mode"))
     p_fpke.add_argument("--read-bflash", action="store_true", help=tr("В режиме report также считать BFlash (96 КБ)", "Also read BFlash (96 KB) in report mode"))
     p_fpke.add_argument("--read-cflash", action="store_true", help=tr("В режиме report также считать CodeFlash (2 МБ)", "Also read CodeFlash (2 MB) in report mode"))
@@ -2586,6 +2905,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_fpke.add_argument("--gateway-channel", type=int, default=0, help=tr("Канал RSCAN0 шлюза J533 (по умолчанию 0 — Komfort CAN)", "J533 RSCAN0 sub-bus channel (default 0 — Komfort CAN)"))
     p_fpke.add_argument("-o", "--output", help=tr("Путь к выходному файлу .bin", "Output .bin file path"))
     p_fpke.add_argument("--output-dir", help=tr("Папка для сохранения сессии", "Base output directory for session"))
+    p_fpke.add_argument(
+        "--allow-dpdu-driver",
+        action="store_true",
+        help=tr("Разрешить установленный драйвер D-PDU непроверенной версии (он перепрошьёт VCI под себя)",
+                "Allow an unverified installed D-PDU driver version (it reflashes the VCI to its own version)"),
+    )
     p_fpke.set_defaults(func=cmd_fpke)
 
     p_kombi = _add(
@@ -2618,6 +2943,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_kombi.add_argument("--gateway-channel", type=int, default=0, help=tr("Канал RSCAN0 шлюза J533 (по умолчанию 0 — Komfort CAN)", "J533 RSCAN0 sub-bus channel (default 0 — Komfort CAN)"))
     p_kombi.add_argument("-o", "--output", help=tr("Путь к выходному файлу (.bin или .json)", "Output file path (.bin or .json)"))
     p_kombi.add_argument("--output-dir", help=tr("Папка для сохранения сессии", "Base output directory for session"))
+    p_kombi.add_argument(
+        "--allow-dpdu-driver",
+        action="store_true",
+        help=tr("Разрешить установленный драйвер D-PDU непроверенной версии (он перепрошьёт VCI под себя)",
+                "Allow an unverified installed D-PDU driver version (it reflashes the VCI to its own version)"),
+    )
     p_kombi.set_defaults(func=cmd_kombi)
 
     p_bcm = _add(
@@ -2654,6 +2985,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_bcm.add_argument("--clear-all", action="store_true", help=tr("Очистить все слоты радиоключей FFB (80 02 00)", "Clear all FFB remote key slots (80 02 00)"))
     p_bcm.add_argument("-y", "--yes", action="store_true", help=tr("Подтвердить запись в NvM блока 09 BCM (write-keys / adapt-ffb)", "Confirm live 09 BCM NvM write (write-keys / adapt-ffb)"))
     p_bcm.add_argument("-o", "--output", help=tr("Путь к выходному JSON-файлу", "Output JSON file path"))
+    p_bcm.add_argument(
+        "--allow-dpdu-driver",
+        action="store_true",
+        help=tr("Разрешить установленный драйвер D-PDU непроверенной версии (он перепрошьёт VCI под себя)",
+                "Allow an unverified installed D-PDU driver version (it reflashes the VCI to its own version)"),
+    )
     p_bcm.set_defaults(func=cmd_bcm)
 
     p_mrr = _add(
@@ -2711,6 +3048,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_mrr.add_argument("-y", "--yes", action="store_true", help=tr("Подтвердить запись во Flash / NvM (cp-off / cp-restore / swap-on / swap-restore / write-keys / reset-cp-counter)", "Confirm live Flash / NvM write (cp-off / cp-restore / swap-on / swap-restore / write-keys / reset-cp-counter)"))
     p_mrr.add_argument("-o", "--output", help=tr("Путь к выходному файлу (.bin или .json)", "Output file path (.bin or .json)"))
     p_mrr.add_argument("--output-dir", help=tr("Базовая папка сессии", "Base session output directory"))
+    p_mrr.add_argument(
+        "--allow-dpdu-driver",
+        action="store_true",
+        help=tr("Разрешить установленный драйвер D-PDU непроверенной версии (он перепрошьёт VCI под себя)",
+                "Allow an unverified installed D-PDU driver version (it reflashes the VCI to its own version)"),
+    )
     p_mrr.set_defaults(func=cmd_mrr)
 
     p_elv = _add(
@@ -2756,11 +3099,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_elv.add_argument("--cfg", type=_parse_u8_hex, help=tr("Байт конфигурации WFS5 в hex (например 80 или 0x80, по умолчанию 0x80)", "WFS5 config byte in hex (e.g. 80 or 0x80, default 0x80)"))
     p_elv.add_argument("--brand", type=_parse_u8_hex, help=tr("Байт бренда WFS5 в hex (например 01 или 0x01, по умолчанию 0x01)", "WFS5 brand byte in hex (e.g. 01 or 0x01, default 0x01)"))
     p_elv.add_argument("--no-verify-02f9", action="store_true", help=tr("Пропустить онлайн-проверку криптоподписи 22 02F9 после read-dflash", "Skip live 22 02F9 MAC check after read-dflash"))
-    p_elv.add_argument("--enter-programming", action="store_true", help=tr("В check-bootloader войти в 10 02 и проверить SecurityAccess 27 11/12 (затем 11 02 Reset)", "In check-bootloader enter 10 02 and test SecurityAccess 27 11/12 (then 11 02 Reset)"))
+    p_elv.add_argument("--enter-programming", action="store_true", help=tr("В check-bootloader войти в 10 02 и проверить SecurityAccess 27 11/12 (затем 11 01 Reset)", "In check-bootloader enter 10 02 and test SecurityAccess 27 11/12 (then 11 01 Reset)"))
     p_elv.add_argument("--records", action="store_true", help=tr("Включить полный список всех 47 записей EEELib в вывод JSON", "Include full list of all 47 EEELib records in JSON output"))
     p_elv.add_argument("-y", "--yes", action="store_true", help=tr("Подтвердить запись/сброс в блоке 2B ELV (adapt / virginize / reset-idac / clear-dtc / check-bootloader --enter-programming)", "Confirm live write/reset on 2B ELV (adapt / virginize / reset-idac / clear-dtc / check-bootloader --enter-programming)"))
     p_elv.add_argument("-o", "--output", help=tr("Путь к выходному файлу (.bin или .json)", "Output file path (.bin or .json)"))
     p_elv.add_argument("--output-dir", help=tr("Базовая папка сессии", "Base session output directory"))
+    p_elv.add_argument(
+        "--allow-dpdu-driver",
+        action="store_true",
+        help=tr("Разрешить установленный драйвер D-PDU непроверенной версии (он перепрошьёт VCI под себя)",
+                "Allow an unverified installed D-PDU driver version (it reflashes the VCI to its own version)"),
+    )
     p_elv.set_defaults(func=cmd_elv)
 
     return ap

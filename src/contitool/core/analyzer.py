@@ -623,7 +623,13 @@ def analyze_dflash_swap(df: bytes) -> DflashSwapSummary:
         if spay[0:2] == b"\x11\x02" and spay[6] == 0x03:
             fec_u32, = struct.unpack_from(">I", spay, 2)
             svcrn = spay[7:12].hex()
-            raw_vin = spay[12:29].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+            vin_raw = spay[12:29]
+            cut = len(vin_raw)
+            for idx_b, bv in enumerate(vin_raw):
+                if bv in (0x00, 0xFF):
+                    cut = idx_b
+                    break
+            raw_vin = "".join(chr(bv) for bv in vin_raw[:cut] if 0x20 <= bv <= 0x7E).strip()
             ts_u32, = struct.unpack_from(">I", spay, 30)
             slot_timestamps[fec_u32] = max(slot_timestamps.get(fec_u32, 0), ts_u32)
             factory_eol = not any(spay[FSC_SIGNED_BODY_SIZE:])
@@ -643,7 +649,12 @@ def analyze_dflash_swap(df: bytes) -> DflashSwapSummary:
             if vcrn_matches:
                 # Only treat a certificate's VIN as belonging to this vehicle when its VCRN matches this gateway:
                 # a used gateway re-adapted online keeps the donor car's rejected FSC slots (old VCRN & donor VIN).
-                if scrc_ok and raw_vin and not detected_vin:
+                if (
+                    scrc_ok
+                    and len(raw_vin) == 17
+                    and all(0x20 <= ord(c) <= 0x7E for c in raw_vin)
+                    and not detected_vin
+                ):
                     detected_vin = raw_vin
                 fscs.append(slot_info)
             else:
@@ -951,13 +962,33 @@ def analyze_dflash(df: bytes) -> list[SlotState]:
         if m1 == 0xFFFFFFFF and m2 == 0xFFFFFFFF:
             states.append(SlotState(spec=spec, empty=True, kind="EMPTY"))
             continue
-        base = spec.off1 if m1 == 0x55555555 else spec.off2
-        c_stored, = struct.unpack_from("<I", df, base + spec.crc_off)
-        payload = df[base + 4 : base + 4 + spec.rec_size]
-        c_calc = zlib.crc32(payload) & 0xFFFFFFFF
+
+        def _read_bank(off: int, magic: int) -> tuple[int, bytes, int, int, bool]:
+            c_st, = struct.unpack_from("<I", df, off + spec.crc_off)
+            pay = df[off + 4 : off + 4 + spec.rec_size]
+            c_ca = zlib.crc32(pay) & 0xFFFFFFFF
+            ok = (magic == 0x55555555) and (c_st == c_ca)
+            return magic, pay, c_st, c_ca, ok
+
+        b1 = _read_bank(spec.off1, m1)
+        b2 = _read_bank(spec.off2, m2)
+        if b1[4]:
+            chosen = b1
+        elif b2[4]:
+            chosen = b2
+        elif m1 == 0x55555555:
+            chosen = b1
+        elif m2 == 0x55555555:
+            chosen = b2
+        elif m1 != 0xFFFFFFFF:
+            chosen = b1
+        else:
+            chosen = b2
+
+        chosen_magic, payload, c_stored, c_calc, crc_ok = chosen
         rec_len = spec.crc_off + 4
         mirrored = df[spec.off1 : spec.off1 + rec_len] == df[spec.off2 : spec.off2 + rec_len]
-        kind = classify_dflash_record(payload) if m1 == 0x55555555 or m2 == 0x55555555 else "PARTIAL"
+        kind = classify_dflash_record(payload) if chosen_magic == 0x55555555 else "PARTIAL"
         states.append(
             SlotState(
                 spec=spec,
@@ -965,7 +996,7 @@ def analyze_dflash(df: bytes) -> list[SlotState]:
                 kind=kind,
                 crc_stored=c_stored,
                 crc_calc=c_calc,
-                crc_ok=(c_stored == c_calc and (m1 == 0x55555555 or m2 == 0x55555555)),
+                crc_ok=crc_ok,
                 mirrored=mirrored,
                 first16_hex=payload[:16].hex(),
             )

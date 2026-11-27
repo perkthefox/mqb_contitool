@@ -1153,3 +1153,62 @@ def test_selective_zdc_upload_cflash_descriptor_map_and_7f3431_message(
     res_ok = can_upload_zdc_datasets("fake", base_df, blocks=[2], cflash_bytes=bytes(fake_cf), bus=gw_old)
     assert res_ok["complete"] is True
     assert res_ok["uploaded_blocks"] == [{"idx": 2, "code": "SSA_REASONS", "uds_addr": "0x00002480", "size": 0x0800}]
+
+
+def test_zdc_bom_neg_addr_empty_donor_knob_s030_console_ring_gra_and_all(synth_dflash: bytes) -> None:
+    import struct
+    import zlib
+
+    from contitool.core import zdc as zdc_mod
+
+    set_lang("en")
+    assert "zdc_ver_ok" in zdc_mod.__all__
+    assert "parse_cflash_zdc_upload_map" in zdc_mod.__all__
+
+    # 1. BOM + leading whitespace in ODIS ZDC XML
+    good = bytearray(b"QQ00" + bytes(4348))
+    struct.pack_into("<I", good, 0x10FC, zlib.crc32(bytes(good[:0x10FC])) & 0xFFFFFFFF)
+    xml_bom = (
+        b"\xef\xbb\xbf  \r\n"
+        b'<MESSAGE><PARAMETER_DATA START_ADDRESS="0x0B80" DIAGNOSTIC_ADDRESS="0x19" '
+        b'ZDC_NAME="V09999999ZZ" ZDC_VERSION="0001">' + bytes(good).hex().encode() + b"</PARAMETER_DATA></MESSAGE>"
+    )
+    assert zdc_mod.parse_odis_zdc_file(xml_bom).zdc_idx == 4
+
+    # 2. Unparseable / negative START_ADDRESS does not format as "0x-001"
+    bad_addr_xml = (
+        '<MESSAGE><PARAMETER_DATA START_ADDRESS="zz" DIAGNOSTIC_ADDRESS="0x19" '
+        'ZDC_NAME="V09999999ZZ" ZDC_VERSION="0001">' + bytes(good).hex() + "</PARAMETER_DATA></MESSAGE>"
+    )
+    with pytest.raises(ValueError) as exc_info:
+        zdc_mod.parse_odis_zdc_file(bad_addr_xml)
+    assert "0x-001" not in str(exc_info.value) and "zz" in str(exc_info.value)
+
+    # 3. Empty donor block with copy_donor_passport=True must not mutate target's passport
+    target = apply_zdc_passport(synth_dflash, dataset_pn="V03935000AA", dataset_ver="0005")
+    donor = apply_zdc_passport(synth_dflash, dataset_pn="V03935999ZZ", dataset_ver="0009")
+    # ZDC #1 in donor is all 0xFF (empty)
+    after_empty = import_zdc_block(target, 1, donor, copy_donor_passport=True)
+    assert parse_zdc_passport(after_empty).dataset_pn == "V03935000AA"
+    assert parse_zdc_passport(after_empty).dataset_ver == "0005"
+
+    # 4. _add_4motion_knob sets S030 bits 4, 8, 9 for newly populated knob slots
+    fpa_fwd = build_fpa_preset_block("fwd")
+    assert (fpa_fwd.selectable_mask & ((1 << 4) | (1 << 8) | (1 << 9))) == 0
+    fpa_fwd.add_4motion_knob()
+    assert (fpa_fwd.selectable_mask & (1 << 4)) != 0
+    assert (fpa_fwd.selectable_mask & (1 << 8)) != 0
+    assert (fpa_fwd.selectable_mask & (1 << 9)) != 0
+
+    # 5. button_config() returns empty console_ring when no console input is configured
+    fpa_mfl = build_fpa_preset_block("fwd_dcc")
+    fpa_mfl.configure_buttons(mode="mfl", mfl_keycode=0x19, mfl_ring=[2, 3])
+    bcfg = fpa_mfl.button_config()
+    assert bcfg.mode == "mfl" and bcfg.console_ring == [] and bcfg.mfl_ring == [2, 3]
+
+    # 6. parameterize_dflash_for_fecs repairs corrupt-CRC ZDC #4 for GRA-only FeC 0x10000100
+    corrupt_df = bytearray(synth_dflash)
+    corrupt_df[0x1340:0x1344] = b"BAD!"  # non-empty but bad CRC-32
+    repaired_df, actions = parameterize_dflash_for_fecs(bytes(corrupt_df), [0x10000100])
+    assert check_fec_dataset_support(repaired_df, 0x10000100).supported
+    assert any("JC00" in a for a in actions)

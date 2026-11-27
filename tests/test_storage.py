@@ -21,13 +21,14 @@ def test_gateway_folder_names(synth_cflash: bytes) -> None:
 def test_first_complete_read_becomes_base_read_and_writes_record_what_changed(tmp_path: Path) -> None:
     root = tmp_path / "contitool_runs"
     read = storage.new_session(root, "PN_FZ", "read", dumps=True)
-    images = {"Cflash.bin": bytes(4096), "Dflash.bin": bytes(1024), "Uflash.bin": bytes(512)}
+    images = {name: bytes(sz) for name, sz in storage.AREA_SIZES.items()}
     for name, raw in images.items():
         (read / name).write_bytes(raw)
     (read / "manifest.json").write_text(json.dumps({"areas": {"cflash": {"output_file": str(read / "Cflash.bin")}}}))
     base = storage.keep_as_base(read)
     assert base == root / "PN_FZ" / "dumps" / "base_read" and not read.exists()
     assert json.loads((base / "manifest.json").read_text())["areas"]["cflash"]["output_file"] == str(base / "Cflash.bin")
+    assert not list(base.glob(".manifest_*.tmp"))
     again = storage.new_session(root, "PN_FZ", "read", dumps=True)
     for name, raw in images.items():
         (again / name).write_bytes(raw)
@@ -87,3 +88,35 @@ def test_a_full_read_on_file_is_recognised(tmp_path: Path) -> None:
     other = tmp_path / "unknown"
     shutil.copytree(unit / "dumps", other / "dumps")
     assert not storage.has_full_read(other)  # another gateway's read cannot vouch for an unidentified one
+
+
+def test_keep_as_base_rejects_short_files_and_guards_corrupt_manifest(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    partial = storage.new_session(root, "PN_FZ", "read", dumps=True)
+    for name in storage.AREA_FILES:
+        (partial / name).write_bytes(b"\x00" * 16)
+    assert storage.keep_as_base(partial) == partial
+    assert not (root / "PN_FZ" / "dumps" / "base_read").exists()
+
+    full = storage.new_session(root, "PN_FZ", "read", dumps=True)
+    for name, sz in storage.AREA_SIZES.items():
+        (full / name).write_bytes(bytes(sz))
+    (full / "manifest.json").write_text("{corrupt json", encoding="utf-8")
+    base = storage.keep_as_base(full)
+    assert base == root / "PN_FZ" / "dumps" / "base_read"
+    assert (base / "manifest.json").read_text(encoding="utf-8") == "{corrupt json"
+
+
+def test_latest_area_accepts_both_32_and_36_byte_opbt(tmp_path: Path) -> None:
+    unit = tmp_path / "3Q0907530C_TST-SYN01.01.260000001"
+    r1 = unit / "dumps" / "2026-11-09_10-00-00_read"
+    r2 = unit / "dumps" / "2026-11-09_11-00-00_read"
+    r3 = unit / "dumps" / "2026-11-09_12-00-00_read"
+    for d in (r1, r2, r3):
+        d.mkdir(parents=True)
+    (r1 / "Opbt.bin").write_bytes(bytes(32))
+    assert storage.latest_area(unit, "Opbt.bin") == r1 / "Opbt.bin"
+    (r2 / "Opbt.bin").write_bytes(bytes(36))
+    assert storage.latest_area(unit, "Opbt.bin") == r2 / "Opbt.bin"
+    (r3 / "Opbt.bin").write_bytes(bytes(16))  # truncated: ignored
+    assert storage.latest_area(unit, "Opbt.bin") == r2 / "Opbt.bin"

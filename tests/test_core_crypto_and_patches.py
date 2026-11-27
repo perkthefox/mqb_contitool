@@ -271,3 +271,70 @@ def test_cli_subcommands_end_to_end(
     assert len(fsc_out.read_bytes()) == 171
     assert main(["sign-odx", "-i", str(cf_rsa), "-k", str(kp_json), "-o", str(sig_out)]) == 0
     assert len(sig_out.read_bytes()) == 128
+
+
+def test_crypto_key_hardening_and_patcher_guards(
+    synth_cflash: bytes,
+    synth_dflash: bytes,
+    tmp_path: Path,
+) -> None:
+    import json
+    import os
+    import stat
+    import struct
+
+    from contitool.core.constants import APP_BASE
+    from contitool.core.crypto import _der_int, _der_seq, _gen_prime_512_for_e3, _pem_wrap
+    from contitool.progress import NULL_REPORTER, OperationReporter
+
+    # 1. save_rsa1024_keypair_bundle sets 0o600 on BOTH json_path and priv_path (POSIX)
+    kp = generate_rsa1024_e3_keypair()
+    j_path, priv_path, pub_path = save_rsa1024_keypair_bundle(tmp_path / "sec.json", kp)
+    if os.name == "posix":
+        assert stat.S_IMODE(j_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(priv_path.stat().st_mode) == 0o600
+
+    # 2. JSON branch enforces MSB=1 on n_hex
+    bad_json = tmp_path / "low_msb.json"
+    bad_json.write_text(json.dumps({**kp, "n_hex": "00" + kp["n_hex"][2:]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="Top bit|Старший бит"):
+        load_rsa1024_key_material(bad_json)
+
+    # 3. PEM branch decodes blocks independently and checks ints[mod_idx + 1] == 3
+    n_int = int(kp["n_hex"], 16)
+    # Build a PEM with e=65537 and a stray integer 3 elsewhere (e.g. version=3)
+    bad_e_der = _der_seq([_der_int(3), _der_int(n_int), _der_int(65537)])
+    bad_e_pem = tmp_path / "bad_e.pem"
+    bad_e_pem.write_text(_pem_wrap("RSA PRIVATE KEY", bad_e_der), encoding="utf-8")
+    with pytest.raises(ValueError, match="e is not 3|не равна 3"):
+        load_rsa1024_key_material(bad_e_pem)
+
+    # Multi-block PEM (public followed by private) extracts private exponent cleanly
+    combo_pem = tmp_path / "combo.pem"
+    combo_pem.write_text(pub_path.read_text(encoding="utf-8") + "\n" + priv_path.read_text(encoding="utf-8"), encoding="utf-8")
+    n_combo, d_combo = load_rsa1024_key_material(combo_pem)
+    assert n_combo == bytes.fromhex(kp["n_hex"]) and d_combo == int(kp["d_hex"], 16)
+
+    # 4. build_signed_fsc validates printable ASCII VIN
+    with pytest.raises(ValueError, match="VIN"):
+        build_signed_fsc(0x10000100, b"\x11\x22\x33\x44\x55", "WVWZZZ\x01UZJW000001", n_combo, d_combo)
+    with pytest.raises(ValueError, match="VIN"):
+        build_signed_fsc(0x10000100, b"\x11\x22\x33\x44\x55", "WVWZZZÄUZJW000001", n_combo, d_combo)
+
+    # 5. _gen_prime_512_for_e3 yields a 512-bit prime with p % 3 == 2
+    p = _gen_prime_512_for_e3(NULL_REPORTER, "p", 0)
+    assert p.bit_length() == 512 and p % 3 == 2 and (p >> 510) == 3
+
+    # 6. apply_engineering_patch refuses range_cnt == 0 unless ignore_input_crc=True
+    zero_rc = bytearray(synth_cflash)
+    struct.pack_into("<H", zero_rc, APP_BASE + 0x1E, 0)
+    with pytest.raises(RuntimeError, match="0x0000C21E"):
+        apply_engineering_patch(bytes(zero_rc))
+    repaired, _, _ = apply_engineering_patch(bytes(zero_rc), ignore_input_crc=True)
+    assert analyze_cflash(repaired).crc_ok
+
+    # 7. bind_cp_turnkey forwards reporter to apply_cflash_patch
+    steps: list[str] = []
+    rep = OperationReporter(on_step=lambda snap: steps.append(snap.title))
+    bind_cp_turnkey(synth_cflash, synth_dflash, [(parse_slot_selector("5F"), parse_hex_key("A1" * 16))], reporter=rep)
+    assert any("KSCHUTZ" in s for s in steps) and any("CRC-16" in s for s in steps)

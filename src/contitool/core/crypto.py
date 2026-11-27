@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import contextlib
 import hashlib
 import json
 import os
@@ -152,8 +154,10 @@ def _gen_prime_512_for_e3(reporter: OperationReporter, label: str, base_pct: int
             )
         cand = secrets.randbits(512) | (3 << 510) | 1
         rem = cand % 3
-        if rem in (0, 1):
+        if rem == 0:
             cand += 2
+        elif rem == 1:
+            cand += 4
         if cand.bit_length() == 512 and (cand % 3) == 2 and _is_probable_prime(cand):
             reporter.info(
                 tr(
@@ -295,16 +299,16 @@ def save_rsa1024_keypair_bundle(json_path: Path, kp: dict) -> tuple[Path, Path, 
     """Save JSON keypair + private PKCS#1 PEM + public SPKI PEM next to each other."""
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(kp, indent=2) + "\n", encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(json_path, 0o600)
     priv_pem, pub_pem = export_rsa_keypair_pems(kp)
     stem = json_path.stem
     priv_path = json_path.with_name(f"{stem}.private.pem")
     pub_path = json_path.with_name(f"{stem}.public.pem")
     priv_path.write_text(priv_pem, encoding="utf-8")
     pub_path.write_text(pub_pem, encoding="utf-8")
-    try:
+    with contextlib.suppress(OSError):
         os.chmod(priv_path, 0o600)
-    except OSError:
-        pass
     return json_path, priv_path, pub_path
 
 
@@ -375,32 +379,65 @@ def load_rsa1024_key_material(raw_spec: str | Path) -> tuple[bytes, int | None]:
                     )
                 )
             n_bytes = bytes.fromhex(n_hex)
+            if (n_bytes[0] & 0x80) == 0:
+                raise ValueError(
+                    tr(
+                        "Старший бит 128-байтного модуля RSA должен быть 1 (1024 бита).",
+                        "Top bit of the 128-byte RSA modulus must be 1 (full 1024-bit modulus).",
+                    )
+                )
             d_val = int(obj["d_hex"], 16) if obj.get("d_hex") else None
             return n_bytes, d_val
         if "-----BEGIN" in txt:
-            b64_lines = [
-                ln.strip() for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith("-----")
-            ]
-            der = base64.b64decode("".join(b64_lines))
-            ints = _parse_der_integers(der)
-            mods = [x for x in ints if x.bit_length() == 1024]
-            if not mods:
+            pem_blocks = re.findall(
+                r"-----BEGIN [^-]+-----(.*?)-----END [^-]+-----",
+                txt,
+                flags=re.DOTALL,
+            )
+            if not pem_blocks:
                 raise ValueError(
                     tr(
-                        "В PEM-файле не найден 1024-битный модуль RSA!",
-                        "No 1024-bit RSA modulus found in PEM file!",
+                        "В PEM-файле не найден корректный блок BEGIN/END!",
+                        "No valid BEGIN/END block found in PEM file!",
                     )
                 )
-            if 3 not in ints:
+            found_pub: tuple[bytes, int | None] | None = None
+            saw_bad_exp = False
+            for block in pem_blocks:
+                try:
+                    der = base64.b64decode("".join(block.split()), validate=True)
+                except (binascii.Error, ValueError) as exc:
+                    raise ValueError(
+                        tr("Некорректные данные base64 в PEM-файле!", "Invalid base64 data in PEM file!")
+                    ) from exc
+                ints = _parse_der_integers(der)
+                mod_idx = next((idx for idx, x in enumerate(ints) if x.bit_length() == 1024), None)
+                if mod_idx is None:
+                    continue
+                if mod_idx + 1 >= len(ints) or ints[mod_idx + 1] != 3:
+                    saw_bad_exp = True
+                    continue
+                n_val = ints[mod_idx]
+                priv_cands = [x for x in ints[mod_idx + 2 :] if x != n_val and x.bit_length() > 900]
+                if priv_cands:
+                    return n_val.to_bytes(128, "big"), priv_cands[0]
+                if found_pub is None:
+                    found_pub = (n_val.to_bytes(128, "big"), None)
+            if found_pub is not None:
+                return found_pub
+            if saw_bad_exp:
                 raise ValueError(
                     tr(
                         "Экспонента e в PEM-файле не равна 3 (загрузчик требует e=3)!",
                         "PEM public exponent e is not 3 (bootloader requires e=3)!",
                     )
                 )
-            n_val = mods[0]
-            priv_cands = [x for x in ints if x != n_val and x.bit_length() > 900]
-            return n_val.to_bytes(128, "big"), (priv_cands[0] if priv_cands else None)
+            raise ValueError(
+                tr(
+                    "В PEM-файле не найден 1024-битный модуль RSA!",
+                    "No 1024-bit RSA modulus found in PEM file!",
+                )
+            )
         raw_spec = txt
 
     cleaned = re.sub(r"0x", "", str(raw_spec).strip(), flags=re.IGNORECASE)
@@ -440,7 +477,7 @@ def build_signed_fsc(
             tr("VCRN должен иметь длину ровно 5 байт (10 hex-символов)", "VCRN must be 5 bytes (10 hex chars)")
         )
     vin_clean = vin_str.strip().upper()
-    if vin_clean and len(vin_clean) != 17:
+    if vin_clean and (len(vin_clean) != 17 or not all(0x20 <= ord(c) <= 0x7E for c in vin_clean)):
         raise ValueError(
             tr("VIN должен содержать ровно 17 ASCII-символов", "VIN must be exactly 17 ASCII characters")
         )
