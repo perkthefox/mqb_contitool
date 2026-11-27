@@ -49,6 +49,17 @@ def test_a_block_refuses_fields_it_does_not_have_or_values_that_do_not_fit() -> 
         cp.pack(cp.UDS_APP, {"P2Maxx": 1})
     with pytest.raises(ValueError, match="at most 12"):
         cp.pack(cp.PHYSICAL_CAN, {"CanBaudrateRecord": range(13)})
+    with pytest.raises(ValueError, match="at most 12 bytes"):
+        cp.pack(cp.UDS_APP, {"TesterPresentMessage": b"\x01" * 13})
+    with pytest.raises(ValueError, match="at most 24 bytes"):
+        cp.pack(cp.UDS_APP, {"SessionTimingOverride": b"\x02" * 25})
+    assert cp.unpack(cp.UDS_APP, cp.pack(cp.UDS_APP, {"TesterPresentMessage": b"\xaa" * 12}))[
+        "TesterPresentMessage"
+    ] == b"\xaa" * 12
+    single = (("Flag", "s"),)
+    assert cp.pack(single, {"Flag": b"x"}) == b"x"
+    with pytest.raises(ValueError, match="at most 1 bytes"):
+        cp.pack(single, {"Flag": b"xy"})
 
 
 def test_link_requests_are_the_reference_drivers() -> None:
@@ -103,6 +114,51 @@ def test_replies_parse_into_their_fields() -> None:
 def test_an_ack_of_the_wrong_size_is_a_protocol_error() -> None:
     with pytest.raises(ProtocolError):
         wire.parse(struct.pack(">BHIIH", 4, 1, 2, 3, 0) + b"\0")
+
+
+def test_parse_validates_lengths_and_result_bounds() -> None:
+    # INFO requires at least 10 header bytes
+    assert wire.parse(b"\x09" + bytes(9)) == wire.Info("")
+    assert wire.parse(b"\x09" + bytes(9) + b"ok\0tail") == wire.Info("ok")
+    for n in (1, 5, 9):
+        with pytest.raises(ProtocolError):
+            wire.parse(b"\x09" + bytes(n - 1))
+
+    # IOCTL_REPLY must be exactly 12 bytes
+    valid_ioctl = bytes.fromhex("07ffff850000000100000002")
+    with pytest.raises(ProtocolError):
+        wire.parse(valid_ioctl[:-1])
+    with pytest.raises(ProtocolError):
+        wire.parse(valid_ioctl + b"\x00")
+
+    # PING must be exactly 3 bytes
+    with pytest.raises(ProtocolError):
+        wire.parse(b"\x0a\x12")
+    with pytest.raises(ProtocolError):
+        wire.parse(b"\x0a\x12\x34\x56")
+
+    # RESULT header/footer bounds and exact data length
+    def make_result(*, n_hdr: int = 0, n_foot: int = 0, foot: int = 0,
+                    n_data: int = 2, data: bytes = b"\xaa\xbb") -> bytes:
+        return struct.pack(">BHIIIIIBB4sBBI", 3, 1, 8, 1, 0, 5, 6, 0, n_hdr, b"\x01\x02\x03\x04",
+                           n_foot, foot, n_data) + data
+
+    parsed = wire.parse(make_result(n_hdr=4, n_foot=1, foot=0x5A))
+    assert isinstance(parsed, wire.Result)
+    assert parsed.header == b"\x01\x02\x03\x04"
+    assert parsed.footer == b"\x5a"
+    assert parsed.data == b"\xaa\xbb"
+
+    with pytest.raises(ProtocolError):
+        wire.parse(b"\x03" + bytes(33))  # < 35 bytes
+    with pytest.raises(ProtocolError):
+        wire.parse(make_result(n_hdr=5))  # n_hdr > 4
+    with pytest.raises(ProtocolError):
+        wire.parse(make_result(n_foot=2))  # n_foot > 1
+    with pytest.raises(ProtocolError):
+        wire.parse(make_result(n_data=3, data=b"\xaa\xbb"))  # truncated data
+    with pytest.raises(ProtocolError):
+        wire.parse(make_result(n_data=1, data=b"\xaa\xbb"))  # trailing bytes
 
 
 def test_a_monitor_result_splits_into_frames_with_their_flags() -> None:

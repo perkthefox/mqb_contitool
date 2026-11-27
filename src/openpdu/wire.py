@@ -244,18 +244,30 @@ def parse(payload: bytes) -> Message:
                 raise ProtocolError(f"ack of {len(payload)} bytes")
             return Ack(*struct.unpack(">HIIH", payload[1:]))
         if kind == IOCTL_REPLY:
-            return IoctlReply(*struct.unpack_from(">HBII", payload, 1))
+            if len(payload) != 12:
+                raise ProtocolError(f"ioctl reply of {len(payload)} bytes")
+            return IoctlReply(*struct.unpack(">HBII", payload[1:]))
         if kind == RESULT:
+            if len(payload) < 35:
+                raise ProtocolError(f"truncated result of {len(payload)} bytes")
             (link, hcop, urid, acc, tx_done, start, rx_flags, n_hdr, hdr, n_foot, foot,
              n_data) = struct.unpack_from(">HIIIIIBB4sBBI", payload, 1)
-            data = payload[35:35 + n_data]
-            if len(data) != n_data:
-                raise ProtocolError("truncated result")
+            if n_hdr > 4:
+                raise ProtocolError(f"result header length {n_hdr} exceeds 4")
+            if n_foot > 1:
+                raise ProtocolError(f"result footer length {n_foot} exceeds 1")
+            if len(payload) != 35 + n_data:
+                raise ProtocolError(f"result length mismatch: expected {35 + n_data}, got {len(payload)}")
+            data = payload[35:]
             return Result(link, hcop, urid, acc, tx_done, start, rx_flags, hdr[:n_hdr], bytes([foot])[:n_foot], data)
         if kind == INFO:
+            if len(payload) < 10:
+                raise ProtocolError(f"info of {len(payload)} bytes")
             return Info(payload[10:].split(b"\0", 1)[0].decode("latin-1"))
         if kind == PING:
-            return Ping(struct.unpack_from(">H", payload, 1)[0])
+            if len(payload) != 3:
+                raise ProtocolError(f"ping of {len(payload)} bytes")
+            return Ping(struct.unpack(">H", payload[1:])[0])
         if kind == GREET:
             return Greet(parse_tlv(payload[1:]))
         if kind == GREET_REFUSED:

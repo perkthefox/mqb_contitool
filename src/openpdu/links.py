@@ -27,6 +27,7 @@ log = logging.getLogger("openpdu")
 
 PRIMITIVE_TIMEOUT = 5.0
 CANCEL_TIMEOUT = 2.0  # the VCI answers an IOCTL at once; no answer ends the session, as for any sync request
+CANCEL_DRAIN = 0.2  # s to wait for a cancelled primitive's terminal DONE before unsubscribing
 QUEUE_FULL_RETRY = 0.08  # as the reference driver
 RESPONSE_MARGIN = 2.0  # s the host waits for a UDS response past the VCI's own longest wait
 # the VCI's RX_TIMEOUT: P2 / P2* expired, response-pending (RC78) completion expired, cyclic response timeout
@@ -95,7 +96,18 @@ class Link:
                    hcop: int | None = None, replies: Replies | None = None, **cop: Any) -> list[wire.Result]:
         """Run one primitive to its end and return its results. With `hcop` + `replies` the caller owns the
         subscription (and keeps it afterwards); otherwise it lives just as long as the primitive."""
-        own = replies is None
+        results, _, _ = self._run_primitive(cop_type, data, timeout=timeout, keep_subscription=replies is not None,
+                                            hcop=hcop, replies=replies, **cop)
+        return results
+
+    def _run_primitive(self, cop_type: int, data: bytes = b"", *, timeout: float = PRIMITIVE_TIMEOUT,
+                       keep_subscription: bool = False, hcop: int | None = None, replies: Replies | None = None,
+                       **cop: Any) -> tuple[list[wire.Result], int, Replies]:
+        """Run one primitive to its end and return `(results, hcop, replies)`.
+
+        When `keep_subscription` is True and the primitive finishes cleanly, the active `(self.id, hcop)`
+        subscription is kept for the caller (used by `MonitorLink.start`); otherwise it is unsubscribed before
+        returning or raising."""
         if hcop is None:
             hcop = self.vci.next_hcop()
         if replies is None:
@@ -104,6 +116,7 @@ class Link:
         results: list[wire.Result] = []
         failure: int | None = None
         finished = False
+        what = f"primitive {cop_type} on link {self.id}"
         deadline = time.monotonic() + timeout
         try:
             self.vci.send(payload)
@@ -115,23 +128,36 @@ class Link:
                 elif msg.code == wire.DONE:
                     finished = True
                 elif msg.code == wire.QUEUE_FULL:
-                    time.sleep(QUEUE_FULL_RETRY)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise VciTimeout(f"{what} did not finish within {timeout:g} s")
+                    time.sleep(min(QUEUE_FULL_RETRY, remaining))
+                    if time.monotonic() >= deadline:
+                        raise VciTimeout(f"{what} did not finish within {timeout:g} s")
+                    self.vci.unsubscribe(self.id, hcop)
+                    hcop = self.vci.next_hcop()
+                    replies = self.vci.subscribe(self.id, hcop)
+                    payload = wire.cop(self.id, hcop, cop_type, data, **cop)
                     self.vci.send(payload)
                 elif failure is None:
                     failure = msg.code
+            if not finished:
+                self._cancel(hcop)
+                if self.vci.alive:
+                    drain_deadline = time.monotonic() + CANCEL_DRAIN
+                    while (msg := self.vci.next_reply(replies, drain_deadline)) is not None:
+                        if isinstance(msg, wire.Ack) and msg.code == wire.DONE:
+                            break
         finally:
-            if own:
+            if not (keep_subscription and finished and failure is None):
                 self.vci.unsubscribe(self.id, hcop)
-        if not finished:
-            self._cancel(hcop)
-        what = f"primitive {cop_type} on link {self.id}"
         if failure in UDS_TIMEOUT_CODES:
             raise VciTimeout(f"{what}: no response from the ECU", failure)
         if failure is not None:
             raise Refused(f"{what} failed: code {failure:#06x}", failure)
         if not finished:
             raise VciTimeout(f"{what} did not finish within {timeout:g} s")
-        return results
+        return results, hcop, replies
 
     def _cancel(self, hcop: int) -> None:
         """Best effort: drop a primitive the host gave up on, so it neither runs late nor holds up the link.
@@ -172,19 +198,15 @@ class MonitorLink(Link):
 
     def start(self) -> None:
         """The reference driver's receive-anything primitive: STARTCOMM with one accept-any response."""
-        hcop = self.vci.next_hcop()
-        feed = self.vci.subscribe(self.id, hcop)
-        try:
-            early = self._primitive(wire.STARTCOMM, hcop=hcop, replies=feed, expected=[wire.Expected(1)])
-        except BaseException:
-            self.vci.unsubscribe(self.id, hcop)
-            raise
+        early, hcop, feed = self._run_primitive(wire.STARTCOMM, keep_subscription=True, expected=[wire.Expected(1)])
         self._feed, self._feed_hcop, self._started = feed, hcop, True
         for result in early:
             self._pending.extend(wire.monitor_records(result.data))
 
     def stop(self) -> None:
         try:
+            if self._started and self._feed is not None:
+                self._cancel(self._feed_hcop)
             super().stop()
         finally:
             self._end_feed(ConnectionLost(f"monitor link {self.id} stopped"))

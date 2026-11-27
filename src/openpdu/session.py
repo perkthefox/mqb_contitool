@@ -33,6 +33,8 @@ GREET_TIMEOUT = 15.0  # as the reference driver
 SYNC_TIMEOUT = 12.0
 KEEPALIVE = 5  # s: TCP keepalive idle time and interval, as the reference driver
 KEEPALIVE_PROBES = 3
+MAX_FRAME_BYTES = 1_048_576  # 1 MiB cap on incoming frames to prevent unbounded allocation
+PONG_QUEUE_SIZE = 16
 
 Replies = queue.Queue  # of wire.Message, or the OpenPduError that ended the session
 
@@ -53,6 +55,8 @@ class Vci:
         self._hcop_lock = threading.Lock()
         self._error: OpenPduError | None = None
         self._closing = False
+        self._pong_queue: queue.Queue[int | None] = queue.Queue(maxsize=PONG_QUEUE_SIZE)
+        self._pong_thread: threading.Thread | None = None
         self._reader = threading.Thread(target=self._read_loop, name=f"openpdu-{host}", daemon=True)
         self._reader.start()
 
@@ -69,7 +73,7 @@ class Vci:
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             _keepalive(sock)
-            greet = _read_greet(sock)
+            greet = _read_greet(sock, timeout=timeout)
             sock.settimeout(None)
         except BaseException as exc:
             sock.close()
@@ -89,12 +93,17 @@ class Vci:
 
     def close(self) -> None:
         """End the session. The VCI frees every link of a closed session itself. Idempotent."""
-        self._closing = True
+        with self._routes_lock:
+            self._closing = True
+            pong_thread = self._pong_thread
+        self._wake_pong_worker()
         with contextlib.suppress(OSError):  # already down
             self._sock.shutdown(socket.SHUT_RDWR)
         self._sock.close()
         if self._reader is not threading.current_thread():
             self._reader.join(timeout=2.0)
+        if pong_thread is not None and pong_thread is not threading.current_thread():
+            pong_thread.join(timeout=2.0)
 
     def __enter__(self) -> Vci:
         return self
@@ -200,7 +209,7 @@ class Vci:
 
     def _dispatch(self, msg: wire.Message) -> None:
         if isinstance(msg, wire.Ping):
-            self.send(wire.pong(msg.seq))
+            self._enqueue_pong(msg.seq)
         elif isinstance(msg, wire.Info):
             log.info("VCI: %s", msg.text)
         elif isinstance(msg, wire.IoctlReply) or (isinstance(msg, wire.Ack) and msg.hcop == wire.SYNC):
@@ -212,6 +221,44 @@ class Vci:
         else:
             log.debug("unrouted VCI message %r", msg)
 
+    def _enqueue_pong(self, seq: int) -> None:
+        """Queue a pong reply on a dedicated sender thread so a stalled send buffer never blocks the reader."""
+        with self._routes_lock:
+            if self._closing or self._error is not None:
+                return
+            if self._pong_thread is None:
+                self._pong_thread = threading.Thread(
+                    target=self._pong_loop, name=f"openpdu-{self.host}-pong", daemon=True,
+                )
+                self._pong_thread.start()
+        try:
+            self._pong_queue.put_nowait(seq)
+        except queue.Full:
+            with contextlib.suppress(queue.Empty):
+                self._pong_queue.get_nowait()
+            with contextlib.suppress(queue.Full):
+                self._pong_queue.put_nowait(seq)
+            log.warning("VCI pong queue full; dropped oldest pending pong")
+
+    def _wake_pong_worker(self) -> None:
+        while True:
+            try:
+                self._pong_queue.put_nowait(None)
+                return
+            except queue.Full:
+                with contextlib.suppress(queue.Empty):
+                    self._pong_queue.get_nowait()
+
+    def _pong_loop(self) -> None:
+        while not self._closing and self._error is None:
+            seq = self._pong_queue.get()
+            if seq is None:
+                return
+            try:
+                self.send(wire.pong(seq))
+            except OpenPduError:
+                return
+
     def _fail(self, error: OpenPduError) -> OpenPduError:
         """Mark the session dead and wake every waiter with `error`. Returns the error that ended it."""
         with self._routes_lock:
@@ -219,6 +266,7 @@ class Vci:
                 self._error = error
                 for replies in [self._sync_replies, *self._subscribers.values()]:
                     replies.put(error)
+                self._wake_pong_worker()
             return self._error
 
     def _abort(self, error: OpenPduError) -> OpenPduError:
@@ -256,9 +304,14 @@ def _answers(request: bytes, reply: wire.Message) -> bool:
     return isinstance(reply, wire.Ack) and (kind == wire.CREATE or reply.link == link)
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
+def _recv_exact(sock: socket.socket, n: int, *, deadline: float | None = None) -> bytes:
     buf = bytearray()
     while len(buf) < n:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out reading from VCI")
+            sock.settimeout(remaining)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             raise ConnectionLost("VCI closed the connection")
@@ -266,16 +319,25 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
-def _read_frame(sock: socket.socket) -> bytes:
-    (length,) = struct.unpack(">I", _recv_exact(sock, 4))
-    return _recv_exact(sock, length)
+def _read_frame(sock: socket.socket, *, deadline: float | None = None) -> bytes:
+    (length,) = struct.unpack(">I", _recv_exact(sock, 4, deadline=deadline))
+    if length > MAX_FRAME_BYTES:
+        raise ProtocolError(f"VCI frame too large: {length} bytes (max {MAX_FRAME_BYTES})")
+    return _recv_exact(sock, length, deadline=deadline)
 
 
-def _read_greet(sock: socket.socket) -> wire.Greet:
+def _read_greet(sock: socket.socket, timeout: float | None = None) -> wire.Greet:
+    prev_timeout = sock.gettimeout()
+    if timeout is None:
+        timeout = GREET_TIMEOUT if prev_timeout is None else prev_timeout
+    deadline = time.monotonic() + timeout
     try:
-        msg = wire.parse(_read_frame(sock))
+        msg = wire.parse(_read_frame(sock, deadline=deadline))
     except TimeoutError:
         raise VciTimeout("VCI sent no greet") from None
+    finally:
+        with contextlib.suppress(OSError):
+            sock.settimeout(prev_timeout)
     if isinstance(msg, wire.GreetRefused):
         raise Refused(f"VCI refused the session: {msg.reason}")
     if not isinstance(msg, wire.Greet):

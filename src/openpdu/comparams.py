@@ -123,7 +123,11 @@ def pack(layout: Layout, values: Mapping[str, Any] = {}, defaults: Mapping[str, 
     for name, fmt, count in _fields(layout):
         value = values.get(name, defaults.get(name))
         if fmt[-1] == "s":
-            items.append(bytes(value or b""))
+            raw = bytes(value or b"")
+            max_len = int(fmt[:-1]) if fmt[:-1] else 1
+            if len(raw) > max_len:
+                raise ValueError(f"{name}: at most {max_len} bytes, got {len(raw)}")
+            items.append(raw)
         elif count > 1:
             seq = list(value or ())
             if len(seq) > count:

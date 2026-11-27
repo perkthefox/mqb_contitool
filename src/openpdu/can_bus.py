@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import time
 from typing import Any
 
@@ -13,28 +14,84 @@ from .links import PRIMITIVE_TIMEOUT, MonitorLink, RawLink, close_quietly
 from .session import Vci
 
 
+def _parse_channel(channel: object) -> tuple[str, int]:
+    """Parse "host", "host:port", "[ipv6]", "[ipv6]:port", or bare IPv6 into `(host, port)`."""
+    if channel is None:
+        raise ValueError("OpenPDU channel host must not be empty")
+    raw = str(channel).strip()
+    if not raw:
+        raise ValueError("OpenPDU channel host must not be empty")
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end == -1:
+            raise ValueError(f"invalid OpenPDU channel {channel!r}: missing ']'")
+        host = raw[1:end].strip()
+        rest = raw[end + 1:]
+        if not host:
+            raise ValueError(f"invalid OpenPDU channel {channel!r}: empty host")
+        if rest == "":
+            port_str = ""
+        elif rest.startswith(":"):
+            port_str = rest[1:]
+            if not port_str:
+                raise ValueError(f"invalid OpenPDU channel {channel!r}: empty port")
+        else:
+            raise ValueError(f"invalid OpenPDU channel {channel!r}: unexpected suffix {rest!r}")
+    elif raw.count(":") == 1:
+        host, _, port_str = raw.partition(":")
+        host = host.strip()
+        if not host:
+            raise ValueError(f"invalid OpenPDU channel {channel!r}: empty host")
+        if not port_str:
+            raise ValueError(f"invalid OpenPDU channel {channel!r}: empty port")
+    elif ":" in raw:
+        try:
+            ipaddress.ip_address(raw)
+        except ValueError:
+            raise ValueError(f"invalid OpenPDU channel {channel!r}: wrap IPv6 addresses in brackets") from None
+        host, port_str = raw, ""
+    else:
+        host, port_str = raw, ""
+    if not port_str:
+        return host, wire.PORT
+    try:
+        port = int(port_str)
+    except ValueError:
+        raise ValueError(f"invalid OpenPDU port {port_str!r} in {channel!r}") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"OpenPDU port {port} out of range (1..65535)")
+    return host, port
+
+
 class OpenPduBus(can.BusABC):
-    """`channel` = VCI address, "host" or "host:port". Sends any id, 11- or 29-bit, one frame at a time."""
+    """`channel` = VCI address, "host", "host:port", or "[ipv6]:port". Sends any id, 11- or 29-bit, one frame at a
+    time."""
+
+    every_id_raw = True
 
     def __init__(self, channel: str, bitrate: int = 500_000, *, receive_own_messages: bool = False,
                  **kwargs: Any) -> None:
-        host, _, port = str(channel).partition(":")
+        host, port = _parse_channel(channel)
         self.receive_own_messages = receive_own_messages
-        self.vci = Vci.connect(host, int(port or wire.PORT))
+        self.vci = Vci.connect(host, port)
         physical = {"Baudrate": bitrate}
+        monitor: MonitorLink | None = None
+        raw: RawLink | None = None
         try:
-            self.monitor = MonitorLink.open(self.vci, physical=physical)
-            try:
-                self.raw = RawLink.open(self.vci, physical=physical)
-            except BaseException:
-                close_quietly(self.monitor)
-                raise
+            monitor = MonitorLink.open(self.vci, physical=physical)
+            self.monitor = monitor
+            raw = RawLink.open(self.vci, physical=physical)
+            self.raw = raw
+            version = ".".join(map(str, self.vci.greet.version))
+            self.channel_info = f"OpenPDU {host} (VCI firmware {version})"
+            super().__init__(channel=channel, **kwargs)
         except BaseException:
+            if raw is not None:
+                close_quietly(raw)
+            if monitor is not None:
+                close_quietly(monitor)
             self.vci.close()
             raise
-        version = ".".join(map(str, self.vci.greet.version))
-        self.channel_info = f"OpenPDU {host} (VCI firmware {version})"
-        super().__init__(channel=channel, **kwargs)
 
     def send(self, msg: can.Message, timeout: float | None = None) -> None:
         """The VCI keeps one RawMode frame in flight, so a send always waits for the VCI's ack of its frame.
@@ -67,6 +124,8 @@ class OpenPduBus(can.BusABC):
     def shutdown(self) -> None:
         """Free both links and end the session. A link that fails to close is only logged: the session ends
         either way, and the VCI frees the links of a closed session itself."""
+        if getattr(self, "_is_shutdown", False):
+            return
         super().shutdown()
         close_quietly(self.raw)
         close_quietly(self.monitor)

@@ -15,7 +15,8 @@ from fake_vci import SYNC, VW, FakeVci, ack, result, retarget, wait_for
 
 from openpdu import ConnectionLost, ProtocolError, Refused, Vci, VciTimeout
 from openpdu import comparams as cp
-from openpdu.can_bus import OpenPduBus
+from openpdu import session as openpdu_session
+from openpdu.can_bus import OpenPduBus, _parse_channel
 
 
 @pytest.fixture
@@ -66,11 +67,15 @@ def test_monitor_and_raw_links_send_exactly_what_the_reference_driver_sends(fake
         echoes = [monitor.recv(1.0), monitor.recv(1.0)]
         raw.close()
         monitor.close()
-    assert fake_vci.received[2:] == [VW[name] for name in (
-        "create_monitor", "connect_monitor", "start_monitor", "create_raw", "connect_raw", "start_raw",
-        "send_raw_11bit", "send_raw_29bit", "stop_raw", "disconnect_raw", "destroy_raw", "stop_monitor",
-        "disconnect_monitor", "destroy_monitor",
-    )]
+    cancel_monitor = struct.pack(">BHBII", 0x06, 0x017E, 0x81, 0, 0)
+    assert fake_vci.received[2:] == [
+        *[VW[name] for name in (
+            "create_monitor", "connect_monitor", "start_monitor", "create_raw", "connect_raw", "start_raw",
+            "send_raw_11bit", "send_raw_29bit", "stop_raw", "disconnect_raw", "destroy_raw",
+        )],
+        cancel_monitor,
+        *[VW[name] for name in ("stop_monitor", "disconnect_monitor", "destroy_monitor")],
+    ]
     assert [(e.can_id, e.extended, e.echo) for e in echoes] == [(0x710, False, True), (0x1BFCA2ED, True, True)]
     assert echoes[1].data == bytes(range(8))
 
@@ -99,7 +104,11 @@ def test_a_full_vci_queue_gets_the_same_primitive_again(fake_vci: FakeVci) -> No
     with connect(fake_vci) as vci, vci.raw_link() as raw:
         raw.send(0x710, b"\x02\x3e\x00")
     sends = [p for p in fake_vci.received if is_primitive(p, 4)]
-    assert sends == [refused_once[0]] * 2
+    assert len(sends) == 2
+    first_hcop = struct.unpack_from(">I", sends[0], 3)[0]
+    retry_hcop = struct.unpack_from(">I", sends[1], 3)[0]
+    assert retry_hcop != first_hcop
+    assert sends[1] == retarget(sends[0], hcop=retry_hcop)
 
 
 @pytest.mark.parametrize("code,error", [(0x1CE8, Refused), (0x0133, VciTimeout), (0x0134, VciTimeout),
@@ -343,3 +352,173 @@ def test_a_non_blocking_bus_send_still_waits_for_its_frame(fake_vci: FakeVci) ->
     finally:
         bus.shutdown()
     assert len([p for p in fake_vci.received if is_primitive(p, 4)]) == 1
+
+
+def test_queue_full_trailing_done_does_not_satisfy_the_retry(fake_vci: FakeVci) -> None:
+    rejected: list[int] = []
+
+    def queue_full_with_trailing_done(p: bytes) -> list[bytes] | None:
+        if is_primitive(p, 4) and not rejected:
+            hcop = struct.unpack_from(">I", p, 3)[0]
+            rejected.append(hcop)
+            return [ack(1, hcop, 0x1E), ack(1, hcop, 0)]  # trailing DONE for the rejected attempt
+        return None
+
+    fake_vci.answer = queue_full_with_trailing_done
+    with connect(fake_vci) as vci, vci.isotp_link(0x710, 0x77A) as uds:
+        assert uds.request(b"\x22\xf1\x87") == b"\x62\xf1\x87"
+    assert len(rejected) == 1
+    sends = [p for p in fake_vci.received if is_primitive(p, 4)]
+    assert len(sends) == 2
+    assert struct.unpack_from(">I", sends[1], 3)[0] != rejected[0]
+
+
+def test_queue_full_respects_deadline_and_raises_timeout(fake_vci: FakeVci) -> None:
+    def always_full(p: bytes) -> list[bytes] | None:
+        if is_primitive(p, 4):
+            hcop = struct.unpack_from(">I", p, 3)[0]
+            return [ack(0x142, hcop, 0x1E)]
+        return None
+
+    fake_vci.answer = always_full
+    with connect(fake_vci) as vci, vci.raw_link() as raw:
+        t0 = time.monotonic()
+        with pytest.raises(VciTimeout):
+            raw.send(0x710, b"\x02\x3e\x00", timeout=0.05)
+        elapsed = time.monotonic() - t0
+    assert elapsed < 0.25
+    assert len([p for p in fake_vci.received if is_primitive(p, 4)]) == 1
+
+
+def test_timeout_cancels_before_unsubscribing_and_drains_done(fake_vci: FakeVci) -> None:
+    subscribed_at_cancel: list[bool] = []
+    vci_ref: list[Vci] = []
+
+    def hang_then_finish_on_cancel(p: bytes) -> list[bytes] | None:
+        if is_primitive(p, 4):
+            return [ack(1, struct.unpack_from(">I", p, 3)[0], 0xC9)]
+        if p[0] == 0x06 and p[3] == 0x81:
+            link = struct.unpack_from(">H", p, 1)[0]
+            hcop = struct.unpack_from(">I", p, 4)[0]
+            subscribed_at_cancel.append((link, hcop) in vci_ref[0]._subscribers)
+            return [b"\x07" + p[1:4] + bytes(8), ack(link, hcop, 0)]
+        return None
+
+    fake_vci.answer = hang_then_finish_on_cancel
+    with connect(fake_vci) as vci:
+        vci_ref.append(vci)
+        with vci.isotp_link(0x710, 0x77A) as uds:
+            t0 = time.monotonic()
+            with pytest.raises(VciTimeout):
+                uds.request(b"\x22\xf1\x87", timeout=0.1)
+            elapsed = time.monotonic() - t0
+            assert not vci._subscribers
+    assert subscribed_at_cancel == [True]
+    # Returned promptly once terminal DONE arrived instead of waiting the full drain window
+    assert elapsed < 0.28
+
+
+def test_monitor_stop_cancels_feed_before_stopcomm(fake_vci: FakeVci) -> None:
+    with connect(fake_vci) as vci:
+        monitor = vci.monitor()
+        feed_hcop = monitor._feed_hcop
+        monitor.stop()
+        monitor.close()
+    cancel_msg = struct.pack(">BHBII", 0x06, 0x017E, 0x81, feed_hcop, 0)
+    stop_idx = next(i for i, p in enumerate(fake_vci.received) if is_primitive(p, 2))
+    cancel_idx = fake_vci.received.index(cancel_msg)
+    assert cancel_idx < stop_idx
+
+
+def test_oversized_frame_is_rejected_with_protocol_error(fake_vci: FakeVci) -> None:
+    with connect(fake_vci) as vci:
+        # Push only a bogus 4-byte length header exceeding MAX_FRAME_BYTES without sending the payload
+        with fake_vci._lock:
+            assert fake_vci._client is not None
+            fake_vci._client.sendall(struct.pack(">I", openpdu_session.MAX_FRAME_BYTES + 1))
+        assert wait_for(lambda: not vci.alive)
+        with pytest.raises(ProtocolError, match="too large"):
+            vci.ioctl(0x05)
+
+
+def test_trickling_greet_respects_overall_deadline() -> None:
+    """A peer sending 1 byte per 60 ms must still hit the 150 ms overall greet deadline."""
+    stop = threading.Event()
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        port = server.getsockname()[1]
+
+        def trickle() -> None:
+            try:
+                client, _ = server.accept()
+            except OSError:
+                return
+            with client:
+                data = struct.pack(">I", 20) + b"\x0e" + bytes(19)
+                for i in range(len(data)):
+                    if stop.wait(0.06):
+                        break
+                    try:
+                        client.sendall(data[i:i + 1])
+                    except OSError:
+                        break
+
+        t = threading.Thread(target=trickle, daemon=True)
+        t.start()
+        try:
+            t0 = time.monotonic()
+            with pytest.raises(VciTimeout):
+                Vci.connect("127.0.0.1", port, timeout=0.15)
+            elapsed = time.monotonic() - t0
+            assert elapsed < 0.5
+        finally:
+            stop.set()
+            t.join(timeout=1.0)
+
+
+def test_stalled_pong_does_not_block_reader_thread(fake_vci: FakeVci) -> None:
+    with connect(fake_vci) as vci, vci.monitor() as monitor:
+        # Hold _send_lock to simulate a stalled TCP send buffer
+        with vci._send_lock:
+            fake_vci.push(bytes.fromhex("0a1234"))
+            fake_vci.bus_frame(0x77A, b"\x02\x7e\x00")
+            # Reader must keep dispatching bus frames even though pong cannot send yet
+            rec = monitor.recv(1.0)
+            assert rec is not None and rec.can_id == 0x77A and rec.data == b"\x02\x7e\x00"
+        # Once send unblocks, the queued pong goes out
+        assert wait_for(lambda: bytes.fromhex("0b1234") in fake_vci.received)
+
+
+def test_openpdu_bus_channel_parsing_and_every_id_raw(fake_vci: FakeVci) -> None:
+    assert OpenPduBus.every_id_raw is True
+    assert _parse_channel("192.168.0.10") == ("192.168.0.10", 4500)
+    assert _parse_channel("192.168.0.10:4501") == ("192.168.0.10", 4501)
+    assert _parse_channel("[::1]:4501") == ("::1", 4501)
+    assert _parse_channel("[::1]") == ("::1", 4500)
+    assert _parse_channel("::1") == ("::1", 4500)
+    for bad in ("", "   ", ":4500", "[]:4500", "[]", "[::1", "[::1]extra",
+                "127.0.0.1:", "[::1]:", "127.0.0.1:0", "127.0.0.1:70000", "127.0.0.1:abc"):
+        with pytest.raises(ValueError):
+            _parse_channel(bad)
+    with pytest.raises(ValueError):
+        OpenPduBus("")
+
+    bus = OpenPduBus(f"127.0.0.1:{fake_vci.port}")
+    try:
+        assert bus.every_id_raw is True
+    finally:
+        bus.shutdown()
+        bus.shutdown()  # guarded by _is_shutdown
+
+
+def test_openpdu_bus_cleans_up_if_super_init_fails(fake_vci: FakeVci, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("super init failed")
+
+    monkeypatch.setattr(can.BusABC, "__init__", boom)
+    with pytest.raises(RuntimeError, match="super init failed"):
+        OpenPduBus(f"127.0.0.1:{fake_vci.port}")
+    # Both raw and monitor links were disconnected and destroyed before VCI closed
+    assert VW["disconnect_raw"] in fake_vci.received
+    assert VW["destroy_raw"] in fake_vci.received
+    assert VW["disconnect_monitor"] in fake_vci.received
+    assert VW["destroy_monitor"] in fake_vci.received
