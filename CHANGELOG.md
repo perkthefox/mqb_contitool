@@ -1,5 +1,21 @@
 # Changelog / История изменений
 
+## 2.2.1a — 2026-11-27
+
+### 🇷🇺 Добавлено
+- **Окно «Настройки» и выбор канала автообновлений (`stable` / `candidate`):**
+  - В шапку программы и меню **«Файл → Настройки…»** (`Ctrl+,` / `⌘,`) добавлен диалог настроек с выбором канала обновлений и кнопкой немедленной проверки.
+  - **`stable` (по умолчанию):** получает только проверенные основные релизы из `main` (`/releases/latest`) — кандидат-релизы (`-rc`) и пререлизы жёстко отсеиваются и никогда не пересекаются со стабильной веткой. Старые версии ContiTool (до `2.2.1a`) также видят только стабильный канал и не поймают кандидат-релиз.
+  - **`candidate`:** открывает получение ранних релиз-кандидатов новых веток (например, `2.3.0-rc1` с поддержкой `17 FPK_E / AID`, `17 Kombi VDD`, `09 BCM`, `13 ACC MRR`, `2B ELV` и RAM-моста `J533`), а после выхода финальной версии автоматически переводит на неё.
+- **Улучшенный подбор архива при обновлении:** проверка архитектуры CPU (`arm64` / `x86_64`) и строгая фильтрация только `https://`-ссылок релизов.
+
+### 🇬🇧 Added
+- **Settings dialog & auto-update channel switcher (`stable` / `candidate`):**
+  - Added a **Settings** button in the header and **File → Settings…** (`Ctrl+,` / `⌘,`) to choose the update channel and trigger an immediate update check.
+  - **`stable` (default):** tracks verified `main` releases only (`/releases/latest`) — release candidates (`-rc`) and pre-releases are strictly filtered out and never leak into the stable channel. Older ContiTool builds (prior to `2.2.1a`) also stay isolated on stable releases only.
+  - **`candidate`:** opts into early release candidates ahead of `main` (such as `2.3.0-rc1` with `17 FPK_E / AID`, `17 Kombi VDD`, `09 BCM`, `13 ACC MRR`, `2B ELV`, and the `J533` RAM-Bridge) and seamlessly upgrades to the final release once it ships.
+- **Hardened update asset matching:** CPU architecture matching (`arm64` / `x86_64`) and strict `https://` URL validation for release downloads.
+
 ## 2.2.1 — 2026-11-23
 
 ### 🇷🇺 Исправлено

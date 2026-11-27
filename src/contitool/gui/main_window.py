@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
@@ -59,6 +60,7 @@ from contitool.gui.connection import CanConnection, ConnectionDialog, ensure_rea
 from contitool.gui.dialogs.guide import GuideDialog
 from contitool.gui.dialogs.problem_report import ProblemReportDialog
 from contitool.gui.dialogs.restore import RestoreDialog
+from contitool.gui.dialogs.settings import SettingsDialog
 from contitool.gui.screens.ecu import EcuScreen
 from contitool.gui.screens.start import StartScreen
 from contitool.gui.screens.terminal import TerminalScreen
@@ -198,6 +200,10 @@ class MainWindow(QMainWindow):
         self.btn_conn.setCursor(Qt.CursorShape.PointingHandCursor)
         lay.addWidget(self.btn_conn, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        self.btn_settings = button("", "Chip", slot=self.show_settings)
+        self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay.addWidget(self.btn_settings, 0, Qt.AlignmentFlag.AlignVCenter)
+
         self._lang_buttons: dict[str, QPushButton] = {}
         lang_group = QButtonGroup(self)
         lang = QHBoxLayout()
@@ -234,9 +240,11 @@ class MainWindow(QMainWindow):
         self.act_report = act(self.show_report, "Ctrl+I")
         self.act_close = act(self.close_ecu, QKeySequence.StandardKey.Close)
         self.act_conn = act(self.show_connection)
+        self.act_settings = act(self.show_settings, QKeySequence.StandardKey.Preferences)
+        self.act_settings.setMenuRole(QAction.MenuRole.PreferencesRole)
         self.act_quit = act(self.close, QKeySequence.StandardKey.Quit)
         self.act_quit.setMenuRole(QAction.MenuRole.QuitRole)
-        for a in (self.act_read, self.act_folder, self.act_files, None, self.act_export, self.act_restore, self.act_frf, None, self.act_report, self.act_close, None, self.act_conn, None, self.act_quit):
+        for a in (self.act_read, self.act_folder, self.act_files, None, self.act_export, self.act_restore, self.act_frf, None, self.act_report, self.act_close, None, self.act_conn, self.act_settings, None, self.act_quit):
             self.menu_file.addSeparator() if a is None else self.menu_file.addAction(a)
 
         self.menu_view = mb.addMenu("")
@@ -638,6 +646,15 @@ class MainWindow(QMainWindow):
         self._report_dlg = dlg
         dlg.show()
 
+    def show_settings(self) -> None:
+        dlg = SettingsDialog(self)
+        if not run_dialog(dlg):
+            return
+        if dlg.check_now_requested:
+            self.updates.check(manual=True)
+        elif dlg.selected_channel != dlg.initial_channel and getattr(sys, "frozen", False):
+            self.updates.check(manual=False)
+
     def show_about(self) -> None:
         QMessageBox.about(
             self,
@@ -714,6 +731,9 @@ class MainWindow(QMainWindow):
         self.act_report.setText(tr("Подробный отчёт", "Full report"))
         self.act_close.setText(tr("Закрыть блок", "Close ECU"))
         self.act_conn.setText(tr("Подключение к блоку…", "ECU connection…"))
+        self.act_settings.setText(tr("Настройки…", "Settings…"))
+        self.btn_settings.setText(tr("Настройки", "Settings"))
+        self.btn_settings.setToolTip(tr("Настройки программы и канал обновлений", "Application settings and update channel"))
         self.act_quit.setText(tr("Выход", "Quit"))
         self.menu_view.setTitle(tr("Вид", "View"))
         self.act_mode_ecu.setText(tr("Блок", "ECU"))
