@@ -141,13 +141,11 @@ class OperationRunner(QObject):
         elif isinstance(res, Path):
             target_path = res
 
-        try:
-            if on_success is not None:
-                on_success(res)
-        finally:  # a failing UI callback must never leave the runner stuck "busy"
-            self._cleanup_worker()
-            self.was_cancelled = False
-            self.operation_finished.emit(True, title, target_path)
+        self._cleanup_worker()
+        self.was_cancelled = False
+        self.operation_finished.emit(True, title, target_path)
+        if on_success is not None:
+            on_success(res)
 
     @Slot(str)
     def _on_worker_cancel(self, msg: str) -> None:

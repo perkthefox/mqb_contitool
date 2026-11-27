@@ -197,3 +197,62 @@ def test_a_late_closed_signal_after_disconnect_is_ignored() -> None:
     term._on_closed("")  # called with no sender, as a queued signal from an already deleted session arrives
     assert term._state == "off" and term.session is None
     win.close()
+
+
+def test_can_session_uds_only_uses_uds_session_for_any_ecu_id() -> None:
+    """On uds_only D-PDU buses, CanSession._run_command opens link.uds_session() for any (tx_id, rx_id), not just 710/77A."""
+    from contextlib import contextmanager
+
+    from contitool.can.transport import J533CanLink
+    from contitool.gui.can_session import CanSession
+
+    set_lang("en")
+    opened_sessions: list[tuple[int, int]] = []
+    sent_payloads: list[bytes] = []
+
+    class FakeDpduBus:
+        uds_only = True
+        uds_refusal = "unsupported"
+
+        @contextmanager
+        def uds_session(self, tx_id: int, rx_id: int, **_kw):  # noqa: ANN003, ANN202
+            opened_sessions.append((tx_id, rx_id))
+            yield True
+
+        def request_uds(self, payload: bytes, **_kw) -> bytes:  # noqa: ANN003
+            sent_payloads.append(payload)
+            return b"\x62\xf1\x875NA920740B"
+
+        def recv(self, timeout=None):  # noqa: ANN001, ANN202
+            return None
+
+        def shutdown(self) -> None:
+            pass
+
+    bus = FakeDpduBus()
+    link = J533CanLink("", bus=bus)
+    sess = CanSession("VW_PDUAPI", "dpdu", 500_000, bus=bus)
+    sess._run_command(link, ("uds", 0x714, 0x77E, bytes.fromhex("22F187"), 2.0))
+    assert opened_sessions == [(0x714, 0x77E)]
+    assert sent_payloads == [bytes.fromhex("22F187")]
+    assert any(r.kind == "uds-resp" and r.arb_id == 0x77E and b"5NA920740B" in r.data for r in sess.rows)
+
+
+def test_terminal_save_handles_os_error(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+
+    from contitool.gui.can_session import TraceRow
+    from contitool.gui.screens import terminal as term_mod
+
+    set_lang("en")
+    app, win = create_window()
+    term = win.terminal
+    term.model.append([TraceRow(0.0, "rx", 0x77A, bytes.fromhex("62F190"))])
+    out = tmp_path / "trace.txt"
+    warns: list[str] = []
+    monkeypatch.setattr(term_mod.QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
+    monkeypatch.setattr(Path, "write_text", lambda *_a, **_k: (_ for _ in ()).throw(OSError("permission denied")))
+    monkeypatch.setattr(term_mod.QMessageBox, "warning", lambda _p, _t, msg, *a, **k: warns.append(msg))
+    term._save()
+    assert warns and "permission denied" in warns[0]
+    win.close()

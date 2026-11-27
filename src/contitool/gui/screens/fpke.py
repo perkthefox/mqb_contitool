@@ -11,6 +11,7 @@ import secrets as _py_secrets
 import shutil
 import time
 from typing import Any
+import weakref
 
 from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
 from shiboken6 import isValid as _qt_valid
@@ -730,11 +731,19 @@ class FpkeScreen(QWidget):
             bolo_info=self._cflash_boot_info,
         )
 
+    def _edited_dflash_name(self) -> str:
+        return self._orig_dflash_path.name if self._orig_dflash_path else "Dflash.bin"
+
     def _commit_dflash_bytes(self, new_df: bytes, log_msg: str) -> None:
         """Save modified DataFlash into a non-destructive working copy (`ContiTool_edited/Dflash.bin`) and refresh UI."""
-        if self.folder is not None and self.folder.is_dir():
-            edit_dir = self.folder / "ContiTool_edited"
-            out_name = self._orig_dflash_path.name if self._orig_dflash_path else "Dflash.bin"
+        base_dir = (
+            self.folder
+            if (self.folder is not None and self.folder.is_dir())
+            else (self._orig_dflash_path.parent if self._orig_dflash_path is not None else None)
+        )
+        if base_dir is not None and base_dir.is_dir():
+            edit_dir = base_dir / "ContiTool_edited"
+            out_name = self._edited_dflash_name()
             work_path = edit_dir / out_name
             try:
                 atomic_write(work_path, new_df)
@@ -964,23 +973,43 @@ class FpkeScreen(QWidget):
             self._donor_passport = data
         else:
             raw = path.read_bytes()
-            if not is_fpke_dflash(raw):
+            from contitool.core.kombi import (
+                detect_kombi_files,
+                extract_kombi_immo_passport,
+                is_kombi_dflash,
+                normalize_kombi_dflash_input,
+            )
+
+            if is_kombi_dflash(raw):
+                norm = normalize_kombi_dflash_input(raw)
+                sib = detect_kombi_files([path.parent])
+                cf_path = sib.get("cflash")
+                cf_bytes = cf_path.read_bytes() if (cf_path is not None and cf_path.is_file()) else None
+                self._donor_path = path
+                self._donor_dflash = norm
+                self._donor_cflash = cf_bytes
+                self._donor_passport = extract_kombi_immo_passport(norm, cf_bytes)
+                self._recipient_path = path
+                self._recipient_dflash = norm
+                self._recipient_cflash = cf_bytes
+            elif is_fpke_dflash(raw):
+                sib = detect_fpke_files([path.parent])
+                cf_path = sib.get("cflash")
+                cf_bytes = cf_path.read_bytes() if (cf_path is not None and cf_path.is_file()) else None
+                self._donor_path = path
+                self._donor_dflash = raw
+                self._donor_cflash = cf_bytes
+                self._donor_passport = extract_fpke_immo_passport(raw, cf_bytes)
+                self._recipient_path = path
+                self._recipient_dflash = raw
+                self._recipient_cflash = cf_bytes
+            else:
                 raise ValueError(
                     tr(
-                        f"Файл «{path.name}» не является корректным 64 КБ дампом DataFlash FPK_E.",
-                        f"File “{path.name}” is not a valid 64 KB FPK_E DataFlash dump.",
+                        f"Файл «{path.name}» ({len(raw)} Б) не является корректным дампом DataFlash FPK_E (64 КБ) или Kombi VDD.",
+                        f"File “{path.name}” ({len(raw)} B) is not a valid FPK_E (64 KB) or Kombi VDD DataFlash dump.",
                     )
                 )
-            sib = detect_fpke_files([path.parent])
-            cf_path = sib.get("cflash")
-            cf_bytes = cf_path.read_bytes() if (cf_path is not None and cf_path.is_file()) else None
-            self._donor_path = path
-            self._donor_dflash = raw
-            self._donor_cflash = cf_bytes
-            self._donor_passport = extract_fpke_immo_passport(raw, cf_bytes)
-            self._recipient_path = path
-            self._recipient_dflash = raw
-            self._recipient_cflash = cf_bytes
         self._swap_ab = False
         self._refresh_nav()
         self._render_page()
@@ -1020,6 +1049,13 @@ class FpkeScreen(QWidget):
         df_open, cf_open = self._own_dflash_and_cflash()
         if df_open is None or self._donor_dflash is None:
             return None
+        from contitool.core.kombi import is_kombi_dflash, plan_kombi_a_to_b_transfer
+
+        if is_kombi_dflash(self._donor_dflash) and self._donor_passport is not None:
+            target_passport = extract_fpke_immo_passport(df_open, cf_open)
+            if self._swap_ab:
+                return plan_kombi_a_to_b_transfer(target_passport, self._donor_passport)
+            return plan_kombi_a_to_b_transfer(self._donor_passport, target_passport)
         if self._swap_ab:
             return plan_fpke_a_to_b_transfer(
                 df_open,
@@ -1414,6 +1450,7 @@ class FpkeScreen(QWidget):
         self.btn_report.setText(tr("Отчёт", "Report"))
         self.btn_report.setEnabled(bool(self.dflash_info or self.extra_info or self.ident_items or self._cflash_boot_info))
         self.btn_close.setText(tr("Закрыть", "Close"))
+        self.btn_close.setEnabled(not self.runner.is_busy)
 
         clear_layout(self.grid_id)
         clear_layout(self.grid_mcu_id)
@@ -2426,8 +2463,7 @@ class FpkeScreen(QWidget):
             trailing=(btn_cp_cod,),
             tip="EEL 0x30 + 11..30 (DID 0x0600, 20 bytes)",
         )
-        if cur_cod:
-            self._bind_hex_validator(ed_coding, b_cod, 20, allow_empty=True)
+        self._bind_hex_validator(ed_coding, b_cod, 20, allow_empty=True)
 
         odo_row.addWidget(c_odo, 2)
         odo_row.addWidget(c_cod, 5)
@@ -3810,6 +3846,7 @@ class FpkeScreen(QWidget):
                 interface=iface,
                 session_dir=sdir,
                 use_stream=use_stream,
+                blank_check_dflash=(mode == "dflash"),
                 keep_open=not via_gw,
                 via_gateway=via_gw,
                 gateway_bridge=gw_bridge,
@@ -4029,11 +4066,18 @@ class FpkeScreen(QWidget):
         except OSError as exc:
             QMessageBox.warning(self, tr("Ошибка чтения файла", "File read error"), str(exc))
             return
-        if not is_fpke_dflash(raw):
+        from contitool.core.kombi import is_kombi_dflash
+
+        if is_kombi_dflash(raw) or not is_fpke_dflash(raw):
             QMessageBox.warning(
                 self,
                 tr("Некорректный файл DataFlash", "Invalid DataFlash file"),
                 tr(
+                    f"Файл «{path.name}» ({len(raw)} Б) является дампом Kombi VDD (V850E2) и несовместим с FPK_E (RH850).",
+                    f"File “{path.name}” ({len(raw)} B) is a Kombi VDD (V850E2) dump and cannot be written to FPK_E (RH850).",
+                )
+                if is_kombi_dflash(raw)
+                else tr(
                     f"Файл «{path.name}» ({len(raw)} Б) не является валидным 64 КБ дампом DataFlash FPK_E.",
                     f"File “{path.name}” ({len(raw)} B) is not a valid 64 KB FPK_E DataFlash dump.",
                 ),
@@ -4141,7 +4185,7 @@ class FpkeScreen(QWidget):
             if df_cur is None or not learned_ids:
                 return
             padded_ids = list(learned_ids[:8]) + [""] * max(0, 8 - len(learned_ids))
-            with contextlib.suppress(Exception):
+            try:
                 new_df = self._apply_dflash_edits(
                     df_cur,
                     key_display_ids=padded_ids,
@@ -4158,6 +4202,13 @@ class FpkeScreen(QWidget):
                         f"Список обученных через катушку ключей ({learned_cnt} шт.) синхронизирован с рабочей копией дампа.",
                         f"Coil-learned key list ({learned_cnt} keys) synchronized with working dump.",
                     ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.note.emit(
+                    tr(
+                        f"Предупреждение: не удалось синхронизировать список ключей с рабочей копией дампа: {exc}",
+                        f"Warning: failed to synchronize learned key list with working dump: {exc}",
+                    )
                 )
 
         dlg = FpkeCoilKeyLearnDialog(
@@ -4403,7 +4454,22 @@ class _FpkeCanControlPanel(QWidget):
         self._sweep_timer = QTimer(self)
         self._sweep_timer.setInterval(120)
         self._sweep_timer.timeout.connect(self._sync_sweep_readouts)
-        self.runner.busy_changed.connect(self._on_runner_busy)
+
+        panel_ref = weakref.ref(self)
+        runner_ref = self.runner
+
+        def _busy_slot(busy: bool) -> None:
+            panel = panel_ref()
+            if panel is not None and _qt_valid(panel):
+                panel._on_runner_busy(busy)
+
+        def _disconnect_busy(*_a: Any, r: OperationRunner = runner_ref, s: Callable[[bool], None] = _busy_slot) -> None:
+            with contextlib.suppress(RuntimeError, TypeError):
+                r.busy_changed.disconnect(s)
+
+        self._busy_slot = _busy_slot
+        runner_ref.busy_changed.connect(_busy_slot)
+        self.destroyed.connect(_disconnect_busy)
 
         self.sync_state()
 
@@ -4985,8 +5051,17 @@ class _FpkeCanControlPanel(QWidget):
         existing, port, iface, via_gw = params
         sink = self._status_sink
         dtcs_sink = self._dtcs_sink
+        is_kombi = self.kombi_mode
 
         def task(rep: Any) -> dict[str, Any]:
+            if is_kombi:
+                from contitool.can.kombi import _managed_kombi_session, kombi_run_procedure
+
+                if via_gw and existing is None:
+                    with _managed_kombi_session(port, interface=iface, keep_open=False, via_gateway=True) as lnk:
+                        return kombi_run_procedure(lnk, "clear_dtc", reporter=rep)
+                lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
+                return kombi_run_procedure(lnk, "clear_dtc", reporter=rep)
             lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
             return fpke_run_procedure(lnk, "clear_dtc", reporter=rep)
 
@@ -5518,16 +5593,33 @@ class FpkeCoilKeyLearnDialog(Dialog):
 
         self.ed_s0.textChanged.connect(lambda _t: self._update_s01_validation())
         self.ed_s1.textChanged.connect(lambda _t: self._update_s01_validation())
-        self._update_s01_validation()
+        self.runner.busy_changed.connect(self._on_runner_busy)
+        self._on_runner_busy(self.runner.is_busy)
 
         self.finish(cancel_text=tr("Закрыть", "Close"))
         self.resize(self.width(), self.height() + 26)
         self._fit_screen()
 
+    def done(self, result: int) -> None:
+        with contextlib.suppress(RuntimeError, TypeError):
+            self.runner.busy_changed.disconnect(self._on_runner_busy)
+        super().done(result)
+
+    def _on_runner_busy(self, _busy: bool) -> None:
+        if not _qt_valid(self):
+            return
+        idle = not self.runner.is_busy
+        for btn in (self.btn_poll_coil, self.btn_extract_s01, self.btn_learn_key, self.btn_finish_learn):
+            if _qt_valid(btn):
+                btn.setEnabled(idle)
+        self._update_s01_validation()
+
     def _clean_hex(self, txt: str) -> str:
         return "".join(txt.split()).replace("0x", "").replace("0X", "").upper()
 
     def _update_s01_validation(self) -> None:
+        if not _qt_valid(self):
+            return
         s0_h = self._clean_hex(self.ed_s0.text())
         s1_h = self._clean_hex(self.ed_s1.text())
         if len(s0_h) != 32 or len(s1_h) != 32 or not all(c in "0123456789ABCDEF" for c in s0_h + s1_h):
@@ -5543,12 +5635,25 @@ class FpkeCoilKeyLearnDialog(Dialog):
             self.btn_start_02f7.setEnabled(False)
             return
 
-        ver = fpke_verify_s0_s1(
-            bytes.fromhex(s0_h),
-            bytes.fromhex(s1_h),
-            self._expected_crc_a or None,
-            self._expected_crc_b or None,
-        )
+        try:
+            ver = fpke_verify_s0_s1(
+                bytes.fromhex(s0_h),
+                bytes.fromhex(s1_h),
+                self._expected_crc_a or None,
+                self._expected_crc_b or None,
+            )
+        except ValueError:
+            self.lbl_crc_state.setText(tr("Некорректные S0/S1 или CRC", "Invalid S0/S1 or CRC"))
+            set_tone(self.lbl_crc_state, "err")
+            self.lbl_slots_preview.setText(
+                tr(
+                    f"Ожидаемые CRC-32 (0x68): A={self._expected_crc_a or '—'} • B={self._expected_crc_b or '—'}",
+                    f"Expected CRC-32 (0x68): A={self._expected_crc_a or '—'} • B={self._expected_crc_b or '—'}",
+                )
+            )
+            self.btn_prepare_additive.setEnabled(False)
+            self.btn_start_02f7.setEnabled(False)
+            return
         self.lbl_slots_preview.setText(
             f"Slot A: {ver['slot_a_hex']} (CRC: {ver['crc_a_le_hex']})  •  "
             f"Slot B: {ver['slot_b_hex']} (CRC: {ver['crc_b_le_hex']})"
@@ -5556,8 +5661,9 @@ class FpkeCoilKeyLearnDialog(Dialog):
         if ver["valid"]:
             self.lbl_crc_state.setText(tr("CRC A/B совпали с 0x68", "CRC A/B match 0x68"))
             set_tone(self.lbl_crc_state, "ok")
-            self.btn_prepare_additive.setEnabled(True)
-            self.btn_start_02f7.setEnabled(True)
+            idle = not self.runner.is_busy
+            self.btn_prepare_additive.setEnabled(idle)
+            self.btn_start_02f7.setEnabled(idle)
             if self._on_s0_s1_cached is not None:
                 self._on_s0_s1_cached(s0_h, s1_h)
         else:
@@ -5608,6 +5714,17 @@ class FpkeCoilKeyLearnDialog(Dialog):
                     gateway_channel=gw_ch,
                     reporter=rep,
                 )
+        elif self._kombi_mode and self.via_gateway:
+            if not ensure_ready(self.conn, self):
+                return
+            port = self.conn.port
+            iface = self.conn.interface or "slcan"
+
+            def task(rep: Any) -> dict[str, Any]:
+                from contitool.can.kombi import _managed_kombi_session
+
+                with _managed_kombi_session(port, interface=iface, keep_open=False, via_gateway=True) as lnk:
+                    return fn(lnk, rep)
         else:
             params = self._prepare_link_params()
             if params is None:
@@ -5634,14 +5751,26 @@ class FpkeCoilKeyLearnDialog(Dialog):
     def run_poll_coil(self) -> None:
         if self.runner.is_busy:
             return
-        params = self._prepare_link_params()
-        if params is None:
-            return
-        existing, port, iface, via_gw = params
+        if self._kombi_mode and self.via_gateway:
+            if not ensure_ready(self.conn, self):
+                return
+            port = self.conn.port
+            iface = self.conn.interface or "slcan"
 
-        def task(rep: Any) -> dict[str, Any]:
-            lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
-            return fpke_coil_poll_transponder(lnk, reporter=rep)
+            def task(rep: Any) -> dict[str, Any]:
+                from contitool.can.kombi import _managed_kombi_session
+
+                with _managed_kombi_session(port, interface=iface, keep_open=False, via_gateway=True) as lnk:
+                    return fpke_coil_poll_transponder(lnk, reporter=rep)
+        else:
+            params = self._prepare_link_params()
+            if params is None:
+                return
+            existing, port, iface, via_gw = params
+
+            def task(rep: Any) -> dict[str, Any]:
+                lnk = existing if existing is not None else open_or_reuse_fpke_link(port, interface=iface, via_gateway=via_gw)
+                return fpke_coil_poll_transponder(lnk, reporter=rep)
 
         def done(res: dict[str, Any]) -> None:
             if not _qt_valid(self):
@@ -5747,9 +5876,31 @@ class FpkeCoilKeyLearnDialog(Dialog):
         )
 
     def run_start_learning_02f7(self) -> None:
+        if self.runner.is_busy:
+            return
+        target_n = self.spn_target_keys.value()
+        ans = QMessageBox.warning(
+            self,
+            tr("Перезапись всех ключей (2E 02F7)", "Overwrite all keys (2E 02F7)"),
+            tr(
+                f"Команда 2E 02F7 полностью сотрёт ВСЕ текущие транспондерные ключи в панели приборов (learned_keys = 0)!\n\n"
+                f"После запуска потребуется заново приложить к катушке все {target_n} ключ(ей) (и старые, и новые). "
+                "Неприложенные старые ключи перестанут заводить автомобиль.\n\n"
+                "Для добавления ключа без удаления старых используйте кнопку «1А. Дописать новый (Режим 5)».\n\n"
+                "Продолжить и стереть текущие ключи (2E 02F7)?",
+                f"Command 2E 02F7 will erase ALL existing transponder keys stored in the cluster (learned_keys = 0)!\n\n"
+                f"You will need to present all {target_n} key(s) (both existing and new) to the LF coil. "
+                "Any existing key not re-learned will stop starting the vehicle.\n\n"
+                "To add a key while keeping existing ones, use “1A. Add new key (Mode 5)” instead.\n\n"
+                "Proceed and erase existing keys (2E 02F7)?",
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes or self.runner.is_busy:
+            return
         s0_h = self._clean_hex(self.ed_s0.text())
         s1_h = self._clean_hex(self.ed_s1.text())
-        target_n = self.spn_target_keys.value()
 
         def done(res: dict[str, Any]) -> None:
             if not _qt_valid(self):

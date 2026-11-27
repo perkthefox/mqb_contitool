@@ -239,3 +239,70 @@ def test_a_link_check_through_a_wrapped_j2534_driver_shows_the_warning(monkeypat
                    "adapter_warning": "Adapter “OpenVCX32” (OpenVCX) is not a VAS 6154"})
     assert dlg.lbl_check.text() == "⚠ ECU answers: 3Q0907530AG\nAdapter “OpenVCX32” (OpenVCX) is not a VAS 6154"
     win.close()
+
+
+def test_connection_update_closes_active_fpke_link(monkeypatch) -> None:
+    from contitool.can import fpke as can_fpke
+
+    set_lang("en")
+    app, win = create_window()
+    closed_fpke: list[bool] = []
+    closed_dpdu: list[bool] = []
+    monkeypatch.setattr(can_fpke, "close_active_fpke_link", lambda: closed_fpke.append(True))
+    monkeypatch.setattr(connection.dpdu, "close_session", lambda: closed_dpdu.append(True))
+
+    win.conn.interface, win.conn.port = "slcan", "/dev/cu.usbmodem1"
+    # Same (interface, port) must NOT tear down active links
+    win.conn.update("slcan", "/dev/cu.usbmodem1", win.conn.out_dir, True)
+    assert closed_fpke == [] and closed_dpdu == []
+
+    # Changing (interface, port) must close both active FPK_E link and D-PDU session
+    win.conn.update("dpdu", "VW_PDUAPI", win.conn.out_dir, True)
+    assert closed_fpke == [True] and closed_dpdu == [True]
+    win.close()
+
+
+def test_let_finish_disconnects_idle_worker_and_closed_dialog_ignores_late_slots(monkeypatch) -> None:
+    from PySide6.QtCore import QObject, Signal
+
+    set_lang("en")
+    app, win = create_window()
+
+    class FakeWorker(QObject):
+        succeeded = Signal(object)
+        failed = Signal(str)
+        finished = Signal()
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.deleted = False
+
+        def isRunning(self) -> bool:  # noqa: N802
+            return False
+
+        def deleteLater(self) -> None:  # noqa: N802
+            self.deleted = True
+
+    w = FakeWorker()
+    seen: list[str] = []
+    w.succeeded.connect(lambda v: seen.append(f"ok:{v}"))
+    w.failed.connect(lambda e: seen.append(f"err:{e}"))
+    connection._let_finish(w)
+    assert w.deleted is True
+    # Signals must be disconnected even when worker was not running
+    w.succeeded.emit("late")
+    w.failed.emit("late-err")
+    assert seen == []
+
+    # Closed ConnectionDialog ignores late _show_found / _check_ok / _check_done calls
+    monkeypatch.setattr(connection, "discover_adapters", lambda: FOUND)
+    dlg = connection.ConnectionDialog(win.conn, win)
+    _scanned(app, dlg)
+    before_text = dlg.lbl_check.text()
+    dlg.done(0)
+    assert dlg._closed is True
+    dlg._show_found([])
+    dlg._check_ok({"responding": True, "ident": [{"did": "F187", "value": "LATE"}]})
+    dlg._check_done("late error", "err")
+    assert dlg.lbl_check.text() == before_text
+    win.close()

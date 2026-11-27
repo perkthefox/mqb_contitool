@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid as _qt_valid
 
 from contitool.can import SUPPORTED_CAN_INTERFACES, FoundAdapter, can_identify, discover_adapters, unsupported_ecu_reason
 from contitool.can import dpdu
@@ -65,6 +66,9 @@ class CanConnection(QObject):
 
     def update(self, interface: str, port: str, out_dir: Path, wiring_confirmed: bool, title: str = "") -> None:
         if (interface, port) != (self.interface, self.port):
+            from contitool.can.fpke import close_active_fpke_link
+
+            close_active_fpke_link()  # any cached 17 FPK_E / Kombi link belongs to the previous adapter
             dpdu.close_session()  # a D-PDU link kept open belongs to the adapter that was picked before
         self.interface, self.port, self.out_dir, self.wiring_confirmed = interface, port, out_dir, wiring_confirmed
         self.title = title
@@ -93,16 +97,22 @@ _ORPHANS: set[OperationWorker] = set()  # threads of closed dialogs, kept alive 
 
 def _let_finish(worker: OperationWorker | None) -> None:
     """Never block the GUI on a closing dialog and never destroy a running thread: detach it, drop it when it ends."""
-    if worker is None or not worker.isRunning():
+    if worker is None:
         return
     for sig in (worker.succeeded, worker.failed):
         try:
             sig.disconnect()
         except (RuntimeError, TypeError):
             pass
+    worker.finished.connect(lambda w=worker: (_ORPHANS.discard(w), w.deleteLater()))
+    if not worker.isRunning():
+        worker.deleteLater()
+        return
     worker.setParent(None)
     _ORPHANS.add(worker)
-    worker.finished.connect(lambda w=worker: (_ORPHANS.discard(w), w.deleteLater()))
+    if not worker.isRunning():
+        _ORPHANS.discard(worker)
+        worker.deleteLater()
 
 
 DIALOG_SIZE = (720, 560)  # the dialog keeps it; texts come and go with the adapter, the body scrolls
@@ -193,6 +203,7 @@ class ConnectionDialog(Dialog):
         self._check: OperationWorker | None = None
         self._scan: OperationWorker | None = None
         self._first_scan = True
+        self._closed = False
 
         self.body.addLayout(row(group_label(tr("Адаптер", "Adapter")), 1,
                                 button(tr("Обновить", "Refresh"), "GhostBtn", slot=self.refresh)))
@@ -296,6 +307,8 @@ class ConnectionDialog(Dialog):
         self._sync()
 
     def _show_found(self, found: list[FoundAdapter]) -> None:
+        if not _qt_valid(self) or getattr(self, "_closed", False):
+            return
         if self._scan is not None:
             self._scan.wait()
         self._scan = None
@@ -454,6 +467,8 @@ class ConnectionDialog(Dialog):
         self._sync()
 
     def _check_ok(self, res: dict[str, Any]) -> None:
+        if not _qt_valid(self) or getattr(self, "_closed", False):
+            return
         values = {i["did"]: i["value"] for i in res.get("ident", [])}
         found = ", ".join(filter(None, (values.get("F187"), values.get("F197"), values.get("F189") and f"SW {values['F189']}")))
         ecu_kind = str(res.get("ecu_kind") or "")
@@ -480,6 +495,8 @@ class ConnectionDialog(Dialog):
         self._check_done("✓ " + tr("Блок отвечает", "ECU answers") + tag + (f": {found}" if found else ""), "ok")
 
     def _check_done(self, text: str, tone: str) -> None:
+        if not _qt_valid(self) or getattr(self, "_closed", False):
+            return
         if self._check is not None:
             self._check.wait()
         self._check = None
@@ -509,6 +526,7 @@ class ConnectionDialog(Dialog):
         self.accept()
 
     def done(self, result: int) -> None:  # accept() and reject() both end here
+        self._closed = True
         _let_finish(self._check)
         _let_finish(self._scan)
         self._check = self._scan = None

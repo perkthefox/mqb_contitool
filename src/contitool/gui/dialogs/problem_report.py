@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import subprocess
 import sys
 import time
@@ -45,15 +46,20 @@ class ProblemReportDialog(Dialog):
         note = Callout("warn")
         note.label.setText(tr(
             "Логи могут содержать идентификаторы блока — проверьте архив перед публикацией. "
-            "Только GitHub Issues (без личных сообщений автору).",
-            "Logs may include ECU identifiers — review the archive before posting. Use GitHub Issues only.",
+            "Без галочки «Приложить дампы памяти» криптографические ключи автомобиля (IKA/GFA/K_c/K_5/S0/S1/FD11) "
+            "маскируются и вырезаются из отчёта. Только GitHub Issues (без личных сообщений автору).",
+            "Logs may include ECU identifiers — review the archive before posting. "
+            "When “Attach the memory dumps” is unchecked, cryptographic vehicle keys (IKA/GFA/K_c/K_5/S0/S1/FD11) "
+            "are stripped/masked from the report. Use GitHub Issues only.",
         ))
         self.body.addWidget(note)
         self.chk_dumps = QCheckBox(tr("Приложить дампы памяти", "Attach the memory dumps"))
         self.body.addWidget(self.chk_dumps)
         dumps_note = hint(tr(
-            "В дампах содержатся VIN, FAZIT и VCRN — прикладывайте только если без них проблему не воспроизвести.",
-            "Dumps contain VIN, FAZIT, and VCRN — attach only if needed to diagnose the issue.",
+            "В дампах содержатся VIN, FAZIT, VCRN и криптографические ключи иммобилайзера/CP — "
+            "прикладывайте только если без них проблему не воспроизвести (без галочки ключи из отчёта маскируются).",
+            "Dumps contain VIN, FAZIT, VCRN, and immobilizer/CP cryptographic keys — "
+            "attach only if needed to diagnose the issue (when unchecked, cryptographic vehicle keys are stripped/masked).",
         ))
         dumps_note.setWordWrap(True)
         self.body.addWidget(dumps_note)
@@ -93,15 +99,16 @@ class ProblemReportDialog(Dialog):
         finally:
             QApplication.restoreOverrideCursor()
         size = dest.stat().st_size
+        dest_html = html.escape(str(dest))
         if size > GITHUB_ATTACH_LIMIT:
             self._status(tr(
-                f"Архив сохранён: {dest}<br>Он {size / 2**20:.0f} МБ, а GitHub принимает до 25 МБ — создайте отчёт без дампов.",
-                f"Archive saved: {dest}<br>It is {size / 2**20:.0f} MB and GitHub takes up to 25 MB — create the report without dumps.",
+                f"Архив сохранён: {dest_html}<br>Он {size / 2**20:.0f} МБ, а GitHub принимает до 25 МБ — создайте отчёт без дампов.",
+                f"Archive saved: {dest_html}<br>It is {size / 2**20:.0f} MB and GitHub takes up to 25 MB — create the report without dumps.",
             ), "warn")
         else:
             self._status(tr(
-                f"Архив сохранён и выделен в папке: {dest}<br>Перетащите его в описание issue на открывшейся странице GitHub.",
-                f"Archive saved and selected in its folder: {dest}<br>Drag it into the issue description on the GitHub page that opened.",
+                f"Архив сохранён и выделен в папке: {dest_html}<br>Перетащите его в описание issue на открывшейся странице GitHub.",
+                f"Archive saved and selected in its folder: {dest_html}<br>Drag it into the issue description on the GitHub page that opened.",
             ), "ok")
         if open_browser:
             QDesktopServices.openUrl(QUrl(issue_url(self.failure, env, self.log_text)))

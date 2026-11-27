@@ -123,7 +123,7 @@ def _summarize_recent_folder(folder: Path) -> dict[str, Any]:
             or "eellogical.bin" in file_sizes
             or "eel_phys_offsets.bin" in file_sizes
             or "kombi" in raw_name.lower()
-            or part_num.startswith(("5NA920740", "5NA920750", "5E0920740", "5E0920750", "5G0920", "3Q0920"))
+            or part_num.startswith(("5NA920740", "5NA920750", "5E0920740", "5E0920750", "5G0920", "3Q0920", "8V0920860"))
         )
     )
     is_fpke = (
@@ -161,7 +161,7 @@ def _summarize_recent_folder(folder: Path) -> dict[str, Any]:
         sz_df = next(s for n, s in file_sizes.items() if "dflash" in n)
         tags.append("DF 32K" if sz_df == 32768 else "DF 64K")
     if "eellogical.bin" in file_sizes:
-        tags.append("EEL 132")
+        tags.append("EEL 130" if file_sizes["eellogical.bin"] == 8334 else "EEL 132")
     if any("sram" in n for n in file_sizes):
         tags.append("SRAM")
     if any("uflash" in n for n in file_sizes):

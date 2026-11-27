@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QStackedWidget,
     QTableView,
@@ -697,7 +698,10 @@ class TerminalScreen(QWidget):
         )
         if path:
             lines = ["\t".join(TraceModel.headers())] + ["\t".join(TraceModel.cells(r)) for r in self.model.rows]
-            Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+            try:
+                Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError as exc:
+                QMessageBox.warning(self, tr("Ошибка сохранения трафика", "Failed to save traffic"), str(exc))
 
     def _copy_selection(self) -> None:
         rows = sorted({self.proxy.mapToSource(i).row() for i in self.table.selectionModel().selectedRows()})

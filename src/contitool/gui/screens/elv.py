@@ -55,6 +55,8 @@ from contitool.core.elv import (
     elv_parse_dflash,
     elv_virginize_dflash,
 )
+from contitool.core.fpke import is_fpke_dflash
+from contitool.core.kombi import is_kombi_dflash
 from contitool.gui import theme
 from contitool.gui.connection import CanConnection, ensure_ready
 from contitool.gui.theme import mono_font, set_tone
@@ -516,9 +518,13 @@ class ElvScreen(QWidget):
             self._reset_drafts()
 
         if isinstance(res.get("passport"), dict):
-            self._passport = dict(res["passport"])
+            for k, v in res["passport"].items():
+                if v is not None and v != "":
+                    self._passport[k] = v
         if isinstance(res.get("status"), dict):
-            self._status = dict(res["status"])
+            for k, v in res["status"].items():
+                if v is not None and v != "":
+                    self._status[k] = v
         if res.get("dflash_bytes") is not None:
             self._dflash_bytes = bytes(res["dflash_bytes"])
         if isinstance(res.get("dflash_parsed"), dict):
@@ -2571,7 +2577,10 @@ class ElvScreen(QWidget):
     def action_load_cluster_dflash(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            tr("Выбрать Dflash.bin приборной панели 17 FPK_E", "Select 17 FPK_E Instrument Cluster Dflash.bin"),
+            tr(
+                "Выбрать DataFlash (Dflash.bin / EelLogical.bin) приборной панели 17 FPK_E / Kombi",
+                "Select 17 FPK_E / Kombi Instrument Cluster DataFlash (Dflash.bin / EelLogical.bin)",
+            ),
             "",
             "Binary (*.bin *.raw);;All (*)",
         )
@@ -2579,6 +2588,16 @@ class ElvScreen(QWidget):
             return
         try:
             raw = Path(path).read_bytes()
+            if not (is_kombi_dflash(raw) or is_fpke_dflash(raw)):
+                QMessageBox.warning(
+                    self,
+                    tr("Ошибка разбора 17 FPK_E / Kombi", "17 FPK_E / Kombi Parse Error"),
+                    tr(
+                        "Выбранный файл не распознан как DataFlash панели приборов 17 FPK_E (64 КиБ) или 17 Kombi VDD (64 / 32 КиБ / EEL 9 533 / 8 334 Б).",
+                        "The selected file is not a recognised 17 FPK_E (64 KiB) or 17 Kombi VDD (64 / 32 KiB / EEL 9,533 / 8,334 B) cluster DataFlash dump.",
+                    ),
+                )
+                return
             mat = elv_extract_cluster_material(raw)
         except OSError as exc:
             QMessageBox.warning(
@@ -2588,7 +2607,7 @@ class ElvScreen(QWidget):
             )
             return
         except Exception as exc:
-            QMessageBox.warning(self, tr("Ошибка разбора FPK_E", "FPK_E Parse Error"), str(exc))
+            QMessageBox.warning(self, tr("Ошибка разбора 17 FPK_E / Kombi", "17 FPK_E / Kombi Parse Error"), str(exc))
             return
 
         self._cluster_material = mat
@@ -2895,6 +2914,9 @@ class ElvScreen(QWidget):
                 self._verify_02f9 = dict(res["verify_02f9"])
 
             if res.get("ok"):
+                self._dflash_bytes = None
+                self._dflash_parsed = None
+                self._dflash_path = None
                 self._draft_cur_k5 = new_k5
                 self._refresh_all()
                 self.changed.emit()
@@ -3040,6 +3062,9 @@ class ElvScreen(QWidget):
                 self._verify_02f9 = dict(res["verify_02f9"])
 
             if res.get("ok"):
+                self._dflash_bytes = None
+                self._dflash_parsed = None
+                self._dflash_path = None
                 if res.get("virgin_k5_hex"):
                     self._draft_cur_k5 = str(res["virgin_k5_hex"]).upper()
                 self._refresh_all()

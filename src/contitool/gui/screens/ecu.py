@@ -433,6 +433,7 @@ class EcuScreen(QWidget):
         self.btn_restore.setEnabled(not self.runner.is_busy)
         self.btn_report.setText(tr("Подробный отчёт", "Full report"))
         self.btn_close.setText(tr("Закрыть", "Close"))
+        self.btn_close.setEnabled(not self.runner.is_busy)
 
         clear_layout(self.grid_id)
         clear_layout(self.grid_mcu_id)
@@ -2040,7 +2041,11 @@ class EcuScreen(QWidget):
         src = self.ws.path("dflash")
         if src is None:
             return
-        df = src.read_bytes()
+        try:
+            df = src.read_bytes()
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка экспорта параметрии", "Dataset export error"), str(exc))
+            return
         blocks = populated_zdc_blocks(df)
         if not blocks:
             QMessageBox.information(self, tr("Экспорт параметрии", "Dataset export"),
@@ -2053,13 +2058,17 @@ class EcuScreen(QWidget):
         dest, n = Path(chosen) / f"ZDC_{self.ws.part_number or 'J533'}_{time.strftime('%Y-%m-%d_%H-%M')}", 2
         while dest.exists():
             dest, n = Path(chosen) / f"ZDC_{self.ws.part_number or 'J533'}_{time.strftime('%Y-%m-%d_%H-%M')}_{n}", n + 1
-        dest.mkdir(parents=True)
-        codes = {spec[0]: spec[1] for spec in ZDC_DATASET_SPECS}
-        for idx in blocks:
-            name = f"ZDC{idx}_{codes.get(idx, 'BLOCK')}"
-            (dest / f"{name}.xml").write_bytes(build_odis_zdc_file(df, idx))
-            (dest / f"{name}.bin").write_bytes(export_zdc_block(df, idx))
-        (dest / "ZDC_area_0000-303F.bin").write_bytes(df[:0x3040])  # passport and all blocks, as DataFlash holds them
+        try:
+            dest.mkdir(parents=True)
+            codes = {spec[0]: spec[1] for spec in ZDC_DATASET_SPECS}
+            for idx in blocks:
+                name = f"ZDC{idx}_{codes.get(idx, 'BLOCK')}"
+                (dest / f"{name}.xml").write_bytes(build_odis_zdc_file(df, idx))
+                (dest / f"{name}.bin").write_bytes(export_zdc_block(df, idx))
+            (dest / "ZDC_area_0000-303F.bin").write_bytes(df[:0x3040])  # passport and all blocks, as DataFlash holds them
+        except OSError as exc:
+            QMessageBox.warning(self, tr("Ошибка экспорта параметрии", "Dataset export error"), str(exc))
+            return
         self.note.emit(tr(f"Параметрия сохранена ({len(blocks)} бл.): {dest}", f"Datasets saved ({len(blocks)} blocks): {dest}"))
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(dest)))
 
@@ -2252,7 +2261,7 @@ class EcuScreen(QWidget):
         self.runner.run_task(
             tr("Ожидание нажатия кнопки на руле (12 с)", "Waiting for steering-wheel button press (12 s)"),
             lambda rep: can_learn_mfl_button(port, interface=iface, reporter=rep),
-            on_success=show_res,
+            on_success=self._here(show_res),
         )
 
     def _replace_key(self, target: str) -> None:

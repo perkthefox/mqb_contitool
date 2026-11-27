@@ -49,6 +49,8 @@ from contitool.core.bcm import (
     bcm_extract_cluster_ffb_material,
     bcm_support_info,
 )
+from contitool.core.fpke import is_fpke_dflash
+from contitool.core.kombi import is_kombi_dflash
 from contitool.gui import theme
 from contitool.gui.connection import CanConnection, ensure_ready
 from contitool.gui.theme import mono_font, set_tone
@@ -223,6 +225,7 @@ class BcmScreen(QWidget):
         self.runner = runner
         self._cluster_provider = cluster_provider
         self._is_open = False
+        self._session_gen: int = 0
         self._via_gateway = False
         self._gateway_bridge = False
         self._gateway_channel = 0
@@ -238,14 +241,14 @@ class BcmScreen(QWidget):
         self._dtcs: list[dict[str, Any]] | None = None
         self._key = "cp_keys"
 
-        # Persistent form drafts across page re-renders
-        self._draft_cur_ika: str = ""
+        # Persistent form drafts across page re-renders (None = inherit from live/cluster state; "" = explicitly cleared)
+        self._draft_cur_ika: str | None = None
         self._draft_new_ika: str = ""
-        self._draft_new_gfa: str = ""
+        self._draft_new_gfa: str | None = None
         self._draft_write_reset: bool = True
-        self._draft_ffb_gfa: str = ""
-        self._draft_ffb_kc: str = ""
-        self._draft_ffb_kffb: str = ""
+        self._draft_ffb_gfa: str | None = None
+        self._draft_ffb_kc: str | None = None
+        self._draft_ffb_kffb: str | None = None
         self._draft_ffb_freq: int = 0x03
         self._draft_sync_gfa: bool = False
         self._draft_ffb_rows: list[dict[str, Any]] = [
@@ -302,6 +305,35 @@ class BcmScreen(QWidget):
         if key in self._nav_items:
             self.nav.setCurrentItem(self._nav_items[key])
 
+    def _reset_session_state(self) -> None:
+        self._session_gen += 1
+        self._passport = {}
+        self._status = {}
+        self._dtcs = None
+        self._ika_hex = ""
+        self._gfa_hex = ""
+        self._profile_override = ""
+        self._profile = bcm_detect_profile()
+        self._via_gateway = False
+        self._gateway_bridge = False
+        self._gateway_channel = 0
+        self._cluster_material = None
+        self._cluster_source_manual = False
+        self._ffb_drafts_dirty = False
+        self._draft_cur_ika = None
+        self._draft_new_ika = ""
+        self._draft_new_gfa = None
+        self._draft_write_reset = True
+        self._draft_ffb_gfa = None
+        self._draft_ffb_kc = None
+        self._draft_ffb_kffb = None
+        self._draft_ffb_freq = 0x03
+        self._draft_sync_gfa = False
+        self._draft_ffb_rows = [
+            {"enabled": idx == 1, "serial": "", "counter": 0, "source": "manual"}
+            for idx in range(1, 8)
+        ]
+
     def open_from_discovered(
         self,
         ecu: DiscoveredEcu | None = None,
@@ -312,6 +344,7 @@ class BcmScreen(QWidget):
         auto_read: bool = True,
     ) -> None:
         """Open the 09 BCM workspace from a bus scan `DiscoveredEcu` and immediately read all BCM data."""
+        self._reset_session_state()
         self._is_open = True
         if ecu is not None:
             self._via_gateway = bool(ecu.via_gateway)
@@ -331,14 +364,16 @@ class BcmScreen(QWidget):
             self._via_gateway = bool(via_gateway)
             self._gateway_bridge = bool(gateway_bridge)
             self._gateway_channel = int(gateway_channel)
-        self._cluster_source_manual = False
-        self._ffb_drafts_dirty = False
         self._sync_cluster_material_if_available(silent=True)
         self.select(self._key)
         self.refresh()
         self.changed.emit()
         if auto_read and self.conn.ready and not self.conn.busy_reason() and not self.runner.is_busy:
-            QTimer.singleShot(0, self.action_read_all)
+            gen = self._session_gen
+            QTimer.singleShot(
+                0,
+                lambda g=gen: _qt_valid(self) and self._is_open and self._session_gen == g and self.action_read_all(),
+            )
 
     def open_from_read_result(
         self,
@@ -348,49 +383,19 @@ class BcmScreen(QWidget):
         gateway_channel: int = 0,
     ) -> None:
         """Open the 09 BCM workspace on its first page populated from `can_bcm_read_all()`."""
+        self._reset_session_state()
         self._is_open = True
         self._via_gateway = bool(res.get("via_gateway", False))
         self._gateway_bridge = bool(gateway_bridge or res.get("gateway_bridged", False))
         self._gateway_channel = int(gateway_channel)
-        self._ika_hex = ""
-        self._gfa_hex = ""
-        self._draft_cur_ika = ""
-        self._passport = {}
-        self._status = {}
-        self._dtcs = None
-        self._cluster_source_manual = False
-        self._ffb_drafts_dirty = False
         self._key = "cp_keys"
         self.select("cp_keys")
         self._sync_cluster_material_if_available(silent=True)
-        self._on_all_read(res)
+        self._on_all_read(res, expected_gen=self._session_gen)
 
     def close_bcm(self) -> None:
         self._is_open = False
-        self._passport = {}
-        self._status = {}
-        self._dtcs = None
-        self._ika_hex = ""
-        self._gfa_hex = ""
-        self._profile_override = ""
-        self._via_gateway = False
-        self._gateway_bridge = False
-        self._gateway_channel = 0
-        self._cluster_material = None
-        self._cluster_source_manual = False
-        self._ffb_drafts_dirty = False
-        self._draft_cur_ika = ""
-        self._draft_new_ika = ""
-        self._draft_new_gfa = ""
-        self._draft_ffb_gfa = ""
-        self._draft_ffb_kc = ""
-        self._draft_ffb_kffb = ""
-        self._draft_ffb_freq = 0x03
-        self._draft_sync_gfa = False
-        self._draft_ffb_rows = [
-            {"enabled": idx == 1, "serial": "", "counter": 0, "source": "manual"}
-            for idx in range(1, 8)
-        ]
+        self._reset_session_state()
         self.changed.emit()
 
     def set_routing(self, *, via_gateway: bool, gateway_bridge: bool, gateway_channel: int = 0) -> None:
@@ -668,6 +673,7 @@ class BcmScreen(QWidget):
         self.btn_term_top.setText(tr("CAN-терминал", "CAN terminal"))
         self.btn_term_top.setEnabled(not busy)
         self.btn_close_top.setText(tr("Закрыть", "Close"))
+        self.btn_close_top.setEnabled(not busy)
 
         clear_layout(self.grid_id)
         for c in range(8):
@@ -894,6 +900,7 @@ class BcmScreen(QWidget):
         self._profile_override = val
         self._profile = bcm_detect_profile(self._passport, sw_profile=val or None)
         self._refresh_identity()
+        self._render_page()
 
     # ────────────────────────────── Page 1: Component Protection (IKA / GFA) ──────────────────────────────
 
@@ -979,7 +986,7 @@ class BcmScreen(QWidget):
             ),
         )
 
-        cur_ika_val = (self._draft_cur_ika or self._ika_hex).upper()
+        cur_ika_val = (self._draft_cur_ika if self._draft_cur_ika is not None else self._ika_hex).upper()
         self.ed_write_cur_ika = QLineEdit(cur_ika_val)
         self.ed_write_cur_ika.setFont(mono_font(12))
         self.ed_write_cur_ika.setPlaceholderText("32 HEX (16 B)")
@@ -1021,7 +1028,7 @@ class BcmScreen(QWidget):
         self._bind_hex_validator(self.ed_write_new_ika, b_new_ika, 16, allow_empty=True)
         sec_write.body.addWidget(c_new_ika)
 
-        new_gfa_val = (self._draft_new_gfa or self._gfa_hex).upper()
+        new_gfa_val = (self._draft_new_gfa if self._draft_new_gfa is not None else self._gfa_hex).upper()
         self.ed_write_new_gfa = QLineEdit(new_gfa_val)
         self.ed_write_new_gfa.setFont(mono_font(12))
         self.ed_write_new_gfa.setPlaceholderText("32 HEX (16 B)")
@@ -1108,7 +1115,11 @@ class BcmScreen(QWidget):
         # Row 1: GFA + Frequency
         r1 = QHBoxLayout()
         r1.setSpacing(10)
-        gfa_val = (self._draft_ffb_gfa or self._gfa_hex or cm.get("gfa_hex") or "").upper()
+        gfa_val = (
+            self._draft_ffb_gfa
+            if self._draft_ffb_gfa is not None
+            else (self._gfa_hex or cm.get("gfa_hex") or "")
+        ).upper()
         self.ed_ffb_gfa = QLineEdit(gfa_val)
         self.ed_ffb_gfa.setFont(mono_font(12))
         self.ed_ffb_gfa.setPlaceholderText(tr("Пусто = авто-чтение GFA из BCM по XCP", "Blank = auto-read GFA via XCP"))
@@ -1136,7 +1147,7 @@ class BcmScreen(QWidget):
         # Row 2: K_c + K_ffb
         r2 = QHBoxLayout()
         r2.setSpacing(10)
-        kc_val = (self._draft_ffb_kc or cm.get("kc_hex") or "").upper()
+        kc_val = (self._draft_ffb_kc if self._draft_ffb_kc is not None else (cm.get("kc_hex") or "")).upper()
         self.ed_ffb_kc = QLineEdit(kc_val)
         self.ed_ffb_kc.setFont(mono_font(12))
         self.ed_ffb_kc.setPlaceholderText("32 HEX (EEL 0x68)")
@@ -1144,7 +1155,7 @@ class BcmScreen(QWidget):
         c_kc, b_kc = self._field_box(tr("МАСТЕР-КЛЮЧ K_c (17 FPK_E)", "IMMO MASTER KEY K_c (17 FPK_E)"), self.ed_ffb_kc)
         self._bind_hex_validator(self.ed_ffb_kc, b_kc, 16, allow_empty=True)
 
-        kffb_val = (self._draft_ffb_kffb or cm.get("k_ffb_hex") or "").upper()
+        kffb_val = (self._draft_ffb_kffb if self._draft_ffb_kffb is not None else (cm.get("k_ffb_hex") or "")).upper()
         self.ed_ffb_kffb = QLineEdit(kffb_val)
         self.ed_ffb_kffb.setFont(mono_font(12))
         self.ed_ffb_kffb.setPlaceholderText("AES_Kc(C16)")
@@ -1573,7 +1584,7 @@ class BcmScreen(QWidget):
             self._draft_ffb_kc = str(mat["kc_hex"]).upper()
         if mat.get("k_ffb_hex"):
             self._draft_ffb_kffb = str(mat["k_ffb_hex"]).upper()
-        if mat.get("gfa_hex") and not self._draft_ffb_gfa and not self._gfa_hex:
+        if mat.get("gfa_hex") and self._draft_ffb_gfa is None and not self._gfa_hex:
             self._draft_ffb_gfa = str(mat["gfa_hex"]).upper()
         bcm_by_slot = {
             int(s["slot"]): s
@@ -1702,7 +1713,10 @@ class BcmScreen(QWidget):
     def action_load_cluster_dflash_file(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
             self,
-            tr("Выберите DataFlash (Dflash.bin) панели приборов 17 FPK_E", "Select 17 FPK_E DataFlash (Dflash.bin)"),
+            tr(
+                "Выберите DataFlash (Dflash.bin / EelLogical.bin) панели приборов 17 FPK_E / Kombi",
+                "Select 17 FPK_E / Kombi DataFlash (Dflash.bin / EelLogical.bin)",
+            ),
             str(Path.cwd()),
             "Binary (*.bin *.raw);;All Files (*)",
         )
@@ -1710,6 +1724,16 @@ class BcmScreen(QWidget):
             return
         try:
             raw = Path(path_str).read_bytes()
+            if not (is_kombi_dflash(raw) or is_fpke_dflash(raw)):
+                QMessageBox.warning(
+                    self,
+                    "ContiTool",
+                    tr(
+                        "Выбранный файл не распознан как DataFlash панели приборов 17 FPK_E (64 КиБ) или 17 Kombi VDD (64 / 32 КиБ / EEL 9 533 / 8 334 Б).",
+                        "The selected file is not a recognised 17 FPK_E (64 KiB) or 17 Kombi VDD (64 / 32 KiB / EEL 9,533 / 8,334 B) cluster DataFlash dump.",
+                    ),
+                )
+                return
             freq = int(self._status.get("freq_code", self._draft_ffb_freq))
             mat = bcm_extract_cluster_ffb_material(raw, freq_code=freq)
             self._cluster_source_manual = True
@@ -1721,12 +1745,33 @@ class BcmScreen(QWidget):
 
     # ────────────────────────────── Live CAN Actions ──────────────────────────────
 
+    @staticmethod
+    def _parse_hex_field(raw_txt: str, expected_bytes: int, *, allow_empty: bool = False) -> tuple[bool, str]:
+        cleaned = "".join(raw_txt.split()).replace("0x", "").replace("0X", "")
+        if not cleaned:
+            return allow_empty, ""
+        if len(cleaned) != expected_bytes * 2:
+            return False, cleaned
+        try:
+            bytes.fromhex(cleaned)
+        except ValueError:
+            return False, cleaned
+        return True, cleaned.upper()
+
+    def _callback_valid(self, expected_gen: int | None) -> bool:
+        if not _qt_valid(self) or not self._is_open:
+            return False
+        if expected_gen is not None and self._session_gen != expected_gen:
+            return False
+        return True
+
     def action_read_all(self) -> None:
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
         via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
+        gen = self._session_gen
         self.runner.run_task(
             tr("Опрос 09 BCM (паспорт, статус, радиоключи FFB, ошибки)", "Polling 09 BCM (passport, status, FFB keys, DTCs)"),
             lambda rep: can_bcm_read_all(
@@ -1739,10 +1784,12 @@ class BcmScreen(QWidget):
                 include_keys=False,
                 reporter=rep,
             ),
-            on_success=self._on_all_read,
+            on_success=lambda res, g=gen: self._on_all_read(res, expected_gen=g),
         )
 
-    def _on_all_read(self, res: dict[str, Any]) -> None:
+    def _on_all_read(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
+            return
         if isinstance(res.get("passport"), dict):
             self._passport.update(res["passport"])
         if isinstance(res.get("status"), dict):
@@ -1758,7 +1805,7 @@ class BcmScreen(QWidget):
             self._draft_cur_ika = self._ika_hex.upper()
         if res.get("gfa_working_hex"):
             self._gfa_hex = str(res["gfa_working_hex"])
-            if not self._draft_new_gfa:
+            if self._draft_new_gfa is None:
                 self._draft_new_gfa = self._gfa_hex.upper()
             if not self._ffb_drafts_dirty:
                 self._draft_ffb_gfa = self._gfa_hex.upper()
@@ -1774,6 +1821,7 @@ class BcmScreen(QWidget):
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
         via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
+        gen = self._session_gen
         self.runner.run_task(
             tr("Опрос паспорта и статуса 09 BCM (UDS 0x70E)", "Polling 09 BCM passport & status (UDS 0x70E)"),
             lambda rep: can_bcm_status(
@@ -1786,10 +1834,12 @@ class BcmScreen(QWidget):
                 include_nvm_slots=True,
                 reporter=rep,
             ),
-            on_success=self._on_status_read,
+            on_success=lambda res, g=gen: self._on_status_read(res, expected_gen=g),
         )
 
-    def _on_status_read(self, res: dict[str, Any]) -> None:
+    def _on_status_read(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
+            return
         if isinstance(res.get("passport"), dict):
             self._passport.update(res["passport"])
         if isinstance(res.get("status"), dict):
@@ -1807,9 +1857,12 @@ class BcmScreen(QWidget):
             return
         if not run_dialog(BcmReadKeysDialog(include_ika=False, via_gateway=self._via_gateway, status=self._status, parent=self)):
             return
+        if self.runner.is_busy:
+            return
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
         via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
+        gen = self._session_gen
         self.runner.run_task(
             tr("Чтение GFA из 09 BCM (WFS Job 5 + XCP)", "Reading GFA from 09 BCM (WFS Job 5 + XCP)"),
             lambda rep: can_bcm_read_gfa(
@@ -1821,7 +1874,7 @@ class BcmScreen(QWidget):
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
-            on_success=self._on_keys_read,
+            on_success=lambda res, g=gen: self._on_keys_read(res, expected_gen=g),
         )
 
     def action_read_keys(self) -> None:
@@ -1829,9 +1882,12 @@ class BcmScreen(QWidget):
             return
         if not run_dialog(BcmReadKeysDialog(include_ika=True, via_gateway=self._via_gateway, status=self._status, parent=self)):
             return
+        if self.runner.is_busy:
+            return
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
         via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
+        gen = self._session_gen
         self.runner.run_task(
             tr("Чтение IKA + GFA из 09 BCM (WFS Ch 3 + XCP)", "Reading IKA + GFA from 09 BCM (WFS Ch 3 + XCP)"),
             lambda rep: can_bcm_read_keys(
@@ -1843,10 +1899,12 @@ class BcmScreen(QWidget):
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
-            on_success=self._on_keys_read,
+            on_success=lambda res, g=gen: self._on_keys_read(res, expected_gen=g),
         )
 
-    def _on_keys_read(self, res: dict[str, Any]) -> None:
+    def _on_keys_read(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
+            return
         if isinstance(res.get("passport"), dict):
             self._passport.update(res["passport"])
         if isinstance(res.get("status"), dict):
@@ -1860,7 +1918,7 @@ class BcmScreen(QWidget):
             self._draft_cur_ika = self._ika_hex.upper()
         if res.get("gfa_working_hex"):
             self._gfa_hex = str(res["gfa_working_hex"])
-            if not self._draft_new_gfa:
+            if self._draft_new_gfa is None:
                 self._draft_new_gfa = self._gfa_hex.upper()
             if not self._ffb_drafts_dirty:
                 self._draft_ffb_gfa = self._gfa_hex.upper()
@@ -1897,12 +1955,12 @@ class BcmScreen(QWidget):
     def action_write_keys(self, *, include_ika: bool) -> None:
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
-        cur_ika = (
+        cur_ika_raw = (
             self.ed_write_cur_ika.text()
             if hasattr(self, "ed_write_cur_ika") and _qt_valid(self.ed_write_cur_ika)
-            else self._draft_cur_ika
+            else (self._draft_cur_ika if self._draft_cur_ika is not None else self._ika_hex)
         ).strip()
-        new_ika = (
+        new_ika_raw = (
             (
                 self.ed_write_new_ika.text()
                 if hasattr(self, "ed_write_new_ika") and _qt_valid(self.ed_write_new_ika)
@@ -1911,28 +1969,47 @@ class BcmScreen(QWidget):
             if include_ika
             else ""
         )
-        new_gfa = (
+        new_gfa_raw = (
             self.ed_write_new_gfa.text()
             if hasattr(self, "ed_write_new_gfa") and _qt_valid(self.ed_write_new_gfa)
-            else self._draft_new_gfa
+            else (self._draft_new_gfa if self._draft_new_gfa is not None else self._gfa_hex)
         ).strip()
         hard_reset = self._draft_write_reset
 
-        if not cur_ika:
+        if not cur_ika_raw:
             QMessageBox.warning(
                 self,
                 "ContiTool",
                 tr("Укажите текущий IKA блока 09 BCM (или нажмите «Считать IKA + GFA»).", "Enter the current 09 BCM IKA (or click “Read IKA + GFA”)."),
             )
             return
-        if include_ika and not new_ika:
+        cur_ok, cur_ika = self._parse_hex_field(cur_ika_raw, 16, allow_empty=False)
+        if not cur_ok:
             QMessageBox.warning(
                 self,
-                "ContiTool",
-                tr("Укажите новый IKA (32 hex) для DID 0x00BE.", "Enter the new IKA (32 hex) for DID 0x00BE."),
+                tr("Некорректный текущий IKA", "Invalid current IKA"),
+                tr("Текущий IKA должен содержать ровно 32 hex-символа (16 байт).", "Current IKA must contain exactly 32 hex characters (16 bytes)."),
             )
             return
-        if not new_gfa:
+        if include_ika:
+            if not new_ika_raw:
+                QMessageBox.warning(
+                    self,
+                    "ContiTool",
+                    tr("Укажите новый IKA (32 hex) для DID 0x00BE.", "Enter the new IKA (32 hex) for DID 0x00BE."),
+                )
+                return
+            new_ika_ok, new_ika = self._parse_hex_field(new_ika_raw, 16, allow_empty=False)
+            if not new_ika_ok:
+                QMessageBox.warning(
+                    self,
+                    tr("Некорректный новый IKA", "Invalid new IKA"),
+                    tr("Новый IKA (DID 0x00BE) должен содержать ровно 32 hex-символа (16 байт).", "New IKA (DID 0x00BE) must contain exactly 32 hex characters (16 bytes)."),
+                )
+                return
+        else:
+            new_ika = ""
+        if not new_gfa_raw:
             QMessageBox.warning(
                 self,
                 "ContiTool",
@@ -1942,28 +2019,48 @@ class BcmScreen(QWidget):
                 ),
             )
             return
+        gfa_ok, new_gfa = self._parse_hex_field(new_gfa_raw, 16, allow_empty=False)
+        if not gfa_ok:
+            QMessageBox.warning(
+                self,
+                tr("Некорректный GFA", "Invalid GFA"),
+                tr("Целевой GFA (DID 0x00BD) должен содержать ровно 32 hex-символа (16 байт).", "Target GFA (DID 0x00BD) must contain exactly 32 hex characters (16 bytes)."),
+            )
+            return
 
         confirm_body = (
             tr(
                 f"Записать новый IKA (2E 00BE) и групповой ключ GFA (2E 00BD) в NvM блока 09 BCM?\n\n"
-                f"Новый IKA: {new_ika.upper()}\nНовый GFA: {new_gfa.upper()}\n\n"
+                f"Новый IKA: {new_ika}\nНовый GFA: {new_gfa}\n\n"
                 "Запись 00BE изменяет активный ключ шифрования BCM — обязательно сохраните новый IKA!",
                 f"Write new IKA (2E 00BE) and group key GFA (2E 00BD) to 09 BCM NvM?\n\n"
-                f"New IKA: {new_ika.upper()}\nNew GFA: {new_gfa.upper()}\n\n"
+                f"New IKA: {new_ika}\nNew GFA: {new_gfa}\n\n"
                 "Writing 00BE changes the BCM's active encryption key — make sure you save the new IKA!",
             )
             if include_ika
             else tr(
-                f"Записать групповой ключ GFA (2E 00BD) в NvM блока 09 BCM?\n\nНовый GFA: {new_gfa.upper()}",
-                f"Write group key GFA (2E 00BD) to 09 BCM NvM?\n\nNew GFA: {new_gfa.upper()}",
+                f"Записать групповой ключ GFA (2E 00BD) в NvM блока 09 BCM?\n\nНовый GFA: {new_gfa}",
+                f"Write group key GFA (2E 00BD) to 09 BCM NvM?\n\nNew GFA: {new_gfa}",
             )
         )
-        if QMessageBox.question(self, tr("Подтверждение записи в 09 BCM", "Confirm 09 BCM NvM Write"), confirm_body) != QMessageBox.StandardButton.Yes:
+        if (
+            QMessageBox.question(
+                self,
+                tr("Подтверждение записи в 09 BCM", "Confirm 09 BCM NvM Write"),
+                confirm_body,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        if self.runner.is_busy:
             return
 
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
         via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
+        gen = self._session_gen
         self.runner.run_task(
             tr("Запись ключей CP (2E 00BE / 00BD) в 09 BCM", "Writing CP keys (2E 00BE / 00BD) to 09 BCM"),
             lambda rep: can_bcm_write_keys(
@@ -1979,10 +2076,12 @@ class BcmScreen(QWidget):
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
-            on_success=self._on_keys_written,
+            on_success=lambda res, g=gen: self._on_keys_written(res, expected_gen=g),
         )
 
-    def _on_keys_written(self, res: dict[str, Any]) -> None:
+    def _on_keys_written(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
+            return
         if res.get("active_ika_hex"):
             self._ika_hex = str(res["active_ika_hex"])
             self._draft_cur_ika = self._ika_hex.upper()
@@ -1998,12 +2097,50 @@ class BcmScreen(QWidget):
     def action_adapt_selected_ffb(self) -> None:
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
-        gfa_txt = (self.ed_ffb_gfa.text() if hasattr(self, "ed_ffb_gfa") and _qt_valid(self.ed_ffb_gfa) else self._draft_ffb_gfa).strip()
-        kc_txt = (self.ed_ffb_kc.text() if hasattr(self, "ed_ffb_kc") and _qt_valid(self.ed_ffb_kc) else self._draft_ffb_kc).strip()
-        kffb_txt = (self.ed_ffb_kffb.text() if hasattr(self, "ed_ffb_kffb") and _qt_valid(self.ed_ffb_kffb) else self._draft_ffb_kffb).strip()
+        cm = self._cluster_material or {}
+        gfa_raw = (
+            self.ed_ffb_gfa.text()
+            if hasattr(self, "ed_ffb_gfa") and _qt_valid(self.ed_ffb_gfa)
+            else (self._draft_ffb_gfa if self._draft_ffb_gfa is not None else (self._gfa_hex or cm.get("gfa_hex") or ""))
+        ).strip()
+        kc_raw = (
+            self.ed_ffb_kc.text()
+            if hasattr(self, "ed_ffb_kc") and _qt_valid(self.ed_ffb_kc)
+            else (self._draft_ffb_kc if self._draft_ffb_kc is not None else (cm.get("kc_hex") or ""))
+        ).strip()
+        kffb_raw = (
+            self.ed_ffb_kffb.text()
+            if hasattr(self, "ed_ffb_kffb") and _qt_valid(self.ed_ffb_kffb)
+            else (self._draft_ffb_kffb if self._draft_ffb_kffb is not None else (cm.get("k_ffb_hex") or ""))
+        ).strip()
         if hasattr(self, "cmb_ffb_freq") and _qt_valid(self.cmb_ffb_freq) and self.cmb_ffb_freq.currentData() is not None:
             self._draft_ffb_freq = int(self.cmb_ffb_freq.currentData())
         freq_code = int(self._draft_ffb_freq)
+
+        gfa_ok, gfa_txt = self._parse_hex_field(gfa_raw, 16, allow_empty=True)
+        if not gfa_ok:
+            QMessageBox.warning(
+                self,
+                tr("Некорректный GFA", "Invalid GFA"),
+                tr("GFA блока 09 BCM должен содержать ровно 32 hex-символа (16 байт) либо быть пустым.", "09 BCM GFA must contain exactly 32 hex characters (16 bytes) or be left blank."),
+            )
+            return
+        kc_ok, kc_txt = self._parse_hex_field(kc_raw, 16, allow_empty=True)
+        if not kc_ok:
+            QMessageBox.warning(
+                self,
+                tr("Некорректный K_c", "Invalid K_c"),
+                tr("Мастер-ключ K_c должен содержать ровно 32 hex-символа (16 байт) либо быть пустым.", "Master key K_c must contain exactly 32 hex characters (16 bytes) or be left blank."),
+            )
+            return
+        kffb_ok, kffb_txt = self._parse_hex_field(kffb_raw, 16, allow_empty=True)
+        if not kffb_ok:
+            QMessageBox.warning(
+                self,
+                tr("Некорректный K_ffb", "Invalid K_ffb"),
+                tr("Секрет радиоканала K_ffb должен содержать ровно 32 hex-символа (16 байт) либо быть пустым.", "FFB secret K_ffb must contain exactly 32 hex characters (16 bytes) or be left blank."),
+            )
+            return
 
         if not kffb_txt and not kc_txt:
             QMessageBox.warning(
@@ -2020,16 +2157,19 @@ class BcmScreen(QWidget):
         for idx, row_data in enumerate(self._draft_ffb_rows, start=1):
             if not row_data["enabled"]:
                 continue
-            ser_hex = "".join(str(row_data["serial"]).split()).replace("0x", "").replace("0X", "")
-            if not ser_hex:
-                continue
-            if len(ser_hex) != 8:
+            ser_ok, ser_hex = self._parse_hex_field(str(row_data["serial"]), 4, allow_empty=True)
+            if not ser_ok:
                 QMessageBox.warning(
                     self,
                     "ContiTool",
-                    tr(f"Слот #{idx}: серийный ID ключа должен содержать 8 hex-символов.", f"Slot #{idx}: Serial ID must be 8 hex chars."),
+                    tr(
+                        f"Слот #{idx}: серийный ID ключа должен содержать ровно 8 корректных hex-символов (4 байта).",
+                        f"Slot #{idx}: Serial ID must be exactly 8 valid hex characters (4 bytes).",
+                    ),
                 )
                 return
+            if not ser_hex:
+                continue
             keys_list.append(
                 {
                     "slot_number": idx,
@@ -2047,9 +2187,32 @@ class BcmScreen(QWidget):
             )
             return
 
+        serial_summary = ", ".join(f"#{k['slot_number']} ({k['serial_id']})" for k in keys_list)
+        if (
+            QMessageBox.question(
+                self,
+                tr("Адаптация радиоключей FFB", "Adapt FFB Remote Keys"),
+                tr(
+                    f"Перезаписать слоты радиоключей FFB в DFLASH блока 09 BCM (WFS Ch 3: 80 01 + 80 02)?\n\n"
+                    f"Выбрано ключей: {len(keys_list)} ({serial_summary}).\n"
+                    "Предыдущие слоты FFB в BCM будут заменены выбранным списком.",
+                    f"Overwrite FFB remote key slots in 09 BCM DFLASH (WFS Ch 3: 80 01 + 80 02)?\n\n"
+                    f"Selected keys: {len(keys_list)} ({serial_summary}).\n"
+                    "Existing FFB slots in BCM will be replaced by this list.",
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        if self.runner.is_busy:
+            return
+
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
         via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
+        gen = self._session_gen
         self.runner.run_task(
             tr("Адаптация радиоключей FFB (WFS Ch 3: 80 01 + 80 02)", "Adapting FFB remote keys (WFS Ch 3: 80 01 + 80 02)"),
             lambda rep: can_bcm_adapt_ffb(
@@ -2067,12 +2230,54 @@ class BcmScreen(QWidget):
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
-            on_success=self._on_ffb_adapted,
+            on_success=lambda res, g=gen: self._on_ffb_adapted(res, expected_gen=g),
         )
 
     def action_clear_all_ffb(self) -> None:
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
+        cm = self._cluster_material or {}
+        gfa_raw = (
+            self.ed_ffb_gfa.text()
+            if hasattr(self, "ed_ffb_gfa") and _qt_valid(self.ed_ffb_gfa)
+            else (self._draft_ffb_gfa if self._draft_ffb_gfa is not None else (self._gfa_hex or cm.get("gfa_hex") or ""))
+        ).strip()
+        kc_raw = (
+            self.ed_ffb_kc.text()
+            if hasattr(self, "ed_ffb_kc") and _qt_valid(self.ed_ffb_kc)
+            else (self._draft_ffb_kc if self._draft_ffb_kc is not None else (cm.get("kc_hex") or ""))
+        ).strip()
+        kffb_raw = (
+            self.ed_ffb_kffb.text()
+            if hasattr(self, "ed_ffb_kffb") and _qt_valid(self.ed_ffb_kffb)
+            else (self._draft_ffb_kffb if self._draft_ffb_kffb is not None else (cm.get("k_ffb_hex") or ""))
+        ).strip()
+
+        gfa_ok, gfa_txt = self._parse_hex_field(gfa_raw, 16, allow_empty=True)
+        if not gfa_ok:
+            QMessageBox.warning(
+                self,
+                tr("Некорректный GFA", "Invalid GFA"),
+                tr("GFA блока 09 BCM должен содержать ровно 32 hex-символа (16 байт) либо быть пустым.", "09 BCM GFA must contain exactly 32 hex characters (16 bytes) or be left blank."),
+            )
+            return
+        kc_ok, kc_txt = self._parse_hex_field(kc_raw, 16, allow_empty=True)
+        if not kc_ok:
+            QMessageBox.warning(
+                self,
+                tr("Некорректный K_c", "Invalid K_c"),
+                tr("Мастер-ключ K_c должен содержать ровно 32 hex-символа (16 байт) либо быть пустым.", "Master key K_c must contain exactly 32 hex characters (16 bytes) or be left blank."),
+            )
+            return
+        kffb_ok, kffb_clean = self._parse_hex_field(kffb_raw, 16, allow_empty=True)
+        if not kffb_ok:
+            QMessageBox.warning(
+                self,
+                tr("Некорректный K_ffb", "Invalid K_ffb"),
+                tr("Секрет радиоканала K_ffb должен содержать ровно 32 hex-символа (16 байт) либо быть пустым.", "FFB secret K_ffb must contain exactly 32 hex characters (16 bytes) or be left blank."),
+            )
+            return
+
         if (
             QMessageBox.question(
                 self,
@@ -2083,29 +2288,19 @@ class BcmScreen(QWidget):
                     "Erase ALL learned FFB remote keys in 09 BCM DFLASH (WFS 80 02 00)?\n"
                     "Key fob buttons will stop locking/unlocking the car until re-adapted.",
                 ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
             != QMessageBox.StandardButton.Yes
         ):
             return
-        gfa_txt = (
-            self.ed_ffb_gfa.text()
-            if hasattr(self, "ed_ffb_gfa") and _qt_valid(self.ed_ffb_gfa)
-            else self._draft_ffb_gfa
-        ).strip()
-        kc_txt = (
-            self.ed_ffb_kc.text()
-            if hasattr(self, "ed_ffb_kc") and _qt_valid(self.ed_ffb_kc)
-            else self._draft_ffb_kc
-        ).strip()
-        kffb_raw = (
-            self.ed_ffb_kffb.text()
-            if hasattr(self, "ed_ffb_kffb") and _qt_valid(self.ed_ffb_kffb)
-            else self._draft_ffb_kffb
-        ).strip()
-        kffb_txt = kffb_raw or ("" if kc_txt else ("00" * 16))
+        if self.runner.is_busy:
+            return
+        kffb_txt = kffb_clean or ("" if kc_txt else ("00" * 16))
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
         via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
+        gen = self._session_gen
         self.runner.run_task(
             tr("Очистка всех слотов радиоключей FFB (80 02 00)", "Clearing all FFB remote key slots (80 02 00)"),
             lambda rep: can_bcm_adapt_ffb(
@@ -2122,17 +2317,46 @@ class BcmScreen(QWidget):
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
-            on_success=self._on_ffb_adapted,
+            on_success=lambda res, g=gen: self._on_ffb_adapted(res, expected_gen=g),
         )
 
     def action_read_cluster_and_adapt_ffb(self) -> None:
         if self.runner.is_busy or not ensure_ready(self.conn, self):
             return
+        sync_gfa = self._draft_sync_gfa
+        sync_note_ru = (
+            "\nТакже будет синхронизирован ключ GFA блока BCM по данным панели 17 (2E 00BD)."
+            if sync_gfa
+            else ""
+        )
+        sync_note_en = (
+            "\nBCM GFA will also be synchronized from cluster 17 (2E 00BD)."
+            if sync_gfa
+            else ""
+        )
+        if (
+            QMessageBox.question(
+                self,
+                tr("Адаптация FFB по данным панели 17", "Read 17 Cluster & Adapt FFB"),
+                tr(
+                    "Считать ключи и транспондеры из панели приборов 17 по CAN и перезаписать слоты радиоключей FFB в DFLASH блока 09 BCM (WFS Ch 3: 80 01 + 80 02)?"
+                    + sync_note_ru,
+                    "Read keys and transponders from instrument cluster 17 over CAN and overwrite FFB remote key slots in 09 BCM DFLASH (WFS Ch 3: 80 01 + 80 02)?"
+                    + sync_note_en,
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        if self.runner.is_busy:
+            return
         port, iface = self.conn.port, self.conn.interface
         sw_prof = self._selected_sw_profile()
-        sync_gfa = self._draft_sync_gfa
         cur_ika = self._ika_hex or None
         via_gw, gw_br, gw_ch = self._via_gateway, self._gateway_bridge, self._gateway_channel
+        gen = self._session_gen
         self.runner.run_task(
             tr("Чтение 17 FPK_E по CAN и адаптация FFB в 09 BCM", "Reading 17 FPK_E over CAN and adapting FFB in 09 BCM"),
             lambda rep: can_bcm_adapt_ffb_from_cluster(
@@ -2147,10 +2371,12 @@ class BcmScreen(QWidget):
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
-            on_success=self._on_ffb_adapted,
+            on_success=lambda res, g=gen: self._on_ffb_adapted(res, expected_gen=g),
         )
 
-    def _on_ffb_adapted(self, res: dict[str, Any]) -> None:
+    def _on_ffb_adapted(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
+            return
         self._ffb_drafts_dirty = False
         if res.get("gfa_hex"):
             self._gfa_hex = str(res["gfa_hex"])
@@ -2169,6 +2395,7 @@ class BcmScreen(QWidget):
             return
         port, iface = self.conn.port, self.conn.interface
         via_gw = self._via_gateway
+        gen = self._session_gen
         self.runner.run_task(
             tr("Чтение ошибок 09 BCM (19 02)", "Reading 09 BCM fault codes (19 02)"),
             lambda rep: can_uds_read_dtc(
@@ -2180,7 +2407,7 @@ class BcmScreen(QWidget):
                 interface=iface,
                 reporter=rep,
             ),
-            on_success=self._on_dtc_read,
+            on_success=lambda res, g=gen: self._on_dtc_read(res, expected_gen=g),
         )
 
     def action_clear_dtc(self) -> None:
@@ -2188,6 +2415,7 @@ class BcmScreen(QWidget):
             return
         port, iface = self.conn.port, self.conn.interface
         via_gw = self._via_gateway
+        gen = self._session_gen
         self.runner.run_task(
             tr("Сброс ошибок 09 BCM (14 FF FF FF)", "Clearing 09 BCM fault codes (14 FF FF FF)"),
             lambda rep: can_uds_clear_dtc(
@@ -2199,9 +2427,11 @@ class BcmScreen(QWidget):
                 interface=iface,
                 reporter=rep,
             ),
-            on_success=lambda _r: self._on_dtc_read({"dtcs": []}),
+            on_success=lambda _r, g=gen: self._on_dtc_read({"dtcs": []}, expected_gen=g),
         )
 
-    def _on_dtc_read(self, res: dict[str, Any]) -> None:
+    def _on_dtc_read(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
+            return
         self._dtcs = list(res.get("dtcs") or [])
         self.refresh()

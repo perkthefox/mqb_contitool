@@ -47,6 +47,8 @@ from contitool.can.mrr import (
     can_mrr_write_keys,
 )
 from contitool.core.bcm import bcm_extract_cluster_ffb_material
+from contitool.core.fpke import is_fpke_dflash
+from contitool.core.kombi import is_kombi_dflash
 from contitool.core.mrr import (
     MRR_APP_BASE,
     MRR_BOOT_BASE,
@@ -535,6 +537,7 @@ class MrrScreen(QWidget):
         self._cluster_provider = cluster_provider
 
         self._is_open = False
+        self._session_gen: int = 0
         self._offline_mode = False
         self._via_gateway = False
         self._gateway_bridge = False
@@ -622,6 +625,7 @@ class MrrScreen(QWidget):
         return self._gateway_channel
 
     def _reset_session_state(self) -> None:
+        self._session_gen += 1
         self._passport = {}
         self._status = {}
         self._swap_uds = {}
@@ -667,8 +671,23 @@ class MrrScreen(QWidget):
                 return fallback
         return f"mrr_{self._profile.get('sw', 'unknown')}"
 
-    def _mrr_session_dir(self, kind: str, *, dumps: bool = False) -> Path:
-        return new_session(self.conn.out_dir, self._unit_folder_name(), kind, dumps=dumps)
+    def _mrr_session_dir(self, kind: str, *, dumps: bool = False) -> Path | None:
+        try:
+            return new_session(self.conn.out_dir, self._unit_folder_name(), kind, dumps=dumps)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                tr("Ошибка создания папки сессии", "Session folder error"),
+                str(exc),
+            )
+            return None
+
+    def _callback_valid(self, expected_gen: int | None) -> bool:
+        if not _qt_valid(self) or not self._is_open:
+            return False
+        if expected_gen is not None and self._session_gen != expected_gen:
+            return False
+        return True
 
     def select(self, key: str) -> None:
         if key in self._nav_items:
@@ -712,9 +731,10 @@ class MrrScreen(QWidget):
             # When connected via a vehicle gateway, open over pure UDS first so we never abruptly halt other vehicle buses
             # with J533CanBridge before the user explicitly requests XCP key/memory read.
             use_xcp_on_open = (not self._via_gateway) and self._xcp_available()
+            gen = self._session_gen
             QTimer.singleShot(
                 0,
-                lambda: _qt_valid(self) and (self.action_read_keys() if use_xcp_on_open else self.action_read_status()),
+                lambda g=gen, x=use_xcp_on_open: self._callback_valid(g) and (self.action_read_keys() if x else self.action_read_status()),
             )
 
     def open_from_status_result(
@@ -3258,6 +3278,7 @@ class MrrScreen(QWidget):
         if not ensure_ready(self.conn, self):
             return
         port, iface, via_gw, _gw_br, gw_ch, sw_prof = self._snapshot_routing()
+        gen = self._session_gen
 
         def task(rep: Any) -> dict[str, Any]:
             return can_mrr_status(
@@ -3273,11 +3294,11 @@ class MrrScreen(QWidget):
         self.runner.run_task(
             tr("Чтение паспорта и статуса 13 ACC Radar", "Reading 13 ACC Radar passport & status"),
             task,
-            on_success=self._on_status_read,
+            on_success=lambda res, g=gen: self._on_status_read(res, expected_gen=g),
         )
 
-    def _on_status_read(self, res: dict[str, Any]) -> None:
-        if not _qt_valid(self):
+    def _on_status_read(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
             return
         self._apply_live_result(res)
         self.refresh()
@@ -3287,6 +3308,7 @@ class MrrScreen(QWidget):
         if not ensure_ready(self.conn, self):
             return
         port, iface, via_gw, _gw_br, gw_ch, sw_prof = self._snapshot_routing()
+        gen = self._session_gen
 
         def task(rep: Any) -> dict[str, Any]:
             return can_mrr_swap_status(
@@ -3303,11 +3325,11 @@ class MrrScreen(QWidget):
         self.runner.run_task(
             tr("Проверка состояния SWaP / FeC по UDS (22 3C 00)", "Checking SWaP / FeC status via UDS (22 3C 00)"),
             task,
-            on_success=self._on_swap_uds_read,
+            on_success=lambda res, g=gen: self._on_swap_uds_read(res, expected_gen=g),
         )
 
-    def _on_swap_uds_read(self, res: dict[str, Any]) -> None:
-        if not _qt_valid(self):
+    def _on_swap_uds_read(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
             return
         self._apply_live_result(res)
         sw_uds = self._swap_uds
@@ -3328,6 +3350,9 @@ class MrrScreen(QWidget):
             return
         port, iface, via_gw, gw_br, gw_ch, sw_prof = self._snapshot_routing()
         s_dir = self._mrr_session_dir("mrr_keys", dumps=True)
+        if s_dir is None:
+            return
+        gen = self._session_gen
 
         def task(rep: Any) -> dict[str, Any]:
             return can_mrr_read_keys(
@@ -3344,11 +3369,11 @@ class MrrScreen(QWidget):
         self.runner.run_task(
             tr("Чтение Code Flash (статус CP), DFLASH0 и ключей IKA/GFA", "Reading Code Flash (CP patch status), DFLASH0 & IKA/GFA keys"),
             task,
-            on_success=self._on_keys_read,
+            on_success=lambda res, g=gen: self._on_keys_read(res, expected_gen=g),
         )
 
-    def _on_keys_read(self, res: dict[str, Any]) -> None:
-        if not _qt_valid(self):
+    def _on_keys_read(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
             return
         self._apply_live_result(res)
         s_dir = res.get("session_dir")
@@ -3442,15 +3467,29 @@ class MrrScreen(QWidget):
             if mat is None:
                 path, _ = QFileDialog.getOpenFileName(
                     self,
-                    tr("Выберите Dflash.bin (64 КиБ) панели приборов 17 FPK_E", "Select 17 FPK_E cluster Dflash.bin (64 KiB)"),
+                    tr(
+                        "Выберите DataFlash (Dflash.bin / EelLogical.bin) панели приборов 17 FPK_E / Kombi",
+                        "Select 17 FPK_E / Kombi cluster DataFlash (Dflash.bin / EelLogical.bin)",
+                    ),
                     str(self.conn.out_dir),
                     "Binary (*.bin *.raw);;All Files (*)",
                 )
                 if not path:
                     return
-                mat = bcm_extract_cluster_ffb_material(Path(path).read_bytes())
+                raw = Path(path).read_bytes()
+                if not (is_kombi_dflash(raw) or is_fpke_dflash(raw)):
+                    QMessageBox.warning(
+                        self,
+                        tr("Ошибка чтения дампа 17 FPK_E / Kombi", "17 FPK_E / Kombi dump error"),
+                        tr(
+                            "Выбранный файл не распознан как DataFlash панели приборов 17 FPK_E (64 КиБ) или 17 Kombi VDD (64 / 32 КиБ / EEL 9 533 / 8 334 Б).",
+                            "The selected file is not a recognised 17 FPK_E (64 KiB) or 17 Kombi VDD (64 / 32 KiB / EEL 9,533 / 8,334 B) cluster DataFlash dump.",
+                        ),
+                    )
+                    return
+                mat = bcm_extract_cluster_ffb_material(raw)
         except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, tr("Ошибка чтения дампа 17 FPK_E", "17 FPK_E dump error"), str(exc))
+            QMessageBox.warning(self, tr("Ошибка чтения дампа 17 FPK_E / Kombi", "17 FPK_E / Kombi dump error"), str(exc))
             return
 
         gfa_hex = str((mat or {}).get("gfa_hex") or "")
@@ -3460,8 +3499,8 @@ class MrrScreen(QWidget):
                 self.ed_new_gfa.setText(self._draft_new_gfa)
             self.note.emit(
                 tr(
-                    f"Подставлен GFA из панели приборов 17 FPK_E: {self._draft_new_gfa}",
-                    f"Loaded GFA from 17 FPK_E cluster: {self._draft_new_gfa}",
+                    f"Подставлен GFA из панели приборов 17: {self._draft_new_gfa}",
+                    f"Loaded GFA from 17 cluster: {self._draft_new_gfa}",
                 )
             )
         else:
@@ -3469,8 +3508,8 @@ class MrrScreen(QWidget):
                 self,
                 "ContiTool",
                 tr(
-                    "В выбранном дампе панели приборов 17 FPK_E не найден групповой ключ GFA (слот /1).",
-                    "No vehicle group key GFA (slot /1) found in the selected 17 FPK_E cluster dump.",
+                    "В выбранном дампе панели приборов 17 не найден групповой ключ GFA (слот /1).",
+                    "No vehicle group key GFA (slot /1) found in the selected 17 cluster dump.",
                 ),
             )
 
@@ -3631,6 +3670,7 @@ class MrrScreen(QWidget):
 
         port, iface, via_gw, gw_br, gw_ch, sw_prof = self._snapshot_routing()
         do_rst = self._draft_write_reset
+        gen = self._session_gen
 
         self.runner.run_task(
             tr("Запись IKA / GFA в 13 ACC Radar", "Writing IKA / GFA to 13 ACC Radar"),
@@ -3647,11 +3687,11 @@ class MrrScreen(QWidget):
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
-            on_success=self._on_keys_written,
+            on_success=lambda res, g=gen: self._on_keys_written(res, expected_gen=g),
         )
 
-    def _on_keys_written(self, res: dict[str, Any]) -> None:
-        if not _qt_valid(self):
+    def _on_keys_written(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
             return
         if isinstance(res.get("dflash_fee"), dict) and res["dflash_fee"]:
             self._dflash_fee = dict(res["dflash_fee"])
@@ -3696,6 +3736,7 @@ class MrrScreen(QWidget):
         if not ensure_ready(self.conn, self):
             return
         port, iface, via_gw, gw_br, gw_ch, sw_prof = self._snapshot_routing()
+        gen = self._session_gen
         self.runner.run_task(
             tr("Сброс счётчика CP (03DE → 0) и ошибок DTC", "Resetting CP counter (03DE → 0) & clearing DTCs"),
             lambda rep: can_mrr_reset_cp_counter(
@@ -3707,11 +3748,11 @@ class MrrScreen(QWidget):
                 sw_profile=sw_prof,
                 reporter=rep,
             ),
-            on_success=self._on_cp_counter_reset,
+            on_success=lambda res, g=gen: self._on_cp_counter_reset(res, expected_gen=g),
         )
 
-    def _on_cp_counter_reset(self, res: dict[str, Any]) -> None:
-        if not _qt_valid(self):
+    def _on_cp_counter_reset(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
             return
         if isinstance(res.get("status_after"), dict) and res["status_after"]:
             self._status = dict(res["status_after"])
@@ -3735,7 +3776,10 @@ class MrrScreen(QWidget):
         ):
             return
         s_dir = self._mrr_session_dir("mrr_cp_off", dumps=False)
+        if s_dir is None:
+            return
         port, iface, via_gw, gw_br, gw_ch, sw_prof = self._snapshot_routing()
+        gen = self._session_gen
         self.runner.run_task(
             tr("Деактивация CP в 13 ACC Radar", "Deactivating CP on 13 ACC Radar"),
             lambda rep: can_mrr_deactivate_cp(
@@ -3748,7 +3792,7 @@ class MrrScreen(QWidget):
                 session_dir=s_dir,
                 reporter=rep,
             ),
-            on_success=self._on_cp_flashed,
+            on_success=lambda res, g=gen: self._on_cp_flashed(res, expected_gen=g),
         )
 
     def action_restore_cp_stock(self) -> None:
@@ -3766,7 +3810,10 @@ class MrrScreen(QWidget):
         ):
             return
         s_dir = self._mrr_session_dir("mrr_cp_restore", dumps=False)
+        if s_dir is None:
+            return
         port, iface, via_gw, gw_br, gw_ch, sw_prof = self._snapshot_routing()
+        gen = self._session_gen
         self.runner.run_task(
             tr("Восстановление заводского CP в 13 ACC Radar", "Restoring stock CP on 13 ACC Radar"),
             lambda rep: can_mrr_restore_cp_stock(
@@ -3779,11 +3826,11 @@ class MrrScreen(QWidget):
                 session_dir=s_dir,
                 reporter=rep,
             ),
-            on_success=self._on_cp_flashed,
+            on_success=lambda res, g=gen: self._on_cp_flashed(res, expected_gen=g),
         )
 
-    def _on_cp_flashed(self, res: dict[str, Any]) -> None:
-        if not _qt_valid(self):
+    def _on_cp_flashed(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
             return
         if isinstance(res.get("status_after"), dict) and res["status_after"]:
             self._status = dict(res["status_after"])
@@ -3818,7 +3865,10 @@ class MrrScreen(QWidget):
         ):
             return
         s_dir = self._mrr_session_dir("mrr_swap_on", dumps=False)
+        if s_dir is None:
+            return
         port, iface, via_gw, gw_br, gw_ch, sw_prof = self._snapshot_routing()
+        gen = self._session_gen
         self.runner.run_task(
             tr("Активация функций SWaP / FSC в 13 ACC Radar", "Activating SWaP / FSC features on 13 ACC Radar"),
             lambda rep: can_mrr_activate_swap(
@@ -3833,7 +3883,7 @@ class MrrScreen(QWidget):
                 session_dir=s_dir,
                 reporter=rep,
             ),
-            on_success=self._on_swap_flashed,
+            on_success=lambda res, g=gen: self._on_swap_flashed(res, expected_gen=g),
         )
 
     def action_restore_swap_stock(self) -> None:
@@ -3851,7 +3901,10 @@ class MrrScreen(QWidget):
         ):
             return
         s_dir = self._mrr_session_dir("mrr_swap_restore", dumps=False)
+        if s_dir is None:
+            return
         port, iface, via_gw, gw_br, gw_ch, sw_prof = self._snapshot_routing()
+        gen = self._session_gen
         self.runner.run_task(
             tr("Восстановление заводского SWaP / FSC в 13 ACC Radar", "Restoring stock SWaP / FSC on 13 ACC Radar"),
             lambda rep: can_mrr_restore_swap_stock(
@@ -3864,11 +3917,11 @@ class MrrScreen(QWidget):
                 session_dir=s_dir,
                 reporter=rep,
             ),
-            on_success=self._on_swap_flashed,
+            on_success=lambda res, g=gen: self._on_swap_flashed(res, expected_gen=g),
         )
 
-    def _on_swap_flashed(self, res: dict[str, Any]) -> None:
-        if not _qt_valid(self):
+    def _on_swap_flashed(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
             return
         if isinstance(res.get("status_after"), dict) and res["status_after"]:
             self._status = dict(res["status_after"])
@@ -3886,6 +3939,9 @@ class MrrScreen(QWidget):
             return
         port, iface, via_gw, gw_br, gw_ch, sw_prof = self._snapshot_routing()
         s_dir = self._mrr_session_dir(f"mrr_{region}", dumps=True)
+        if s_dir is None:
+            return
+        gen = self._session_gen
         self.runner.run_task(
             tr(f"Чтение памяти 13 ACC Radar ({region})", f"Reading 13 ACC Radar memory ({region})"),
             lambda rep: can_mrr_read_memory(
@@ -3900,11 +3956,11 @@ class MrrScreen(QWidget):
                 session_dir=s_dir,
                 reporter=rep,
             ),
-            on_success=self._on_memory_read,
+            on_success=lambda res, g=gen: self._on_memory_read(res, expected_gen=g),
         )
 
-    def _on_memory_read(self, res: dict[str, Any]) -> None:
-        if not _qt_valid(self):
+    def _on_memory_read(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
             return
         self._last_mem_report = dict(res)
         if isinstance(res.get("passport"), dict) and res["passport"]:
@@ -4000,8 +4056,11 @@ class MrrScreen(QWidget):
         ):
             return
         s_dir = self._mrr_session_dir("mrr_frf", dumps=False)
+        if s_dir is None:
+            return
         port, iface, via_gw, _gw_br, _gw_ch, sw_prof = self._snapshot_routing()
         allow_mis = bool(soft_warns)
+        gen = self._session_gen
         self.runner.run_task(
             tr(
                 f"Прошивка {frf.part_number} {frf.sw_version} ({frf.kind}) в 13 ACC Radar",
@@ -4018,13 +4077,14 @@ class MrrScreen(QWidget):
                 session_dir=s_dir,
                 reporter=rep,
             ),
-            on_success=self._on_frf_flashed,
+            on_success=lambda res, g=gen: self._on_frf_flashed(res, expected_gen=g),
         )
 
-    def _on_frf_flashed(self, res: dict[str, Any]) -> None:
-        if not _qt_valid(self):
+    def _on_frf_flashed(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
             return
         self._last_frf_report = dict(res)
+        self._profile_override = ""
         if isinstance(res.get("passport_after"), dict) and res["passport_after"]:
             self._passport = dict(res["passport_after"])
             self._profile = mrr_detect_profile(self._passport)
@@ -4052,6 +4112,7 @@ class MrrScreen(QWidget):
         if not ensure_ready(self.conn, self):
             return
         port, iface, via_gw, _gw_br, _gw_ch, _sw_prof = self._snapshot_routing()
+        gen = self._session_gen
         self.runner.run_task(
             tr("Чтение ошибок DTC (13 ACC Radar)", "Reading DTCs (13 ACC Radar)"),
             lambda rep: can_uds_read_dtc(
@@ -4063,13 +4124,14 @@ class MrrScreen(QWidget):
                 via_gateway=via_gw,
                 reporter=rep,
             ),
-            on_success=self._on_dtc_read,
+            on_success=lambda res, g=gen: self._on_dtc_read(res, expected_gen=g),
         )
 
     def action_clear_dtc(self) -> None:
         if not ensure_ready(self.conn, self):
             return
         port, iface, via_gw, _gw_br, _gw_ch, _sw_prof = self._snapshot_routing()
+        gen = self._session_gen
 
         def task(rep: Any) -> dict[str, Any]:
             can_uds_clear_dtc(
@@ -4094,11 +4156,11 @@ class MrrScreen(QWidget):
         self.runner.run_task(
             tr("Сброс и перепроверка ошибок DTC (13 ACC Radar)", "Clearing & re-reading DTCs (13 ACC Radar)"),
             task,
-            on_success=self._on_dtc_read,
+            on_success=lambda res, g=gen: self._on_dtc_read(res, expected_gen=g),
         )
 
-    def _on_dtc_read(self, res: dict[str, Any]) -> None:
-        if not _qt_valid(self):
+    def _on_dtc_read(self, res: dict[str, Any], *, expected_gen: int | None = None) -> None:
+        if not self._callback_valid(expected_gen):
             return
         self._dtcs = list(res.get("dtcs") or [])
         self.refresh()

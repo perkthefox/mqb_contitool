@@ -194,12 +194,23 @@ class CanSession(QThread):
         retried_fallback = False
         while not self._stop.is_set():
             if getattr(link.bus, "uds_only", False):
-                if (tx_id, rx_id) != (0x710, 0x77A):
+                if callable(getattr(link.bus, "uds_session", None)):
+                    with link.uds_session() as hw_ok:
+                        if not hw_ok:
+                            reason = getattr(link.bus, "uds_refusal", "") or ""
+                            detail = f": {reason}" if reason else ""
+                            raise RuntimeError(tr(
+                                f"Не удалось открыть UDS ISO-TP на 0x{tx_id:X} / 0x{rx_id:X}{detail}",
+                                f"Could not open UDS ISO-TP on 0x{tx_id:X} / 0x{rx_id:X}{detail}",
+                            ))
+                        resp = link.bus.request_uds(payload, timeout=timeout, allow_pending=True)
+                elif (tx_id, rx_id) == (0x710, 0x77A):
+                    resp = link.bus.request_uds(payload, timeout=timeout, allow_pending=True)
+                else:
                     raise RuntimeError(tr(
                         "Этот адаптер D-PDU работает только по UDS ISO-TP на 0x710 / 0x77A",
                         "This D-PDU adapter works only over UDS ISO-TP on 0x710 / 0x77A",
                     ))
-                resp = link.bus.request_uds(payload, timeout=timeout, allow_pending=True)
                 self._push("uds-resp", rx_id, resp, describe_uds(resp))
                 return
             link.drain_rx()

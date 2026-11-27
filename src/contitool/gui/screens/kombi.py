@@ -24,6 +24,8 @@ from contitool.can.fpke import FPKE_NATIVE_INTERFACES, atomic_write, get_active_
 from contitool.can.kombi import can_kombi_full_read, can_kombi_write_dflash
 from contitool.core.fpke import detect_fpke_files, extract_fpke_immo_passport, is_fpke_dflash
 from contitool.core.kombi import (
+    KOMBI_DFLASH_POOL_SIZE,
+    KOMBI_EEL_2220_LOGICAL_SIZE,
     KOMBI_EEL_LOGICAL_SIZE,
     analyze_kombi_dflash,
     apply_kombi_dflash_edits,
@@ -31,6 +33,7 @@ from contitool.core.kombi import (
     extract_kombi_immo_passport,
     format_kombi_report,
     format_kombi_transfer_plan,
+    get_kombi_sw_profile,
     is_kombi_dflash,
     kombi_support_info,
     normalize_kombi_dflash_input,
@@ -56,7 +59,7 @@ from contitool.storage import new_session, unit_of_ident
 
 KOMBI_REQUIRED_DUMPS = (
     ("dflash", "DataFlash (EEL)"),
-    ("eel_logical", "EelLogical (132 blk)"),
+    ("eel_logical", "EelLogical"),
 )
 
 KOMBI_OPTIONAL_DUMPS = (
@@ -86,6 +89,26 @@ class KombiScreen(FpkeScreen):
 
     def _is_kombi_mode(self) -> bool:
         return True
+
+    def _edited_dflash_name(self) -> str:
+        return "Dflash.bin"
+
+    def _eel_total_ids(self) -> int:
+        pool_tot = ((self.dflash_info or {}).get("pool") or {}).get("total_ids")
+        if pool_tot:
+            return int(pool_tot)
+        eel_path = self.files.get("eel_logical")
+        if eel_path is not None and eel_path.is_file():
+            with contextlib.suppress(OSError):
+                if eel_path.stat().st_size == KOMBI_EEL_2220_LOGICAL_SIZE:
+                    return 130
+        vals = {item.get("did", ""): item.get("value", "").strip() for item in self.ident_items}
+        meta = (self.dflash_info or {}).get("metadata") or {}
+        sw_v = vals.get("F189") or str(meta.get("sw_version_eel") or "")
+        pn_v = vals.get("F187") or str(meta.get("part_number") or "")
+        if sw_v or pn_v:
+            return int(get_kombi_sw_profile(sw_version=sw_v, part_number=pn_v).get("eel_total_ids", 132))
+        return 132
 
     def _supports_coil_key_learn(self) -> bool:
         return True
@@ -161,8 +184,10 @@ class KombiScreen(FpkeScreen):
             else:
                 raise ValueError(
                     tr(
-                        f"Файл «{path.name}» ({len(raw)} Б) не является валидным дампом DataFlash Kombi (65 536 Б / {KOMBI_EEL_LOGICAL_SIZE} Б) или FPK_E.",
-                        f"File “{path.name}” ({len(raw)} B) is not a valid Kombi (65,536 B / {KOMBI_EEL_LOGICAL_SIZE} B) or FPK_E DataFlash dump.",
+                        f"Файл «{path.name}» ({len(raw)} Б) не является валидным дампом DataFlash Kombi "
+                        f"(65 536 Б / 32 768 Б / 9 533 Б / 8 334 Б) или FPK_E.",
+                        f"File “{path.name}” ({len(raw)} B) is not a valid Kombi "
+                        f"(65,536 B / 32,768 B / {KOMBI_EEL_LOGICAL_SIZE:,} B / {KOMBI_EEL_2220_LOGICAL_SIZE:,} B) or FPK_E DataFlash dump.",
                     )
                 )
             self._recipient_path = path
@@ -320,8 +345,10 @@ class KombiScreen(FpkeScreen):
         else:
             set_pill(self.nav_rows["extra"].pill, "—", "muted")
 
+        tot_ids = self._eel_total_ids()
         clear_layout(self.dumps_list)
         for kind, label in KOMBI_REQUIRED_DUMPS:
+            disp_label = f"EelLogical ({tot_ids} blk)" if kind == "eel_logical" else label
             p = self.files.get(kind)
             if p is not None and p.is_file():
                 is_edited = (
@@ -337,10 +364,10 @@ class KombiScreen(FpkeScreen):
                 else:
                     val = f"{sz_lbl} ✓"
                     tone = "ok"
-                self.dumps_list.addWidget(self._dump_ledger_row(label, val, tone, str(p)))
+                self.dumps_list.addWidget(self._dump_ledger_row(disp_label, val, tone, str(p)))
             else:
                 self.dumps_list.addWidget(
-                    self._dump_ledger_row(label, tr("не считан", "not read"), "muted")
+                    self._dump_ledger_row(disp_label, tr("не считан", "not read"), "muted")
                 )
         for kind, label in KOMBI_OPTIONAL_DUMPS:
             p = self.files.get(kind)
@@ -355,7 +382,7 @@ class KombiScreen(FpkeScreen):
         native_ok = iface in FPKE_NATIVE_INTERFACES
 
         if not native_ok:
-            warn = Callout("", "warn")
+            warn = Callout("warn")
             warn.label.setText(
                 tr(
                     f"<b>Выбран адаптер «{iface}».</b> Для чтения приборной панели Kombi VDD требуется нативный CAN-адаптер "
@@ -366,17 +393,19 @@ class KombiScreen(FpkeScreen):
             )
             lay.addWidget(warn)
 
+        tot_ids = self._eel_total_ids()
+        max_id_hex = f"0x{tot_ids:04X}"
         sec_full = Section()
         sec_full.set_text(
             tr("Чтение памяти Kombi VDD (Supplier Level 7)", "Read Kombi VDD memory (Supplier Level 7)"),
             tr(
-                "Извлекает индивидуальный 16-байтовый ключ FD11 Supplier Level 7 через буфер подгрузки NVM "
-                "(0xFEDD5508 / 0xFEDD5530), авторизуется на уровень SL 7 (6E FD 11 07) и считывает все 132 блока "
-                "EEL DataFlash (0x0001..0x0084, включая закрытые блоки WFS5 / иммо / SHE / CP 0x0063..0x006F). "
+                "Извлекает индивидуальный 16-байтовый ключ FD11 Supplier Level 7 через буфер подгрузки NVM, "
+                f"авторизуется на уровень SL 7 (6E FD 11 07) и считывает все {tot_ids} блоков "
+                f"EEL DataFlash (0x0001..{max_id_hex}, включая закрытые блоки WFS5 / иммо / SHE / CP 0x0063..0x006F). "
                 "Работает как напрямую по Komfort CAN, так и через любой шлюз J533 по штатному 11-битному UDS.",
-                "Extracts the personalized 16-byte FD11 Supplier Level 7 key via the NVM staging buffer "
-                "(0xFEDD5508 / 0xFEDD5530), authenticates to SL 7 (6E FD 11 07), and reads all 132 EEL DataFlash "
-                "blocks (0x0001..0x0084, including WFS5 / immo / SHE / CP blocks 0x0063..0x006F). "
+                "Extracts the personalized 16-byte FD11 Supplier Level 7 key via the NVM staging buffer, "
+                f"authenticates to SL 7 (6E FD 11 07), and reads all {tot_ids} EEL DataFlash "
+                f"blocks (0x0001..{max_id_hex}, including WFS5 / immo / SHE / CP blocks 0x0063..0x006F). "
                 "Works both directly on Komfort CAN and behind any J533 gateway over standard 11-bit UDS.",
             ),
         )
@@ -639,8 +668,10 @@ class KombiScreen(FpkeScreen):
                 self,
                 tr("Некорректный файл DataFlash Kombi", "Invalid Kombi DataFlash file"),
                 tr(
-                    f"Файл «{path.name}» ({len(raw)} Б) не является валидным дампом DataFlash Kombi (65 536 Б или {KOMBI_EEL_LOGICAL_SIZE} Б).",
-                    f"File “{path.name}” ({len(raw)} B) is not a valid Kombi DataFlash dump (65,536 B or {KOMBI_EEL_LOGICAL_SIZE} B).",
+                    f"Файл «{path.name}» ({len(raw)} Б) не является валидным дампом DataFlash Kombi "
+                    "(65 536 Б, 32 768 Б, 9 533 Б или 8 334 Б).",
+                    f"File “{path.name}” ({len(raw)} B) is not a valid Kombi DataFlash dump "
+                    f"(65,536 B, {KOMBI_DFLASH_POOL_SIZE:,} B, {KOMBI_EEL_LOGICAL_SIZE:,} B, or {KOMBI_EEL_2220_LOGICAL_SIZE:,} B).",
                 ),
             )
             return
