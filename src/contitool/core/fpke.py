@@ -512,8 +512,8 @@ def build_fd11_proof(
 # ────────────────────────────── Detection Helpers ──────────────────────────────
 
 
-FPKE_VERIFIED_SW_VERSIONS: tuple[str, ...] = ("6181", "1703", "1711")
-FPKE_VERIFIED_PART_NUMBERS: tuple[str, ...] = ("83A920700E", "5E0920790A")
+FPKE_VERIFIED_SW_VERSIONS: tuple[str, ...] = ("6181", "1701", "1703", "1711")
+FPKE_VERIFIED_PART_NUMBERS: tuple[str, ...] = ("83A920700E", "5E0920790A", "5NA920790D")
 
 
 def is_fpke_ident(ident: list[dict[str, str]]) -> bool:
@@ -591,9 +591,9 @@ def fpke_support_info(
         unit_id_en = f"{pn} (SW {sw})" if (pn and sw) else (pn or f"SW {sw}")
         warning = tr(
             f"Блок {unit_id_ru} официально не поддерживается. Можно попробовать чтение по UDS и Level 8 "
-            "(проверены Continental FPK_E с ПО 6181, 1703 и 1711); перед записью в память будьте осторожны.",
+            "(проверены Continental FPK_E с ПО 6181, 1701, 1703 и 1711); перед записью в память будьте осторожны.",
             f"Unit {unit_id_en} is not officially supported. You can still try UDS and Level 8 reading "
-            "(verified Continental FPK_E SW: 6181, 1703, 1711); use caution before writing to memory.",
+            "(verified Continental FPK_E SW: 6181, 1701, 1703, 1711); use caution before writing to memory.",
         )
 
     return {
@@ -698,10 +698,11 @@ def validate_fpke_extra_area(data: bytes) -> None:
     """Enforce structural postconditions on an RH850 Extra Area read (`0xFF300000`)."""
     if len(data) < 0x80:
         raise RuntimeError(f"Extra Area too short: {len(data)} bytes (expected >= 128)")
-    invalid_words = {b"\x00" * 4, b"\xff" * 4, b"\x55" * 4}
+    invalid_opbt_words = {b"\x00" * 4, b"\xff" * 4, b"\x55" * 4}
+    invalid_security_words = {b"\x00" * 4, b"\x55" * 4}
     if data[:0x40] != b"\xff" * 0x40:
         raise RuntimeError("Extra Area structural check failed: reserved prefix 0x00..0x3F is not erased")
-    if bytes(data[0x40:0x44]) in invalid_words or bytes(data[0x70:0x74]) in invalid_words:
+    if bytes(data[0x40:0x44]) in invalid_security_words or bytes(data[0x70:0x74]) in invalid_opbt_words:
         raise RuntimeError("Extra Area structural check failed: invalid security or OPBT0 word")
 
 

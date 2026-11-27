@@ -2639,7 +2639,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_bcm.add_argument("--interface", choices=iface_choices, default="slcan")
     p_bcm.add_argument("--via-gateway", action="store_true", help=tr("Работать через диагностический CAN шлюза J533 (RAM-мост ch3 ↔ ch0 для XCP/WFS)", "Access BCM through J533 gateway Diagnosis CAN (RAM-Bridge ch3 ↔ ch0 for XCP/WFS)"))
     p_bcm.add_argument("--gateway-channel", type=int, default=0, help=tr("Канал RSCAN0 шлюза J533 (по умолчанию 0 — Komfort CAN)", "J533 RSCAN0 sub-bus channel (default 0 — Komfort CAN)"))
-    p_bcm.add_argument("--profile", choices=("ea_0511", "dd_0273"), help=tr("Явный профиль адресов ОЗУ BCM (ea_0511 или dd_0273)", "Explicit BCM RAM profile (ea_0511 or dd_0273)"))
+    p_bcm.add_argument("--profile", choices=("ea_0511", "dd_0273", "bq_0212", "bl_0175"), help=tr("Явный профиль адресов ОЗУ BCM (ea_0511, dd_0273, bq_0212 или bl_0175)", "Explicit BCM RAM profile (ea_0511, dd_0273, bq_0212, or bl_0175)"))
     p_bcm.add_argument("--current-ika", help=tr("Текущий 16-байтный IKA блока BCM (32 hex) для write-keys", "Current 16-byte BCM IKA (32 hex) for write-keys"))
     p_bcm.add_argument("--new-ika", help=tr("Новый 16-байтный IKA (32 hex) для записи в DID 0x00BE", "New 16-byte IKA (32 hex) to write to DID 0x00BE"))
     p_bcm.add_argument("--new-gfa", "--gfa", dest="new_gfa", help=tr("16-байтный групповой ключ GFA (32 hex) для write-keys (0x00BD) или adapt-ffb", "16-byte vehicle group key GFA (32 hex) for write-keys (0x00BD) or adapt-ffb"))

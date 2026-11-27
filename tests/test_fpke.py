@@ -430,6 +430,24 @@ def test_fpke_extra_area_validation_and_report() -> None:
     with pytest.raises(RuntimeError, match="reserved prefix"):
         validate_fpke_extra_area(bytes(bad_ex))
 
+    # Factory-unlocked Extra Area (security=0xFFFFFFFF, blank IDCODE, valid OPBT0=0xFFFCDF87 as on 5NA920790D SW 1701)
+    unlocked_ex = bytearray(b"\xff" * FPKE_EXTRA_SIZE)
+    struct.pack_into("<I", unlocked_ex, 0x60, 0x00000000)
+    struct.pack_into("<I", unlocked_ex, 0x70, 0xFFFCDF87)
+    assert is_fpke_extra_area(bytes(unlocked_ex))
+    unlocked_info = analyze_fpke_extra_area(bytes(unlocked_ex))
+    assert unlocked_info["security_raw"] == "0xFFFFFFFF"
+    assert unlocked_info["opbt0"] == "0xFFFCDF87"
+    assert unlocked_info["idcode_is_blank_ff"] is True
+
+    # Completely blank all-0xFF (OPBT0=0xFFFFFFFF) or zeroed security (0x00000000) must still be rejected
+    with pytest.raises(RuntimeError, match="invalid security or OPBT0 word"):
+        validate_fpke_extra_area(b"\xff" * FPKE_EXTRA_SIZE)
+    zero_sec = bytearray(unlocked_ex)
+    struct.pack_into("<I", zero_sec, 0x40, 0x00000000)
+    with pytest.raises(RuntimeError, match="invalid security or OPBT0 word"):
+        validate_fpke_extra_area(bytes(zero_sec))
+
 
 # ────────────────────────────── Simulated FPK_E CAN Bus ──────────────────────────────
 
@@ -3463,6 +3481,7 @@ def test_fpke_unverified_sw_allows_read_and_shows_pn_sw_warning(tmp_path: Path) 
     set_lang("ru")
     # Verified SW versions -> no warning
     assert fpke_support_info(f187="83A920700E", f189="6181")["warning"] is None
+    assert fpke_support_info(f187="5NA920790D", f189="1701")["warning"] is None
     assert fpke_support_info(f187="5E0920790A", f189="1703")["warning"] is None
     assert fpke_support_info(f187="5E0920790A", f189="1711")["warning"] is None
 

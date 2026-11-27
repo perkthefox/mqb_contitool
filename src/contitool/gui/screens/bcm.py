@@ -688,7 +688,12 @@ class BcmScreen(QWidget):
         if self._passport and not self._profile.get("matched", True) and not self._profile_override:
             prof_short = tr("не проверен", "unverified")
         else:
-            prof_short = "EA / SW 0511" if prof_id == "ea_0511" else "DD / SW 0273"
+            prof_short = {
+                "ea_0511": "EA / SW 0511",
+                "dd_0273": "DD / SW 0273",
+                "bq_0212": "BQ / SW 0212",
+                "bl_0175": "BL / SW 0173/0175",
+            }.get(prof_id, prof_id)
         top_fields.append((tr("ПРОФИЛЬ ОЗУ", "RAM PROFILE"), prof_short))
         if self._status.get("rf_0a65_hex"):
             top_fields.append((tr("ЧАСТОТА FFB", "FFB RF"), str(self._status.get("freq_label") or "—")))
@@ -838,10 +843,12 @@ class BcmScreen(QWidget):
             lbl_p = QLabel(tr("Профиль ОЗУ:", "RAM profile:"))
             lbl_p.setObjectName("Hint")
             self.cmb_profile = QComboBox()
-            self.cmb_profile.setMinimumWidth(205)
-            self.cmb_profile.addItem(tr("Авто (EA 0511 / DD 0273)", "Auto (EA 0511 / DD 0273)"), "")
+            self.cmb_profile.setMinimumWidth(220)
+            self.cmb_profile.addItem(tr("Авто (0173 / 0175 / 0212 / 0273 / 0511)", "Auto (0173 / 0175 / 0212 / 0273 / 0511)"), "")
             self.cmb_profile.addItem("EA / BH — SW 0511", "ea_0511")
             self.cmb_profile.addItem("DD / CG — SW 0273", "dd_0273")
+            self.cmb_profile.addItem("BQ / BC — SW 0212", "bq_0212")
+            self.cmb_profile.addItem("BL / CJ — SW 0173 / 0175", "bl_0175")
             idx_p = self.cmb_profile.findData(self._profile_override)
             if idx_p >= 0:
                 self.cmb_profile.setCurrentIndex(idx_p)

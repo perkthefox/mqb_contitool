@@ -396,7 +396,7 @@ def fpke_detect_sw_profile(
     pn = "".join((f187 if f187 is not None else (vals.get("F187") or vals.get("F191") or "")).split()).upper()
     if sw.startswith("1711"):
         return "1711"
-    if sw.startswith("1703") or sw.startswith("17") or sw.startswith("16"):
+    if sw.startswith(("1703", "1701", "17", "16")):
         return "1703"
     if pn.startswith(("5E0", "5G0", "5G1", "5NA", "3G0", "565", "5F0", "17A", "2GA", "6VA")):
         return "1703"

@@ -110,16 +110,76 @@ BCM_PROFILES: dict[str, dict[str, Any]] = {
         "job3_state_addr": 0x40004668 + 3 * 0x11,  # 0x4000469B
         "queue_slots": 11,  # 11 * 8 = 0x58 B (0x4000460C..0x40004663)
     },
+    "bq_0212": {
+        "id": "bq_0212",
+        "label": "5Q0 937 084 BQ / BC (SW 0212)",
+        "sw_versions": ("0212",),
+        "part_prefixes": ("5Q0937084BQ", "5Q0937084BC"),
+        "xcp_tx_id": BCM_XCP_TX_ID,
+        "xcp_rx_id": BCM_XCP_RX_ID,
+        "r13": 0x40008004,
+        "gfa_aes_buf": 0x4000D782,
+        "last_round_key_addr": 0x4000D8E4,
+        "gfa_working_addr": 0x4000024F,
+        "ika_working_addr": 0x4000025F,
+        "common_key_addr": 0x4000020F,
+        "ffb_key_addr": 0x40000054,
+        "ffb_nvm_key_addr": 0x40003EE8,  # NvM 0x02: 16 B decrypted K_ffb RAM mirror
+        "ffb_serials_addr": 0x40003EF8,  # NvM 0x13..0x19: 7 x 4 B Serial IDs (BE)
+        "ffb_counters_addr": 0x40003F14,  # NvM 0x05..0x0B: 7 x 4 B Rolling Counters (BE)
+        "ffb_syncs_addr": 0x40003F30,  # NvM 0x0C..0x12: 7 x 1 B sync status (0=OK, 2=desync)
+        "ffb_freq_addr": 0x400058BC,
+        "wfs_rx_desc": 0x40008CC0,
+        "wfs_rx_buf": 0x40003FA6,
+        "selected_queue_addr": 0x4000419C,
+        "queue_base_addr": 0x400041A0,
+        "current_queue_addr": 0x400041E0,
+        "job_state_base_addr": 0x400041E4,
+        "job3_state_addr": 0x400041E4 + 3 * 0x11,  # 0x40004217
+        "queue_slots": 8,  # 8 * 8 = 0x40 B (0x400041A0..0x400041DF)
+    },
+    "bl_0175": {
+        "id": "bl_0175",
+        "label": "5Q0 937 084 BL / CJ / AN / AL (SW 0173 / 0175)",
+        "sw_versions": ("0173", "0175"),
+        "part_prefixes": ("5Q0937084BL", "5Q0937084CJ", "5Q0937084AN", "5Q0937084AL"),
+        "xcp_tx_id": BCM_XCP_TX_ID,
+        "xcp_rx_id": BCM_XCP_RX_ID,
+        "r13": 0x40008004,
+        "gfa_aes_buf": 0x40006402,
+        "last_round_key_addr": 0x40006564,
+        "gfa_working_addr": 0x4000E170,
+        "ika_working_addr": 0x4000E180,
+        "common_key_addr": 0x4000E190,
+        "ffb_key_addr": 0x40007BE8,
+        "ffb_nvm_key_addr": 0x40007BE8,  # NvM 0x02: 16 B decrypted K_ffb RAM mirror
+        "ffb_serials_addr": 0x40007BF8,  # NvM 0x13..0x19: 7 x 4 B Serial IDs (BE)
+        "ffb_counters_addr": 0x40007C14,  # NvM 0x05..0x0B: 7 x 4 B Rolling Counters (BE)
+        "ffb_syncs_addr": 0x40007C30,  # NvM 0x0C..0x12: 7 x 1 B sync status (0=OK, 2=desync)
+        "ffb_freq_addr": 0x400094EC,
+        "wfs_rx_desc": 0x4000BD74,
+        "wfs_rx_buf": 0x40007CA3,
+        "selected_queue_addr": 0x40007E98,
+        "queue_base_addr": 0x40007E9C,
+        "current_queue_addr": 0x40007EDC,
+        "job_state_base_addr": 0x40007EE0,
+        "job3_state_addr": 0x40007EE0 + 3 * 0x11,  # 0x40007F13
+        "queue_slots": 8,  # 8 * 8 = 0x40 B (0x40007E9C..0x40007EDB)
+    },
 }
 
 
 def bcm_get_profile(profile_id: str) -> dict[str, Any]:
-    """Return a copy of the BCM firmware profile dict (`'ea_0511'` or `'dd_0273'`)."""
+    """Return a copy of the BCM firmware profile dict (`'ea_0511'`, `'dd_0273'`, `'bq_0212'`, or `'bl_0175'`)."""
     key = (profile_id or "").strip().lower()
     if key in ("ea", "0511", "ea_0511", "5q0937084ea", "5q0937086bh"):
         return {**BCM_PROFILES["ea_0511"], "matched": True}
     if key in ("dd", "0273", "dd_0273", "5q0937084dd", "5q0937084cg"):
         return {**BCM_PROFILES["dd_0273"], "matched": True}
+    if key in ("bq", "0212", "bq_0212", "5q0937084bq", "5q0937084bc"):
+        return {**BCM_PROFILES["bq_0212"], "matched": True}
+    if key in ("bl", "cj", "0173", "0175", "bl_0175", "bl_0173", "cj_0175", "5q0937084bl", "5q0937084cj", "5q0937084an", "5q0937084al"):
+        return {**BCM_PROFILES["bl_0175"], "matched": True}
     if key in BCM_PROFILES:
         return {**BCM_PROFILES[key], "matched": True}
     raise ValueError(f"Unknown BCM firmware profile: {profile_id!r}")
@@ -215,10 +275,10 @@ def bcm_support_info(
         warning = tr(
             f"Блок {unit_id_ru} официально не поддерживается. Можно попробовать чтение по UDS "
             "(паспорт, статус, слоты FFB, ошибки DTC) и запись IKA/GFA; чтение ключей из ОЗУ (XCP / Job 3) "
-            "проверено только для ПО 0511 и 0273.",
+            "проверено только для ПО 0173, 0175, 0212, 0273 и 0511.",
             f"Unit {unit_id_en} is not officially supported. You can still try UDS reads "
             "(passport, status, FFB slots, DTCs) and IKA/GFA writes; SRAM key extraction (XCP / Job 3) "
-            "is verified only for SW 0511 and 0273.",
+            "is verified only for SW 0173, 0175, 0212, 0273, and 0511.",
         )
     return {
         "verified": verified,

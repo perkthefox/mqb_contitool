@@ -261,8 +261,20 @@ class FakeBcmBus:
             return
         if sid == 0x22 and len(pdu) >= 3:
             did = int.from_bytes(pdu[1:3], "big")
-            pn = b"5Q0937084EA " if self.profile["id"] == "ea_0511" else b"5Q0937084DD "
-            sw = b"0511" if self.profile["id"] == "ea_0511" else b"0273"
+            pn_map = {
+                "ea_0511": b"5Q0937084EA ",
+                "dd_0273": b"5Q0937084DD ",
+                "bq_0212": b"5Q0937084BQ ",
+                "bl_0175": b"5Q0937084BL ",
+            }
+            sw_map = {
+                "ea_0511": b"0511",
+                "dd_0273": b"0273",
+                "bq_0212": b"0212",
+                "bl_0175": b"0175",
+            }
+            pn = pn_map.get(self.profile["id"], b"5Q0937084EA ")
+            sw = sw_map.get(self.profile["id"], b"0511")
             dids: dict[int, bytes] = {
                 0xF187: pn,
                 0xF189: sw,
@@ -499,7 +511,7 @@ def test_bcm_wfs_ch3_ffb_key_synthesis_and_cluster_extraction() -> None:
         assert parsed["display_id"] == tp["display_id"]
 
 
-@pytest.mark.parametrize("profile_id", ["ea_0511", "dd_0273"])
+@pytest.mark.parametrize("profile_id", ["ea_0511", "dd_0273", "bq_0212", "bl_0175"])
 def test_can_bcm_status_read_keys_write_keys_and_adapt_ffb(profile_id: str, tmp_path: Path, monkeypatch) -> None:
     from test_fpke import build_synthetic_fpke_dflash
 
@@ -830,7 +842,7 @@ def test_gui_bcm_dtc_and_learned_ffb_rendering() -> None:
     win.close()
 
 
-@pytest.mark.parametrize("profile_id", ["ea_0511", "dd_0273"])
+@pytest.mark.parametrize("profile_id", ["ea_0511", "dd_0273", "bq_0212", "bl_0175"])
 def test_bcm_keyless_reads_preserve_existing_k_ffb_and_learned_ffb_keys(profile_id: str) -> None:
     from contitool.can.bcm import can_bcm_read_all
 
@@ -1042,7 +1054,7 @@ def test_bcm_adapt_ffb_from_live_cluster_verifies_cluster_presence_on_can() -> N
         )
 
 
-def test_bcm_unknown_sw_refuses_xcp_reads_and_protects_ffb() -> None:
+def test_bcm_unknown_sw_refuses_xcp_reads_and_protects_ffb(monkeypatch) -> None:
     set_lang("en")
 
     class UnknownSwBcmBus(FakeBcmBus):
@@ -1065,6 +1077,27 @@ def test_bcm_unknown_sw_refuses_xcp_reads_and_protects_ffb() -> None:
         can_bcm_read_keys("fake", interface="slcan", bus=bus)
     with pytest.raises(RuntimeError, match="Unsupported 09 BCM firmware"):
         can_bcm_read_gfa("fake", interface="slcan", bus=bus)
+
+    # Also verify via_gateway=True + gateway_bridge=True fails fast over normal UDS BEFORE launching j533_can_bridge!
+    bridge_calls: list[str] = []
+
+    def _forbid_bridge(*_a: Any, **_kw: Any) -> Any:
+        bridge_calls.append("called")
+        raise AssertionError("j533_can_bridge must not be entered for unsupported BCM SW")
+
+    monkeypatch.setattr("contitool.can.bridge.j533_can_bridge", _forbid_bridge)
+    with pytest.raises(RuntimeError, match="Unsupported 09 BCM firmware"):
+        can_bcm_read_keys("fake", interface="slcan", via_gateway=True, gateway_bridge=True, bus=bus)
+    with pytest.raises(RuntimeError, match="Unsupported 09 BCM firmware"):
+        can_bcm_read_gfa("fake", interface="slcan", via_gateway=True, gateway_bridge=True, bus=bus)
+    assert bridge_calls == []
+
+    # Verified SW 0173, 0175 (5Q0937084BL / CJ), and 0212 (5Q0937084BQ) match bl_0175 and bq_0212
+    assert bcm_detect_profile({"part_number": "5Q0937084BL", "sw_version": "0173"})["id"] == "bl_0175"
+    assert bcm_detect_profile({"part_number": "5Q0937084BL", "sw_version": "0175"})["id"] == "bl_0175"
+    assert bcm_detect_profile({"part_number": "5Q0937084CJ", "sw_version": "0175"})["id"] == "bl_0175"
+    assert bcm_detect_profile({"part_number": "5Q0937084BQ", "sw_version": "0212"})["id"] == "bq_0212"
+
     # Learned FFB key must NEVER have been wiped by 80 01
     assert bus.ffb_serials[1] == bytes.fromhex("532B3512")
 

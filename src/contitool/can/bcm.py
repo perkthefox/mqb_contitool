@@ -732,11 +732,11 @@ def _require_verified_bcm_profile(
         raise RuntimeError(
             tr(
                 f"Блок 09 BCM {pn} (ПО {sw}) официально не поддерживается для чтения ключей через XCP / Job 3: "
-                "проверены только 5Q0 937 084 EA / 086 BH (ПО 0511) и 5Q0 937 084 DD / CG (ПО 0273). "
+                "проверены только ПО 0173, 0175, 0212, 0273 и 0511. "
                 "Чтение ключей отменено, чтобы не стереть радиоключи FFB в DFLASH. "
                 "По UDS доступны чтение статуса, ошибок DTC и запись IKA/GFA (2E 00BE / 00BD).",
                 f"Unsupported 09 BCM firmware ({pn}, SW {sw}) for XCP/Job 3 key extraction: only "
-                "5Q0 937 084 EA / 086 BH (SW 0511) and 5Q0 937 084 DD / CG (SW 0273) are officially verified. "
+                "SW 0173, 0175, 0212, 0273, and 0511 are officially verified. "
                 "Key extraction aborted to prevent erasing FFB remote keys in DFLASH. "
                 "Standard UDS status, DTCs, and IKA/GFA writes (2E 00BE / 00BD) remain available.",
             )
@@ -1519,6 +1519,35 @@ def can_bcm_status(
         }
 
 
+def _precheck_bcm_profile_before_bridge(
+    port: str,
+    *,
+    interface: str = "slcan",
+    bus: Any | None = None,
+    sw_profile: str | None = None,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Verify 09 BCM UDS passport & profile support over normal J533 routing BEFORE launching the J533 RAM bridge."""
+    if sw_profile:
+        return {}
+    with _managed_bcm_session(
+        port,
+        interface=interface,
+        log_path=None,
+        bus=bus,
+        via_gateway=True,
+        gateway_bridge=False,
+        needs_raw_komfort=False,
+        sw_profile=sw_profile,
+        reporter=reporter,
+    ) as (pre_link, _):
+        pre_passport = _read_bcm_passport_in_session(pre_link)
+        if pre_passport:
+            pre_profile = bcm_detect_profile(pre_passport, sw_profile=sw_profile)
+            _require_verified_bcm_profile(pre_passport, pre_profile, sw_profile=sw_profile)
+        return pre_passport
+
+
 def can_bcm_read_gfa(
     port: str,
     *,
@@ -1532,6 +1561,15 @@ def can_bcm_read_gfa(
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
     """Read BCM group key `GFA` keyless via WFS Ch 3 Job 5 trigger + XCP `SHORT_UPLOAD` (zero flash writes)."""
+    pre_passport: dict[str, Any] = {}
+    if via_gateway and gateway_bridge and not sw_profile:
+        pre_passport = _precheck_bcm_profile_before_bridge(
+            port,
+            interface=interface,
+            bus=bus,
+            sw_profile=sw_profile,
+            reporter=reporter,
+        )
     with _managed_bcm_session(
         port,
         interface=interface,
@@ -1552,7 +1590,7 @@ def can_bcm_read_gfa(
                 "Identifying 09 BCM and connecting to XCP agent",
             ),
         )
-        passport = _read_bcm_passport_in_session(link)
+        passport = pre_passport or _read_bcm_passport_in_session(link)
         profile = bcm_detect_profile(passport, sw_profile=sw_profile)
         _require_verified_bcm_profile(passport, profile, sw_profile=sw_profile)
         reporter.step(
@@ -1592,6 +1630,15 @@ def can_bcm_read_keys(
     reporter: OperationReporter = NULL_REPORTER,
 ) -> dict[str, Any]:
     """Read both BCM `IKA` (individual key) and `GFA` (vehicle group key) via WFS Ch 3 queue + XCP (zero flash writes)."""
+    pre_passport: dict[str, Any] = {}
+    if via_gateway and gateway_bridge and not sw_profile:
+        pre_passport = _precheck_bcm_profile_before_bridge(
+            port,
+            interface=interface,
+            bus=bus,
+            sw_profile=sw_profile,
+            reporter=reporter,
+        )
     with _managed_bcm_session(
         port,
         interface=interface,
@@ -1612,7 +1659,7 @@ def can_bcm_read_keys(
                 "Identifying 09 BCM and connecting to XCP agent",
             ),
         )
-        passport = _read_bcm_passport_in_session(link)
+        passport = pre_passport or _read_bcm_passport_in_session(link)
         profile = bcm_detect_profile(passport, sw_profile=sw_profile)
         _require_verified_bcm_profile(passport, profile, sw_profile=sw_profile)
 
