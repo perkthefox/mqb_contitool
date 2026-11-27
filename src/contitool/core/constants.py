@@ -15,6 +15,10 @@ AUTHOR_SITE_URL = "https://vwhacking.antonperk.com"
 AUTHOR_SITE_SHORT = "vwhacking.antonperk.com"
 AUTHOR_DRIVE2_URL = "https://www.drive2.ru/users/perkthefox/"
 AUTHOR_TG_URL = "https://t.me/perkthefox"
+AUTHOR_DONATE_TRIBUTE_URL = "https://t.me/tribute/app?startapp=dUo2"
+AUTHOR_DONATE_USDT_TON = "UQAqOBO5Yh3Ci2zYidIymqC6SPWrVcV5Erq6-U2trXvH09ol"
+AUTHOR_DONATE_USDT_TRC20 = "TESSKf8XFw6jCHcRjGiX6sWJW2AHS76wUD"
+AUTHOR_DONATE_BTC = "bc1qltnsw22g5rg5pfcdkzrw08pzjztlx7z6wrtg7x"
 
 # Flash geometry (Continental 3Q0 907 530 xx, Renesas RH850/F1L R7F7010543AFP / R7F7010563AFP)
 APP_BASE = 0x0000C200

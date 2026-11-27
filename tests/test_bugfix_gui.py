@@ -826,11 +826,21 @@ def test_main_window_cluster_provider_close_guard_kombi_symmetry_and_frf(
     win.act_frf.trigger()
     assert frf_called == ["mrr"]
 
-    # show_about lists all 5 supported MQB units
+    # show_about lists all 5 supported MQB units and author support links
     about_texts: list[str] = []
     monkeypatch.setattr(main_window.QMessageBox, "about", lambda _p, _t, body: about_texts.append(body))
     win.show_about()
-    for token in ("19 J533", "17 FPK_E / Kombi", "09 BCM", "13 ACC MRR", "2B ELV"):
+    for token in (
+        "19 J533",
+        "17 FPK_E / Kombi",
+        "09 BCM",
+        "13 ACC MRR",
+        "2B ELV",
+        "https://t.me/tribute/app?startapp=dUo2",
+        "UQAqOBO5Yh3Ci2zYidIymqC6SPWrVcV5Erq6-U2trXvH09ol",
+        "TESSKf8XFw6jCHcRjGiX6sWJW2AHS76wUD",
+        "bc1qltnsw22g5rg5pfcdkzrw08pzjztlx7z6wrtg7x",
+    ):
         assert token in about_texts[0]
 
     # closeEvent prompts on dirty FPK_E Cflash and cancels close if user picks No

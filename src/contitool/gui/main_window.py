@@ -58,6 +58,10 @@ from contitool.cli.formatting import (
 )
 from contitool.core import (
     AUTHOR_CREDIT,
+    AUTHOR_DONATE_BTC,
+    AUTHOR_DONATE_TRIBUTE_URL,
+    AUTHOR_DONATE_USDT_TON,
+    AUTHOR_DONATE_USDT_TRC20,
     AUTHOR_DRIVE2_URL,
     AUTHOR_SITE_SHORT,
     AUTHOR_SITE_URL,
@@ -2131,6 +2135,11 @@ class MainWindow(QMainWindow):
                 f"{AUTHOR_CREDIT}<br>"
                 f'<a href="{AUTHOR_SITE_URL}">{AUTHOR_SITE_SHORT}</a>&nbsp;&nbsp;|&nbsp;&nbsp;'
                 f'<a href="{AUTHOR_DRIVE2_URL}">Drive2</a>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="{AUTHOR_TG_URL}">Telegram</a><br><br>'
+                "<b>Поддержать автора:</b><br>"
+                f'Telegram Tribute: <a href="{AUTHOR_DONATE_TRIBUTE_URL}">{AUTHOR_DONATE_TRIBUTE_URL}</a><br>'
+                f"USDT (TON): <code>{AUTHOR_DONATE_USDT_TON}</code><br>"
+                f"USDT (TRON / TRC20): <code>{AUTHOR_DONATE_USDT_TRC20}</code><br>"
+                f"BTC (Bitcoin): <code>{AUTHOR_DONATE_BTC}</code><br><br>"
                 "Бесплатный инструмент сообщества, не для продажи. Программа предоставляется «как есть», "
                 "без каких-либо гарантий.",
                 f"<b>ContiTool {__version__}</b><br>"
@@ -2139,6 +2148,11 @@ class MainWindow(QMainWindow):
                 f"{AUTHOR_CREDIT}<br>"
                 f'<a href="{AUTHOR_SITE_URL}">{AUTHOR_SITE_SHORT}</a>&nbsp;&nbsp;|&nbsp;&nbsp;'
                 f'<a href="{AUTHOR_DRIVE2_URL}">Drive2</a>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="{AUTHOR_TG_URL}">Telegram</a><br><br>'
+                "<b>Support the author:</b><br>"
+                f'Telegram Tribute: <a href="{AUTHOR_DONATE_TRIBUTE_URL}">{AUTHOR_DONATE_TRIBUTE_URL}</a><br>'
+                f"USDT (TON): <code>{AUTHOR_DONATE_USDT_TON}</code><br>"
+                f"USDT (TRON / TRC20): <code>{AUTHOR_DONATE_USDT_TRC20}</code><br>"
+                f"BTC (Bitcoin): <code>{AUTHOR_DONATE_BTC}</code><br><br>"
                 "Free community tool, not for sale. Provided “as is”, without warranty of any kind.",
             ),
         )

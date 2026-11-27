@@ -17,6 +17,7 @@
 [![Website](https://img.shields.io/badge/Web-vwhacking.antonperk.com-181717?style=flat-square&logo=googlechrome&logoColor=00D8FF)](https://vwhacking.antonperk.com)
 [![Drive2](https://img.shields.io/badge/Drive2-PerkTheFox-E31E24?style=flat-square&logo=rss&logoColor=white)](https://www.drive2.ru/users/perkthefox/)
 [![Telegram](https://img.shields.io/badge/Telegram-%40perkthefox-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/perkthefox)
+[![Donate](https://img.shields.io/badge/%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%B0%D1%82%D1%8C%20%D0%B0%D0%B2%D1%82%D0%BE%D1%80%D0%B0-Tribute%20%2F%20Crypto-F59E0B?style=flat-square)](#поддержать-автора)
 
 **Made by PerkTheFox** · 🇷🇺 Русский · [🇬🇧 English](README.en.md) · [📜 История изменений](CHANGELOG.md) · [📚 Документация](docs/README.md)
 
@@ -280,6 +281,17 @@ ODIS не нужен — проверенный драйвер D-PDU `27.2` ле
 │   └── openpdu/                  # Экспериментальный кроссплатформенный TCP-клиент VAS 6154 (без драйвера D-PDU)
 └── tests/                        # 640+ автотестов алгоритмов, протоколов, эмуляторов и GUI (pytest)
 ```
+
+---
+
+## Поддержать автора
+
+ContiTool всегда бесплатный и открытый — без платных токенов и подписок. Если программа сэкономила вам время, блок или деньги на программаторе, можно поддержать дальнейшие исследования новых ЭБУ MQB:
+
+- **Telegram Tribute:** [t.me/tribute/app?startapp=dUo2](https://t.me/tribute/app?startapp=dUo2)
+- **USDT (`TON`):** `UQAqOBO5Yh3Ci2zYidIymqC6SPWrVcV5Erq6-U2trXvH09ol`
+- **USDT (`TRON / TRC20`):** `TESSKf8XFw6jCHcRjGiX6sWJW2AHS76wUD`
+- **BTC (`Bitcoin`):** `bc1qltnsw22g5rg5pfcdkzrw08pzjztlx7z6wrtg7x`
 
 ---
 

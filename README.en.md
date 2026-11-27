@@ -17,6 +17,7 @@
 [![Website](https://img.shields.io/badge/Web-vwhacking.antonperk.com-181717?style=flat-square&logo=googlechrome&logoColor=00D8FF)](https://vwhacking.antonperk.com)
 [![Drive2](https://img.shields.io/badge/Drive2-PerkTheFox-E31E24?style=flat-square&logo=rss&logoColor=white)](https://www.drive2.ru/users/perkthefox/)
 [![Telegram](https://img.shields.io/badge/Telegram-%40perkthefox-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/perkthefox)
+[![Support](https://img.shields.io/badge/Support%20the%20Author-Tribute%20%2F%20Crypto-F59E0B?style=flat-square)](#support-the-author)
 
 **Made by PerkTheFox** · [🇷🇺 Читать на русском](README.md) · 🇬🇧 English · [📜 Changelog](CHANGELOG.md) · [📚 Deep Docs](docs/README.md)
 
@@ -280,6 +281,17 @@ Byte-accurate `J533` specifications live in **[`docs/`](docs/README.md)**:
 │   └── openpdu/                  # Experimental portable VAS 6154 TCP client (no vendor D-PDU driver)
 └── tests/                        # 640+ unit, protocol, emulator & headless GUI tests (pytest)
 ```
+
+---
+
+## Support the Author
+
+ContiTool is free and open-source — no paid tokens, dongles, or subscriptions. If it saved you hours of bench work or rescued an ECU, you can support ongoing VAG MQB research:
+
+- **Telegram Tribute:** [t.me/tribute/app?startapp=dUo2](https://t.me/tribute/app?startapp=dUo2)
+- **USDT (`TON`):** `UQAqOBO5Yh3Ci2zYidIymqC6SPWrVcV5Erq6-U2trXvH09ol`
+- **USDT (`TRON / TRC20`):** `TESSKf8XFw6jCHcRjGiX6sWJW2AHS76wUD`
+- **BTC (`Bitcoin`):** `bc1qltnsw22g5rg5pfcdkzrw08pzjztlx7z6wrtg7x`
 
 ---
 
