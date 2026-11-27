@@ -211,20 +211,21 @@ class Dialog(QDialog):
         self.buttons.setSpacing(8)
         self._footer.setHidden(True)  # finish() shows it
         outer.addWidget(self._footer)
-        lbl = QLabel(title)
-        lbl.setObjectName("PageTitle")
-        self.body.addWidget(lbl)
+        self.lbl_title = QLabel(title)
+        self.lbl_title.setObjectName("PageTitle")
+        self.body.addWidget(self.lbl_title)
         if subtitle:
             self.body.addWidget(hint(subtitle))
         self.body.addWidget(divider())
         self.resize(width, 10)
 
-    def finish(self, *left: QWidget, ok: QPushButton | None = None, cancel_text: str = "") -> None:
-        """Append the button row: `left` widgets, stretch, Cancel/Close, then the primary `ok` button."""
+    def finish(self, *left: QWidget, ok: QPushButton | None = None, cancel_text: str = "") -> QPushButton:
+        """Build the footer with the optional left widgets and primary button, and return the cancel button."""
         for w in left:
             self.buttons.addWidget(w)
         self.buttons.addStretch(1)
-        self.buttons.addWidget(button(cancel_text or tr("Отмена", "Cancel"), slot=self.reject))
+        cancel = button(cancel_text or tr("Отмена", "Cancel"), slot=self.reject)
+        self.buttons.addWidget(cancel)
         if ok is not None:
             ok.setDefault(True)
             self.buttons.addWidget(ok)
@@ -233,6 +234,7 @@ class Dialog(QDialog):
         content = self._scroll.widget().sizeHint().width() + self._scroll.verticalScrollBar().sizeHint().width()
         self.resize(max(content, self._footer.sizeHint().width(), self._min_width), self.height())
         self.fit_height()
+        return cancel
 
     def fit_height(self) -> None:
         """Height for the current width, never taller than the screen — what does not fit scrolls. adjustSize()

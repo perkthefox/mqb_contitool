@@ -1,5 +1,13 @@
 # Changelog / История изменений
 
+## Unreleased / В разработке
+
+### 🇷🇺 Исправлено
+- В стартовом предупреждении можно переключаться между русским и английским до подтверждения. Главное окно использует выбранный язык.
+
+### 🇬🇧 Fixed
+- The startup warning can be switched between Russian and English before accepting it. The main window uses the selected language.
+
 ## 2.2.1a — 2026-11-27
 
 ### 🇷🇺 Добавлено
