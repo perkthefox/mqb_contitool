@@ -6,6 +6,7 @@ from typing import Any
 import zlib
 
 from contitool.core.fpke import FPKE_FFB_C16, analyze_fpke_dflash
+from contitool.i18n import tr
 
 # ────────────────────────────── CAN Identifiers & Constants ──────────────────────────────
 
@@ -147,10 +148,86 @@ def bcm_detect_profile(
     for prof in BCM_PROFILES.values():
         if sw and sw in prof["sw_versions"]:
             return {**prof, "matched": True}
-    for prof in BCM_PROFILES.values():
-        if pn_norm and any(pn_norm.startswith(pref) for pref in prof["part_prefixes"]):
-            return {**prof, "matched": True}
+    if not sw:
+        for prof in BCM_PROFILES.values():
+            if pn_norm and any(pn_norm.startswith(pref) for pref in prof["part_prefixes"]):
+                return {**prof, "matched": True}
     return {**BCM_PROFILES["ea_0511"], "matched": False}
+
+
+def _extract_bcm_pn_sw(
+    ident_or_passport: dict[str, Any] | list[dict[str, str]] | None = None,
+    *,
+    sw_version: str = "",
+    part_number: str = "",
+) -> tuple[str, str]:
+    pn = part_number.strip()
+    sw = sw_version.strip()
+    if isinstance(ident_or_passport, list):
+        vals = {str(it.get("did", "")).upper(): str(it.get("value", "")).strip() for it in ident_or_passport}
+        if not pn:
+            pn = vals.get("F187") or vals.get("F191") or ""
+        if not sw:
+            sw = vals.get("F189") or ""
+    elif isinstance(ident_or_passport, dict):
+        if not pn:
+            pn = str(
+                ident_or_passport.get("part_number")
+                or ident_or_passport.get("F187")
+                or ident_or_passport.get("hw_part_number")
+                or ident_or_passport.get("F191")
+                or ""
+            ).strip()
+        if not sw:
+            sw = str(ident_or_passport.get("sw_version") or ident_or_passport.get("F189") or "").strip()
+    return pn, sw
+
+
+def bcm_support_info(
+    ident_or_passport: dict[str, Any] | list[dict[str, str]] | None = None,
+    *,
+    sw_version: str = "",
+    part_number: str = "",
+    sw_profile: str | None = None,
+) -> dict[str, Any]:
+    """Return official support status and a clear `(PN + SW)` warning for a `09 BCM` unit without blocking UDS reads."""
+    pn, sw = _extract_bcm_pn_sw(ident_or_passport, sw_version=sw_version, part_number=part_number)
+    profile = bcm_detect_profile(
+        {"part_number": pn, "sw_version": sw} if (pn or sw) else None,
+        sw_version=sw,
+        part_number=pn,
+        sw_profile=sw_profile,
+    )
+    if not pn and not sw:
+        return {
+            "verified": True,
+            "profile_id": str(profile["id"]),
+            "part_number": "",
+            "sw_version": "",
+            "warning": None,
+            "tone": "ok",
+        }
+    verified = bool(profile.get("matched", False))
+    warning: str | None = None
+    if not verified:
+        unit_id_ru = f"{pn} (ПО {sw})" if (pn and sw) else (pn or f"ПО {sw}")
+        unit_id_en = f"{pn} (SW {sw})" if (pn and sw) else (pn or f"SW {sw}")
+        warning = tr(
+            f"Блок {unit_id_ru} официально не поддерживается. Можно попробовать чтение по UDS "
+            "(паспорт, статус, слоты FFB, ошибки DTC) и запись IKA/GFA; чтение ключей из ОЗУ (XCP / Job 3) "
+            "проверено только для ПО 0511 и 0273.",
+            f"Unit {unit_id_en} is not officially supported. You can still try UDS reads "
+            "(passport, status, FFB slots, DTCs) and IKA/GFA writes; SRAM key extraction (XCP / Job 3) "
+            "is verified only for SW 0511 and 0273.",
+        )
+    return {
+        "verified": verified,
+        "profile_id": str(profile["id"]),
+        "part_number": pn,
+        "sw_version": sw,
+        "warning": warning,
+        "tone": "ok" if verified else "warn",
+    }
 
 
 # ────────────────────────────── Pure-Python AES-128 ECB & Final-Round Reconstruction ──────────────────────────────

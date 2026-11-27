@@ -171,7 +171,7 @@ class _LiveTopologyDiagram(QWidget):
                     rect = QRectF(sl_x, ry, sl_w, row_h)
                     col = (
                         theme.CAN
-                        if sl.kind == "fpke"
+                        if sl.kind in ("fpke", "kombi")
                         else (theme.ACCENT if sl.kind == "mrr" else (theme.WARN if sl.kind == "elv" else theme.INFO))
                     )
                     draw_arrow(branch_x, rect.center().y(), rect.left() - 5, rect.center().y(), col if sl.memory_access_available else "#586278", dashed=not sl.memory_access_available)
@@ -224,7 +224,7 @@ class _LiveTopologyDiagram(QWidget):
                 ry = y0 + idx * (row_h + gap_y)
                 col = (
                     theme.CAN
-                    if ecu.kind == "fpke"
+                    if ecu.kind in ("fpke", "kombi")
                     else (theme.ACCENT if ecu.kind == "mrr" else (theme.WARN if ecu.kind == "elv" else theme.OK))
                 )
                 r_e = draw_box(sl_x, ry, sl_w, row_h, f"[{ecu.diag_addr}] {ecu.part_number}", f"0x{ecu.uds_tx_id:03X} → 0x{ecu.uds_rx_id:03X}", col)
@@ -236,11 +236,12 @@ class _LiveTopologyDiagram(QWidget):
 class BusScreen(QWidget):
     """Interactive topology view of all ECUs discovered on Diagnosis CAN or a direct bench harness."""
 
-    scan_requested = Signal(str)  # target_kind ("all", "j533", "fpke", "bcm", "mrr", "elv")
+    scan_requested = Signal(str)  # target_kind ("all", "j533", "fpke", "kombi", "bcm", "mrr", "elv")
     read_ecu_requested = Signal(object)  # DiscoveredEcu
     restore_ecu_requested = Signal(object)  # DiscoveredEcu
     open_j533_workspace_requested = Signal()
     open_fpke_workspace_requested = Signal(object)  # DiscoveredEcu
+    open_kombi_workspace_requested = Signal(object)  # DiscoveredEcu
     open_bcm_workspace_requested = Signal(object)  # DiscoveredEcu
     open_mrr_workspace_requested = Signal(object)  # DiscoveredEcu
     open_elv_workspace_requested = Signal(object)  # DiscoveredEcu
@@ -261,6 +262,7 @@ class BusScreen(QWidget):
         self.target_kind: str = "all"
         self.j533_loaded: bool = False
         self.fpke_loaded: bool = False
+        self.kombi_loaded: bool = False
         self.bcm_loaded: bool = False
         self.mrr_loaded: bool = False
         self.elv_loaded: bool = False
@@ -304,6 +306,7 @@ class BusScreen(QWidget):
         *,
         j533_loaded: bool,
         fpke_loaded: bool,
+        kombi_loaded: bool = False,
         bcm_loaded: bool = False,
         mrr_loaded: bool = False,
         elv_loaded: bool = False,
@@ -311,12 +314,14 @@ class BusScreen(QWidget):
         if (
             self.j533_loaded != j533_loaded
             or self.fpke_loaded != fpke_loaded
+            or self.kombi_loaded != kombi_loaded
             or self.bcm_loaded != bcm_loaded
             or self.mrr_loaded != mrr_loaded
             or self.elv_loaded != elv_loaded
         ):
             self.j533_loaded = j533_loaded
             self.fpke_loaded = fpke_loaded
+            self.kombi_loaded = kombi_loaded
             self.bcm_loaded = bcm_loaded
             self.mrr_loaded = mrr_loaded
             self.elv_loaded = elv_loaded
@@ -489,7 +494,7 @@ class BusScreen(QWidget):
         addr_badge = QLabel(ecu.diag_addr)
         addr_badge.setObjectName("AddrBadge")
         addr_badge.setFont(mono_font(11, bold=True))
-        addr_tone = "ok" if ecu.kind == "j533" else ("can" if ecu.kind == "fpke" else "accent")
+        addr_tone = "ok" if ecu.kind == "j533" else ("can" if ecu.kind in ("fpke", "kombi") else "accent")
         set_tone(addr_badge, addr_tone)
         sec.head.insertWidget(0, addr_badge, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -520,6 +525,11 @@ class BusScreen(QWidget):
             un_box = Callout("err")
             un_box.label.setText(ecu.unsupported_reason)
             sec.body.addWidget(un_box)
+        elif ecu.support_warning:
+            sup_tone = ecu.support_warning_tone if ecu.support_warning_tone in ("warn", "info") else "warn"
+            sup_box = Callout(sup_tone)
+            sup_box.label.setText(ecu.support_warning)
+            sec.body.addWidget(sup_box)
 
         # Compact tabular passport columns
         vals = {it.get("did", ""): it.get("value", "").strip() for it in ecu.ident}
@@ -626,6 +636,29 @@ class BusScreen(QWidget):
             )
             btn_restore_fpk.setEnabled(not busy and ecu.memory_access_available)
             right_actions.append(btn_restore_fpk)
+        elif ecu.kind == "kombi":
+            btn_read_kombi = button(
+                tr("Считать (SL 7)", "Read (SL 7)"),
+                "PrimaryBtn",
+                slot=lambda e=ecu: self.read_ecu_requested.emit(e),
+            )
+            btn_read_kombi.setEnabled(not busy and ecu.memory_access_available)
+            left_actions.append(btn_read_kombi)
+
+            btn_open_kombi = button(
+                tr("Открыть 17 Kombi", "Open 17 Kombi") if self.kombi_loaded else tr("Панель 17 Kombi (UDS)", "Workbench 17 Kombi"),
+                slot=lambda e=ecu: self.open_kombi_workspace_requested.emit(e),
+            )
+            btn_open_kombi.setEnabled(not busy)
+            left_actions.append(btn_open_kombi)
+
+            btn_restore_kombi = button(
+                tr("Залить EEL…", "Write EEL…"),
+                "GhostBtn",
+                slot=lambda e=ecu: self.restore_ecu_requested.emit(e),
+            )
+            btn_restore_kombi.setEnabled(not busy and ecu.memory_access_available)
+            right_actions.append(btn_restore_kombi)
         elif ecu.kind == "bcm":
             btn_read_bcm = button(
                 tr("Считать 09 BCM", "Read 09 BCM"),
@@ -675,7 +708,7 @@ class BusScreen(QWidget):
 
         btn_dtc = button(
             tr("Ошибки DTC", "Read DTCs"),
-            "PrimaryBtn" if ecu.kind not in ("j533", "fpke", "bcm", "mrr", "elv") else "",
+            "PrimaryBtn" if ecu.kind not in ("j533", "fpke", "kombi", "bcm", "mrr", "elv") else "",
             slot=lambda e=ecu: self._read_ecu_dtcs(e),
         )
         btn_dtc.setEnabled(not busy)
@@ -689,7 +722,7 @@ class BusScreen(QWidget):
         btn_clr.setEnabled(not busy)
         left_actions.append(btn_clr)
 
-        if ecu.kind not in ("j533", "fpke"):
+        if ecu.kind not in ("j533", "fpke", "kombi"):
             btn_term = button(
                 tr("CAN-терминал", "CAN terminal"),
                 "",

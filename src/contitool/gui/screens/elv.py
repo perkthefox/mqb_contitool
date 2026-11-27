@@ -47,6 +47,7 @@ from contitool.core.elv import (
     ELV_UDS_TX_ID,
     elv_adapt_dflash,
     elv_bolt_state_label,
+    elv_detect_profile,
     elv_extract_cluster_material,
     elv_idac_state_label,
     elv_is_dflash_bytes,
@@ -219,10 +220,16 @@ class ElvConfirmWriteDialog(Dialog):
         uses_bridge: bool = False,
         is_02e2: bool = True,
         danger: bool = False,
+        support_warning: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent, title, subtitle, width=600)
         self.body.setSpacing(10)
+
+        if support_warning:
+            sup_box = Callout("warn")
+            sup_box.label.setText(support_warning)
+            self.body.addWidget(sup_box)
 
         lbl = hint(summary_html)
         lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -1398,6 +1405,12 @@ class ElvScreen(QWidget):
                 head_row.addWidget(b)
 
         lay.addLayout(head_row)
+
+        elv_prof = elv_detect_profile(self._passport)
+        if elv_prof["warning"]:
+            sup_box = Callout("warn")
+            sup_box.label.setText(elv_prof["warning"])
+            lay.addWidget(sup_box)
 
         if self._key == "immo":
             self._build_page_immo(lay)
@@ -2839,6 +2852,7 @@ class ElvScreen(QWidget):
             via_gateway=self._via_gateway,
             uses_bridge=uses_bridge,
             is_02e2=True,
+            support_warning=elv_detect_profile(self._passport)["warning"],
             parent=self,
         )
         if not run_dialog(dlg) or self.runner.is_busy:
@@ -2987,6 +3001,7 @@ class ElvScreen(QWidget):
             uses_bridge=uses_bridge,
             is_02e2=True,
             danger=True,
+            support_warning=elv_detect_profile(self._passport)["warning"],
             parent=self,
         )
         if not run_dialog(dlg) or self.runner.is_busy:
@@ -3122,6 +3137,7 @@ class ElvScreen(QWidget):
             via_gateway=self._via_gateway,
             uses_bridge=uses_bridge,
             is_02e2=False,
+            support_warning=elv_detect_profile(self._passport)["warning"],
             parent=self,
         )
         if not run_dialog(dlg) or self.runner.is_busy:

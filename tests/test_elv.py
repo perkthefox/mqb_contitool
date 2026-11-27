@@ -1212,3 +1212,53 @@ def test_elv_c1_c6_h10_h11_gui_restore_report_and_cli_guards(tmp_path: Path) -> 
     finally:
         win.close()
 
+
+def test_elv_unverified_pn_sw_allows_read_with_warning_and_banner(tmp_path: Path) -> None:
+    from PySide6.QtWidgets import QApplication, QLabel
+
+    from contitool.core.elv import elv_detect_profile
+    from contitool.gui.main_window import MainWindow
+    from contitool.i18n import set_lang
+    from contitool.progress import OperationReporter
+
+    set_lang("ru")
+    # Verified Marquardt 3Q0 905 861 SW 0032 -> no warning
+    assert elv_detect_profile({"part_number": "3Q0905861", "sw_version": "0032"})["warning"] is None
+
+    # Unverified ELV (different PN or SW) -> warning with PN + SW, read NOT blocked
+    prof = elv_detect_profile({"part_number": "5Q0905861A", "sw_version": "0040"})
+    assert prof["verified"] is False
+    assert prof["warning"] and "5Q0905861A" in prof["warning"] and "0040" in prof["warning"]
+    assert "официально не поддерживается" in prof["warning"]
+
+    bus = FakeElvBus(make_synth_elv_dflash(active_pool=1, format_64k=False))
+    bus.parsed["identity"]["part_number"] = "5Q0905861A"
+    bus.parsed["identity"]["sw_version"] = "0040"
+    warns: list[str] = []
+
+    class RecRep(OperationReporter):
+        def warning(self, message: str) -> None:
+            warns.append(message)
+
+    st = can_elv_status("fake", bus=bus, reporter=RecRep())
+    assert st["officially_supported"] is False
+    assert st["support_warning"] and "5Q0905861A" in st["support_warning"] and "0040" in st["support_warning"]
+
+    df_res = can_elv_read_dflash("fake", out_dir=tmp_path, bus=bus, reporter=RecRep())
+    assert df_res["officially_supported"] is False
+    assert len(df_res["dflash_bytes"]) == 0x8000
+    assert any("5Q0905861A" in w and "0040" in w for w in warns)
+
+    # ElvScreen displays warning banner for unverified ELV
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    try:
+        win.elv_screen.open_from_read_result(df_res)
+        app.processEvents()
+        page_w = win.elv_screen.page_area.widget()
+        texts = [lbl.text() for lbl in page_w.findChildren(QLabel)]
+        assert any("5Q0905861A" in t and "0040" in t and "официально не поддерживается" in t for t in texts)
+    finally:
+        win.close()
+
+

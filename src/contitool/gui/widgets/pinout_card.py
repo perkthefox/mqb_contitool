@@ -21,10 +21,12 @@ PIN_COLORS = {
 }
 
 KOMBI_T18_PIN_COLORS = {
-    1: theme.ERR,   # KL30 +12V
-    10: "#A1A4AB",  # KL31 GND
-    18: theme.OK,   # CAN-H
-    17: theme.INFO, # CAN-L
+    1: theme.ERR,    # KL30 +12V
+    8: "#E0884D",    # D2 Coil 1 (125 kHz)
+    9: "#E0884D",    # D2 Coil 2 (125 kHz)
+    10: "#A1A4AB",   # KL31 GND
+    18: theme.OK,    # CAN-H
+    17: theme.INFO,  # CAN-L
 }
 
 ELV_T4_PIN_COLORS = {

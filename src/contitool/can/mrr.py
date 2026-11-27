@@ -88,6 +88,7 @@ from contitool.core.mrr import (
     mrr_parse_swap_uds_response,
     mrr_read_frf,
     mrr_sum32_be,
+    mrr_support_info,
     mrr_xcp_compute_key,
 )
 from contitool.i18n import tr
@@ -1583,6 +1584,9 @@ def can_mrr_status(
         )
         passport = link.read_passport()
         prof = mrr_detect_profile(passport, sw_version=sw_profile or "")
+        sup = mrr_support_info(passport, sw_version=sw_profile or "")
+        if sup["warning"]:
+            reporter.warning(sup["warning"])
         gen = 1 if prof["mcu"] == "MPC5674K" else 2
         coding_raw = bytes.fromhex(str(passport["coding"])) if passport.get("coding") else None
         reporter.step(
@@ -1614,6 +1618,9 @@ def can_mrr_status(
             "status": status,
             "swap_uds": swap_uds,
             "dtcs": dtcs,
+            "officially_supported": bool(sup["verified"]),
+            "support_warning": sup["warning"],
+            "support_warning_tone": sup["tone"],
         }
 
 
@@ -1728,6 +1735,9 @@ def can_mrr_read_keys(
         passport = link.read_passport()
         status = link.read_status_dids()
         prof = mrr_detect_profile(passport, sw_version=sw_profile or "")
+        sup = mrr_support_info(passport, sw_version=sw_profile or "")
+        if sup["warning"]:
+            reporter.warning(sup["warning"])
 
         reporter.step(2, 3, tr("Подключение и разблокировка XCP (0x1BFEBA00)…", "Connecting and unlocking XCP (0x1BFEBA00)…"))
         xcp_info = link.ensure_xcp_enabled(reporter=reporter)
@@ -1834,6 +1844,9 @@ def can_mrr_read_keys(
             "ecu_kind": "mrr",
             "profile": prof["sw"],
             "profile_verified": bool(prof.get("verified", False)),
+            "officially_supported": bool(sup["verified"]),
+            "support_warning": sup["warning"],
+            "support_warning_tone": sup["tone"],
             "unit": prof["unit"],
             "family": prof["family"],
             "mcu": prof["mcu"],
@@ -2253,6 +2266,9 @@ def can_mrr_read_memory(
     ) as (link, bridged):
         passport = link.read_passport()
         prof = mrr_detect_profile(passport, sw_version=sw_profile or "")
+        sup = mrr_support_info(passport, sw_version=sw_profile or "")
+        if sup["warning"]:
+            reporter.warning(sup["warning"])
         link.ensure_xcp_enabled(reporter=reporter)
 
         reg_key = (region or "dflash").strip().lower()
@@ -2345,6 +2361,9 @@ def can_mrr_read_memory(
             "ecu_kind": "mrr",
             "profile": prof["sw"],
             "profile_verified": bool(prof.get("verified", False)),
+            "officially_supported": bool(sup["verified"]),
+            "support_warning": sup["warning"],
+            "support_warning_tone": sup["tone"],
             "unit": prof["unit"],
             "family": prof["family"],
             "mcu": prof["mcu"],

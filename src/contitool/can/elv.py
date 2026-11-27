@@ -55,6 +55,7 @@ from contitool.core.elv import (
     elv_build_dev_mem_read_frame,
     elv_build_wfs5_01b_response,
     elv_decode_status_dids,
+    elv_detect_profile,
     elv_extract_cluster_material,
     elv_parse_dflash,
     elv_verify_02f9,
@@ -630,6 +631,9 @@ def can_elv_status(
         reporter=reporter,
     ) as (link, _used_bridge):
         passport, status, _raw, dtcs = _read_elv_passport_and_status(link, read_dtcs=read_dtcs)
+    prof = elv_detect_profile(passport)
+    if prof["warning"]:
+        reporter.warning(prof["warning"])
     return {
         "ecu_kind": "elv",
         "diag_addr": "2B",
@@ -638,6 +642,9 @@ def can_elv_status(
         "passport": passport,
         "status": status,
         "dtcs": dtcs if dtcs is not None else [],
+        "profile": prof,
+        "officially_supported": bool(prof["verified"]),
+        "support_warning": prof["warning"],
     }
 
 
@@ -710,6 +717,9 @@ def can_elv_read_dflash(
     ) as (link, used_bridge):
         reporter.step(1, 3, tr("Чтение паспорта и статуса ELV", "Reading ELV passport & status"))
         passport, status, raw_dids, dtcs = _read_elv_passport_and_status(link, read_dtcs=read_dtcs)
+        prof = elv_detect_profile(passport)
+        if prof["warning"]:
+            reporter.warning(prof["warning"])
 
         reporter.step(2, 3, tr("Чтение Data Flash ELV (32 КБ по CAN)", "Reading ELV Data Flash (32 KB over CAN)"))
         dflash_bytes = link.read_dflash_32k(reporter=reporter)
@@ -750,6 +760,9 @@ def can_elv_read_dflash(
             "via_gateway": via_gateway,
             "used_bridge": used_bridge,
             "passport": passport,
+            "profile": prof,
+            "officially_supported": bool(prof["verified"]),
+            "support_warning": prof["warning"],
             "status": status,
             "dflash_sha256": parsed["sha256"],
             "dflash_size": len(dflash_bytes),
@@ -780,6 +793,9 @@ def can_elv_read_dflash(
         "used_bridge": used_bridge,
         "elapsed_sec": elapsed,
         "passport": passport,
+        "profile": prof,
+        "officially_supported": bool(prof["verified"]),
+        "support_warning": prof["warning"],
         "status": status,
         "dflash_bytes": dflash_bytes,
         "dflash_parsed": parsed,
@@ -1509,6 +1525,21 @@ def can_elv_check_bootloader(
 
         mode = None if in_bl else _read_elv_mode(link)
         result["mode"] = mode
+
+        if not in_bl:
+            bl_passport: dict[str, str] = {}
+            for k_key, did in (("part_number", 0xF187), ("sw_version", 0xF189), ("system_name", 0xF197)):
+                with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
+                    raw_d = link.request_uds(bytes([0x22, (did >> 8) & 0xFF, did & 0xFF]), 0x62, timeout=0.9)[3:]
+                    txt_d = _clean_ascii(raw_d)
+                    if txt_d:
+                        bl_passport[k_key] = txt_d
+            if bl_passport:
+                bl_prof = elv_detect_profile(bl_passport)
+                result["officially_supported"] = bool(bl_prof["verified"])
+                result["support_warning"] = bl_prof["warning"]
+                if bl_prof["warning"]:
+                    reporter.warning(bl_prof["warning"])
 
         # In Adapted Mode 2, `10 02` strictly requires WFS5 `0x01A` Type 1 <-> `0x01B` with `KL15=1`.
         # If credentials were not passed (e.g. GUI before reading DFLASH, or CLI), auto-read DFLASH on raw Komfort CAN.

@@ -1387,3 +1387,51 @@ def test_bcm_h4_dpdu_uds_session_and_29bit_warning() -> None:
     assert any("29-bit" in w and "RawMode" in w and "native CAN" in w for w in warnings)
 
 
+def test_bcm_unverified_sw_allows_uds_read_with_pn_sw_warning_and_fixes_prefix_fallback() -> None:
+    from contitool.can.bcm import can_bcm_read_all
+    from contitool.core.bcm import bcm_support_info
+    from contitool.progress import OperationReporter
+
+    set_lang("ru")
+    # Same known EA part number, but DIFFERENT unverified SW 0512 -> must NOT match ea_0511!
+    prof_0512 = bcm_detect_profile({"part_number": "5Q0937084EA", "sw_version": "0512"})
+    assert prof_0512["matched"] is False
+    sup_0512 = bcm_support_info({"part_number": "5Q0937084EA", "sw_version": "0512"})
+    assert sup_0512["verified"] is False
+    assert sup_0512["warning"] is not None
+    assert "5Q0937084EA" in sup_0512["warning"]
+    assert "0512" in sup_0512["warning"]
+    assert "официально не поддерживается" in sup_0512["warning"]
+
+    # Verified 0511 has no warning
+    assert bcm_support_info({"part_number": "5Q0937084EA", "sw_version": "0511"})["warning"] is None
+    # Missing SW still allows known part prefix fallback
+    assert bcm_detect_profile({"part_number": "5Q0937084EA", "sw_version": ""})["matched"] is True
+
+    class UnverifiedEaBus(FakeBcmBus):
+        def _handle_uds(self, payload: bytes) -> None:
+            if payload[:3] == b"\x22\xf1\x87":
+                self._enqueue_isotp(BCM_UDS_RX_ID, b"\x62\xf1\x87" + b"5Q0937084EA ")
+                return
+            if payload[:3] == b"\x22\xf1\x89":
+                self._enqueue_isotp(BCM_UDS_RX_ID, b"\x62\xf1\x89" + b"0512")
+                return
+            super()._handle_uds(payload)
+
+    bus = UnverifiedEaBus(profile_id="ea_0511", freq_code=0x03)
+    bus.ffb_serials[1] = bytes.fromhex("532B3512")
+    warns: list[str] = []
+
+    class RecRep(OperationReporter):
+        def warning(self, message: str) -> None:
+            warns.append(message)
+
+    # UDS read works without blocking and emits (PN + SW) warning; include_keys=True still protects FFB keys!
+    res = can_bcm_read_all("fake", interface="slcan", bus=bus, include_keys=True, reporter=RecRep())
+    assert res["officially_supported"] is False
+    assert res["support_warning"] and "5Q0937084EA" in res["support_warning"] and "0512" in res["support_warning"]
+    assert any("5Q0937084EA" in w and "0512" in w for w in warns)
+    assert bus.ffb_serials[1] == bytes.fromhex("532B3512")
+
+
+

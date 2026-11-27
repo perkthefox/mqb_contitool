@@ -3451,6 +3451,69 @@ def test_gui_and_cli_remaining_high_guards(monkeypatch) -> None:
     assert rc_fpke_dpdu != 0
 
 
+def test_fpke_unverified_sw_allows_read_and_shows_pn_sw_warning(tmp_path: Path) -> None:
+    from PySide6.QtWidgets import QApplication, QLabel
+
+    from contitool.can.fpke import can_fpke_full_read
+    from contitool.core.fpke import fpke_support_info
+    from contitool.gui.main_window import MainWindow
+    from contitool.i18n import set_lang
+    from contitool.progress import OperationReporter
+
+    set_lang("ru")
+    # Verified SW versions -> no warning
+    assert fpke_support_info(f187="83A920700E", f189="6181")["warning"] is None
+    assert fpke_support_info(f187="5E0920790A", f189="1703")["warning"] is None
+    assert fpke_support_info(f187="5E0920790A", f189="1711")["warning"] is None
+
+    # Unverified SW or non-Continental cluster -> warning with PN + SW, still non-blocking
+    sup_unk = fpke_support_info(f187="5G1920791B", f189="4191", f197="KOMBI VISTEON")
+    assert sup_unk["verified"] is False
+    assert sup_unk["warning"] and "5G1920791B" in sup_unk["warning"] and "4191" in sup_unk["warning"]
+    assert "официально не поддерживается" in sup_unk["warning"]
+
+    bus = FakeFpkeBus(sw_profile="83a")
+    bus.ident_map[0xF187] = b"83A920700B "
+    bus.ident_map[0xF189] = b"0295"
+    warns: list[str] = []
+
+    class RecRep(OperationReporter):
+        def warning(self, message: str) -> None:
+            warns.append(message)
+
+    rep = can_fpke_full_read(
+        "fake",
+        session_dir=tmp_path,
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        bus=bus,
+        reporter=RecRep(),
+    )
+    assert rep["officially_supported"] is False
+    assert rep["support_warning"] and "83A920700B" in rep["support_warning"] and "0295" in rep["support_warning"]
+    assert any("83A920700B" in w and "0295" in w for w in warns)
+
+    # FpkeScreen renders support warning callout
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    try:
+        win.fpke_screen.open_from_ident(
+            {
+                "ident": [
+                    {"did": "F187", "label_ru": "Номер детали", "label_en": "Part", "value": "83A920700B"},
+                    {"did": "F189", "label_ru": "ПО", "label_en": "SW", "value": "0295"},
+                ]
+            }
+        )
+        app.processEvents()
+        page_w = win.fpke_screen.page_area.widget()
+        texts = [lbl.text() for lbl in page_w.findChildren(QLabel)]
+        assert any("83A920700B" in t and "0295" in t and "официально не поддерживается" in t for t in texts)
+    finally:
+        win.close()
+
+
+
 
 
 

@@ -115,9 +115,21 @@ def _summarize_recent_folder(folder: Path) -> dict[str, Any]:
                             break
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                     pass
+    is_kombi = (
+        not is_mrr
+        and not is_elv
+        and (
+            "kombi_report.json" in file_sizes
+            or "eellogical.bin" in file_sizes
+            or "eel_phys_offsets.bin" in file_sizes
+            or "kombi" in raw_name.lower()
+            or part_num.startswith(("5NA920740", "5NA920750", "5E0920740", "5E0920750", "5G0920", "3Q0920"))
+        )
+    )
     is_fpke = (
         not is_mrr
         and not is_elv
+        and not is_kombi
         and (
             "extraarea.bin" in file_sizes
             or "fpke_report.json" in file_sizes
@@ -129,6 +141,7 @@ def _summarize_recent_folder(folder: Path) -> dict[str, Any]:
     is_j533 = (
         not is_mrr
         and not is_elv
+        and not is_kombi
         and not is_fpke
         and (
             part_num.startswith(("3Q0", "V03"))
@@ -147,6 +160,8 @@ def _summarize_recent_folder(folder: Path) -> dict[str, Any]:
     if any("dflash" in n for n in file_sizes):
         sz_df = next(s for n, s in file_sizes.items() if "dflash" in n)
         tags.append("DF 32K" if sz_df == 32768 else "DF 64K")
+    if "eellogical.bin" in file_sizes:
+        tags.append("EEL 132")
     if any("sram" in n for n in file_sizes):
         tags.append("SRAM")
     if any("uflash" in n for n in file_sizes):
@@ -170,8 +185,8 @@ def _summarize_recent_folder(folder: Path) -> dict[str, Any]:
         when = ""
 
     return {
-        "addr": "2B" if is_elv else ("13" if is_mrr else ("17" if is_fpke else ("19" if is_j533 else "BIN"))),
-        "tone": "warn" if is_elv else ("info" if is_mrr else ("can" if is_fpke else ("ok" if is_j533 else "muted"))),
+        "addr": "2B" if is_elv else ("13" if is_mrr else ("17" if (is_fpke or is_kombi) else ("19" if is_j533 else "BIN"))),
+        "tone": "warn" if is_elv else ("info" if is_mrr else ("can" if (is_fpke or is_kombi) else ("ok" if is_j533 else "muted"))),
         "title": part_num or raw_name,
         "subtitle": fazit or (session_tag if not m_pn else ""),
         "session": session_tag,
@@ -331,7 +346,8 @@ class _BusTopologyDiagram(QWidget):
         else:
             spec_map = {
                 "j533": ("[19] J533 Gateway", "T20: Pin 19, Pin 9", "0x710 / 0x77A", theme.OK),
-                "fpke": ("[17] Kombi FPK_E", "T18: Pin 18, Pin 17", "0x714 / 0x77E", theme.CAN),
+                "fpke": ("[17] FPK_E (RH850)", "T18: Pin 18, Pin 17", "0x714 / 0x77E", theme.CAN),
+                "kombi": ("[17] Kombi VDD (V850)", "T18: Pin 18, Pin 17", "0x714 / 0x77E", theme.CAN),
                 "bcm": ("[09] BCM J519", "Komfort CAN", "0x70E / 0x778", theme.INFO),
                 "mrr": ("[13] ACC Radar MRR", "Extended CAN", "0x757 / 0x7C1", theme.ACCENT),
                 "elv": ("[2B] ELV J764", "T4: Pin 1, Pin 2", "0x731 / 0x79B", theme.WARN),
@@ -655,7 +671,7 @@ class StartScreen(QWidget):
         read_map = {
             "all": tr("Считать блок", "Read ECU"),
             "j533": tr("Считать 19 J533", "Read 19 J533"),
-            "fpke": tr("Считать 17 FPK_E", "Read 17 FPK_E"),
+            "fpke": tr("Считать 17 Панель", "Read 17 Cluster"),
             "bcm": tr("Считать 09 BCM", "Read 09 BCM"),
             "mrr": tr("Считать 13 Радар", "Read 13 Radar"),
             "elv": tr("Считать 2B ELV", "Read 2B ELV"),
@@ -724,7 +740,7 @@ class StartScreen(QWidget):
         )
         self._target_cards["fpke"].set_labels(
             tr("Панель приборов", "Instrument Cluster"),
-            "FPK_E · 0x714 / 0x77E",
+            "FPK_E / Kombi · 0x714 / 0x77E",
         )
         self._target_cards["bcm"].set_labels(
             tr("Блок BCM J519", "BCM J519"),

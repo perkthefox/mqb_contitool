@@ -47,6 +47,7 @@ from contitool.core.bcm import (
     bcm_derive_k_ffb,
     bcm_detect_profile,
     bcm_extract_cluster_ffb_material,
+    bcm_support_info,
 )
 from contitool.gui import theme
 from contitool.gui.connection import CanConnection, ensure_ready
@@ -684,7 +685,10 @@ class BcmScreen(QWidget):
         if self._passport.get("vin"):
             top_fields.append(("VIN", str(self._passport["vin"])))
         prof_id = self._profile.get("id", "ea_0511")
-        prof_short = "EA / SW 0511" if prof_id == "ea_0511" else "DD / SW 0273"
+        if self._passport and not self._profile.get("matched", True) and not self._profile_override:
+            prof_short = tr("не проверен", "unverified")
+        else:
+            prof_short = "EA / SW 0511" if prof_id == "ea_0511" else "DD / SW 0273"
         top_fields.append((tr("ПРОФИЛЬ ОЗУ", "RAM PROFILE"), prof_short))
         if self._status.get("rf_0a65_hex"):
             top_fields.append((tr("ЧАСТОТА FFB", "FFB RF"), str(self._status.get("freq_label") or "—")))
@@ -846,6 +850,18 @@ class BcmScreen(QWidget):
             head_row.addWidget(self.cmb_profile)
 
         lay.addLayout(head_row)
+
+        sup_info = bcm_support_info(self._passport)
+        if sup_info["warning"]:
+            sup_box = Callout("warn")
+            msg = sup_info["warning"]
+            if self._profile_override:
+                msg += " " + tr(
+                    f"(Выбран ручной профиль ОЗУ: {self._profile_override}.)",
+                    f"(Manual RAM profile override active: {self._profile_override}.)",
+                )
+            sup_box.label.setText(msg)
+            lay.addWidget(sup_box)
 
         if self._key == "cp_keys":
             self._build_cp_keys_page(lay)

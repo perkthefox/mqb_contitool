@@ -38,6 +38,7 @@ from contitool.can import (
     can_flash_frf,
     can_fpke_full_read,
     can_identify,
+    can_kombi_full_read,
     can_mrr_read_keys,
     can_mrr_status,
     can_restore_backup,
@@ -77,6 +78,7 @@ from contitool.core.elv import (
     is_elv_ident,
 )
 from contitool.core.fpke import detect_fpke_files, is_fpke_ident
+from contitool.core.kombi import detect_kombi_files, is_kombi_ident
 from contitool.core.mrr import MRR_DFLASH_SIZE, mrr_detect_profile, mrr_parse_dflash_fee
 from contitool.gui.connection import CanConnection, ConnectionDialog, ensure_ready
 from contitool.gui.dialogs.guide import GuideDialog
@@ -87,6 +89,7 @@ from contitool.gui.screens.bus import BusScreen
 from contitool.gui.screens.ecu import EcuScreen
 from contitool.gui.screens.elv import ElvScreen
 from contitool.gui.screens.fpke import FpkeScreen
+from contitool.gui.screens.kombi import KombiScreen
 from contitool.gui.screens.mrr import MrrScreen
 from contitool.gui.screens.start import StartScreen
 from contitool.gui.screens.terminal import TerminalScreen
@@ -118,7 +121,7 @@ class MainWindow(QMainWindow):
         self.runner = OperationRunner(self)
         self.ws = Workspace(self)
         self.conn = CanConnection(self)
-        self._active_screen: str = "start"  # "start" | "bus" | "j533" | "fpke" | "bcm" | "mrr" | "elv"
+        self._active_screen: str = "start"  # "start" | "bus" | "j533" | "fpke" | "kombi" | "bcm" | "mrr" | "elv"
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -136,6 +139,7 @@ class MainWindow(QMainWindow):
         self.bus_screen = BusScreen(self.conn, self.runner)
         self.ecu_screen = EcuScreen(self.ws, self.conn, self.runner)
         self.fpke_screen = FpkeScreen(self.conn, self.runner)
+        self.kombi_screen = KombiScreen(self.conn, self.runner)
         self.bcm_screen = BcmScreen(
             self.conn,
             self.runner,
@@ -155,6 +159,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.bus_screen)
         self.stack.addWidget(self.ecu_screen)
         self.stack.addWidget(self.fpke_screen)
+        self.stack.addWidget(self.kombi_screen)
         self.stack.addWidget(self.bcm_screen)
         self.stack.addWidget(self.mrr_screen)
         self.stack.addWidget(self.elv_screen)
@@ -172,6 +177,7 @@ class MainWindow(QMainWindow):
         self.bus_screen.restore_ecu_requested.connect(self._on_bus_restore_ecu)
         self.bus_screen.open_j533_workspace_requested.connect(lambda: self.switch_ecu_view("j533"))
         self.bus_screen.open_fpke_workspace_requested.connect(self._on_bus_open_fpke_workspace)
+        self.bus_screen.open_kombi_workspace_requested.connect(self._on_bus_open_kombi_workspace)
         self.bus_screen.open_bcm_workspace_requested.connect(self._on_bus_open_bcm_workspace)
         self.bus_screen.open_mrr_workspace_requested.connect(self._on_bus_open_mrr_workspace)
         self.bus_screen.open_elv_workspace_requested.connect(self._on_bus_open_elv_workspace)
@@ -182,6 +188,7 @@ class MainWindow(QMainWindow):
         self.ecu_screen.restore_requested.connect(lambda: self.restore_backup(force_j533=True))
         self.ecu_screen.terminal_requested.connect(self._open_in_terminal)
         self.fpke_screen.close_requested.connect(self.close_ecu)
+        self.kombi_screen.close_requested.connect(self.close_ecu)
         self.bcm_screen.close_requested.connect(self.close_ecu)
         self.bcm_screen.open_terminal_requested.connect(self._on_bcm_open_terminal)
         self.mrr_screen.close_requested.connect(self.close_ecu)
@@ -198,6 +205,8 @@ class MainWindow(QMainWindow):
         self.ecu_screen.note.connect(lambda _m: self._ensure_console_visible())
         self.fpke_screen.note.connect(self.console.note)
         self.fpke_screen.note.connect(lambda _m: self._ensure_console_visible())
+        self.kombi_screen.note.connect(self.console.note)
+        self.kombi_screen.note.connect(lambda _m: self._ensure_console_visible())
         self.bcm_screen.note.connect(self.console.note)
         self.bcm_screen.note.connect(lambda _m: self._ensure_console_visible())
         self.mrr_screen.note.connect(self.console.note)
@@ -223,6 +232,8 @@ class MainWindow(QMainWindow):
         self.ws.changed.connect(self._refresh_screen)
         self.fpke_screen.changed.connect(self._refresh_header)
         self.fpke_screen.changed.connect(self._refresh_screen)
+        self.kombi_screen.changed.connect(self._refresh_header)
+        self.kombi_screen.changed.connect(self._refresh_screen)
         self.bcm_screen.changed.connect(self._refresh_header)
         self.bcm_screen.changed.connect(self._refresh_screen)
         self.mrr_screen.changed.connect(self._refresh_header)
@@ -292,12 +303,14 @@ class MainWindow(QMainWindow):
         sw_lay.setSpacing(2)
         self.btn_sw_j533 = QPushButton()
         self.btn_sw_fpke = QPushButton()
+        self.btn_sw_kombi = QPushButton()
         self.btn_sw_bcm = QPushButton()
         self.btn_sw_mrr = QPushButton()
         self.btn_sw_elv = QPushButton()
         for b, target in (
             (self.btn_sw_j533, "j533"),
             (self.btn_sw_fpke, "fpke"),
+            (self.btn_sw_kombi, "kombi"),
             (self.btn_sw_bcm, "bcm"),
             (self.btn_sw_mrr, "mrr"),
             (self.btn_sw_elv, "elv"),
@@ -387,25 +400,61 @@ class MainWindow(QMainWindow):
     def _is_fpke_active(self) -> bool:
         return self.fpke_screen.is_open and (
             self._active_screen == "fpke"
-            or (not self.ws.is_open and not self.bcm_screen.is_open and not self.mrr_screen.is_open and not self.elv_screen.is_open)
+            or (
+                not self.ws.is_open
+                and not self.kombi_screen.is_open
+                and not self.bcm_screen.is_open
+                and not self.mrr_screen.is_open
+                and not self.elv_screen.is_open
+            )
+        )
+
+    def _is_kombi_active(self) -> bool:
+        return self.kombi_screen.is_open and (
+            self._active_screen == "kombi"
+            or (
+                not self.ws.is_open
+                and not self.fpke_screen.is_open
+                and not self.bcm_screen.is_open
+                and not self.mrr_screen.is_open
+                and not self.elv_screen.is_open
+            )
         )
 
     def _is_bcm_active(self) -> bool:
         return self.bcm_screen.is_open and (
             self._active_screen == "bcm"
-            or (not self.ws.is_open and not self.fpke_screen.is_open and not self.mrr_screen.is_open and not self.elv_screen.is_open)
+            or (
+                not self.ws.is_open
+                and not self.fpke_screen.is_open
+                and not self.kombi_screen.is_open
+                and not self.mrr_screen.is_open
+                and not self.elv_screen.is_open
+            )
         )
 
     def _is_mrr_active(self) -> bool:
         return self.mrr_screen.is_open and (
             self._active_screen == "mrr"
-            or (not self.ws.is_open and not self.fpke_screen.is_open and not self.bcm_screen.is_open and not self.elv_screen.is_open)
+            or (
+                not self.ws.is_open
+                and not self.fpke_screen.is_open
+                and not self.kombi_screen.is_open
+                and not self.bcm_screen.is_open
+                and not self.elv_screen.is_open
+            )
         )
 
     def _is_elv_active(self) -> bool:
         return self.elv_screen.is_open and (
             self._active_screen == "elv"
-            or (not self.ws.is_open and not self.fpke_screen.is_open and not self.bcm_screen.is_open and not self.mrr_screen.is_open)
+            or (
+                not self.ws.is_open
+                and not self.fpke_screen.is_open
+                and not self.kombi_screen.is_open
+                and not self.bcm_screen.is_open
+                and not self.mrr_screen.is_open
+            )
         )
 
     def _export_active(self) -> None:
@@ -415,27 +464,34 @@ class MainWindow(QMainWindow):
             self.mrr_screen.action_export_json()
         elif self._is_bcm_active():
             self.bcm_screen.action_export_keys_json()
+        elif self._is_kombi_active():
+            self.kombi_screen.export_backup()
         elif self._is_fpke_active():
             self.fpke_screen.export_backup()
         else:
             self.ecu_screen.export_backup()
 
     def _provide_fpke_cluster_material(self) -> dict[str, Any] | None:
-        if not self.fpke_screen.is_open:
+        scr: FpkeScreen | None = None
+        if self.fpke_screen.is_open and (self._active_screen == "fpke" or not self.kombi_screen.is_open):
+            scr = self.fpke_screen
+        elif self.kombi_screen.is_open:
+            scr = self.kombi_screen
+        if scr is None:
             return None
-        df_bytes = self.fpke_screen._working_dflash_bytes
-        cf_bytes = self.fpke_screen._cflash_bytes
+        df_bytes = scr._working_dflash_bytes
+        cf_bytes = scr._cflash_bytes
         if df_bytes is not None:
             return {
                 "dflash_bytes": df_bytes,
                 "cflash_bytes": cf_bytes,
-                "s0_hex": str(getattr(self.fpke_screen, "_cached_s0_hex", "") or ""),
-                "s1_hex": str(getattr(self.fpke_screen, "_cached_s1_hex", "") or ""),
+                "s0_hex": str(getattr(scr, "_cached_s0_hex", "") or ""),
+                "s1_hex": str(getattr(scr, "_cached_s1_hex", "") or ""),
             }
-        df_path = self.fpke_screen._working_dflash_path or self.fpke_screen.files.get("dflash")
+        df_path = scr._working_dflash_path or scr.files.get("dflash")
         if df_path is None or not df_path.is_file():
             return None
-        cf_path = self.fpke_screen.files.get("cflash")
+        cf_path = scr.files.get("cflash")
         try:
             df_raw = df_path.read_bytes()
             cf_raw = cf_bytes if cf_bytes is not None else (cf_path.read_bytes() if (cf_path is not None and cf_path.is_file()) else None)
@@ -444,8 +500,8 @@ class MainWindow(QMainWindow):
         return {
             "dflash_bytes": df_raw,
             "cflash_bytes": cf_raw,
-            "s0_hex": str(getattr(self.fpke_screen, "_cached_s0_hex", "") or ""),
-            "s1_hex": str(getattr(self.fpke_screen, "_cached_s1_hex", "") or ""),
+            "s0_hex": str(getattr(scr, "_cached_s0_hex", "") or ""),
+            "s1_hex": str(getattr(scr, "_cached_s1_hex", "") or ""),
         }
 
     def _refresh_header(self) -> None:
@@ -462,6 +518,7 @@ class MainWindow(QMainWindow):
         self.bus_screen.set_loaded_flags(
             j533_loaded=self.ws.is_open,
             fpke_loaded=self.fpke_screen.is_open,
+            kombi_loaded=self.kombi_screen.is_open,
             bcm_loaded=self.bcm_screen.is_open,
             mrr_loaded=self.mrr_screen.is_open,
             elv_loaded=self.elv_screen.is_open,
@@ -470,6 +527,7 @@ class MainWindow(QMainWindow):
         open_count = (
             int(self.ws.is_open)
             + int(self.fpke_screen.is_open)
+            + int(self.kombi_screen.is_open)
             + int(self.bcm_screen.is_open)
             + int(self.mrr_screen.is_open)
             + int(self.elv_screen.is_open)
@@ -499,6 +557,12 @@ class MainWindow(QMainWindow):
             self.act_report.setEnabled(False)
             self.act_export.setEnabled(bool(self.bcm_screen._ika_hex or self.bcm_screen._gfa_hex or self.bcm_screen._status))
             self.act_close.setEnabled(True)
+        elif self._is_kombi_active():
+            self.tab_ecu.setText(tr("Блок", "ECU") if open_count >= 2 else tr("Блок", "ECU") + f" {self.kombi_screen.part_number}")
+            self.tab_term.setText(tr("CAN-терминал", "CAN terminal"))
+            self.act_report.setEnabled(True)
+            self.act_export.setEnabled(bool(self.kombi_screen.files))
+            self.act_close.setEnabled(True)
         elif self._is_fpke_active():
             self.tab_ecu.setText(tr("Блок", "ECU") if open_count >= 2 else tr("Блок", "ECU") + f" {self.fpke_screen.part_number}")
             self.tab_term.setText(tr("CAN-терминал", "CAN terminal"))
@@ -513,16 +577,22 @@ class MainWindow(QMainWindow):
                 else tr("Блок", "ECU") + (f" {self.ws.part_number}" if open_ and self.ws.part_number else "")
             )
             self.tab_term.setText(tr("CAN-терминал", "CAN terminal"))
-            self.act_report.setEnabled(open_ or self.fpke_screen.is_open)
-            self.act_export.setEnabled(open_ or bool(self.fpke_screen.files))
+            self.act_report.setEnabled(open_ or self.fpke_screen.is_open or self.kombi_screen.is_open)
+            self.act_export.setEnabled(open_ or bool(self.fpke_screen.files) or bool(self.kombi_screen.files))
             self.act_close.setEnabled(
-                open_ or self.fpke_screen.is_open or self.bcm_screen.is_open or self.mrr_screen.is_open or self.elv_screen.is_open
+                open_
+                or self.fpke_screen.is_open
+                or self.kombi_screen.is_open
+                or self.bcm_screen.is_open
+                or self.mrr_screen.is_open
+                or self.elv_screen.is_open
             )
 
         self.ecu_switch_track.setVisible(open_count >= 2)
         if open_count >= 2:
             self.btn_sw_j533.setVisible(self.ws.is_open)
             self.btn_sw_fpke.setVisible(self.fpke_screen.is_open)
+            self.btn_sw_kombi.setVisible(self.kombi_screen.is_open)
             self.btn_sw_bcm.setVisible(self.bcm_screen.is_open)
             self.btn_sw_mrr.setVisible(self.mrr_screen.is_open)
             self.btn_sw_elv.setVisible(self.elv_screen.is_open)
@@ -530,6 +600,8 @@ class MainWindow(QMainWindow):
             self.btn_sw_j533.setToolTip(f"19 J533 — {self.ws.part_number}" if self.ws.part_number else "19 J533")
             self.btn_sw_fpke.setText("17 FPK_E")
             self.btn_sw_fpke.setToolTip(f"17 FPK_E — {self.fpke_screen.part_number}" if self.fpke_screen.part_number else "17 FPK_E")
+            self.btn_sw_kombi.setText("17 Kombi")
+            self.btn_sw_kombi.setToolTip(f"17 Kombi — {self.kombi_screen.part_number}" if self.kombi_screen.part_number else "17 Kombi")
             self.btn_sw_bcm.setText("09 BCM")
             self.btn_sw_bcm.setToolTip(f"09 BCM — {self.bcm_screen.part_number}" if self.bcm_screen.part_number else "09 BCM")
             self.btn_sw_mrr.setText("13 MRR")
@@ -538,10 +610,11 @@ class MainWindow(QMainWindow):
             self.btn_sw_elv.setToolTip(f"2B ELV — {self.elv_screen.part_number}" if self.elv_screen.part_number else "2B ELV")
             self.btn_sw_j533.setChecked(self._active_screen == "j533")
             self.btn_sw_fpke.setChecked(self._active_screen == "fpke")
+            self.btn_sw_kombi.setChecked(self._active_screen == "kombi")
             self.btn_sw_bcm.setChecked(self._active_screen == "bcm")
             self.btn_sw_mrr.setChecked(self._active_screen == "mrr")
             self.btn_sw_elv.setChecked(self._active_screen == "elv")
-            for b in (self.btn_sw_j533, self.btn_sw_fpke, self.btn_sw_bcm, self.btn_sw_mrr, self.btn_sw_elv):
+            for b in (self.btn_sw_j533, self.btn_sw_fpke, self.btn_sw_kombi, self.btn_sw_bcm, self.btn_sw_mrr, self.btn_sw_elv):
                 b.updateGeometry()
             self.ecu_switch_track.updateGeometry()
         for b in (self.tab_bus, self.tab_ecu, self.tab_term):
@@ -589,6 +662,8 @@ class MainWindow(QMainWindow):
             self.terminal.set_target_ecu("mrr")
         elif self._is_bcm_active():
             self.terminal.set_target_ecu("bcm")
+        elif self._is_kombi_active():
+            self.terminal.set_target_ecu("kombi")
         elif self._is_fpke_active():
             self.terminal.set_target_ecu("fpke")
         elif self._active_screen == "j533" or self.ws.is_open:
@@ -596,16 +671,20 @@ class MainWindow(QMainWindow):
         if mode == "bus":
             self._active_screen = "bus"
         elif mode == "ecu" and self._active_screen == "bus":
-            if self.elv_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open and not self.bcm_screen.is_open and not self.mrr_screen.is_open:
+            if self.elv_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open and not self.kombi_screen.is_open and not self.bcm_screen.is_open and not self.mrr_screen.is_open:
                 self._active_screen = "elv"
-            elif self.mrr_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open and not self.bcm_screen.is_open:
+            elif self.mrr_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open and not self.kombi_screen.is_open and not self.bcm_screen.is_open:
                 self._active_screen = "mrr"
-            elif self.bcm_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open:
+            elif self.bcm_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open and not self.kombi_screen.is_open:
                 self._active_screen = "bcm"
+            elif self.kombi_screen.is_open and not self.ws.is_open and not self.fpke_screen.is_open:
+                self._active_screen = "kombi"
             elif self.fpke_screen.is_open and not self.ws.is_open:
                 self._active_screen = "fpke"
             elif self.ws.is_open:
                 self._active_screen = "j533"
+            elif self.kombi_screen.is_open:
+                self._active_screen = "kombi"
             elif self.bcm_screen.is_open:
                 self._active_screen = "bcm"
             elif self.mrr_screen.is_open:
@@ -650,13 +729,19 @@ class MainWindow(QMainWindow):
         if self._active_screen == "bcm" and self.bcm_screen.is_open:
             self.stack.setCurrentWidget(self.bcm_screen)
             return
+        if self._active_screen == "kombi" and self.kombi_screen.is_open:
+            self.stack.setCurrentWidget(self.kombi_screen)
+            return
         if self._active_screen == "fpke" and self.fpke_screen.is_open:
             self.stack.setCurrentWidget(self.fpke_screen)
             return
         if self._active_screen == "j533" and self.ws.is_open:
             self.stack.setCurrentWidget(self.ecu_screen)
             return
-        if self.fpke_screen.is_open:
+        if self.kombi_screen.is_open:
+            self._active_screen = "kombi"
+            self.stack.setCurrentWidget(self.kombi_screen)
+        elif self.fpke_screen.is_open:
             self._active_screen = "fpke"
             self.stack.setCurrentWidget(self.fpke_screen)
         elif self.ws.is_open:
@@ -784,6 +869,15 @@ class MainWindow(QMainWindow):
         )
         if chosen:
             folder_path = Path(chosen)
+            kombi_files = detect_kombi_files([folder_path])
+            if kombi_files:
+                if self.ws.is_open and not self.bus_screen.has_scan:
+                    self.ws.close()
+                self._active_screen = "kombi"
+                self.kombi_screen.open_from_files(kombi_files, folder=folder_path, source="disk")
+                self._refresh_header()
+                self._refresh_screen()
+                return
             fpke_files = detect_fpke_files([folder_path])
             if fpke_files:
                 if self.ws.is_open and not self.bus_screen.has_scan:
@@ -864,6 +958,15 @@ class MainWindow(QMainWindow):
             self.open_folder(str(paths[0]))
             return
         file_list = [p for p in paths if p.is_file()]
+        kombi_files = detect_kombi_files(file_list)
+        if kombi_files:
+            if self.ws.is_open and not self.bus_screen.has_scan:
+                self.ws.close()
+            self._active_screen = "kombi"
+            self.kombi_screen.open_from_files(kombi_files, folder=file_list[0].parent if file_list else None, source="disk")
+            self._refresh_header()
+            self._refresh_screen()
+            return
         fpke_files = detect_fpke_files(file_list)
         if fpke_files:
             if self.ws.is_open and not self.bus_screen.has_scan:
@@ -995,6 +1098,17 @@ class MainWindow(QMainWindow):
                     self.fpke_screen.gateway_bridge = bool(ecu.bridge_available)
                     self.fpke_screen.gateway_channel = 0 if ecu.gateway_channel is None else int(ecu.gateway_channel)
                     self.fpke_screen.refresh()
+            elif ecu.kind == "kombi" and self.kombi_screen.is_open:
+                has_kombi_pn = bool(
+                    any(it.get("did") in ("F187", "F191") for it in self.kombi_screen.ident_items)
+                    or (self.kombi_screen.dflash_info or {}).get("metadata", {}).get("part_number")
+                )
+                kombi_pn = self.kombi_screen.part_number.replace(" ", "").upper() if has_kombi_pn else ""
+                if not kombi_pn or not ecu_pn or kombi_pn == ecu_pn:
+                    self.kombi_screen.via_gateway = bool(ecu.via_gateway)
+                    self.kombi_screen.gateway_bridge = bool(ecu.bridge_available)
+                    self.kombi_screen.gateway_channel = 0 if ecu.gateway_channel is None else int(ecu.gateway_channel)
+                    self.kombi_screen.refresh()
             elif ecu.kind == "bcm" and self.bcm_screen.is_open:
                 bcm_pn = (
                     self.bcm_screen._passport.get("part_number")
@@ -1092,7 +1206,13 @@ class MainWindow(QMainWindow):
 
     def _on_bus_restore_ecu(self, ecu: DiscoveredEcu) -> None:
         ident = ecu.to_ident_dict()
-        if ecu.kind == "fpke":
+        if ecu.kind == "kombi":
+            self._active_screen = "kombi"
+            self.kombi_screen.open_from_ident(ident)
+            self._refresh_header()
+            self._refresh_screen()
+            self.kombi_screen.restore_dflash_from_file()
+        elif ecu.kind == "fpke":
             self._active_screen = "fpke"
             self.fpke_screen.open_from_ident(ident)
             self._refresh_header()
@@ -1120,6 +1240,19 @@ class MainWindow(QMainWindow):
             self.fpke_screen.open_from_ident(ident)
         self.switch_ecu_view("fpke")
 
+    def _on_bus_open_kombi_workspace(self, ecu: DiscoveredEcu) -> None:
+        ident = ecu.to_ident_dict()
+        if self.kombi_screen.is_open:
+            self.kombi_screen.via_gateway = bool(ecu.via_gateway)
+            self.kombi_screen.gateway_bridge = bool(ecu.bridge_available)
+            self.kombi_screen.gateway_channel = int(ecu.gateway_channel or 0)
+            if not self.kombi_screen.ident_items and ecu.ident:
+                self.kombi_screen.ident_items = list(ecu.ident)
+            self.kombi_screen.refresh()
+        else:
+            self.kombi_screen.open_from_ident(ident)
+        self.switch_ecu_view("kombi")
+
     def read_over_can(self) -> None:
         """Check the link and show who answers first; the read starts only after the user confirms."""
         self.set_mode("ecu")  # frees the adapter if the terminal holds it
@@ -1127,14 +1260,14 @@ class MainWindow(QMainWindow):
         if not ensure_ready(self.conn, self):
             return
         port, iface = self.conn.port, self.conn.interface
-        if target_kind in ("j533", "fpke", "bcm", "mrr", "elv"):
+        if target_kind in ("j533", "fpke", "kombi", "bcm", "mrr", "elv"):
             self.bus_screen.clear_scan()
             self._refresh_header()
 
             def _scan_target(rep: Any) -> dict[str, Any]:
                 scan_res = can_scan_bus(port, interface=iface, target_kind=target_kind, reporter=rep)
                 for ecu in scan_res.ecus:
-                    if ecu.kind == target_kind:
+                    if ecu.kind == target_kind or (target_kind in ("fpke", "kombi") and ecu.diag_addr == "17"):
                         return ecu.to_ident_dict()
                 return scan_res.ecus[0].to_ident_dict()
 
@@ -1153,7 +1286,8 @@ class MainWindow(QMainWindow):
         )
 
     def _confirm_read(self, ident: dict[str, Any]) -> None:
-        is_kombi = ident.get("ecu_kind") == "fpke" or is_fpke_ident(ident.get("ident") or [])
+        is_v850_kombi = ident.get("ecu_kind") == "kombi" or is_kombi_ident(ident.get("ident") or [])
+        is_fpke_cluster = (not is_v850_kombi) and (ident.get("ecu_kind") == "fpke" or is_fpke_ident(ident.get("ident") or []))
         is_bcm = ident.get("ecu_kind") == "bcm"
         is_mrr = ident.get("ecu_kind") == "mrr"
         is_elv = ident.get("ecu_kind") == "elv" or is_elv_ident(ident.get("ident") or [])
@@ -1169,7 +1303,15 @@ class MainWindow(QMainWindow):
                 self._read_elv_over_can(ident)
                 return
             if dlg.restore_chosen:
-                if is_kombi:
+                if is_v850_kombi:
+                    if self.ws.is_open and not self.bus_screen.has_scan:
+                        self.ws.close()
+                    self._active_screen = "kombi"
+                    self.kombi_screen.open_from_ident(ident)
+                    self._refresh_header()
+                    self._refresh_screen()
+                    self.kombi_screen.restore_dflash_from_file()
+                elif is_fpke_cluster:
                     if self.ws.is_open and not self.bus_screen.has_scan:
                         self.ws.close()
                     self._active_screen = "fpke"
@@ -1183,7 +1325,9 @@ class MainWindow(QMainWindow):
                         self.restore_backup()
                     finally:
                         self._force_j533_restore = False
-            elif is_kombi:
+            elif is_v850_kombi:
+                self._read_kombi_over_can(ident)
+            elif is_fpke_cluster:
                 self._read_fpke_over_can(ident)
             else:
                 self._backup_over_can(ident)
@@ -1248,15 +1392,38 @@ class MainWindow(QMainWindow):
 
         def task(rep: Any) -> dict[str, Any]:
             if xcp_on_open:
-                st_res = can_mrr_read_keys(
-                    port,
-                    interface=iface,
-                    via_gateway=via_gw,
-                    gateway_bridge=gw_br,
-                    gateway_channel=gw_ch,
-                    session_dir=s_dir,
-                    reporter=rep,
-                )
+                try:
+                    st_res = can_mrr_read_keys(
+                        port,
+                        interface=iface,
+                        via_gateway=via_gw,
+                        gateway_bridge=gw_br,
+                        gateway_channel=gw_ch,
+                        session_dir=s_dir,
+                        reporter=rep,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    if ident.get("officially_supported", True):
+                        raise
+                    rep.warning(
+                        tr(
+                            f"Чтение памяти XCP не удалось ({exc}) — переключаемся на чтение статуса и DTC по UDS.",
+                            f"XCP memory read failed ({exc}) — falling back to UDS status & DTC read.",
+                        )
+                    )
+                    st_res = can_mrr_status(
+                        port,
+                        interface=iface,
+                        via_gateway=via_gw,
+                        gateway_bridge=False,
+                        gateway_channel=gw_ch,
+                        reporter=rep,
+                    )
+                    st_res["session_dir"] = str(s_dir)
+                    s_dir.mkdir(parents=True, exist_ok=True)
+                    (s_dir / "mrr_read_report.json").write_text(
+                        json.dumps(st_res, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+                    )
             else:
                 st_res = can_mrr_status(
                     port,
@@ -1431,6 +1598,54 @@ class MainWindow(QMainWindow):
             on_success=done,
         )
 
+    def _read_kombi_over_can(self, ident: dict[str, Any]) -> None:
+        """Read V850E2 17 Kombi VDD DataFlash (132 EEL records at SL 7) over CAN, then open KombiScreen."""
+        port, iface = self.conn.port, self.conn.interface
+        ident_list = list(ident.get("ident") or [])
+        via_gw = bool(ident.get("via_gateway", False))
+        gw_br = bool(ident.get("gateway_bridge", ident.get("bridge_available", False)))
+        gw_ch = int(ident.get("gateway_channel") or 0)
+        sdir = new_session(self.conn.out_dir, unit_of_ident(ident_list), "kombi_read", dumps=True)
+
+        def task(rep: Any) -> dict[str, Any]:
+            res = can_kombi_full_read(
+                port,
+                interface=iface,
+                session_dir=sdir,
+                ident=ident_list,
+                keep_open=not via_gw,
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
+                reporter=rep,
+            )
+            res["session_dir"] = str(keep_as_base(sdir))
+            return res
+
+        def done(res: dict[str, Any]) -> None:
+            folder = Path(str(res.get("session_dir", sdir)))
+            detected = detect_kombi_files([folder])
+            if self.ws.is_open and not self.bus_screen.has_scan:
+                self.ws.close()
+            self._active_screen = "kombi"
+            self.kombi_screen.ident_items = ident_list
+            self.kombi_screen.open_from_files(
+                detected,
+                folder=folder,
+                source="can",
+                via_gateway=via_gw,
+                gateway_bridge=gw_br,
+                gateway_channel=gw_ch,
+            )
+            self._refresh_header()
+            self._refresh_screen()
+
+        self.runner.run_task(
+            tr("Чтение EEL DataFlash 17 Kombi (SL 7)", "Reading 17 Kombi EEL DataFlash (SL 7)"),
+            task,
+            on_success=done,
+        )
+
     def _backup_over_can(self, ident: dict[str, Any]) -> None:
         """Into the gateway's own dumps/ folder; its first complete read becomes its base_read (storage.py)."""
         port, iface = self.conn.port, self.conn.interface
@@ -1482,6 +1697,9 @@ class MainWindow(QMainWindow):
         """Write backup files the user picks back into the ECU; the workflow refuses a backup of another ECU."""
         self.set_mode("ecu")  # frees the adapter if the terminal holds it
         force_j533 = force_j533 or bool(getattr(self, "_force_j533_restore", False))
+        if not force_j533 and self._is_kombi_active():
+            self.kombi_screen.restore_dflash_from_file()
+            return
         if not force_j533 and self._is_fpke_active():
             self.fpke_screen.restore_dflash_from_file()
             return
@@ -1568,9 +1786,55 @@ class MainWindow(QMainWindow):
             self._refresh_header()
             self._refresh_screen()
             return
+        closing_kombi = self.kombi_screen.is_open and (
+            self._active_screen == "kombi"
+            or (
+                not self.ws.is_open
+                and not self.fpke_screen.is_open
+                and not self.bcm_screen.is_open
+                and not self.mrr_screen.is_open
+                and not self.elv_screen.is_open
+            )
+        )
+        if closing_kombi:
+            if self.kombi_screen.is_dflash_modified and QMessageBox.question(
+                self,
+                tr("Закрыть блок", "Close the ECU"),
+                tr(
+                    "Есть изменения DataFlash, не записанные в приборную панель. Изменённый дамп останется на диске.\n\nЗакрыть?",
+                    "There are DataFlash changes that were not written to the cluster. The edited dump stays on disk.\n\nClose?",
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self.kombi_screen.close_kombi()
+            if self.fpke_screen.is_open:
+                self._active_screen = "fpke"
+            elif self.ws.is_open:
+                self._active_screen = "j533"
+            elif self.bcm_screen.is_open:
+                self._active_screen = "bcm"
+            elif self.mrr_screen.is_open:
+                self._active_screen = "mrr"
+            elif self.elv_screen.is_open:
+                self._active_screen = "elv"
+            elif self.bus_screen.has_scan:
+                self._active_screen = "bus"
+            else:
+                self._active_screen = "start"
+            self._refresh_header()
+            self._refresh_screen()
+            return
         closing_fpke = self.fpke_screen.is_open and (
             self._active_screen == "fpke"
-            or (not self.ws.is_open and not self.bcm_screen.is_open and not self.mrr_screen.is_open and not self.elv_screen.is_open)
+            or (
+                not self.ws.is_open
+                and not self.kombi_screen.is_open
+                and not self.bcm_screen.is_open
+                and not self.mrr_screen.is_open
+                and not self.elv_screen.is_open
+            )
         )
         if closing_fpke:
             if self.fpke_screen.is_cflash_dirty and QMessageBox.question(
@@ -1596,7 +1860,9 @@ class MainWindow(QMainWindow):
             ) != QMessageBox.StandardButton.Yes:
                 return
             self.fpke_screen.close_kombi()
-            if self.ws.is_open:
+            if self.kombi_screen.is_open:
+                self._active_screen = "kombi"
+            elif self.ws.is_open:
                 self._active_screen = "j533"
             elif self.bcm_screen.is_open:
                 self._active_screen = "bcm"
@@ -1626,7 +1892,9 @@ class MainWindow(QMainWindow):
         ) != QMessageBox.StandardButton.Yes:
             return
         self.ws.close()
-        if self.fpke_screen.is_open:
+        if self.kombi_screen.is_open:
+            self._active_screen = "kombi"
+        elif self.fpke_screen.is_open:
             self._active_screen = "fpke"
         elif self.bcm_screen.is_open:
             self._active_screen = "bcm"
@@ -1797,8 +2065,21 @@ class MainWindow(QMainWindow):
         """Non-blocking: the log and the screen stay usable while the offer is open; a newer failure replaces it."""
         if self._report_dlg is not None:
             self._report_dlg.close()
-        if self._is_fpke_active():
+        if self._is_kombi_active():
             dumps: dict[str, Path] = {}
+            orig_df = self.kombi_screen._orig_dflash_path
+            if orig_df is not None and orig_df.is_file():
+                dumps[f"loaded/{orig_df.name}"] = orig_df
+            for kind, p in self.kombi_screen.files.items():
+                if kind == "dflash" and orig_df is not None:
+                    continue
+                if p is not None and p.is_file():
+                    dumps[f"loaded/{p.name}"] = p
+            work_df = self.kombi_screen._working_dflash_path
+            if self.kombi_screen.is_dflash_modified and work_df is not None and work_df.is_file():
+                dumps[f"edited/{work_df.name}"] = work_df
+        elif self._is_fpke_active():
+            dumps = {}
             orig_df = self.fpke_screen._orig_dflash_path
             orig_cf = self.fpke_screen._orig_cflash_path
             if orig_df is not None and orig_df.is_file():
@@ -1859,6 +2140,9 @@ class MainWindow(QMainWindow):
 
     def show_report(self) -> None:
         """Full offline analysis of every loaded dump, as plain text."""
+        if self._is_kombi_active():
+            self.kombi_screen.show_report()
+            return
         if self._is_fpke_active():
             self.fpke_screen.show_report()
             return
@@ -1974,13 +2258,14 @@ class EcuFoundDialog(Dialog):
 
     def __init__(self, ident: dict[str, Any], conn: CanConnection, parent: QWidget | None = None) -> None:
         ecu_kind = str(ident.get("ecu_kind") or "")
-        is_kombi = ecu_kind == "fpke" or is_fpke_ident(ident.get("ident") or [])
+        is_v850_kombi = ecu_kind == "kombi" or is_kombi_ident(ident.get("ident") or [])
+        is_kombi = is_v850_kombi or ecu_kind == "fpke" or is_fpke_ident(ident.get("ident") or [])
         is_bcm = ecu_kind == "bcm"
         is_mrr = ecu_kind == "mrr"
         is_elv = ecu_kind == "elv" or is_elv_ident(ident.get("ident") or [])
         mem_unavail = str(ident.get("memory_unavailable_reason") or "")
         unsupported = str(ident.get("unsupported") or ("" if (is_kombi or is_bcm or is_mrr or is_elv) else (unsupported_ecu_reason(ident.get("ident", [])) or "")))
-        if not unsupported and is_kombi and ident.get("via_gateway") and not ident.get("bridge_available") and mem_unavail:
+        if not unsupported and is_kombi and not is_v850_kombi and ident.get("via_gateway") and not ident.get("bridge_available") and mem_unavail:
             unsupported = mem_unavail
         in_fbl = bool(ident.get("in_fbl")) and not unsupported and not is_kombi and not is_bcm and not is_mrr and not is_elv
         self.unsupported = unsupported
@@ -2005,6 +2290,11 @@ class EcuFoundDialog(Dialog):
                 subtitle = tr(
                     f"На {conn.display()} ответил блокиратор руля ELV (2B).",
                     f"An ELV (2B) steering column lock answered on {conn.display()}.",
+                )
+            elif is_v850_kombi:
+                subtitle = tr(
+                    f"На {conn.display()} ответила приборная панель 17 Kombi VDD (V850E2).",
+                    f"A 17 Kombi VDD (V850E2) instrument cluster answered on {conn.display()}.",
                 )
             elif is_kombi:
                 subtitle = tr(
@@ -2044,6 +2334,12 @@ class EcuFoundDialog(Dialog):
         grid.setColumnStretch(1, 1)
         if ident.get("ident"):
             self.body.addLayout(grid)
+        support_warning = str(ident.get("support_warning") or "")
+        support_tone = str(ident.get("support_warning_tone") or "warn")
+        if support_warning and not unsupported:
+            sup_box = Callout(support_tone if support_tone in ("warn", "info") else "warn")
+            sup_box.label.setText(support_warning)
+            self.body.addWidget(sup_box)
         if unsupported:
             err = Callout("err")
             err.label.setText(unsupported)
@@ -2076,6 +2372,16 @@ class EcuFoundDialog(Dialog):
                 slot=self._choose_restore,
             )
             self.finish(self.btn_read_anyway, ok=self.btn_ok)
+        elif is_v850_kombi:
+            gw_hint = tr(
+                "Будет получен доступ Supplier Level 7 (SL 7) и считаны все 132 блока EEL DataFlash "
+                "(0x0001..0x0084: иммо WFS5, транспондеры, пробег, кодировка, ключи FD11) по штатному UDS 0x23. В память ничего не пишется.",
+                "Supplier Level 7 (SL 7) will be established and all 132 EEL DataFlash records "
+                "(0x0001..0x0084: WFS5 immo, transponders, odometer, coding, FD11 keys) will be read over standard UDS 0x23. Nothing is written to memory.",
+            )
+            self.body.addWidget(hint(gw_hint))
+            self.btn_ok = button(tr("Считать блок (SL 7)", "Read ECU (SL 7)"), "PrimaryBtn", slot=self.accept)
+            self.finish(ok=self.btn_ok)
         elif is_kombi:
             if ident.get("via_gateway"):
                 gw_hint = tr(

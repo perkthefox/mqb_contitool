@@ -1176,3 +1176,70 @@ def test_transport_init_closes_log_file_on_bus_failure_and_formats_rx_id_and_cap
     with J533CanLink("fake", bus=BusyVehicleBus()) as link:
         n = link.drain_rx(max_frames=16_384, max_time=0.2)
     assert 1 <= n <= 5  # stopped by time cap instead of draining 16,384 frames
+
+
+def test_slave_support_warnings_do_not_block_reads_while_gateway_stays_strict() -> None:
+    """Slave ECUs with unverified (PN + SW) warn without blocking; 19 J533 gateway remains strictly blocked."""
+    from PySide6.QtWidgets import QApplication, QLabel
+
+    from contitool.can.workflows import unsupported_ecu_reason
+    from contitool.gui.main_window import EcuFoundDialog, MainWindow
+    from contitool.i18n import set_lang
+    from contitool.progress import OperationReporter
+
+    set_lang("ru")
+
+    # 1. Gateway 19 J533 stays STRICT: Lear & 5Q0 are still hard-blocked
+    lear_ident = [
+        {"did": "F187", "label_ru": "Номер детали", "label_en": "Part", "value": "3Q0907530L"},
+        {"did": "F189", "label_ru": "ПО", "label_en": "SW", "value": "4344"},
+        {"did": "F19E", "label_ru": "ODX", "label_en": "ODX", "value": "EV_GatewLear"},
+    ]
+    assert unsupported_ecu_reason(lear_ident) is not None
+
+    # 2. Bus scan on unverified FPK_E (83A920700B / 0295) + unverified BCM (5Q0937084CG / 0253)
+    bus = FakeMultiEcuBus(has_j533=True, has_fpke=True, has_bcm=True)
+    warns: list[str] = []
+
+    class RecRep(OperationReporter):
+        def warning(self, message: str) -> None:
+            warns.append(message)
+
+    scan = can_scan_bus("fake", interface="slcan", bus=bus, reporter=RecRep())
+    fpke = scan.find("fpke")
+    bcm = scan.find("bcm")
+    assert fpke is not None and bcm is not None
+    # Neither is hard-blocked (`unsupported` is None), both have `support_warning` with exact PN + SW!
+    assert fpke.unsupported is None
+    assert fpke.officially_supported is False
+    assert fpke.support_warning and "83A920700B" in fpke.support_warning and "0295" in fpke.support_warning
+    assert bcm.unsupported is None
+    assert bcm.officially_supported is False
+    assert bcm.support_warning and "5Q0937084CG" in bcm.support_warning and "0253" in bcm.support_warning
+    assert any("83A920700B" in w and "0295" in w for w in warns)
+    assert any("5Q0937084CG" in w and "0253" in w for w in warns)
+
+    # 3. BusScreen & EcuFoundDialog display warning AND keep Read button enabled
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    try:
+        win.bus_screen.set_scan_result(scan)
+        app.processEvents()
+        bus_labels = [lbl.text() for lbl in win.bus_screen.findChildren(QLabel)]
+        assert any("83A920700B" in t and "0295" in t for t in bus_labels)
+        assert any("5Q0937084CG" in t and "0253" in t for t in bus_labels)
+
+        dlg_fpk = EcuFoundDialog(fpke.to_ident_dict(), win.conn, win)
+        assert not dlg_fpk.unsupported
+        assert dlg_fpk.btn_ok is not None and dlg_fpk.btn_ok.isEnabled()
+        dlg_texts = [lbl.text() for lbl in dlg_fpk.findChildren(QLabel)]
+        assert any("83A920700B" in t and "0295" in t for t in dlg_texts)
+        dlg_fpk.close()
+
+        dlg_gw = EcuFoundDialog({"ecu_kind": "j533", "ident": lear_ident}, win.conn, win)
+        assert bool(dlg_gw.unsupported)
+        assert dlg_gw.btn_ok is None
+        dlg_gw.close()
+    finally:
+        win.close()
+

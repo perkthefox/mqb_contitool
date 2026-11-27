@@ -61,8 +61,17 @@ from contitool.can.transport import (
     UdsNegativeResponse,
     describe_loader_error,
 )
-from contitool.core.elv import ELV_NM_WAKE_ID, ELV_NM_WAKE_PAYLOAD, ELV_UDS_RX_ID, ELV_UDS_TX_ID, is_elv_ident
-from contitool.core.fpke import is_fpke_ident
+from contitool.core.bcm import bcm_support_info
+from contitool.core.elv import (
+    ELV_NM_WAKE_ID,
+    ELV_NM_WAKE_PAYLOAD,
+    ELV_UDS_RX_ID,
+    ELV_UDS_TX_ID,
+    elv_detect_profile,
+    is_elv_ident,
+)
+from contitool.core.fpke import fpke_support_info, is_fpke_ident
+from contitool.core.mrr import mrr_support_info
 from contitool.core.analyzer import (
     FBL_LIBRARY_ID,
     UnrecognisedUflashError,
@@ -1445,6 +1454,7 @@ def can_identify(
 
     Read-only: no reset, no RAM-Loader. Identifiers the ECU rejects are left out. `bus` is for tests."""
     from contitool.can.fpke import close_active_fpke_link, open_or_reuse_fpke_link
+    from contitool.core.kombi import is_kombi_ident, kombi_support_info
 
     if bus is None:
         close_active_fpke_link()
@@ -1452,7 +1462,7 @@ def can_identify(
     result: dict[str, Any] = {
         "responding": False,
         "ident": [],
-        "ecu_kind": norm_target if norm_target in ("fpke", "bcm", "mrr", "elv") else "j533",
+        "ecu_kind": norm_target if norm_target in ("fpke", "kombi", "bcm", "mrr", "elv") else "j533",
     }
     in_fbl = False
     probed_fpke = False
@@ -1467,7 +1477,7 @@ def can_identify(
                 result["adapter_warning"] = _j2534_wrapper_problem(wrapped)
                 reporter.warning(result["adapter_warning"])
         reporter.step(1, 2, tr("Проверка связи с блоком (UDS 10 03)", "Checking the link to the ECU (UDS 10 03)"))
-        if norm_target == "fpke":
+        if norm_target in ("fpke", "kombi"):
             ok_fpke, in_fbl = _probe_fpke_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
             if not ok_fpke:
                 raise RuntimeError(
@@ -1646,6 +1656,12 @@ def can_identify(
                 )
             else:
                 result["capabilities"] = ["uds", "memory", "dtc", "terminal"]
+            sup = bcm_support_info(result["ident"])
+            result["officially_supported"] = bool(sup["verified"])
+            if sup["warning"]:
+                result["support_warning"] = sup["warning"]
+                result["support_warning_tone"] = sup["tone"]
+                reporter.warning(sup["warning"])
             skip_gateway_checks = True
         elif probed_mrr:
             result["ecu_kind"] = "mrr"
@@ -1662,6 +1678,12 @@ def can_identify(
                 )
             else:
                 result["capabilities"] = ["uds", "memory", "dtc", "terminal"]
+            sup = mrr_support_info(result["ident"])
+            result["officially_supported"] = bool(sup["verified"])
+            if sup["warning"]:
+                result["support_warning"] = sup["warning"]
+                result["support_warning_tone"] = sup["tone"]
+                reporter.warning(sup["warning"])
             skip_gateway_checks = True
         elif probed_elv or is_elv_ident(result["ident"]):
             result["ecu_kind"] = "elv"
@@ -1678,11 +1700,46 @@ def can_identify(
                 )
             else:
                 result["capabilities"] = ["uds", "memory", "dtc", "terminal"]
+            sup = elv_detect_profile(result["ident"])
+            result["officially_supported"] = bool(sup["verified"])
+            if sup["warning"]:
+                result["support_warning"] = sup["warning"]
+                result["support_warning_tone"] = sup["tone"]
+                reporter.warning(sup["warning"])
+            skip_gateway_checks = True
+        elif is_kombi_ident(result["ident"]) or (norm_target == "kombi" and probed_fpke and not is_fpke_ident(result["ident"])):
+            result["ecu_kind"] = "kombi"
+            result["diag_addr"] = "17"
+            result["uds_tx_id"] = f"0x{FPKE_UDS_TX_ID:03X}"
+            result["uds_rx_id"] = f"0x{FPKE_UDS_RX_ID:03X}"
+            sup = kombi_support_info(result["ident"])
+            result["officially_supported"] = bool(sup["verified"])
+            if sup["warning"]:
+                result["support_warning"] = sup["warning"]
+                result["support_warning_tone"] = sup["tone"]
+            if interface not in FPKE_NATIVE_INTERFACES:
+                kombi_unsupported = tr(
+                    "Работа с панелью приборов Kombi VDD поддерживается только через нативный CAN-адаптер "
+                    "(CANable / SLCAN / candleLight).",
+                    "Kombi VDD instrument cluster operations require a native CAN adapter "
+                    "(CANable / SLCAN / candleLight).",
+                )
+                result["unsupported"] = kombi_unsupported
+                reporter.warning(kombi_unsupported)
+            else:
+                if sup["warning"]:
+                    reporter.warning(sup["warning"])
+                keep_fpke_alive = bus is None
             skip_gateway_checks = True
         elif probed_fpke or is_fpke_ident(result["ident"]):
             result["ecu_kind"] = "fpke"
             result["uds_tx_id"] = f"0x{FPKE_UDS_TX_ID:03X}"
             result["uds_rx_id"] = f"0x{FPKE_UDS_RX_ID:03X}"
+            sup = fpke_support_info(result["ident"])
+            result["officially_supported"] = bool(sup["verified"])
+            if sup["warning"]:
+                result["support_warning"] = sup["warning"]
+                result["support_warning_tone"] = sup["tone"]
             if interface not in FPKE_NATIVE_INTERFACES:
                 fpke_unsupported = tr(
                     "Работа с панелью приборов Kombi / FPK_E поддерживается только через нативный CAN-адаптер "
@@ -1693,6 +1750,8 @@ def can_identify(
                 result["unsupported"] = fpke_unsupported
                 reporter.warning(fpke_unsupported)
             else:
+                if sup["warning"]:
+                    reporter.warning(sup["warning"])
                 keep_fpke_alive = bus is None
             skip_gateway_checks = True
         else:

@@ -512,8 +512,16 @@ def build_fd11_proof(
 # ────────────────────────────── Detection Helpers ──────────────────────────────
 
 
+FPKE_VERIFIED_SW_VERSIONS: tuple[str, ...] = ("6181", "1703", "1711")
+FPKE_VERIFIED_PART_NUMBERS: tuple[str, ...] = ("83A920700E", "5E0920790A")
+
+
 def is_fpke_ident(ident: list[dict[str, str]]) -> bool:
-    """True when UDS identification DIDs belong to a VAG Kombi / FPK_E instrument cluster."""
+    """True when UDS identification DIDs belong to a VAG FPK_E (RH850/D1L + R-Car D1) instrument cluster."""
+    from contitool.core.kombi import is_kombi_ident
+
+    if is_kombi_ident(ident):
+        return False
     vals = {item.get("did", ""): item.get("value", "").strip() for item in ident or []}
     odx = vals.get("F19E", "").upper()
     sys_name = vals.get("F197", "").upper()
@@ -524,6 +532,77 @@ def is_fpke_ident(ident: list[dict[str, str]]) -> bool:
         if len(pn) >= 9 and pn[3:6] == "920":
             return True
     return False
+
+
+def fpke_support_info(
+    ident: list[dict[str, str]] | dict[str, Any] | None = None,
+    *,
+    f189: str | None = None,
+    f187: str | None = None,
+    f191: str | None = None,
+    f197: str | None = None,
+    f19e: str | None = None,
+    f17c: str | None = None,
+) -> dict[str, Any]:
+    """Return official support status and a clear `(PN + SW)` warning for a `17 Kombi / FPK_E` cluster without blocking reads."""
+    vals: dict[str, str] = {}
+    if isinstance(ident, list):
+        vals = {str(it.get("did", "")).upper(): str(it.get("value", "")).strip() for it in ident}
+    elif isinstance(ident, dict):
+        vals = {
+            "F187": str(ident.get("part_number") or ident.get("F187") or "").strip(),
+            "F189": str(ident.get("sw_version") or ident.get("F189") or "").strip(),
+            "F191": str(ident.get("hw_part_number") or ident.get("F191") or "").strip(),
+            "F197": str(ident.get("system_name") or ident.get("F197") or "").strip(),
+            "F19E": str(ident.get("asam_odx") or ident.get("F19E") or "").strip(),
+            "F17C": str(ident.get("fazit") or ident.get("F17C") or "").strip(),
+        }
+
+    pn = (f187 if f187 is not None else (vals.get("F187") or vals.get("F191") or (f191 or ""))).strip()
+    sw = (f189 if f189 is not None else vals.get("F189", "")).strip()
+    sys_name = (f197 if f197 is not None else vals.get("F197", "")).strip().upper()
+    odx = (f19e if f19e is not None else vals.get("F19E", "")).strip().upper()
+    fazit = (f17c if f17c is not None else vals.get("F17C", "")).strip().upper()
+
+    if not pn and not sw:
+        return {
+            "verified": True,
+            "part_number": "",
+            "sw_version": "",
+            "warning": None,
+            "tone": "ok",
+        }
+
+    pn_norm = "".join(pn.split()).upper()
+    sw_norm = "".join(sw.split()).upper()
+    meta_upper = f"{sys_name} {odx} {fazit}"
+    non_conti = any(tok in meta_upper for tok in ("VISTEON", "BOSCH", "JCI", "JOHNSON", "MARELLI"))
+
+    if non_conti:
+        verified = False
+    elif sw_norm:
+        verified = sw_norm in FPKE_VERIFIED_SW_VERSIONS
+    else:
+        verified = pn_norm in FPKE_VERIFIED_PART_NUMBERS
+
+    warning: str | None = None
+    if not verified:
+        unit_id_ru = f"{pn} (ПО {sw})" if (pn and sw) else (pn or f"ПО {sw}")
+        unit_id_en = f"{pn} (SW {sw})" if (pn and sw) else (pn or f"SW {sw}")
+        warning = tr(
+            f"Блок {unit_id_ru} официально не поддерживается. Можно попробовать чтение по UDS и Level 8 "
+            "(проверены Continental FPK_E с ПО 6181, 1703 и 1711); перед записью в память будьте осторожны.",
+            f"Unit {unit_id_en} is not officially supported. You can still try UDS and Level 8 reading "
+            "(verified Continental FPK_E SW: 6181, 1703, 1711); use caution before writing to memory.",
+        )
+
+    return {
+        "verified": verified,
+        "part_number": pn,
+        "sw_version": sw,
+        "warning": warning,
+        "tone": "ok" if verified else "warn",
+    }
 
 
 def is_fpke_cflash(data: bytes) -> bool:
@@ -2501,8 +2580,10 @@ def eel_append_records(
     dflash: bytes,
     updates: dict[int, bytes],
     cflash: bytes | None = None,
+    *,
+    layout: dict[str, Any] | None = None,
 ) -> bytes:
-    """Append updated EEL T01 records into a 64 KiB FPK_E DataFlash image (`ac-eel.md` §2.3–2.4).
+    """Append updated EEL T01 records into a 64 KiB DataFlash image (`ac-eel.md` §2.3–2.4).
 
     - Writes only changed logical records into the active head virtual block (or activates the next
       virtual block in ring order when the head VB is full).
@@ -2512,14 +2593,14 @@ def eel_append_records(
     if len(dflash) != FPKE_DFLASH_SIZE:
         raise ValueError(
             tr(
-                f"Ожидается образ DataFlash FPK_E размером 65 536 байт (получено {len(dflash)} Б).",
-                f"Expected 65,536-byte FPK_E DataFlash, got {len(dflash)} bytes.",
+                f"Ожидается образ DataFlash размером 65 536 байт (получено {len(dflash)} Б).",
+                f"Expected 65,536-byte DataFlash, got {len(dflash)} bytes.",
             )
         )
     if not updates:
         return bytes(dflash)
 
-    lay = fpke_eel_layout(cflash, dflash)
+    lay = layout if layout is not None else fpke_eel_layout(cflash, dflash)
     df = bytearray(dflash)
     pending: list[tuple[int, bytes]] = []
     for ident, raw_rec in updates.items():

@@ -24,6 +24,8 @@ from contitool.can import (
     can_fpke_write_dflash,
     can_health_check,
     can_identify,
+    can_kombi_full_read,
+    can_kombi_write_dflash,
     can_learn_mfl_button,
     can_mrr_activate_swap,
     can_mrr_deactivate_cp,
@@ -86,14 +88,20 @@ from contitool.core import (
     analyze_eeprom,
     analyze_fpke_dflash,
     analyze_fpke_extra_area,
+    analyze_kombi_dflash,
     analyze_opbt,
     analyze_uflash,
     compare_fpke_immo_passports,
     extract_fpke_immo_passport,
+    extract_kombi_immo_passport,
     format_fpke_immo_comparison,
     format_fpke_report,
     format_fpke_transfer_plan,
+    format_kombi_report,
+    format_kombi_transfer_plan,
+    normalize_kombi_dflash_input,
     plan_fpke_a_to_b_transfer,
+    plan_kombi_a_to_b_transfer,
     apply_cflash_patch,
     apply_cflash_rsa_modulus,
     apply_dflash_swap_fecs,
@@ -1364,6 +1372,158 @@ def cmd_fpke(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_kombi(args: argparse.Namespace) -> int:
+    """CLI handler for V850E2/Dx4 17 Kombi VDD (5NA 920 740 B SW 0310, EV_DashBoardVDDMQBAB) at Supplier Level 7."""
+    import json
+
+    action = args.kombi_action
+    if action == "inspect":
+        if not args.dflash:
+            raise ValueError(
+                tr(
+                    "Для kombi inspect укажите --dflash ПУТЬ_К_DFLASH.bin (или EelLogical.bin)",
+                    "kombi inspect requires --dflash PATH_TO_DFLASH.bin (or EelLogical.bin)",
+                )
+            )
+        cf_bytes = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+        df_info = analyze_kombi_dflash(clean_user_path(args.dflash).read_bytes(), cf_bytes)
+        print(format_kombi_report(dflash_info=df_info))
+        return 0
+
+    if action == "export-immo":
+        if not args.dflash:
+            raise ValueError(tr("Для kombi export-immo укажите --dflash ПУТЬ_К_DFLASH.bin", "kombi export-immo requires --dflash PATH_TO_DFLASH.bin"))
+        cf_bytes = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+        passport = extract_kombi_immo_passport(clean_user_path(args.dflash).read_bytes(), cf_bytes)
+        payload = json.dumps(passport, ensure_ascii=False, indent=2) + "\n"
+        if args.output:
+            out_p = clean_user_path(args.output)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(payload, encoding="utf-8")
+            print(tr(f"✓ Immo-паспорт 17 Kombi сохранён: {out_p}", f"✓ 17 Kombi immo passport saved: {out_p}"))
+        else:
+            print(payload, end="")
+        return 0
+
+    if action == "compare-immo":
+        if not args.dflash or not args.dflash_b:
+            raise ValueError(
+                tr(
+                    "Для kombi compare-immo укажите --dflash ПУТЬ_A и --dflash-b ПУТЬ_B",
+                    "kombi compare-immo requires --dflash PATH_A and --dflash-b PATH_B",
+                )
+            )
+        p_a = clean_user_path(args.dflash)
+        p_b = clean_user_path(args.dflash_b)
+        cf_a = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+        cf_b = clean_user_path(args.cflash_b).read_bytes() if args.cflash_b else None
+        pass_a = json.loads(p_a.read_text(encoding="utf-8")) if p_a.suffix.lower() == ".json" else extract_kombi_immo_passport(p_a.read_bytes(), cf_a)
+        pass_b = json.loads(p_b.read_text(encoding="utf-8")) if p_b.suffix.lower() == ".json" else extract_kombi_immo_passport(p_b.read_bytes(), cf_b)
+        cmp_res = compare_fpke_immo_passports(pass_a, pass_b)
+        print(format_fpke_immo_comparison(cmp_res, pass_a, pass_b))
+        return 0 if cmp_res["semantic_match"] else 2
+
+    if action == "plan-transfer":
+        if not args.dflash or not args.dflash_b:
+            raise ValueError(
+                tr(
+                    "Для kombi plan-transfer укажите --dflash ДОНОР_A.bin и --dflash-b РЕЦИПИЕНТ_B.bin",
+                    "kombi plan-transfer requires --dflash DONOR_A.bin and --dflash-b RECIPIENT_B.bin",
+                )
+            )
+        cf_a = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+        cf_b = clean_user_path(args.cflash_b).read_bytes() if args.cflash_b else None
+        pass_a = extract_kombi_immo_passport(clean_user_path(args.dflash).read_bytes(), cf_a)
+        pass_b = extract_kombi_immo_passport(clean_user_path(args.dflash_b).read_bytes(), cf_b)
+        plan = plan_kombi_a_to_b_transfer(pass_a, pass_b)
+        print(format_kombi_transfer_plan(plan))
+        if args.output:
+            out_p = clean_user_path(args.output)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(tr(f"\n✓ План переноса сохранён: {out_p}", f"\n✓ Transfer plan saved: {out_p}"))
+        return 0
+
+    if not args.port and args.interface not in ("j2534", "dpdu"):
+        raise ValueError(
+            tr(
+                "Укажите порт CAN-адаптера через --port (список портов: contitool can ports)",
+                "Specify CAN adapter port via --port (list available ports with: contitool can ports)",
+            )
+        )
+    port = args.port or ""
+    via_gw = bool(getattr(args, "via_gateway", False))
+    gw_ch = int(getattr(args, "gateway_channel", 0) or 0)
+    base_out = clean_user_path(args.output_dir) if args.output_dir else None
+    out_file = clean_user_path(args.output) if args.output else None
+    cf_bytes = clean_user_path(args.cflash).read_bytes() if args.cflash else None
+    disp = _make_cli_display(args)
+    rep = disp.create_reporter()
+    try:
+        if action == "write-dflash":
+            if not args.dflash:
+                raise ValueError(
+                    tr(
+                        "Для kombi write-dflash укажите --dflash ПУТЬ_К_DFLASH.bin",
+                        "kombi write-dflash requires --dflash PATH_TO_DFLASH.bin",
+                    )
+                )
+            if not getattr(args, "yes", False):
+                raise ValueError(
+                    tr(
+                        "Операция 'kombi write-dflash' записывает блоки EEL DataFlash в приборную панель 17 Kombi по CAN (UDS 0x3D на SL 7). "
+                        "Убедитесь в стабильном питании +12 В и добавьте флаг --yes.",
+                        "Operation 'kombi write-dflash' writes EEL DataFlash records to the 17 Kombi cluster over CAN (UDS 0x3D at SL 7). "
+                        "Confirm stable +12V bench power and pass --yes.",
+                    )
+                )
+            sdir = default_session_dir(base_out, "kombi_write")
+            base_df = clean_user_path(args.base_dflash) if getattr(args, "base_dflash", None) else None
+            res = can_kombi_write_dflash(
+                port,
+                clean_user_path(args.dflash),
+                interface=args.interface,
+                base_dflash=base_df,
+                cflash_bytes=cf_bytes,
+                session_dir=sdir,
+                wake_seconds=args.wake_seconds,
+                allow_foreign=getattr(args, "allow_foreign", False),
+                reset_after=not getattr(args, "no_reset", False),
+                keep_open=False,
+                via_gateway=via_gw,
+                gateway_bridge=via_gw,
+                gateway_channel=gw_ch,
+                reporter=rep,
+            )
+            print(
+                f"\n✓ 17 Kombi EEL DataFlash written & verified ({res['blocks_written']} records: {', '.join(res.get('written_eel_ids', []))}) "
+                f"| Session: {res['session_dir']}"
+            )
+            return 0
+        sdir = out_file.parent if out_file is not None else default_session_dir(base_out, "kombi_read")
+        res = can_kombi_full_read(
+            port,
+            interface=args.interface,
+            session_dir=sdir,
+            wake_seconds=args.wake_seconds,
+            cflash_bytes=cf_bytes,
+            via_gateway=via_gw,
+            gateway_bridge=via_gw,
+            gateway_channel=gw_ch,
+            reporter=rep,
+        )
+        print(
+            format_kombi_report(
+                dflash_info=res.get("secrets"),
+                ident=res.get("ident"),
+            )
+        )
+        print(f"\n✓ Session: {res['session_dir']} | Report: {res['report_path']}")
+    finally:
+        disp.finish()
+    return 0
+
+
 def cmd_bcm(args: argparse.Namespace) -> int:
     import json
 
@@ -2337,9 +2497,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_can.add_argument("--interface", choices=iface_choices, default="slcan")
     p_can.add_argument(
         "--target",
-        choices=("all", "j533", "fpke", "bcm", "mrr", "elv"),
+        choices=("all", "j533", "fpke", "kombi", "bcm", "mrr", "elv"),
         default="all",
-        help=tr("Целевой блок для can scan (all, j533, fpke, bcm, mrr, elv)", "Target ECU for can scan (all, j533, fpke, bcm, mrr, elv)"),
+        help=tr("Целевой блок для can scan (all, j533, fpke, kombi, bcm, mrr, elv)", "Target ECU for can scan (all, j533, fpke, kombi, bcm, mrr, elv)"),
     )
     p_can.add_argument(
         "-i",
@@ -2427,6 +2587,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_fpke.add_argument("-o", "--output", help=tr("Путь к выходному файлу .bin", "Output .bin file path"))
     p_fpke.add_argument("--output-dir", help=tr("Папка для сохранения сессии", "Base output directory for session"))
     p_fpke.set_defaults(func=cmd_fpke)
+
+    p_kombi = _add(
+        "kombi",
+        tr(
+            "Работа с приборной панелью 17 Kombi VDD (5NA 920 740 B SW 0310, V850E2/Dx4, EV_DashBoardVDDMQBAB): получение SL 7, чтение/запись всех 132 блоков EEL DataFlash по UDS 0x23/0x3D",
+            "17 Kombi VDD instrument cluster (5NA 920 740 B SW 0310, V850E2/Dx4, EV_DashBoardVDDMQBAB): SL 7 access, read/write all 132 EEL DataFlash records over UDS 0x23/0x3D",
+        ),
+    )
+    p_kombi.add_argument(
+        "kombi_action",
+        choices=("inspect", "read", "write-dflash", "export-immo", "compare-immo", "plan-transfer"),
+        help=tr(
+            "Действие: inspect, read, write-dflash, export-immo, compare-immo, plan-transfer",
+            "Action: inspect, read, write-dflash, export-immo, compare-immo, plan-transfer",
+        ),
+    )
+    p_kombi.add_argument("--port", help=tr("Порт CAN-адаптера", "CAN adapter port"))
+    p_kombi.add_argument("--interface", choices=iface_choices, default="slcan")
+    p_kombi.add_argument("-i", "--dflash", "--donor-dflash", dest="dflash", help=tr("Путь к Dflash.bin (64 КБ) или EelLogical.bin (9,533 Б) / Донор A", "Path to Dflash.bin (64 KB) or EelLogical.bin (9,533 B) / Donor A"))
+    p_kombi.add_argument("--base-dflash", help=tr("Опциональный исходный Dflash.bin для вычисления дельты записей EEL", "Optional original Dflash.bin to compute EEL record delta"))
+    p_kombi.add_argument("--allow-foreign", action="store_true", help=tr("Разрешить запись дампа с отличающимся идентификатором FD11", "Allow writing a dump with a different FD11 identifier"))
+    p_kombi.add_argument("--no-reset", action="store_true", help=tr("Не выполнять сброс 11 02 после записи", "Skip 11 02 reset after write"))
+    p_kombi.add_argument("-y", "--yes", action="store_true", help=tr("Подтвердить запись в EEL DataFlash по CAN", "Confirm CAN EEL DataFlash write"))
+    p_kombi.add_argument("--dflash-b", "--recipient-dflash", dest="dflash_b", help=tr("Второй дамп Dflash.bin / Реципиент B (для compare-immo / plan-transfer)", "Second Dflash.bin / Recipient B (for compare-immo / plan-transfer)"))
+    p_kombi.add_argument("--cflash", "--donor-cflash", dest="cflash", help=tr("Опциональный путь к Cflash.bin / Донор A", "Optional Cflash.bin / Donor A"))
+    p_kombi.add_argument("--cflash-b", "--recipient-cflash", dest="cflash_b", help=tr("Опциональный путь к Cflash.bin Реципиента B", "Optional Cflash.bin for Recipient B"))
+    p_kombi.add_argument("--wake-seconds", type=float, default=1.0, help=tr("Время пробуждения панели приборов CAN-посылками (по умолчанию 1.0 с)", "CAN keepalive wake duration (default 1.0 s)"))
+    p_kombi.add_argument("--via-gateway", action="store_true", help=tr("Работать с панелью 17 Kombi через диагностический CAN шлюза J533", "Access 17 Kombi cluster through J533 gateway Diagnosis CAN"))
+    p_kombi.add_argument("--gateway-channel", type=int, default=0, help=tr("Канал RSCAN0 шлюза J533 (по умолчанию 0 — Komfort CAN)", "J533 RSCAN0 sub-bus channel (default 0 — Komfort CAN)"))
+    p_kombi.add_argument("-o", "--output", help=tr("Путь к выходному файлу (.bin или .json)", "Output file path (.bin or .json)"))
+    p_kombi.add_argument("--output-dir", help=tr("Папка для сохранения сессии", "Base output directory for session"))
+    p_kombi.set_defaults(func=cmd_kombi)
 
     p_bcm = _add(
         "bcm",

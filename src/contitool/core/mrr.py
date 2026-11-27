@@ -1075,6 +1075,101 @@ def mrr_detect_profile(
     return out
 
 
+def mrr_support_info(
+    ident_or_passport: dict[str, Any] | list[dict[str, str]] | None = None,
+    *,
+    sw_version: str = "",
+    part_number: str = "",
+) -> dict[str, Any]:
+    """Return official support status and a clear `(PN + SW)` notice for a `13 ACC` radar.
+
+    Radar checks are intentionally lighter than gateway checks: reading (UDS & XCP memory/DFLASH0/keys),
+    standard UDS IKA/GFA writes, and compatible FRF flashing are never blocked on unverified SW versions.
+    """
+    p: dict[str, Any] = {}
+    if isinstance(ident_or_passport, list):
+        vals = {str(it.get("did", "")).upper(): str(it.get("value", "")).strip() for it in ident_or_passport}
+        p = {
+            "part_number": vals.get("F187") or "",
+            "hw_part_number": vals.get("F191") or "",
+            "sw_version": vals.get("F189") or "",
+            "system_name": vals.get("F197") or "",
+            "asam_odx": vals.get("F19E") or "",
+        }
+    elif isinstance(ident_or_passport, dict):
+        p = dict(ident_or_passport)
+
+    pn = (
+        part_number
+        or str(p.get("part_number") or p.get("F187") or p.get("hw_part_number") or p.get("F191") or "")
+    ).strip()
+    sw = (sw_version or str(p.get("sw_version") or p.get("F189") or "")).strip()
+    if not pn and not sw:
+        return {
+            "verified": True,
+            "bosch_family": True,
+            "part_number": "",
+            "sw_version": "",
+            "warning": None,
+            "tone": "ok",
+        }
+
+    prof = mrr_detect_profile(p, sw_version=sw, part_number=pn)
+    verified = bool(prof.get("verified", False))
+    if verified:
+        return {
+            "verified": True,
+            "bosch_family": True,
+            "part_number": pn,
+            "sw_version": sw or str(prof.get("sw") or ""),
+            "warning": None,
+            "tone": "ok",
+        }
+
+    pn_norm = "".join(pn.split()).upper()
+    sys_name = str(p.get("system_name") or p.get("F197") or "").upper()
+    asam = str(p.get("asam_odx") or p.get("F19E") or "").upper()
+    alien_platform = (
+        pn_norm.startswith(("2Q0", "5WA", "7N0"))
+        or "CONTI" in sys_name
+        or "ARS" in sys_name
+        or (bool(asam) and not asam.startswith(("EV_ACCBOSCHVW48", "EV_ACCBOSCHVW416", "EV_ACCBOSCHVW372")))
+    )
+    bosch_family = (not alien_platform) and (
+        pn_norm.startswith(("3Q0907572", "3QF907572", "5QF907572", "5Q0907572", "5Q0907561", "561907567"))
+        or "MRR" in sys_name
+        or asam.startswith(("EV_ACCBOSCHVW48", "EV_ACCBOSCHVW416", "EV_ACCBOSCHVW372"))
+    )
+
+    unit_id_ru = f"{pn} (ПО {sw})" if (pn and sw) else (pn or f"ПО {sw}")
+    unit_id_en = f"{pn} (SW {sw})" if (pn and sw) else (pn or f"SW {sw}")
+    if bosch_family:
+        warning = tr(
+            f"Блок {unit_id_ru} официально не поддерживается для патчей CP/SWaP. "
+            "Чтение памяти по XCP, ключи IKA/GFA, диагностика и прошивка FRF доступны.",
+            f"Unit {unit_id_en} is not officially supported for CP/SWaP patches. "
+            "XCP memory reads, IKA/GFA keys, diagnostics, and FRF flashing remain available.",
+        )
+        tone = "info"
+    else:
+        warning = tr(
+            f"Блок {unit_id_ru} официально не поддерживается (другая платформа радара). "
+            "Можно попробовать чтение по UDS, но XCP и прошивка Bosch MRR не подойдут.",
+            f"Unit {unit_id_en} is not officially supported (different radar platform). "
+            "You can still try UDS reading, but Bosch MRR XCP and flashing will not apply.",
+        )
+        tone = "warn"
+
+    return {
+        "verified": False,
+        "bosch_family": bosch_family,
+        "part_number": pn,
+        "sw_version": sw,
+        "warning": warning,
+        "tone": tone,
+    }
+
+
 def mrr_decode_status_dids(raw_dids: dict[str, str]) -> dict[str, Any]:
     """Decode MRR Component Protection & XcpGate UDS DIDs (03DE, 0440, 043F, 02E0, 02F9, 0902)."""
     decoded: dict[str, Any] = {}

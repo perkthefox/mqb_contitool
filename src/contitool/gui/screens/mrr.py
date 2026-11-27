@@ -68,6 +68,7 @@ from contitool.core.mrr import (
     mrr_inspect_cflash_swap_state,
     mrr_parse_dflash_fee,
     mrr_read_frf,
+    mrr_support_info,
 )
 from contitool.gui import theme
 from contitool.gui.connection import CanConnection, ensure_ready
@@ -1471,6 +1472,13 @@ class MrrScreen(QWidget):
 
         lay.addLayout(head_row)
 
+        sup_info = mrr_support_info(self._passport)
+        if sup_info["warning"]:
+            sup_tone = sup_info["tone"] if sup_info["tone"] in ("warn", "info") else "warn"
+            sup_box = Callout(sup_tone)
+            sup_box.label.setText(sup_info["warning"])
+            lay.addWidget(sup_box)
+
         if self._key == "cp_keys":
             self._build_cp_keys_page(lay)
         elif self._key == "memory":
@@ -1696,12 +1704,10 @@ class MrrScreen(QWidget):
             if patch_state == "unsupported_sw":
                 box.label.setText(
                     tr(
-                        f"<b>Версия ПО «{prof['sw']}» отсутствует в списке проверенных профилей патча.</b> "
-                        "Запись в Code Flash и SRAM заблокирована для безопасности. Привязка ключей <b>IKA / GFA</b> "
-                        "по штатному UDS и чтение памяти доступны.",
-                        f"<b>SW version “{prof['sw']}” is not in the verified patch profile table.</b> "
-                        "Code Flash and SRAM writes are locked for safety. Standard UDS <b>IKA / GFA</b> key pairing "
-                        "and memory backup remain available.",
+                        f"<b>Патчи CP и SWaP для ПО «{prof['sw']}» не проверялись</b> и отключены для безопасности. "
+                        "Чтение памяти, ключи <b>IKA / GFA</b>, штатная привязка по UDS и прошивка FRF работают.",
+                        f"<b>CP & SWaP patches for SW “{prof['sw']}” are unverified</b> and disabled for safety. "
+                        "Memory reads, <b>IKA / GFA</b> keys, standard UDS pairing, and FRF flashing remain available.",
                     )
                 )
             else:

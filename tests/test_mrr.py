@@ -2742,3 +2742,62 @@ def test_mrr_cli_and_gui_flash_frf(tmp_path: Path, monkeypatch, capsys) -> None:
     finally:
         win.close()
 
+
+def test_mrr_unverified_sw_allows_all_reads_with_softer_pn_sw_notice() -> None:
+    from contitool.core.mrr import mrr_support_info
+    from contitool.progress import OperationReporter
+
+    set_lang("ru")
+    # Verified SW -> no warning
+    assert mrr_support_info({"part_number": "3Q0907572B", "sw_version": "0192"})["warning"] is None
+
+    # Unverified Bosch MRR family SW -> softer "info" notice with PN + SW, reads still allowed
+    sup_bosch = mrr_support_info(
+        {"part_number": "3Q0907572C", "sw_version": "0198", "asam_odx": "EV_ACCBOSCHVW48X"}
+    )
+    assert sup_bosch["verified"] is False
+    assert sup_bosch["bosch_family"] is True
+    assert sup_bosch["tone"] == "info"
+    assert sup_bosch["warning"] and "3Q0907572C" in sup_bosch["warning"] and "0198" in sup_bosch["warning"]
+    assert "официально не поддерживается" in sup_bosch["warning"]
+
+    # Alien radar platform (e.g. Continental 2Q0) -> amber "warn" notice with PN + SW
+    sup_alien = mrr_support_info({"part_number": "2Q0907572R", "sw_version": "0372", "system_name": "ACC CONTI"})
+    assert sup_alien["verified"] is False
+    assert sup_alien["bosch_family"] is False
+    assert sup_alien["tone"] == "warn"
+    assert sup_alien["warning"] and "2Q0907572R" in sup_alien["warning"] and "0372" in sup_alien["warning"]
+
+    class UnverifiedMrrBus(FakeMrrBus):
+        def _handle_uds(self, payload: bytes) -> None:
+            if payload[:3] == b"\x22\xf1\x87":
+                self._enqueue_isotp(MRR_UDS_RX_ID, b"\x62\xf1\x87" + b"3Q0907572C ")
+                return
+            if payload[:3] == b"\x22\xf1\x89":
+                self._enqueue_isotp(MRR_UDS_RX_ID, b"\x62\xf1\x89" + b"0198")
+                return
+            super()._handle_uds(payload)
+
+    bus = UnverifiedMrrBus(sw_profile="0192", xcp_gate_open=True)
+    warns: list[str] = []
+
+    class RecRep(OperationReporter):
+        def warning(self, message: str) -> None:
+            warns.append(message)
+
+    st = can_mrr_status("fake", bus=bus, reporter=RecRep())
+    assert st["officially_supported"] is False
+    assert st["support_warning"] and "3Q0907572C" in st["support_warning"] and "0198" in st["support_warning"]
+
+    keys = can_mrr_read_keys("fake", bus=bus, reporter=RecRep())
+    assert keys["officially_supported"] is False
+    assert keys["ika_hex"] == bus.ika.hex()
+    assert keys["gfa_hex"] == bus.gfa.hex()
+    assert keys["cp_patch_state"] == "unsupported_sw"
+    assert any("3Q0907572C" in w and "0198" in w for w in warns)
+
+    # Code Flash CP patching still refuses unknown SW
+    with pytest.raises(RuntimeError):
+        can_mrr_deactivate_cp("fake", bus=bus)
+
+

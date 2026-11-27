@@ -53,6 +53,7 @@ from contitool.core.bcm import (
     bcm_get_profile,
     bcm_gfa_raw_to_working,
     bcm_recover_ika_from_job3,
+    bcm_support_info,
 )
 from contitool.i18n import tr
 from contitool.progress import NULL_REPORTER, OperationReporter
@@ -730,12 +731,12 @@ def _require_verified_bcm_profile(
         sw = passport.get("sw_version") or "—"
         raise RuntimeError(
             tr(
-                f"Неподдерживаемая версия ПО 09 BCM ({pn}, ПО {sw}) для операций XCP/Job 3: проверены только "
-                "5Q0 937 084 EA / 086 BH (ПО 0511) и 5Q0 937 084 DD / CG (ПО 0273). "
-                "Чтение ключей отменено, чтобы не повредить радиоключи FFB в DFLASH. "
+                f"Блок 09 BCM {pn} (ПО {sw}) официально не поддерживается для чтения ключей через XCP / Job 3: "
+                "проверены только 5Q0 937 084 EA / 086 BH (ПО 0511) и 5Q0 937 084 DD / CG (ПО 0273). "
+                "Чтение ключей отменено, чтобы не стереть радиоключи FFB в DFLASH. "
                 "По UDS доступны чтение статуса, ошибок DTC и запись IKA/GFA (2E 00BE / 00BD).",
-                f"Unsupported 09 BCM firmware ({pn}, SW {sw}) for XCP/Job 3 operations: only "
-                "5Q0 937 084 EA / 086 BH (SW 0511) and 5Q0 937 084 DD / CG (SW 0273) are verified. "
+                f"Unsupported 09 BCM firmware ({pn}, SW {sw}) for XCP/Job 3 key extraction: only "
+                "5Q0 937 084 EA / 086 BH (SW 0511) and 5Q0 937 084 DD / CG (SW 0273) are officially verified. "
                 "Key extraction aborted to prevent erasing FFB remote keys in DFLASH. "
                 "Standard UDS status, DTCs, and IKA/GFA writes (2E 00BE / 00BD) remain available.",
             )
@@ -1265,6 +1266,9 @@ def can_bcm_read_all(
                 )
             )
         profile = bcm_detect_profile(passport, sw_profile=sw_profile)
+        sup = bcm_support_info(passport, sw_profile=sw_profile)
+        if sup["warning"]:
+            reporter.warning(sup["warning"])
 
         reporter.step(
             2,
@@ -1313,10 +1317,11 @@ def can_bcm_read_all(
                         f"Auto IKA/GFA read via XCP skipped: {exc}",
                     )
                 )
-                with contextlib.suppress(Exception):
-                    gfa_only = _read_bcm_gfa_in_session(link, profile, pre_status=status, reporter=reporter)
-                    gfa_working_hex = gfa_only.get("gfa_working_hex", "")
-                    k_ffb_hex = gfa_only.get("k_ffb_hex", "")
+                if profile.get("matched", True) or sw_profile:
+                    with contextlib.suppress(Exception):
+                        gfa_only = _read_bcm_gfa_in_session(link, profile, pre_status=status, reporter=reporter)
+                        gfa_working_hex = gfa_only.get("gfa_working_hex", "")
+                        k_ffb_hex = gfa_only.get("k_ffb_hex", "")
 
         return {
             "ecu_kind": "bcm",
@@ -1325,6 +1330,8 @@ def can_bcm_read_all(
             "via_gateway": bool(via_gateway),
             "gateway_bridged": bool(bridged),
             "profile": profile,
+            "officially_supported": bool(sup["verified"]),
+            "support_warning": sup["warning"],
             "passport": passport,
             "status": status,
             "dtcs": dtcs,
@@ -1488,6 +1495,9 @@ def can_bcm_status(
                 )
             )
         profile = bcm_detect_profile(passport, sw_profile=sw_profile)
+        sup = bcm_support_info(passport, sw_profile=sw_profile)
+        if sup["warning"]:
+            reporter.warning(sup["warning"])
         reporter.step(
             2,
             2,
@@ -1502,6 +1512,8 @@ def can_bcm_status(
             "via_gateway": bool(via_gateway),
             "gateway_bridged": bool(bridged),
             "profile": profile,
+            "officially_supported": bool(sup["verified"]),
+            "support_warning": sup["warning"],
             "passport": passport,
             "status": status,
         }

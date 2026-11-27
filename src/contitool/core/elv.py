@@ -1506,6 +1506,10 @@ def elv_extract_cluster_material(
     }
 
 
+ELV_VERIFIED_SW_VERSIONS: tuple[str, ...] = ("0032",)
+ELV_VERIFIED_PART_PREFIXES: tuple[str, ...] = ("3Q0905861",)
+
+
 def is_elv_ident(ident: list[dict[str, str]]) -> bool:
     """Return True if a UDS identification list belongs to a VAG MQB Marquardt ELV (`2B` / `3Q0 905 861`)."""
     vals = " ".join(str(it.get("value", "")).upper() for it in ident)
@@ -1517,6 +1521,80 @@ def is_elv_ident(ident: list[dict[str, str]]) -> bool:
         if did in ("F187", "F191") and val.startswith(("3Q0905861", "5Q0905861", "2Q0905861")):
             return True
     return False
+
+
+def elv_detect_profile(
+    ident_or_passport: dict[str, Any] | list[dict[str, str]] | None = None,
+    *,
+    sw_version: str = "",
+    part_number: str = "",
+) -> dict[str, Any]:
+    """Check whether a `2B ELV` unit matches verified Marquardt `3Q0 905 861` (`SW 0032`) without blocking reads."""
+    pn = part_number.strip()
+    sw = sw_version.strip()
+    sys_name = ""
+    asam = ""
+    if isinstance(ident_or_passport, list):
+        vals = {str(it.get("did", "")).upper(): str(it.get("value", "")).strip() for it in ident_or_passport}
+        if not pn:
+            pn = vals.get("F187") or vals.get("F191") or ""
+        if not sw:
+            sw = vals.get("F189") or ""
+        sys_name = vals.get("F197") or ""
+        asam = vals.get("F19E") or ""
+    elif isinstance(ident_or_passport, dict):
+        if not pn:
+            pn = str(
+                ident_or_passport.get("part_number")
+                or ident_or_passport.get("F187")
+                or ident_or_passport.get("hw_part_number")
+                or ident_or_passport.get("F191")
+                or ""
+            ).strip()
+        if not sw:
+            sw = str(ident_or_passport.get("sw_version") or ident_or_passport.get("F189") or "").strip()
+        sys_name = str(ident_or_passport.get("system_name") or ident_or_passport.get("F197") or "").strip()
+        asam = str(ident_or_passport.get("asam_odx") or ident_or_passport.get("F19E") or "").strip()
+
+    if not pn and not sw:
+        return {
+            "verified": True,
+            "part_number": "",
+            "sw_version": "",
+            "warning": None,
+            "tone": "ok",
+        }
+
+    pn_norm = "".join(pn.split()).upper()
+    sw_norm = sw.strip().upper()
+    meta_upper = f"{sys_name} {asam}".upper()
+    other_vendor = any(tok in meta_upper for tok in ("KOSTAL", "HUF", "VALEO", "TRW", "ZF", "BOSCH"))
+    pn_ok = (not pn_norm) or pn_norm.startswith(ELV_VERIFIED_PART_PREFIXES)
+    sw_ok = (sw_norm in ELV_VERIFIED_SW_VERSIONS) if sw_norm else pn_norm.startswith(ELV_VERIFIED_PART_PREFIXES)
+    verified = (not other_vendor) and pn_ok and sw_ok
+
+    warning: str | None = None
+    if not verified:
+        unit_id_ru = f"{pn} (ПО {sw})" if (pn and sw) else (pn or f"ПО {sw}")
+        unit_id_en = f"{pn} (SW {sw})" if (pn and sw) else (pn or f"SW {sw}")
+        warning = tr(
+            f"Блок {unit_id_ru} официально не поддерживается. Можно попробовать чтение по UDS и чтение Data Flash "
+            "(32 КБ) — проверена только Marquardt 3Q0 905 861 (ПО 0032); перед записью и тестом загрузчика "
+            "соблюдайте осторожность.",
+            f"Unit {unit_id_en} is not officially supported. You can still try UDS and 32 KB Data Flash reads — "
+            "only Marquardt 3Q0 905 861 (SW 0032) is verified; use caution before writes or bootloader checks.",
+        )
+
+    return {
+        "verified": verified,
+        "part_number": pn,
+        "sw_version": sw,
+        "warning": warning,
+        "tone": "ok" if verified else "warn",
+    }
+
+
+elv_support_info = elv_detect_profile
 
 
 def elv_detect_folder_files(folder: Path) -> dict[str, Path]:

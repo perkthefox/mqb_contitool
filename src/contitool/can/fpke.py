@@ -63,6 +63,7 @@ from contitool.core.fpke import (
     eel_read_record_any,
     extract_fpke_eel_updates,
     fpke_eel_layout,
+    fpke_support_info,
     is_fpke_dflash,
     normalize_fpke_dflash_for_faci,
     summarize_fpke_dflash_changes,
@@ -1686,8 +1687,30 @@ def _read_sw_profile(link: FpkeCanLink) -> str | None:
         r87 = link.request_uds(b"\x22\xf1\x87", 0x62, timeout=0.8)
         f187_str = r87[3:].decode("latin1", errors="ignore").strip("\x00 ")
     if f189_str or f187_str:
+        link._last_ident_sw = f189_str
+        link._last_ident_pn = f187_str
         return fpke_detect_sw_profile(f189=f189_str, f187=f187_str)
     return None
+
+
+def _check_fpke_link_support(
+    link: FpkeCanLink,
+    *,
+    ident: list[dict[str, str]] | None = None,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> dict[str, Any]:
+    """Check whether the connected FPK_E `(PN + SW)` is officially verified and log a non-blocking warning if not."""
+    if ident:
+        sup = fpke_support_info(ident)
+    else:
+        sup = fpke_support_info(
+            f189=getattr(link, "_last_ident_sw", ""),
+            f187=getattr(link, "_last_ident_pn", ""),
+        )
+    if sup["warning"] and not getattr(link, "_support_warned", False):
+        link._support_warned = True
+        reporter.warning(sup["warning"])
+    return sup
 
 
 def _refine_link_profile_from_stack(link: FpkeCanLink, *, force: bool = False) -> dict[str, Any]:
@@ -1849,6 +1872,7 @@ def fpke_establish_level8(
             )
     elif getattr(link, "_explicit_sw_profile", None) is None:
         _probe_link_sw_profile(link, force=True)
+    _check_fpke_link_support(link, reporter=reporter)
     prof = _resolve_link_profile(link)
     prof_name = str(prof["name"])
     ptr_frame = int(prof["pointer_frame"])
@@ -2483,6 +2507,7 @@ def can_fpke_full_read(
         try:
             if ident and getattr(link, "sw_profile", None) is None:
                 link.sw_profile = fpke_detect_sw_profile(ident)
+            sup = _check_fpke_link_support(link, ident=ident, reporter=reporter)
             reporter.step(
                 step_no,
                 total_steps,
@@ -2494,6 +2519,8 @@ def can_fpke_full_read(
                 wake_seconds=eff_wake,
                 reporter=reporter,
             )
+            if not ident:
+                sup = _check_fpke_link_support(link, reporter=reporter)
 
             step_no += 1
             reporter.step(
@@ -2629,6 +2656,8 @@ def can_fpke_full_read(
             report: dict[str, Any] = {
                 "target": prof["target_label"],
                 "sw_profile": prof["name"],
+                "officially_supported": bool(sup["verified"]),
+                "support_warning": sup["warning"],
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "port": port,
                 "interface": interface,
@@ -2812,9 +2841,12 @@ def can_fpke_read_region(
 
             atomic_write(bin_path, data)
             prof = _resolve_link_profile(link)
+            sup = _check_fpke_link_support(link, reporter=reporter)
             report: dict[str, Any] = {
                 "target": prof["target_label"],
                 "sw_profile": prof["name"],
+                "officially_supported": bool(sup["verified"]),
+                "support_warning": sup["warning"],
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "port": port,
                 "interface": interface,
@@ -4068,6 +4100,7 @@ def can_fpke_write_dflash(
                 wake_seconds=eff_wake,
                 reporter=reporter,
             )
+            _check_fpke_link_support(link, reporter=reporter)
 
             # Step 2: Extra Area + IDAUTH unlock + live Dflash_before.bin backup
             reporter.step(

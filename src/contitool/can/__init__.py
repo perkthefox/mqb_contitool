@@ -202,6 +202,20 @@ from contitool.can.elv import (
     can_elv_status,
     can_elv_virginize,
 )
+from contitool.can.kombi import (
+    KombiCanLink,
+    can_kombi_full_read,
+    can_kombi_run_sl7_action,
+    can_kombi_write_dflash,
+    kombi_authenticate_fd11,
+    kombi_check_sl7,
+    kombi_ensure_sl7,
+    kombi_extract_sl7_key,
+    kombi_nvm_reload_block,
+    kombi_read_all_eel_in_session,
+    kombi_run_procedure,
+    kombi_temporary_immo_mode0,
+)
 from contitool.can.bridge import (
     BRIDGE_NATIVE_INTERFACES,
     J533CanBridge,
@@ -527,4 +541,16 @@ __all__ = [
     "can_elv_reset_idac",
     "can_elv_status",
     "can_elv_virginize",
+    "KombiCanLink",
+    "can_kombi_full_read",
+    "can_kombi_run_sl7_action",
+    "can_kombi_write_dflash",
+    "kombi_authenticate_fd11",
+    "kombi_check_sl7",
+    "kombi_ensure_sl7",
+    "kombi_extract_sl7_key",
+    "kombi_nvm_reload_block",
+    "kombi_read_all_eel_in_session",
+    "kombi_run_procedure",
+    "kombi_temporary_immo_mode0",
 ]

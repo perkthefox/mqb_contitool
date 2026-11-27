@@ -80,6 +80,21 @@ ECU_SPECS: tuple[EcuSpec, ...] = (
         full_support=True,
     ),
     EcuSpec(
+        kind="kombi",
+        diag_addr="17",
+        uds_tx_id=0x714,
+        uds_rx_id=0x77E,
+        name_ru="Панель приборов Kombi VDD (17)",
+        name_en="Kombi VDD Instrument Cluster (17)",
+        short_ru="Kombi VDD (17)",
+        short_en="Kombi VDD (17)",
+        is_gateway=False,
+        gateway_channel=0,  # Komfort CAN (RSCAN0 ch0, STB=P11_12)
+        needs_bridge_for_memory=False,
+        needs_direct_wake=True,
+        full_support=True,
+    ),
+    EcuSpec(
         kind="bcm",
         diag_addr="09",
         uds_tx_id=0x70E,
@@ -127,7 +142,9 @@ ECU_SPECS: tuple[EcuSpec, ...] = (
 )
 
 ECU_SPEC_BY_KIND: dict[str, EcuSpec] = {s.kind: s for s in ECU_SPECS}
-ECU_SPEC_BY_ADDR: dict[str, EcuSpec] = {s.diag_addr.upper(): s for s in ECU_SPECS}
+ECU_SPEC_BY_ADDR: dict[str, EcuSpec] = {}
+for _s in ECU_SPECS:
+    ECU_SPEC_BY_ADDR.setdefault(_s.diag_addr.upper(), _s)
 SLAVE_ECU_SPECS: tuple[EcuSpec, ...] = tuple(s for s in ECU_SPECS if not s.is_gateway)
 
 
@@ -156,6 +173,9 @@ class DiscoveredEcu:
     unsupported: str | None = None
     memory_unavailable_reason: str | None = None
     capabilities: tuple[str, ...] = ("uds",)
+    officially_supported: bool = True
+    support_warning: str | None = None
+    support_warning_tone: str = "warn"
 
     @property
     def spec(self) -> EcuSpec:
@@ -238,6 +258,20 @@ class DiscoveredEcu:
             if self.can_read_memory:
                 return tr("Прямой CAN, полный доступ", "Direct CAN, full access")
             return tr("Прямой CAN (только UDS)", "Direct CAN (UDS only)")
+        if self.kind == "kombi":
+            if self.via_gateway:
+                if self.can_read_memory:
+                    return tr(
+                        "Через шлюз J533 (UDS SL 7, 132 бл. EEL)",
+                        "Via J533 gateway (UDS SL 7, 132 EEL blk)",
+                    )
+                return tr("Через шлюз (только UDS)", "Via gateway (UDS only)")
+            if self.can_read_memory:
+                return tr(
+                    "Прямой CAN, полный доступ (SL 7, 132 бл. EEL)",
+                    "Direct CAN, full access (SL 7, 132 EEL blk)",
+                )
+            return tr("Прямой CAN (только UDS)", "Direct CAN (UDS only)")
         if self.kind == "bcm":
             if self.via_gateway:
                 if self.bridge_available:
@@ -318,6 +352,10 @@ class DiscoveredEcu:
             out["unsupported"] = self.unsupported
         if self.memory_unavailable_reason:
             out["memory_unavailable_reason"] = self.memory_unavailable_reason
+        out["officially_supported"] = self.officially_supported
+        if self.support_warning:
+            out["support_warning"] = self.support_warning
+            out["support_warning_tone"] = self.support_warning_tone
         return out
 
 
@@ -337,7 +375,10 @@ class BusScanResult:
 
     def find(self, kind: str) -> DiscoveredEcu | None:
         want = kind.strip().lower()
-        return next((e for e in self.ecus if e.kind == want), None)
+        found = next((e for e in self.ecus if e.kind == want), None)
+        if found is None and want in ("fpke", "kombi"):
+            found = next((e for e in self.ecus if e.kind in ("fpke", "kombi")), None)
+        return found
 
     @property
     def slaves(self) -> list[DiscoveredEcu]:
@@ -460,7 +501,70 @@ def _build_gateway_ecu(link: J533CanLink, in_fbl: bool, reporter: OperationRepor
     )
 
 
+def _apply_slave_support(ecu: DiscoveredEcu) -> DiscoveredEcu:
+    """Populate `officially_supported` / `support_warning` on a discovered slave ECU without blocking reads."""
+    sup: dict[str, Any] | None = None
+    if ecu.kind == "fpke":
+        from contitool.core.fpke import fpke_support_info
+
+        sup = fpke_support_info(ecu.ident)
+    elif ecu.kind == "kombi":
+        from contitool.core.kombi import kombi_support_info
+
+        sup = kombi_support_info(ecu.ident)
+    elif ecu.kind == "bcm":
+        from contitool.core.bcm import bcm_support_info
+
+        sup = bcm_support_info(ecu.ident)
+    elif ecu.kind == "mrr":
+        from contitool.core.mrr import mrr_support_info
+
+        sup = mrr_support_info(ecu.ident)
+    elif ecu.kind == "elv":
+        from contitool.core.elv import elv_detect_profile
+
+        sup = elv_detect_profile(ecu.ident)
+    if sup is not None:
+        ecu.officially_supported = bool(sup.get("verified", True))
+        ecu.support_warning = sup.get("warning")
+        ecu.support_warning_tone = str(sup.get("tone") or "warn")
+    return ecu
+
+
 def _build_slave_ecu(
+    spec: EcuSpec,
+    ident: list[dict[str, str]],
+    *,
+    via_gateway: bool,
+    gateway_bridge_capable: bool,
+    interface: str,
+    bus_injected: bool,
+    in_fbl: bool,
+    bridge_adapter_ok: bool = False,
+) -> DiscoveredEcu:
+    """`bridge_adapter_ok`: the scan found the adapter able to carry the J533 bridge (`bridge_bus_ok`)."""
+    if spec.diag_addr == "17" and ident:
+        from contitool.core.fpke import is_fpke_ident
+        from contitool.core.kombi import is_kombi_ident
+
+        if is_kombi_ident(ident):
+            spec = ECU_SPEC_BY_KIND["kombi"]
+        elif spec.kind == "kombi" and is_fpke_ident(ident):
+            spec = ECU_SPEC_BY_KIND["fpke"]
+    ecu = _build_slave_ecu_raw(
+        spec,
+        ident,
+        via_gateway=via_gateway,
+        gateway_bridge_capable=gateway_bridge_capable,
+        interface=interface,
+        bus_injected=bus_injected,
+        in_fbl=in_fbl,
+        bridge_adapter_ok=bridge_adapter_ok,
+    )
+    return _apply_slave_support(ecu)
+
+
+def _build_slave_ecu_raw(
     spec: EcuSpec,
     ident: list[dict[str, str]],
     *,
@@ -546,6 +650,41 @@ def _build_slave_ecu(
             in_fbl=in_fbl,
             unsupported=fpke_unsupported,
             memory_unavailable_reason=fpke_unsupported,
+            capabilities=("uds",),
+        )
+
+    if spec.kind == "kombi":
+        if native_ok:
+            return DiscoveredEcu(
+                kind="kombi",
+                diag_addr=spec.diag_addr,
+                uds_tx_id=spec.uds_tx_id,
+                uds_rx_id=spec.uds_rx_id,
+                ident=ident,
+                via_gateway=via_gateway,
+                gateway_channel=spec.gateway_channel if via_gateway else None,
+                bridge_available=gateway_bridge_capable if via_gateway else False,
+                in_fbl=in_fbl,
+                capabilities=("uds", "memory"),
+            )
+        kombi_unsupported = tr(
+            "Работа с панелью приборов Kombi VDD поддерживается только через нативный CAN-адаптер "
+            "(CANable / SLCAN / candleLight).",
+            "Kombi VDD instrument cluster operations require a native CAN adapter "
+            "(CANable / SLCAN / candleLight).",
+        )
+        return DiscoveredEcu(
+            kind="kombi",
+            diag_addr=spec.diag_addr,
+            uds_tx_id=spec.uds_tx_id,
+            uds_rx_id=spec.uds_rx_id,
+            ident=ident,
+            via_gateway=via_gateway,
+            gateway_channel=spec.gateway_channel if via_gateway else None,
+            bridge_available=False,
+            in_fbl=in_fbl,
+            unsupported=kombi_unsupported,
+            memory_unavailable_reason=kombi_unsupported,
             capabilities=("uds",),
         )
 
@@ -803,7 +942,13 @@ def can_scan_bus(
     scan_notes: list[str] = []
     keep_direct_fpke_alive = False
 
-    slave_targets = [ECU_SPEC_BY_KIND[k] for k in wanted if not ECU_SPEC_BY_KIND[k].is_gateway]
+    seen_slave_tx: set[int] = set()
+    slave_targets: list[EcuSpec] = []
+    for k in wanted:
+        sp = ECU_SPEC_BY_KIND[k]
+        if not sp.is_gateway and sp.uds_tx_id not in seen_slave_tx:
+            seen_slave_tx.add(sp.uds_tx_id)
+            slave_targets.append(sp)
     probe_gateway = ("j533" in wanted) or bool(slave_targets)
     explicit_slave_only = ("j533" not in wanted) and bool(slave_targets)
     total_steps = (1 if (probe_gateway and not explicit_slave_only) else 0) + len(slave_targets)
@@ -980,6 +1125,8 @@ def can_scan_bus(
                             + f" — {ecu.access_summary}",
                         )
                     )
+                    if ecu.support_warning:
+                        reporter.warning(ecu.support_warning)
                 if is_fixed_dpdu and uds_driver_refused and not any(not e.spec.is_gateway for e in ecus):
                     note = tr(
                         "Адаптер D-PDU открыл фиксированный канал только для шлюза 0x710/0x77A — опрос ведомых блоков недоступен.",
@@ -1000,7 +1147,7 @@ def can_scan_bus(
                         f"Direct probe: {spec.short_name} ({spec.diag_addr}, 0x{spec.uds_tx_id:03X} → 0x{spec.uds_rx_id:03X})",
                     ),
                 )
-                if spec.kind == "fpke":
+                if spec.kind in ("fpke", "kombi"):
                     ok_s, fbl_s = _probe_fpke_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
                     ka_direct = bus is None and interface in BRIDGE_NATIVE_INTERFACES
                 elif spec.kind == "bcm":
@@ -1031,7 +1178,7 @@ def can_scan_bus(
                     in_fbl=fbl_s,
                 )
                 ecus.append(ecu)
-                if spec.kind == "fpke" and ka_direct:
+                if ecu.kind in ("fpke", "kombi") and ka_direct:
                     keep_direct_fpke_alive = True
                 reporter.info(
                     tr(
@@ -1043,6 +1190,8 @@ def can_scan_bus(
                         + f" — {ecu.access_summary}",
                     )
                 )
+                if ecu.support_warning:
+                    reporter.warning(ecu.support_warning)
 
         ext29_ecus = [e for e in ecus if e.kind in ("bcm", "mrr", "elv") and e.can_read_memory]
         if interface == "dpdu" and ext29_ecus:
@@ -1060,12 +1209,13 @@ def can_scan_bus(
             scan_notes.append(note)
             reporter.warning(note)
 
-    if keep_direct_fpke_alive and len(ecus) == 1 and ecus[0].kind == "fpke":
+    if keep_direct_fpke_alive and len(ecus) == 1 and ecus[0].kind in ("fpke", "kombi"):
         with contextlib.suppress(Exception):
             fpke_link = open_or_reuse_fpke_link(port, interface=interface)
             fpke_link.start_keepalive()
 
-    if explicit_slave_only and topology == "gateway" and not any(e.kind in wanted for e in ecus):
+    wanted_addrs = {ECU_SPEC_BY_KIND[k].diag_addr for k in wanted}
+    if explicit_slave_only and topology == "gateway" and not any(e.kind in wanted or e.diag_addr in wanted_addrs for e in ecus):
         target_labels = ", ".join(
             f"[{ECU_SPEC_BY_KIND[k].diag_addr}] {ECU_SPEC_BY_KIND[k].short_name} (0x{ECU_SPEC_BY_KIND[k].uds_tx_id:03X})"
             for k in wanted
@@ -1169,7 +1319,7 @@ def can_uds_read_dtc(
         elif tx_id == 0x731 or rx_id == 0x79B or ecu_kind == "elv":
             link.UDS_FC_PAD = 0x55
         reporter.step(1, 1, tr(f"Чтение ошибок DTC (0x{tx_id:03X} → 0x{rx_id:03X})", f"Reading DTCs (0x{tx_id:03X} → 0x{rx_id:03X})"))
-        if ecu_kind == "fpke" and not via_gateway and bus is None and interface in BRIDGE_NATIVE_INTERFACES:
+        if ecu_kind in ("fpke", "kombi") and not via_gateway and bus is None and interface in BRIDGE_NATIVE_INTERFACES:
             _wake_direct_fpke_once(link)
         elif (ecu_kind == "elv" or tx_id == 0x731) and not via_gateway and bus is None and interface in BRIDGE_NATIVE_INTERFACES:
             _wake_direct_elv_once(link)
@@ -1195,7 +1345,7 @@ def can_uds_read_dtc(
             continue
         if ecu_kind == "j533":
             disp, desc = dtc_mod.describe(code)
-        elif ecu_kind == "fpke":
+        elif ecu_kind in ("fpke", "kombi"):
             disp, desc = dtc_mod.describe_fpke(code)
         elif ecu_kind == "bcm":
             disp, desc = dtc_mod.describe_bcm(code)
@@ -1262,7 +1412,7 @@ def can_uds_clear_dtc(
         elif tx_id == 0x731 or rx_id == 0x79B or ecu_kind == "elv":
             link.UDS_FC_PAD = 0x55
         reporter.step(1, 1, tr(f"Сброс ошибок DTC (0x{tx_id:03X} → 0x{rx_id:03X})", f"Clearing DTCs (0x{tx_id:03X} → 0x{rx_id:03X})"))
-        if ecu_kind == "fpke" and not via_gateway and bus is None and interface in BRIDGE_NATIVE_INTERFACES:
+        if ecu_kind in ("fpke", "kombi") and not via_gateway and bus is None and interface in BRIDGE_NATIVE_INTERFACES:
             _wake_direct_fpke_once(link)
         elif (ecu_kind == "elv" or tx_id == 0x731) and not via_gateway and bus is None and interface in BRIDGE_NATIVE_INTERFACES:
             _wake_direct_elv_once(link)

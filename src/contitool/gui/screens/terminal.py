@@ -361,8 +361,8 @@ class TerminalScreen(QWidget):
             self.ed_rx.setText(pair[1])
 
     def set_target_ecu(self, kind: str) -> None:
-        """Select default UDS IDs for gateway (`j533`), instrument cluster (`fpke`), BCM (`bcm`), ACC radar (`mrr`), or ELV (`elv`)."""
-        idx_map = {"j533": 0, "fpke": 1, "bcm": 2, "mrr": 3, "elv": 4}
+        """Select default UDS IDs for gateway (`j533`), instrument cluster (`fpke`/`kombi`), BCM (`bcm`), ACC radar (`mrr`), or ELV (`elv`)."""
+        idx_map = {"j533": 0, "fpke": 1, "kombi": 1, "bcm": 2, "mrr": 3, "elv": 4}
         idx = idx_map.get(kind.strip().lower(), 0)
         self.cmb_target.setCurrentIndex(idx)
         self._on_target_changed(idx)
