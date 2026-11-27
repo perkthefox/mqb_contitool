@@ -379,3 +379,67 @@ def test_windows_build_loads_its_own_openssl_first(tmp_path, monkeypatch) -> Non
     monkeypatch.setattr(app_mod, "_BUNDLED_DLLS", [])
     app_mod._use_bundled_openssl()
     assert loaded == [str(tmp_path / "libcrypto-3-x64.dll"), str(tmp_path / "libssl-3-x64.dll")]
+
+
+def test_system_language_detection_and_disclaimer_live_switch(monkeypatch) -> None:
+    """Russian OS locale -> 'ru', any other locale -> 'en', and DisclaimerDialog switches RU<->EN before accepting."""
+    from contitool.gui import app as app_mod
+    from contitool.gui.dialogs.disclaimer import DisclaimerDialog
+    from contitool.i18n import detect_system_lang, lang_from_locale
+
+    for ru_loc in ("ru", "ru_RU", "ru-RU", "ru_RU.UTF-8", "Russian_Russia.1251"):
+        assert lang_from_locale(ru_loc) == "ru"
+        assert detect_system_lang(ru_loc) == "ru"
+    for other_loc in ("en_US", "en-GB", "de_DE", "tr_TR", "pl_PL", "zh_CN", "C", ""):
+        assert lang_from_locale(other_loc) == "en"
+        assert detect_system_lang(other_loc) == "en"
+
+    app, win = create_window()
+    qs = QSettings()
+    prev_saved = qs.value(app_mod._LANG_SETTING)
+    prev_lang = get_lang()
+    try:
+        monkeypatch.delenv("CONTI_CP_LANG", raising=False)
+        qs.remove(app_mod._LANG_SETTING)
+
+        monkeypatch.setattr(app_mod, "detect_gui_system_lang", lambda: "en")
+        assert app_mod.resolve_startup_lang() == "en"
+        assert app_mod.resolve_startup_lang(explicit_lang="ru") == "ru"
+
+        monkeypatch.setattr(app_mod, "detect_gui_system_lang", lambda: "ru")
+        assert app_mod.resolve_startup_lang() == "ru"
+
+        # Live switch inside DisclaimerDialog before accepting updates both dialog and MainWindow and persists ui/language
+        set_lang("ru")
+        dlg = DisclaimerDialog(win)
+        assert dlg._lang_buttons["ru"].isChecked()
+        assert "Прочитайте" in dlg.windowTitle()
+        assert dlg.btn_ok.text() == "Продолжить"
+        assert dlg._btn_cancel is not None and dlg._btn_cancel.text() == "Выйти"
+
+        dlg._lang_buttons["en"].click()
+        app.processEvents()
+        assert get_lang() == "en"
+        assert dlg._lang_buttons["en"].isChecked()
+        assert "Read this" in dlg.windowTitle()
+        assert dlg.btn_ok.text() == "Continue"
+        assert dlg._btn_cancel.text() == "Quit"
+        assert qs.value(app_mod._LANG_SETTING) == "en"
+        assert app_mod.resolve_startup_lang() == "en"  # saved preference overrides OS locale
+        assert win.menu_file.title() == "File"  # MainWindow behind disclaimer updated live
+
+        dlg._lang_buttons["ru"].click()
+        app.processEvents()
+        assert get_lang() == "ru"
+        assert dlg.btn_ok.text() == "Продолжить"
+        assert qs.value(app_mod._LANG_SETTING) == "ru"
+        dlg.reject()
+    finally:
+        if prev_saved is None:
+            qs.remove(app_mod._LANG_SETTING)
+        else:
+            qs.setValue(app_mod._LANG_SETTING, prev_saved)
+        set_lang(prev_lang)
+        win.close()
+        app.processEvents()
+

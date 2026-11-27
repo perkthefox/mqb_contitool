@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QLocale, QSettings, Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
@@ -13,13 +14,43 @@ from contitool import __version__
 from contitool.can import dpdu
 from contitool.gui.main_window import MainWindow
 from contitool.gui.theme import apply_theme, build_app_icon
+from contitool.i18n import lang_from_locale, normalize_lang_code, set_lang
 
-
+_LANG_SETTING = "ui/language"
 _APP: QApplication | None = None
 
 
-def create_window() -> tuple[QApplication, MainWindow]:
-    """Instantiate QApplication (if needed) and MainWindow (used both by app entry & GUI tests)."""
+def detect_gui_system_lang() -> str:
+    """Detect OS UI language via Qt's `QLocale.system()`: Russian -> `'ru'`, all other languages -> `'en'`."""
+    loc = QLocale.system()
+    ui_langs = list(loc.uiLanguages() or ())
+    if ui_langs:
+        return lang_from_locale(ui_langs[0])
+    if loc.language() == QLocale.Language.Russian:
+        return "ru"
+    return lang_from_locale(loc.name())
+
+
+def save_ui_lang(lang: str) -> str:
+    """Switch active UI language and remember the user's explicit preference in `QSettings`."""
+    chosen = set_lang(lang)
+    QSettings().setValue(_LANG_SETTING, chosen)
+    return chosen
+
+
+def resolve_startup_lang(*, explicit_lang: str | None = None) -> str:
+    """Resolve initial GUI language: CLI/env override -> saved preference -> OS system locale (RU vs EN)."""
+    for candidate in (explicit_lang, os.environ.get("CONTI_CP_LANG")):
+        norm = normalize_lang_code(candidate)
+        if norm:
+            return norm
+    saved = normalize_lang_code(str(QSettings().value(_LANG_SETTING, "") or ""))
+    if saved:
+        return saved
+    return detect_gui_system_lang()
+
+
+def _ensure_app() -> QApplication:
     global _APP
     app = QApplication.instance()
     if app is None:
@@ -34,6 +65,12 @@ def create_window() -> tuple[QApplication, MainWindow]:
     app.setOrganizationName("PerkTheFox")
     app.setWindowIcon(build_app_icon())
     apply_theme(app)
+    return app
+
+
+def create_window() -> tuple[QApplication, MainWindow]:
+    """Instantiate QApplication (if needed) and MainWindow (used both by app entry & GUI tests)."""
+    app = _ensure_app()
     win = MainWindow()
     return app, win
 
@@ -65,13 +102,15 @@ def _use_bundled_openssl() -> None:
                 pass  # Qt then falls back to Schannel
 
 
-def run_gui() -> int:
+def run_gui(*, explicit_lang: str | None = None) -> int:
     """Launch the ContiTool Desktop GUI event loop."""
     from contitool.gui.dialogs.disclaimer import confirm_disclaimer
     from contitool.report import failure_from_exception
 
     _use_bundled_openssl()
 
+    _ensure_app()
+    set_lang(resolve_startup_lang(explicit_lang=explicit_lang))
     app, win = create_window()
     win.show()
     if not confirm_disclaimer(win):

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import locale
 import os
+import re
 import types
 import weakref
 
@@ -77,6 +79,33 @@ def subscribe_lang_change(callback: Callable[[str], None]) -> Callable[[], None]
             _LISTENERS.remove(entry)
 
     return _unsubscribe
+
+
+def lang_from_locale(locale_name: str | None) -> str:
+    """Map an OS locale / UI language tag to `'ru'` (for Russian) or `'en'` (for everything else)."""
+    raw = (locale_name or "").strip().lower()
+    if not raw:
+        return "en"
+    primary = re.split(r"[-_.\s@]", raw, maxsplit=1)[0]
+    return "ru" if primary in ("ru", "rus", "russian") else "en"
+
+
+def detect_system_lang(locale_name: str | None = None) -> str:
+    """Detect default UI language from OS locale: Russian if the system is Russian, English otherwise."""
+    if locale_name is not None:
+        return lang_from_locale(locale_name)
+    env_override = normalize_lang_code(os.environ.get("CONTI_CP_LANG"))
+    if env_override:
+        return env_override
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        val = (os.environ.get(var) or "").strip()
+        if val and val.lower() not in ("c", "posix", "c.utf-8", "c.utf8"):
+            return lang_from_locale(val)
+    try:
+        loc_code, _ = locale.getlocale()
+    except ValueError:
+        loc_code = None
+    return lang_from_locale(loc_code)
 
 
 def detect_early_cli_lang(argv: list[str]) -> str | None:

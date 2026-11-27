@@ -213,13 +213,18 @@ class Dialog(QDialog):
         self.buttons.setSpacing(8)
         self._footer.setHidden(True)  # finish() shows it
         outer.addWidget(self._footer)
-        lbl = QLabel(title)
-        lbl.setObjectName("PageTitle")
-        lbl.setWordWrap(True)
-        self.body.addWidget(lbl)
+        self._lbl_title = QLabel(title)
+        self._lbl_title.setObjectName("PageTitle")
+        self._lbl_title.setWordWrap(True)
+        self._title_row = QHBoxLayout()
+        self._title_row.setContentsMargins(0, 0, 0, 0)
+        self._title_row.setSpacing(12)
+        self._title_row.addWidget(self._lbl_title, 1, Qt.AlignmentFlag.AlignVCenter)
+        self.body.addLayout(self._title_row)
         if subtitle:
             self.body.addWidget(hint(subtitle))
         self.body.addWidget(divider())
+        self._btn_cancel: QPushButton | None = None
         self.resize(width, 10)
 
     def finish(self, *left: QWidget, ok: QPushButton | None = None, cancel_text: str = "") -> None:
@@ -227,7 +232,8 @@ class Dialog(QDialog):
         for w in left:
             self.buttons.addWidget(w)
         self.buttons.addStretch(1)
-        self.buttons.addWidget(button(cancel_text or tr("Отмена", "Cancel"), slot=self.reject))
+        self._btn_cancel = button(cancel_text or tr("Отмена", "Cancel"), slot=self.reject)
+        self.buttons.addWidget(self._btn_cancel)
         if ok is not None:
             ok.setDefault(True)
             self.buttons.addWidget(ok)

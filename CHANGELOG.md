@@ -76,6 +76,7 @@
 
 #### Приватность, стабильность и аудит (640+ автотестов)
 - **Окно «Настройки» и каналы автообновлений (`stable` / `candidate`):** выбор канала обновлений прямо в интерфейсе (с жёсткой изоляцией каналов — стабильные и старые версии никогда не поймают кандидат-релиз, а релиз-кандидаты автоматически переходят на финальный релиз после выхода).
+- **Автоопределение языка системы и выбор языка на стартовом предупреждении:** при первом запуске ContiTool автоматически выбирает русский язык, если язык ОС — русский, и английский для всех остальных языков; прямо в стартовом окне предупреждения появился переключатель **`RU | EN`**, чтобы можно было сменить язык до принятия условий (выбор запоминается).
 - **Безопасный «Отчёт о проблеме»:** при снятой галочке «Приложить дампы» из логов и JSON автоматически вырезаются ключи (`IKA`, `GFA`, `K_ffb`, `K_c`, `K_5`, `S0`, `S1`, `IDCODE`), `VIN` и `FAZIT`, а файлы с ключами и трассами не попадают в архив.
 - **Ускорение J2534 и стабильность транспорта:** убрана задержка 250 мс на каждый UDS-кадр в `J2534Bus`, усилена проверка префиксов UDS, защищён аппаратный ISO-TP на `nonraw` D-PDU, усилены RH850-апплеты (`PSW.ID | PSW.NP`, раздельный вход/выход FACI P/E).
 - **Надёжность GUI:** защита всех фоновых коллбэков при переключении/закрытии экранов, подтверждения перед записью `BCM FFB` и `FPK_E 2E 02F7`, запрет случайного закрытия окна посреди CAN-операции.
@@ -124,6 +125,7 @@
 
 #### Privacy, Transport & Hardening (640+ Automated Tests)
 - **Settings dialog & auto-update channels (`stable` / `candidate`):** switch update channels inside the app with strict channel isolation (stable and legacy builds never catch candidate releases, and RC users seamlessly graduate to final stable releases once published).
+- **Automatic OS language & disclaimer language switch:** on first launch ContiTool picks Russian on Russian OS locales and English on all other locales, and adds a live **`RU | EN`** toggle directly inside the startup disclaimer so users can switch languages before accepting (saved across restarts).
 - **Privacy-safe Problem Reports:** keys (`IKA`, `GFA`, `K_ffb`, `K_c`, `K_5`, `S0`, `S1`, `IDCODE`), `VIN`, and `FAZIT` are automatically redacted and secret-bearing files excluded whenever "Attach dumps" is unchecked.
 - **Transport & applet reliability:** eliminated 250 ms/frame batch stalls in `J2534Bus`, hardened UDS prefix validation and `nonraw` D-PDU ISO-TP sessions, and tightened RH850 applets (`PSW.ID | PSW.NP`, split FACI P/E transitions).
 - **GUI safety:** async callback lifecycle guards on screen close/switch, destructive confirmations for `BCM FFB` and `FPK_E 2E 02F7`, and close-block protection while a CAN task is active.

@@ -388,7 +388,7 @@ def _plan_fpke_transfer_from_passports(donor: dict[str, Any], recipient: dict[st
 def cmd_gui(args: argparse.Namespace) -> int:
     from contitool.gui.app import run_gui
 
-    return run_gui()
+    return run_gui(explicit_lang=getattr(args, "lang", None))
 
 
 def cmd_banks(args: argparse.Namespace) -> int:

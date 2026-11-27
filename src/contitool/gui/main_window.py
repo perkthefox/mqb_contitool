@@ -346,7 +346,7 @@ class MainWindow(QMainWindow):
             b.setProperty("pos", pos)
             b.setCheckable(True)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(lambda _c=False, c=code: set_lang(c))
+            b.clicked.connect(lambda _c=False, c=code: self._on_lang_picked(c))
             lang_group.addButton(b)
             lang.addWidget(b)
             self._lang_buttons[code] = b
@@ -2103,6 +2103,13 @@ class MainWindow(QMainWindow):
         dlg.destroyed.connect(lambda *_a, d=dlg: setattr(self, "_report_dlg", None) if self._report_dlg is d else None)
         self._report_dlg = dlg
         dlg.show()
+
+    @staticmethod
+    def _on_lang_picked(code: str) -> None:
+        from PySide6.QtCore import QSettings
+
+        chosen = set_lang(code)
+        QSettings().setValue("ui/language", chosen)
 
     def show_settings(self) -> None:
         dlg = SettingsDialog(self)
