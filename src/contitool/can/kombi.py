@@ -53,6 +53,8 @@ from contitool.core.kombi import (
     EEL_KOMBI_2220_IDS,
     KOMBI_2220_FDE3_AFFECTED_EEL_IDS,
     KOMBI_2220_RAM_FD11_STATE_ADDR,
+    KOMBI_2220_RAM_SL7_KEY_ADDR,
+    KOMBI_2220_RAM_STAGING_ADDR,
     KOMBI_ALIGN4_EEL_IDS,
     KOMBI_CFLASH_ADDR,
     KOMBI_CFLASH_SIZE,
@@ -307,6 +309,147 @@ def kombi_clear_sa1_delay_timer(
     return {"cleared": True, "stage": "ecu_reset_1102", "needs_restage": True}
 
 
+KOMBI_SL7_SCAN_RANGES: tuple[tuple[int, int], ...] = (
+    (0xFEDD0000, 0xFEDD8000),  # Primary NvM .bss region (SW 2220 @ 0xFEDD2480, SW 0310 @ 0xFEDD5530)
+    (0xFEDD8000, 0xFEDE0000),  # Upper 0xFEDDxxxx RAM
+    (0xFEDC9600, 0xFEDD0000),  # RAM immediately above protected Immo/CP mirror window
+    (0xFEDC0000, 0xFEDC8900),  # Lower RAM below protected Immo/CP mirror window
+    (0xFEDE0000, 0xFEE00000),  # Upper V850E2 RAM fallback
+)
+
+
+def _is_valid_kombi_sl7_record(rec_20: bytes | bytearray | memoryview) -> tuple[bool, bytes, int, int]:
+    """Validate a 20-byte `[16B AES key || 4B LE CRC-32]` record from the V850E2 NvM staging buffer."""
+    if len(rec_20) != 20:
+        return False, b"", 0, 0
+    k16 = bytes(rec_20[:16])
+    c_stored = int.from_bytes(rec_20[16:20], "little")
+    c_calc = zlib.crc32(k16) & 0xFFFFFFFF
+    if c_stored != c_calc or k16 in (b"\x00" * 16, b"\xff" * 16) or len(set(k16)) < 4:
+        return False, k16, c_stored, c_calc
+    return True, k16, c_stored, c_calc
+
+
+def _scan_ram_for_sl7_key(
+    link: FpkeCanLink,
+    *,
+    fd11_id_15b: bytes | None = None,
+    checked_addrs: set[int] | None = None,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> tuple[bytes, int, int] | None:
+    """Scan V850E2 RAM in `10 4F + SA1` via `UDS 0x23` to locate the NvM staging buffer and 20-byte `FD11 SL 7` record."""
+    already = set(checked_addrs or ())
+    for known_addr in (KOMBI_2220_RAM_SL7_KEY_ADDR, KOMBI_RAM_SL7_KEY_ADDR):
+        if known_addr in already:
+            continue
+        already.add(known_addr)
+        with contextlib.suppress(UdsNegativeResponse, Exception):
+            raw_20 = fpke_read_memory_0x23(link, known_addr, 20, timeout=1.5)
+            ok, k16, c_st, _c_ca = _is_valid_kombi_sl7_record(raw_20)
+            if ok:
+                return k16, c_st, known_addr
+
+    reporter.can_log(
+        tr(
+            "Автопоиск буфера NvM staging и ключа FD11 SL 7 в RAM (0xFEDD0000..0xFEDFFFFF)…",
+            "Auto-scanning RAM for NvM staging buffer and FD11 SL 7 key (0xFEDD0000..0xFEDFFFFF)…",
+        )
+    )
+    chunk_size = 500
+    stride = 432  # 68-byte 4-byte-aligned overlap holds full [8B NvM header + 40B prefix + 20B SL7 record]
+    reqs_done = 0
+
+    for start_addr, end_addr in KOMBI_SL7_SCAN_RANGES:
+        best_region_match: tuple[int, bytes, int, int] | None = None
+        addr = start_addr
+        while addr < end_addr:
+            reporter.check_cancelled()
+            read_len = min(chunk_size, end_addr - addr)
+            if read_len < 20:
+                break
+            buf: bytes | None = None
+            base_addr = addr
+            try:
+                buf = fpke_read_memory_0x23(link, addr, read_len, timeout=1.5)
+            except UdsNegativeResponse:
+                # Near a protected RAM boundary, try smaller 128-byte sub-reads before moving on
+                sub_buf = bytearray()
+                sub_base: int | None = None
+                for sub_off in range(0, read_len, 128):
+                    sub_sz = min(128, read_len - sub_off)
+                    if sub_sz < 20:
+                        break
+                    try:
+                        part = fpke_read_memory_0x23(link, addr + sub_off, sub_sz, timeout=1.2)
+                        if sub_base is None:
+                            sub_base = addr + sub_off
+                        sub_buf.extend(part)
+                    except Exception:
+                        if len(sub_buf) >= 20:
+                            break
+                        sub_buf.clear()
+                        sub_base = None
+                if sub_base is not None and len(sub_buf) >= 20:
+                    buf = bytes(sub_buf)
+                    base_addr = sub_base
+            except OperationCancelledError:
+                raise
+            except Exception:
+                pass
+
+            reqs_done += 1
+            if reqs_done % 24 == 0:
+                with contextlib.suppress(Exception):
+                    link.request_uds(b"\x3e\x00", 0x7E, timeout=1.0)
+
+            if buf is not None and len(buf) >= 20:
+                limit = len(buf) - 20
+                for pos in range(0, limit + 1, 4):
+                    cand_addr = base_addr + pos
+                    if cand_addr in already:
+                        continue
+                    ok, k16, c_st, _ = _is_valid_kombi_sl7_record(buf[pos : pos + 20])
+                    if not ok:
+                        continue
+                    # Disambiguate L0..6 (+0x14) vs SL 7 (+0x28): if pos+20 is ALSO a valid [16B key + 4B CRC32],
+                    # then pos is L0..6 and pos+20 is SL 7!
+                    if pos + 40 <= len(buf):
+                        ok_next, _, _, _ = _is_valid_kombi_sl7_record(buf[pos + 20 : pos + 40])
+                        if ok_next:
+                            continue
+
+                    score = 1
+                    if pos >= 20:
+                        ok_prev, _, _, _ = _is_valid_kombi_sl7_record(buf[pos - 20 : pos])
+                        if ok_prev:
+                            score += 3
+                    if (
+                        pos >= 0x28
+                        and isinstance(fd11_id_15b, bytes)
+                        and len(fd11_id_15b) == 15
+                        and buf[pos - 0x28 : pos - 0x28 + 15] == fd11_id_15b
+                    ):
+                        score += 4
+                    if pos >= 0x30:
+                        hdr = buf[pos - 0x30 : pos - 0x28]
+                        blk_id = int.from_bytes(hdr[0:2], "little")
+                        if hdr[2] in (0, 1) and hdr[3] == 0 and hdr[5] == 0x08 and 1 <= blk_id <= 0x0100:
+                            score += 3 if blk_id in (0x0018, 0x005C) else 2
+
+                    if score >= 2:
+                        return k16, c_st, cand_addr
+                    if best_region_match is None or score > best_region_match[0]:
+                        best_region_match = (score, k16, c_st, cand_addr)
+
+            addr += stride
+
+        if best_region_match is not None:
+            _, b_k16, b_crc, b_addr = best_region_match
+            return b_k16, b_crc, b_addr
+
+    return None
+
+
 def kombi_extract_sl7_key(
     link: FpkeCanLink,
     *,
@@ -314,7 +457,7 @@ def kombi_extract_sl7_key(
     ecu_reset_wait_s: float = 2.0,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> tuple[bytes, dict[str, Any]]:
-    """Read the 16-byte `FD11 Supplier Level 7` record from the NvM staging buffer (`0xFEDD5530` on `0310`, `0xFEDD2480` on `2220`)."""
+    """Read the 16-byte `FD11 Supplier Level 7` record from the NvM staging buffer (`0xFEDD5530` on `0310`, `0xFEDD2480` on `2220`, or auto-discovered)."""
     prof = _get_link_kombi_profile(link)
     sa1_delta = int(prof["sa1_delta"])
     reset_delta = int(prof.get("sa1_lockout_reset_delta", KOMBI_SA1_LOCKOUT_RESET_DELTA))
@@ -422,16 +565,41 @@ def kombi_extract_sl7_key(
     )
     key_16b, crc_stored, crc_calc = _unlock_sa1_and_read_20(allow_session_reset=True, restage_on_reset=True)
     if crc_stored != crc_calc or key_16b in (b"\xff" * 16, b"\x00" * 16):
-        raise RuntimeError(
-            tr(
-                f"Не удалось извлечь валидный ключ FD11 Level 7 из 0x{sl7_key_addr:08X}: "
-                f"CRC32=0x{crc_stored:08X} (ожидался 0x{crc_calc:08X}).",
-                f"Failed to extract a valid FD11 Level 7 key from 0x{sl7_key_addr:08X}: "
-                f"CRC32=0x{crc_stored:08X} (expected 0x{crc_calc:08X}).",
-            )
+        scanned = _scan_ram_for_sl7_key(
+            link,
+            fd11_id_15b=getattr(link, "_kombi_fd11_id_15b", None),
+            checked_addrs={sl7_key_addr},
+            reporter=reporter,
         )
+        if scanned is not None:
+            key_16b, crc_stored, found_sl7_addr = scanned
+            crc_calc = crc_stored
+            found_staging_addr = found_sl7_addr - 0x28
+            sl7_key_addr = found_sl7_addr
+            staging_addr = found_staging_addr
+            prof["ram_sl7_key_addr"] = found_sl7_addr
+            prof["ram_staging_addr"] = found_staging_addr
+            if found_sl7_addr not in (KOMBI_RAM_SL7_KEY_ADDR, KOMBI_2220_RAM_SL7_KEY_ADDR):
+                prof["auto_discovered_ram"] = True
+            link._kombi_sw_profile = prof
+            reporter.can_log(
+                tr(
+                    f"Найден буфер NvM staging 0x{found_staging_addr:08X} и запись FD11 SL 7 @ 0x{found_sl7_addr:08X} (CRC32=0x{crc_stored:08X}).",
+                    f"Discovered NvM staging buffer 0x{found_staging_addr:08X} and FD11 SL 7 record @ 0x{found_sl7_addr:08X} (CRC32=0x{crc_stored:08X}).",
+                )
+            )
+        else:
+            raise RuntimeError(
+                tr(
+                    f"Не удалось извлечь валидный ключ FD11 Level 7 из 0x{sl7_key_addr:08X}: "
+                    f"CRC32=0x{crc_stored:08X} (ожидался 0x{crc_calc:08X}).",
+                    f"Failed to extract a valid FD11 Level 7 key from 0x{sl7_key_addr:08X}: "
+                    f"CRC32=0x{crc_stored:08X} (expected 0x{crc_calc:08X}).",
+                )
+            )
     meta: dict[str, Any] = {
         "staging_addr": f"0x{sl7_key_addr:08X}",
+        "nvm_staging_base_addr": f"0x{staging_addr:08X}",
         "key_hex": key_16b.hex(),
         "crc32_le": f"0x{crc_stored:08X}",
         "crc32_valid": True,
@@ -833,13 +1001,58 @@ def kombi_read_raw_physical_dflash_in_session(
     return bytes(phys_data), direct_eel
 
 
+def _discover_live_kombi_eel_layout(
+    link: FpkeCanLink,
+    prof: dict[str, Any],
+    *,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> None:
+    """Query `22 FE 30` (and the CodeFlash EEL descriptor table at `SL 7`) to auto-adapt `eel_ids` and `phys_table_addr`."""
+    try:
+        fe30 = link.request_uds(b"\x22\xfe\x30", 0x62, timeout=1.5)
+    except Exception:
+        return
+    if len(fe30) < 21 or fe30[:3] != b"\x62\xfe\x30":
+        return
+    desc_table_addr = int.from_bytes(fe30[3:7], "big")
+    n_blocks = int.from_bytes(fe30[7:9], "big")
+    phys_table_addr = int.from_bytes(fe30[15:19], "big")
+    if 0xFEDC0000 <= phys_table_addr <= 0xFEDFFFFF:
+        prof["ram_eel_phys_table_addr"] = phys_table_addr
+    if not (64 <= n_blocks <= 200 and 0x00008000 <= desc_table_addr <= 0x002F0000):
+        return
+    try:
+        raw_desc = _read_chunked_0x23(link, desc_table_addr, n_blocks * 4, chunk_size=256)
+    except Exception:
+        return
+    if len(raw_desc) != n_blocks * 4:
+        return
+    live_ids: dict[int, int] = {}
+    for i in range(n_blocks):
+        eid, esz = struct.unpack_from("<HH", raw_desc, i * 4)
+        if eid != i + 1 or not (3 <= esz <= 512):
+            return
+        live_ids[eid] = esz
+    if 0x0063 in live_ids and 0x0068 in live_ids:
+        cur_ids = prof.get("eel_ids") or {}
+        if live_ids != cur_ids:
+            prof["eel_ids"] = live_ids
+            prof["eel_logical_size"] = sum(live_ids.values())
+            reporter.can_log(
+                tr(
+                    f"Автоопределение таблицы EEL (22 FE30 @ 0x{desc_table_addr:08X}): {n_blocks} блоков ({prof['eel_logical_size']} Б), таблица смещений RAM @ 0x{phys_table_addr:08X}.",
+                    f"Auto-discovered EEL layout (22 FE30 @ 0x{desc_table_addr:08X}): {n_blocks} blocks ({prof['eel_logical_size']} B), RAM offset table @ 0x{phys_table_addr:08X}.",
+                )
+            )
+
+
 def kombi_read_all_eel_in_session(
     link: FpkeCanLink,
     *,
     read_physical_dflash: bool = False,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> tuple[bytes, bytes, dict[str, Any]]:
-    """Read all EEL DataFlash records (`132` records / `9,533` B on `0310`, `130` records / `8,334` B on `2220`) at `SL 7`.
+    """Read all EEL DataFlash records (`132` records / `9,533` B on `0310`, `130` records / `8,334` B on `2220`, or dynamic) at `SL 7`.
 
     Returns `(dflash_64k_eel_t01, eel_logical_bytes, meta)`.
     """
@@ -847,6 +1060,9 @@ def kombi_read_all_eel_in_session(
         kombi_ensure_sl7(link, wake_seconds=0.5, reporter=reporter)
 
     prof = _get_link_kombi_profile(link)
+    if prof.get("auto_discovered_ram") or not getattr(link, "_kombi_fe30_checked", False):
+        link._kombi_fe30_checked = True
+        _discover_live_kombi_eel_layout(link, prof, reporter=reporter)
     eel_ids: dict[int, int] = dict(prof["eel_ids"])
     n_blocks = len(eel_ids)
     logical_total = int(prof["eel_logical_size"])
@@ -913,8 +1129,9 @@ def kombi_read_all_eel_in_session(
 
     if eel_ids[0x0064] > 0x2A:
         tail_sz = eel_ids[0x0064] - 0x2A
-        tail_64 = _read_chunked_0x23(link, KOMBI_EEL_VIRTUAL_BASE | (0x0064 << 8) | 0x2A, tail_sz, chunk_size=tail_sz)
-        eel_0064[0x2A : 0x2A + tail_sz] = tail_64
+        with contextlib.suppress(Exception):
+            tail_64 = _read_chunked_0x23(link, KOMBI_EEL_VIRTUAL_BASE | (0x0064 << 8) | 0x2A, tail_sz, chunk_size=tail_sz)
+            eel_0064[0x2A : 0x2A + tail_sz] = tail_64
 
     # 2. Read live EEL physical word-offset table in RAM (n_blocks x 2 bytes)
     phys_word_offsets: tuple[int, ...] = (0,) * n_blocks
@@ -924,7 +1141,7 @@ def kombi_read_all_eel_in_session(
         if len(idx_raw) == phys_tbl_bytes:
             phys_word_offsets = struct.unpack(f"<{n_blocks}H", idx_raw)
 
-    # 3. Read all EEL records (1..132 on 0310, 1..130 on 2220)
+    # 3. Read all EEL records (1..132 on 0310, 1..130 on 2220, or dynamic)
     records: dict[int, bytes] = {}
     logical_concat = bytearray()
     phys_map: dict[str, dict[str, Any]] = {}
@@ -948,6 +1165,7 @@ def kombi_read_all_eel_in_session(
             vaddr0 = KOMBI_EEL_VIRTUAL_BASE | (eel_id << 8) | 0x00
             try:
                 raw_rec = _read_chunked_0x23(link, vaddr0, eel_size, chunk_size=128)
+                raw_rec = struct.pack("<H", eel_size) + bytes(raw_rec[2:])
             except Exception:
                 vaddr2 = KOMBI_EEL_VIRTUAL_BASE | (eel_id << 8) | 0x02
                 try:
@@ -980,7 +1198,9 @@ def kombi_read_all_eel_in_session(
         cur_immo_mode = r68_cur[0x4B] if len(r68_cur) > 0x4B else 0x01
         unlock_method = prof.get("immo_mode0_unlock_method", "direct_0x3d_ef00684b")
         can_read_phys = (
-            bool(prof["can_switch_immo_mode0_at_sl7"]) and unlock_method == "direct_0x3d_ef00684b"
+            bool(prof["can_switch_immo_mode0_at_sl7"])
+            and unlock_method == "direct_0x3d_ef00684b"
+            and not prof.get("auto_discovered_ram")
         ) or cur_immo_mode == 0x00
         if can_read_phys:
             phys_mode0_state: dict[str, Any] = {}

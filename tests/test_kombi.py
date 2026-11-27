@@ -1158,6 +1158,104 @@ def test_kombi_2220_75byte_eel68_kessy_bit7_and_uflash_guard() -> None:
     assert r68_after2[0x4D:0x80] == b"\xff" * 51
 
 
+def test_kombi_6p0920740a_sw1422_auto_discovers_ram_staging_and_fe30_eel_layout(tmp_path: Path) -> None:
+    """When a V850E2 Kombi cluster (e.g. 6P0920740A SW 1422) has its NvM staging buffer at a shifted RAM address
+    (and 0xFEDD5530 holds a timing table like `64 00 fa 00 f4 01...`), `kombi_extract_sl7_key` auto-scans RAM,
+    locates the NvM staging buffer + SL 7 key, authenticates SL 7, queries `22 FE 30` for the live EEL layout,
+    and reads the full DataFlash cleanly."""
+    from contitool.can.kombi import KOMBI_2220_RAM_SL7_KEY_ADDR, kombi_ensure_sl7, kombi_read_all_eel_in_session
+    from contitool.core.kombi import analyze_kombi_dflash, detect_kombi_files, is_kombi_ident
+
+    assert is_kombi_ident([{"did": "F187", "value": "6P0920740A"}, {"did": "F189", "value": "1422"}]) is True
+
+    shifted_staging_addr = 0xFEDD1848
+    shifted_sl7_addr = shifted_staging_addr + 0x28  # 0xFEDD1870
+    shifted_phys_tbl_addr = 0xFEDC7900
+    desc_tbl_addr = 0x00015320
+
+    class Fake6P0KombiLink(_FakeKombiCanLink):
+        def __init__(self) -> None:
+            super().__init__(_build_synthetic_kombi_records())
+            # Custom EEL layout on SW 1422: 131 blocks, with block 3 sized 190 B instead of 249 B
+            self.custom_eel_ids = {k: v for k, v in EEL_KOMBI_0310_IDS.items() if k <= 131}
+            self.custom_eel_ids[3] = 190
+            self.records[3] = struct.pack("<H", 190) + bytes(i & 0xFF for i in range(188))
+            del self.records[132]
+
+        def uds_request(self, req: bytes, timeout: float = 2.0) -> bytes:
+            if req == bytes.fromhex("22f187"):
+                return b"\x62\xf1\x876P0920740A  "
+            if req == bytes.fromhex("22f189"):
+                return b"\x62\xf1\x891422"
+            if req == bytes.fromhex("22fe30"):
+                # 62 FE 30 + desc_addr(4B) + n_blocks(2B) + dflash_base(4B) + 0003 + phys_tbl_addr(4B) + 000A
+                return (
+                    b"\x62\xfe\x30"
+                    + desc_tbl_addr.to_bytes(4, "big")
+                    + len(self.custom_eel_ids).to_bytes(2, "big")
+                    + (0x02000000).to_bytes(4, "big")
+                    + b"\x00\x03"
+                    + shifted_phys_tbl_addr.to_bytes(4, "big")
+                    + b"\x00\x0a"
+                )
+            if req[:2] == bytes.fromhex("2344") and len(req) == 10:
+                addr, size = struct.unpack(">II", req[2:10])
+                # At 0xFEDD5530, return the exact timing constant table seen on real 6P0920740A SW 1422
+                if addr == KOMBI_RAM_SL7_KEY_ADDR and size == 20:
+                    return b"\x63" + bytes.fromhex("6400fa00f401000032006400c800f40100001500")
+                if addr == KOMBI_2220_RAM_SL7_KEY_ADDR and size == 20:
+                    return b"\x63" + (b"\x00" * 20)
+                # Descriptor table in CodeFlash @ 0x00015320
+                if desc_tbl_addr <= addr and addr + size <= desc_tbl_addr + len(self.custom_eel_ids) * 4:
+                    tbl = bytearray()
+                    for eid, esz in sorted(self.custom_eel_ids.items()):
+                        tbl.extend(struct.pack("<HH", eid, esz))
+                    off = addr - desc_tbl_addr
+                    return b"\x63" + bytes(tbl[off : off + size])
+                if addr == shifted_phys_tbl_addr:
+                    return b"\x63" + (b"\x20\x00" * (size // 2))
+                # Any RAM read in 0xFEDD0000..0xFEDE0000 returns a memory image containing the NvM header + shifted staging buffer
+                if 0xFEDD0000 <= addr and addr + size <= 0xFEDE0000:
+                    if self.sa_level < 1 and self.sl_level < 7:
+                        return bytes.fromhex("7f2333")
+                    out = bytearray(size)
+                    for i in range(size):
+                        cur = addr + i
+                        # 8-byte NvM manager state header at shifted_staging_addr - 8: block 0x0018, status 0x08
+                        if shifted_staging_addr - 8 <= cur < shifted_staging_addr:
+                            hdr = bytes.fromhex("1800000000080000")
+                            out[i] = hdr[cur - (shifted_staging_addr - 8)]
+                        elif shifted_staging_addr <= cur < shifted_staging_addr + len(self.ram_staging):
+                            out[i] = self.ram_staging[cur - shifted_staging_addr]
+                    return b"\x63" + bytes(out)
+            return super().uds_request(req, timeout=timeout)
+
+    link = Fake6P0KombiLink()
+    acc = kombi_ensure_sl7(link, wake_seconds=0.0)
+    assert acc["supplier_level"] == 7
+    assert acc["staging_addr"] == f"0x{shifted_sl7_addr:08X}"
+    assert acc["nvm_staging_base_addr"] == f"0x{shifted_staging_addr:08X}"
+
+    df_bytes, logical_bytes, meta = kombi_read_all_eel_in_session(link, read_physical_dflash=True)
+    assert len(df_bytes) == 65536
+    assert len(logical_bytes) == sum(link.custom_eel_ids.values())
+    assert meta["eel_blocks_read"] == 131
+
+    sdir = tmp_path / "6p0_read"
+    sdir.mkdir()
+    (sdir / "Dflash.bin").write_bytes(df_bytes)
+    (sdir / "EelLogical.bin").write_bytes(logical_bytes)
+    det = detect_kombi_files([sdir])
+    assert det["dflash"] == sdir / "Dflash.bin"
+    assert det["eel_logical"] == sdir / "EelLogical.bin"
+
+    info = analyze_kombi_dflash(df_bytes)
+    assert info["metadata"]["vin"] == "XW8ZZZ5NZJG235992"
+    info_from_logical = analyze_kombi_dflash(logical_bytes)
+    assert info_from_logical["metadata"]["vin"] == "XW8ZZZ5NZJG235992"
+
+
+
 
 
 

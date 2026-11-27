@@ -357,7 +357,7 @@ def is_kombi_ident(ident: list[dict[str, str]] | dict[str, Any] | None) -> bool:
         return False
     if "VDDMQB" in odx or "EV_DASHBOARDVDD" in odx:
         return True
-    if pn in KOMBI_VERIFIED_PART_NUMBERS or pn.startswith(("5NA920740", "8V0920860")):
+    if pn in KOMBI_VERIFIED_PART_NUMBERS or pn.startswith(("5NA920740", "8V0920860", "6P0920740")):
         return True
     if len(pn) >= 9 and pn[3:6] == "920" and sw in KOMBI_VERIFIED_SW_VERSIONS:
         return True
@@ -445,29 +445,39 @@ def kombi_eel_layout(
     *,
     ids: dict[int, int] | None = None,
 ) -> dict[str, Any]:
-    """Return the 28-VB EEL T01 container layout descriptor for Kombi V850E2 (`0310` 132-record or `2220` 130-record)."""
-    chosen_ids = ids
+    """Return the 28-VB EEL T01 container layout descriptor for Kombi V850E2 (`0310` 132-record, `2220` 130-record, or dynamic)."""
+    chosen_ids = dict(ids) if ids is not None else None
     if chosen_ids is None and dflash is not None and len(dflash) == KOMBI_DFLASH_SYNTH_SIZE:
         lay_0310 = {"vb": 0x800, "n_vb": 28, "base": 0, "threshold": 8, "ids": EEL_KOMBI_0310_IDS}
         lay_2220 = {"vb": 0x800, "n_vb": 28, "base": 0, "threshold": 8, "ids": EEL_KOMBI_2220_IDS}
         _, lat_0310 = eel_parse_pool(lay_0310, dflash)
         _, lat_2220 = eel_parse_pool(lay_2220, dflash)
+        ok_0310 = sum(
+            1
+            for ident, (_vb, top, _ref) in lat_0310.items()
+            if int.from_bytes(dflash[top : top + 2], "little") == EEL_KOMBI_0310_IDS.get(ident, -1)
+        )
+        ok_2220 = sum(
+            1
+            for ident, (_vb, top, _ref) in lat_2220.items()
+            if int.from_bytes(dflash[top : top + 2], "little") == EEL_KOMBI_2220_IDS.get(ident, -1)
+        )
         has_high_id = any(ident > 130 for ident in lat_0310)
-        if not has_high_id and lat_2220:
-            ok_0310 = sum(
-                1
-                for ident, (_vb, top, _ref) in lat_0310.items()
-                if int.from_bytes(dflash[top : top + 2], "little") == EEL_KOMBI_0310_IDS.get(ident, -1)
-            )
-            ok_2220 = sum(
-                1
-                for ident, (_vb, top, _ref) in lat_2220.items()
-                if int.from_bytes(dflash[top : top + 2], "little") == EEL_KOMBI_2220_IDS.get(ident, -1)
-            )
-            if ok_2220 > ok_0310:
-                chosen_ids = EEL_KOMBI_2220_IDS
+        if not has_high_id and lat_2220 and ok_2220 > ok_0310:
+            chosen_ids = dict(EEL_KOMBI_2220_IDS)
+            lat_win = lat_2220
+        else:
+            chosen_ids = dict(EEL_KOMBI_0310_IDS)
+            lat_win = lat_0310
+        # Adapt to self-describing `<H` record headers from other V850E2 SW revisions (e.g. 6P0 920 740 A SW 1422)
+        if max(ok_0310, ok_2220) >= 32:
+            for ident, (_vb, top, _ref) in lat_win.items():
+                if top + 2 <= len(dflash):
+                    hdr_sz = int.from_bytes(dflash[top : top + 2], "little")
+                    if 3 <= hdr_sz <= 512:
+                        chosen_ids[ident] = hdr_sz
     if chosen_ids is None:
-        chosen_ids = EEL_KOMBI_0310_IDS
+        chosen_ids = dict(EEL_KOMBI_0310_IDS)
     return {
         "vb": 0x800,
         "n_vb": 28,
@@ -483,6 +493,7 @@ def _choose_kombi_eel_ids_for_records(
 ) -> dict[int, int]:
     if eel_ids is not None:
         return dict(eel_ids)
+    base_ids = dict(EEL_KOMBI_0310_IDS)
     if 131 not in records and 132 not in records:
         r64 = records.get(0x64)
         r66 = records.get(0x66)
@@ -493,8 +504,18 @@ def _choose_kombi_eel_ids_for_records(
             or (r03 is not None and len(r03) in (174, 172))
             or len(records) == len(EEL_KOMBI_2220_IDS)
         ):
-            return dict(EEL_KOMBI_2220_IDS)
-    return dict(EEL_KOMBI_0310_IDS)
+            base_ids = dict(EEL_KOMBI_2220_IDS)
+    # If a full dynamic record set (>= 64 records, each with a matching `<H` header) is passed, adapt individual block sizes
+    if len(records) >= 64 and all(
+        len(raw) >= 3 and int.from_bytes(raw[:2], "little") == len(raw) for raw in records.values()
+    ):
+        for ident, raw in records.items():
+            base_ids[ident] = len(raw)
+        max_rec_id = max(records)
+        if max_rec_id < max(base_ids):
+            for k in [k for k in base_ids if k > max_rec_id]:
+                del base_ids[k]
+    return base_ids
 
 
 def _build_empty_eel_t01_pool(first_rec_1: bytes, n_vb: int = 28, vb_size: int = 0x800) -> bytes:
@@ -546,22 +567,41 @@ def build_kombi_eel_dflash(
 
 
 def unpack_kombi_logical_eel(blob: bytes) -> dict[int, bytes]:
-    """Unpack a contiguous `9,533`-byte (`SW 0310`) or `8,334`-byte (`SW 2220`) logical EEL dump into `{eel_id: raw}`."""
+    """Unpack a contiguous `9,533`-byte (`SW 0310`), `8,334`-byte (`SW 2220`), or self-describing `<H`-prefixed logical EEL dump."""
     if len(blob) == KOMBI_EEL_LOGICAL_SIZE:
-        target_ids = EEL_KOMBI_0310_IDS
+        target_ids: dict[int, int] | None = EEL_KOMBI_0310_IDS
     elif len(blob) == KOMBI_EEL_2220_LOGICAL_SIZE:
         target_ids = EEL_KOMBI_2220_IDS
     else:
-        raise ValueError(
-            f"Expected {KOMBI_EEL_LOGICAL_SIZE}-byte (SW 0310) or {KOMBI_EEL_2220_LOGICAL_SIZE}-byte (SW 2220) logical EEL image, got {len(blob)} bytes"
-        )
-    records: dict[int, bytes] = {}
-    off = 0
-    for ident, sz in sorted(target_ids.items()):
-        rec = bytes(blob[off : off + sz])
-        records[ident] = struct.pack("<H", sz) + rec[2:]
-        off += sz
-    return records
+        target_ids = None
+    if target_ids is not None:
+        records: dict[int, bytes] = {}
+        off = 0
+        for ident, sz in sorted(target_ids.items()):
+            rec = bytes(blob[off : off + sz])
+            records[ident] = struct.pack("<H", sz) + rec[2:]
+            off += sz
+        return records
+
+    # Self-describing `<H`-prefixed logical stream (from dynamic `22 FE 30` EEL table discovery)
+    if 4096 <= len(blob) <= 32768:
+        dyn_records: dict[int, bytes] = {}
+        off = 0
+        ident = 1
+        while off + 2 <= len(blob) and ident <= 256:
+            sz = int.from_bytes(blob[off : off + 2], "little")
+            if not (3 <= sz <= 512) or off + sz > len(blob):
+                dyn_records.clear()
+                break
+            dyn_records[ident] = bytes(blob[off : off + sz])
+            off += sz
+            ident += 1
+        if off == len(blob) and len(dyn_records) >= 64 and 0x0063 in dyn_records and 0x0068 in dyn_records:
+            return dyn_records
+
+    raise ValueError(
+        f"Expected {KOMBI_EEL_LOGICAL_SIZE}-byte (SW 0310) or {KOMBI_EEL_2220_LOGICAL_SIZE}-byte (SW 2220) logical EEL image, got {len(blob)} bytes"
+    )
 
 
 def _kombi_physical_active_vbs(raw_32k: bytes) -> list[tuple[int, int]]:
@@ -666,13 +706,16 @@ def unpack_kombi_physical_dflash(raw_32k: bytes) -> dict[int, bytes]:
 
 
 def normalize_kombi_dflash_input(data: bytes) -> bytes:
-    """Convert a 32 KiB physical DataFlash dump, 9,533 B / 8,334 B logical EEL dump, or 64 KiB EEL T01 `Dflash.bin` into a 64 KiB EEL T01 image."""
+    """Convert a 32 KiB physical DataFlash dump, logical EEL dump, or 64 KiB EEL T01 `Dflash.bin` into a 64 KiB EEL T01 image."""
     if len(data) in KOMBI_EEL_LOGICAL_SIZES:
         return build_kombi_eel_dflash(unpack_kombi_logical_eel(data))
     if len(data) == KOMBI_DFLASH_POOL_SIZE and is_kombi_dflash(data):
         return build_kombi_eel_dflash(unpack_kombi_physical_dflash(data))
     if len(data) == KOMBI_DFLASH_SYNTH_SIZE and is_kombi_dflash(data):
         return bytes(data)
+    if 4096 <= len(data) < KOMBI_DFLASH_POOL_SIZE and is_kombi_dflash(data):
+        recs = unpack_kombi_logical_eel(data)
+        return build_kombi_eel_dflash(recs, eel_ids={k: len(v) for k, v in recs.items()})
     raise ValueError(
         tr(
             f"Некорректный дамп DataFlash Kombi ({len(data)} Б): ожидается 32 768 Б (физический DataFlash), 65 536 Б (Dflash.bin) или 9 533 / 8 334 Б (EelLogical.bin).",
@@ -682,7 +725,7 @@ def normalize_kombi_dflash_input(data: bytes) -> bytes:
 
 
 def is_kombi_dflash(data: bytes) -> bool:
-    """True when `data` is a valid Kombi V850E2 DataFlash dump (`32 KiB` physical, `9,533 B` / `8,334 B` logical EEL, or `64 KiB` EEL T01)."""
+    """True when `data` is a valid Kombi V850E2 DataFlash dump (`32 KiB` physical, logical EEL, or `64 KiB` EEL T01)."""
     if len(data) in KOMBI_EEL_LOGICAL_SIZES:
         target_ids = EEL_KOMBI_2220_IDS if len(data) == KOMBI_EEL_2220_LOGICAL_SIZE else EEL_KOMBI_0310_IDS
         off = 0
@@ -704,7 +747,7 @@ def is_kombi_dflash(data: bytes) -> bool:
     if len(data) == KOMBI_DFLASH_SYNTH_SIZE and is_fpke_dflash(data):
         lay = kombi_eel_layout(data)
         _blocks, latest = eel_parse_pool(lay, data)
-        if not latest or any(ident > 132 for ident in latest):
+        if not latest or any(ident > 160 for ident in latest):
             return False
         ok_cnt = sum(
             1
@@ -712,6 +755,12 @@ def is_kombi_dflash(data: bytes) -> bool:
             if int.from_bytes(data[top : top + 2], "little") == lay["ids"].get(ident, -1)
         )
         return ok_cnt >= 100
+    if 4096 <= len(data) < KOMBI_DFLASH_POOL_SIZE:
+        try:
+            recs = unpack_kombi_logical_eel(data)
+            return len(recs) >= 100 and 0x0063 in recs and 0x0068 in recs
+        except Exception:
+            return False
     return False
 
 
@@ -742,7 +791,7 @@ def detect_kombi_files(paths: list[Path]) -> dict[str, Path]:
             if is_kombi_dflash(raw):
                 found.setdefault("physical_dflash", p)
                 found.setdefault("dflash", p)
-        elif sz in KOMBI_EEL_LOGICAL_SIZES:
+        elif sz in KOMBI_EEL_LOGICAL_SIZES or (4096 <= sz < KOMBI_DFLASH_POOL_SIZE and "logical" in low):
             raw = p.read_bytes()
             if is_kombi_dflash(raw):
                 found.setdefault("eel_logical", p)
