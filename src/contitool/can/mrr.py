@@ -174,6 +174,7 @@ class MrrCanLink(J533CanLink):
         )
         self.via_gateway = bool(via_gateway)
         self.sw_profile = sw_profile.strip().upper() if sw_profile else None
+        self._detected_sw: str | None = None
         self.xcp_tx_id = MRR_XCP_TX_ID
         self.xcp_rx_id = MRR_XCP_RX_ID
         self.fast_can_id = MRR_FAST_CAN_ID
@@ -213,7 +214,18 @@ class MrrCanLink(J533CanLink):
     ) -> bytes:
         """Send UDS request on `0x757/0x7C1`, routing via `uds_session` on `uds_only`/`nonraw` D-PDU buses."""
         if self._should_use_hw_uds():
-            with self.uds_session():
+            with self.uds_session() as active:
+                if not active and getattr(self.bus, "uds_only", False):
+                    refusal = str(getattr(self.bus, "uds_refusal", "") or "").strip()
+                    detail = f" ({refusal})" if refusal else ""
+                    raise TimeoutError(
+                        tr(
+                            f"Адаптер D-PDU не смог открыть аппаратный канал UDS ISO-TP для 13 ACC Radar "
+                            f"(0x{self.UDS_TX_ID:03X} → 0x{self.UDS_RX_ID:03X}){detail}.",
+                            f"D-PDU adapter could not open a hardware UDS ISO-TP link for 13 ACC Radar "
+                            f"(0x{self.UDS_TX_ID:03X} → 0x{self.UDS_RX_ID:03X}){detail}.",
+                        )
+                    )
                 return super().request_uds(
                     uds_payload,
                     expected_sid,
@@ -271,6 +283,7 @@ class MrrCanLink(J533CanLink):
                 )
             )
         passport["raw_dids"] = raw_dids
+        self._detected_sw = str(passport.get("sw_version") or "").strip().upper() or None
         profile = mrr_detect_profile(passport, sw_version=self.sw_profile or "")
         passport["detected_profile"] = profile["sw"]
         passport["profile_verified"] = bool(profile.get("verified", False))
@@ -497,14 +510,24 @@ class MrrCanLink(J533CanLink):
             )
         )
         self.request_uds(b"\x10\x03", 0x50, timeout=1.5)
+        live_sw = (self._detected_sw or self.sw_profile or "").strip().upper()
+        if not live_sw:
+            with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
+                live_sw = _clean_ascii(self.read_did(0xF189, timeout=1.0)).strip().upper()
+
         unlocked = False
         used_addend = MRR_LOGIN_XCP_GATE
         last_nrc_35: UdsNegativeResponse | None = None
+        last_err: Exception | None = None
+        entered_4f = False
 
         for session_id, addend in ((0x03, MRR_LOGIN_XCP_GATE), (0x4F, MRR_DEV_ADDEND_0192)):
+            if session_id == 0x4F and last_nrc_35 is not None and live_sw != "0192":
+                break
             try:
                 if session_id != 0x03:
                     self.request_uds(bytes([0x10, session_id]), 0x50, timeout=1.2)
+                    entered_4f = True
                 seed_resp = self.request_uds(b"\x27\x03", 0x67, timeout=1.2)
                 if len(seed_resp) >= 6:
                     seed = int.from_bytes(seed_resp[2:6], "big")
@@ -518,14 +541,19 @@ class MrrCanLink(J533CanLink):
                     used_addend = addend
                     break
             except UdsNegativeResponse as exc:
-                if exc.nrc == 0x37:
+                last_err = exc
+                if exc.nrc in (0x36, 0x37):
+                    if entered_4f:
+                        with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
+                            self.request_uds(b"\x10\x03", 0x50, timeout=1.2)
+                    nrc_name = "exceededNumberOfAttempts" if exc.nrc == 0x36 else "requiredTimeDelayNotExpired"
                     raise RuntimeError(
                         tr(
-                            "Доступ SecurityAccess (27 03/04) для активации XcpGate заблокирован таймером "
-                            "(NRC 0x37 requiredTimeDelayNotExpired): подождите ~10 минут при включённом питании "
+                            f"Доступ SecurityAccess (27 03/04) для активации XcpGate заблокирован таймером "
+                            f"(NRC 0x{exc.nrc:02X} {nrc_name}): подождите ~10 минут при включённом питании "
                             "радара (не выключая +12 В) и повторите попытку.",
-                            "SecurityAccess (27 03/04) for XcpGate activation is locked out by time delay "
-                            "(NRC 0x37 requiredTimeDelayNotExpired): wait ~10 minutes with radar power ON "
+                            f"SecurityAccess (27 03/04) for XcpGate activation is locked out by time delay "
+                            f"(NRC 0x{exc.nrc:02X} {nrc_name}): wait ~10 minutes with radar power ON "
                             "(do not cycle +12 V) and retry.",
                         )
                     ) from exc
@@ -533,18 +561,31 @@ class MrrCanLink(J533CanLink):
                     last_nrc_35 = exc
                     continue
                 continue
-            except (*TRANSPORT_ERRORS, UnexpectedUdsResponse):
+            except (*TRANSPORT_ERRORS, UnexpectedUdsResponse) as exc:
+                last_err = exc
                 continue
 
-        if not unlocked and last_nrc_35 is not None:
+        if entered_4f and not unlocked:
+            with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
+                self.request_uds(b"\x10\x03", 0x50, timeout=1.2)
+
+        if not unlocked:
+            if last_nrc_35 is not None:
+                raise RuntimeError(
+                    tr(
+                        "Радар 13 ACC отклонил ключ SecurityAccess (27 04, NRC 0x35 invalidKey) при активации XcpGate: "
+                        "логин доступа не принят текущей версией ПО (повторные неверные попытки включат блокировку NRC 0x36/0x37).",
+                        "13 ACC Radar rejected the SecurityAccess key (27 04, NRC 0x35 invalidKey) while enabling XcpGate: "
+                        "the login key was not accepted by this firmware (repeated failed attempts will trigger NRC 0x36/0x37 lockout).",
+                    )
+                ) from last_nrc_35
+            detail = f": {last_err}" if last_err is not None else ""
             raise RuntimeError(
                 tr(
-                    "Радар 13 ACC отклонил ключ SecurityAccess (27 04, NRC 0x35 invalidKey) при активации XcpGate: "
-                    "логин доступа не принят текущей версией ПО (повторные неверные попытки включат блокировку NRC 0x37).",
-                    "13 ACC Radar rejected the SecurityAccess key (27 04, NRC 0x35 invalidKey) while enabling XcpGate: "
-                    "the login key was not accepted by this firmware (repeated failed attempts will trigger NRC 0x37 lockout).",
+                    f"Не удалось разблокировать SecurityAccess (27 03/04) радара 13 ACC перед записью XcpGate (DID 0x0902){detail}.",
+                    f"Failed to unlock 13 ACC Radar SecurityAccess (27 03/04) before writing XcpGate (DID 0x0902){detail}.",
                 )
-            ) from last_nrc_35
+            ) from last_err
 
         orig_0902 = 0x00
         with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
@@ -1206,6 +1247,7 @@ class MrrCanLink(J533CanLink):
         sector_reports: list[dict[str, Any]] = []
 
         for (addr, data), (_, pre_data, _, _) in zip(sectors, pre_reads):
+            self.verify_region_checksum(addr, pre_data)
             if backup_dir is not None:
                 bkp_dir = Path(backup_dir)
                 bkp_dir.mkdir(parents=True, exist_ok=True)
@@ -1270,118 +1312,120 @@ class MrrCanLink(J533CanLink):
             orig_sector_drv = saved_flash_ram[2][1]
             orig_stage = saved_flash_ram[3][1]
             original_payload = self.xcp_read_memory(MRR_DRIVER_ADDRESS, len(fast_wr_drv))
+            reporter.check_cancelled()
             sram_written = False
-            try:
-                self.xcp_configure_sram_exec(True, profile=prof)
-                sram_written = True
-                with self.suspend_rx_trace():
-                    self._write_fast_ram_raw(
-                        [
-                            ("flash_drv_low", flash_drv_low_addr, drv_bytes[:MRR_FLASH_DRIVER_HALF_SIZE]),
-                            (
-                                "flash_drv_high",
-                                flash_drv_high_addr,
-                                drv_bytes[MRR_FLASH_DRIVER_HALF_SIZE:MRR_FLASH_DRIVER_SIZE],
-                            ),
-                            ("flash_sector_drv", sector_drv_addr, padded_sector_drv),
-                        ],
-                        profile=prof,
-                        timeout_loops=timeout_loops,
-                        reporter=reporter,
-                    )
-                self.xcp_write_ram(synch_slot, sector_drv_addr.to_bytes(4, "big"), ram_end=ram_end)
-                for addr, data, entry in to_write:
-                    reporter.info(
-                        tr(
-                            f"Стирание и прошивка сектора Code Flash 0x{addr:08X} ({len(data) // 1024} КиБ)…",
-                            f"Erasing and programming Code Flash sector 0x{addr:08X} ({len(data) // 1024} KiB)…",
-                        )
-                    )
-                    ctrl_params = (
-                        addr.to_bytes(4, "big")
-                        + len(data).to_bytes(4, "big")
-                        + (0xFFFFFFFF).to_bytes(4, "big")
-                        + (0).to_bytes(4, "big")
-                        + timeout_loops.to_bytes(4, "big")
-                    )
-                    self.xcp_write_ram(MRR_DRIVER_CONTROL + 0x28, ctrl_params, ram_end=ram_end)
-                    self.xcp_write_ram(MRR_DRIVER_CONTROL + 0x60, b"\x00" * 8, ram_end=ram_end)
+            with reporter.uninterruptible():
+                try:
+                    self.xcp_configure_sram_exec(True, profile=prof)
+                    sram_written = True
                     with self.suspend_rx_trace():
-                        dto, batches, stream_sec = self._stream_on_ready(
-                            data,
-                            addr,
-                            count_in_bytes=True,
-                            first_ready_timeout=20.0,
-                            batch_timeout=5.0,
-                            label=f"flash_0x{addr:06X}",
+                        self._write_fast_ram_raw(
+                            [
+                                ("flash_drv_low", flash_drv_low_addr, drv_bytes[:MRR_FLASH_DRIVER_HALF_SIZE]),
+                                (
+                                    "flash_drv_high",
+                                    flash_drv_high_addr,
+                                    drv_bytes[MRR_FLASH_DRIVER_HALF_SIZE:MRR_FLASH_DRIVER_SIZE],
+                                ),
+                                ("flash_sector_drv", sector_drv_addr, padded_sector_drv),
+                            ],
+                            profile=prof,
+                            timeout_loops=timeout_loops,
                             reporter=reporter,
                         )
-                    status_words = self.xcp_read_memory(MRR_DRIVER_CONTROL + 0x30, 8)
-                    wd_words = self.xcp_read_memory(MRR_DRIVER_CONTROL + 0x60, 8)
-                    drv_status = int.from_bytes(status_words[0:4], "big")
-                    drv_detail = int.from_bytes(status_words[4:8], "big")
-                    wd_kicks = int.from_bytes(wd_words[0:4], "big")
-                    wd_challenge = int.from_bytes(wd_words[4:8], "big")
-                    entry["dto"] = dto.hex()
-                    entry["driver_status"] = drv_status
-                    entry["driver_detail"] = f"0x{drv_detail:08X}"
-                    entry["wd_kick_count"] = wd_kicks
-                    entry["last_wd_challenge"] = f"0x{wd_challenge:08X}"
-                    entry["batches"] = batches
-                    entry["stream_elapsed_sec"] = round(stream_sec, 3)
-                    entry["stream_bytes_per_sec"] = round(len(data) / stream_sec) if stream_sec else 0
-                    if dto[:2] != b"\xFF\x00" or drv_status != 0:
-                        raise RuntimeError(
-                            f"Flash sector write failed at 0x{addr:08X}: "
-                            f"dto={dto.hex()} status=0x{drv_status:X} detail=0x{drv_detail:08X}"
+                    self.xcp_write_ram(synch_slot, sector_drv_addr.to_bytes(4, "big"), ram_end=ram_end)
+                    for addr, data, entry in to_write:
+                        reporter.info(
+                            tr(
+                                f"Стирание и прошивка сектора Code Flash 0x{addr:08X} ({len(data) // 1024} КиБ)…",
+                                f"Erasing and programming Code Flash sector 0x{addr:08X} ({len(data) // 1024} KiB)…",
+                            )
                         )
-                    entry["erased_and_written"] = True
-            finally:
-                had_exc = sys.exc_info()[0] is not None
-                cleanup_err: Exception | None = None
-                cleanup_steps: list[tuple[str, Any]] = [
-                    ("restore_synch_pre", lambda: self.xcp_write_ram(synch_slot, original_slot, ram_end=ram_end)),
-                ]
-                if sram_written:
-                    def _restore_driver_sram() -> None:
+                        ctrl_params = (
+                            addr.to_bytes(4, "big")
+                            + len(data).to_bytes(4, "big")
+                            + (0xFFFFFFFF).to_bytes(4, "big")
+                            + (0).to_bytes(4, "big")
+                            + timeout_loops.to_bytes(4, "big")
+                        )
+                        self.xcp_write_ram(MRR_DRIVER_CONTROL + 0x28, ctrl_params, ram_end=ram_end)
+                        self.xcp_write_ram(MRR_DRIVER_CONTROL + 0x60, b"\x00" * 8, ram_end=ram_end)
                         with self.suspend_rx_trace():
-                            self._write_fast_ram_raw(
-                                [
-                                    ("restore_sector_drv", sector_drv_addr, orig_sector_drv),
-                                    ("restore_stage", MRR_FLASH_STAGE_BUFFER, orig_stage),
-                                    ("restore_drv_high", flash_drv_high_addr, orig_drv_high),
-                                    ("restore_drv_low", flash_drv_low_addr, orig_drv_low),
-                                ],
-                                profile=prof,
-                                timeout_loops=timeout_loops,
+                            dto, batches, stream_sec = self._stream_on_ready(
+                                data,
+                                addr,
+                                count_in_bytes=True,
+                                first_ready_timeout=20.0,
+                                batch_timeout=5.0,
+                                label=f"flash_0x{addr:06X}",
                                 reporter=reporter,
                             )
-
-                    cleanup_steps.append(("restore_flash_drv_sram", _restore_driver_sram))
-                cleanup_steps.extend(
-                    [
-                        ("restore_synch_mid", lambda: self.xcp_write_ram(synch_slot, original_slot, ram_end=ram_end)),
-                        ("disable_sram_exec", lambda: self.xcp_configure_sram_exec(False, profile=prof)),
-                        ("restore_synch_post", lambda: self.xcp_write_ram(synch_slot, original_slot, ram_end=ram_end)),
-                        ("restore_arg_state", lambda: self.xcp_write_ram(r3_arg_state, original_arg_state, ram_end=ram_end)),
-                        ("restore_ctrl", lambda: self.xcp_write_ram(MRR_DRIVER_CONTROL, original_control, ram_end=ram_end)),
-                        ("restore_payload", lambda: self.xcp_write_ram(MRR_DRIVER_ADDRESS, original_payload, ram_end=ram_end)),
-                    ]
-                )
-                for step_name, fn in cleanup_steps:
-                    try:
-                        fn()
-                    except Exception as exc:  # noqa: BLE001
-                        if cleanup_err is None:
-                            cleanup_err = exc
-                        reporter.warning(
-                            tr(
-                                f"Предупреждение при очистке SRAM после записи Flash ({step_name}): {exc}",
-                                f"SRAM cleanup warning after Flash write ({step_name}): {exc}",
+                        status_words = self.xcp_read_memory(MRR_DRIVER_CONTROL + 0x30, 8)
+                        wd_words = self.xcp_read_memory(MRR_DRIVER_CONTROL + 0x60, 8)
+                        drv_status = int.from_bytes(status_words[0:4], "big")
+                        drv_detail = int.from_bytes(status_words[4:8], "big")
+                        wd_kicks = int.from_bytes(wd_words[0:4], "big")
+                        wd_challenge = int.from_bytes(wd_words[4:8], "big")
+                        entry["dto"] = dto.hex()
+                        entry["driver_status"] = drv_status
+                        entry["driver_detail"] = f"0x{drv_detail:08X}"
+                        entry["wd_kick_count"] = wd_kicks
+                        entry["last_wd_challenge"] = f"0x{wd_challenge:08X}"
+                        entry["batches"] = batches
+                        entry["stream_elapsed_sec"] = round(stream_sec, 3)
+                        entry["stream_bytes_per_sec"] = round(len(data) / stream_sec) if stream_sec else 0
+                        if dto[:2] != b"\xFF\x00" or drv_status != 0:
+                            raise RuntimeError(
+                                f"Flash sector write failed at 0x{addr:08X}: "
+                                f"dto={dto.hex()} status=0x{drv_status:X} detail=0x{drv_detail:08X}"
                             )
-                        )
-                if cleanup_err is not None and not had_exc:
-                    raise cleanup_err
+                        entry["erased_and_written"] = True
+                finally:
+                    had_exc = sys.exc_info()[0] is not None
+                    cleanup_err: Exception | None = None
+                    cleanup_steps: list[tuple[str, Any]] = [
+                        ("restore_synch_pre", lambda: self.xcp_write_ram(synch_slot, original_slot, ram_end=ram_end)),
+                    ]
+                    if sram_written:
+                        def _restore_driver_sram() -> None:
+                            with self.suspend_rx_trace():
+                                self._write_fast_ram_raw(
+                                    [
+                                        ("restore_sector_drv", sector_drv_addr, orig_sector_drv),
+                                        ("restore_stage", MRR_FLASH_STAGE_BUFFER, orig_stage),
+                                        ("restore_drv_high", flash_drv_high_addr, orig_drv_high),
+                                        ("restore_drv_low", flash_drv_low_addr, orig_drv_low),
+                                    ],
+                                    profile=prof,
+                                    timeout_loops=timeout_loops,
+                                    reporter=reporter,
+                                )
+
+                        cleanup_steps.append(("restore_flash_drv_sram", _restore_driver_sram))
+                    cleanup_steps.extend(
+                        [
+                            ("restore_synch_mid", lambda: self.xcp_write_ram(synch_slot, original_slot, ram_end=ram_end)),
+                            ("disable_sram_exec", lambda: self.xcp_configure_sram_exec(False, profile=prof)),
+                            ("restore_synch_post", lambda: self.xcp_write_ram(synch_slot, original_slot, ram_end=ram_end)),
+                            ("restore_arg_state", lambda: self.xcp_write_ram(r3_arg_state, original_arg_state, ram_end=ram_end)),
+                            ("restore_ctrl", lambda: self.xcp_write_ram(MRR_DRIVER_CONTROL, original_control, ram_end=ram_end)),
+                            ("restore_payload", lambda: self.xcp_write_ram(MRR_DRIVER_ADDRESS, original_payload, ram_end=ram_end)),
+                        ]
+                    )
+                    for step_name, fn in cleanup_steps:
+                        try:
+                            fn()
+                        except Exception as exc:  # noqa: BLE001
+                            if cleanup_err is None:
+                                cleanup_err = exc
+                            reporter.warning(
+                                tr(
+                                    f"Предупреждение при очистке SRAM после записи Flash ({step_name}): {exc}",
+                                    f"SRAM cleanup warning after Flash write ({step_name}): {exc}",
+                                )
+                            )
+                    if cleanup_err is not None and not had_exc:
+                        raise cleanup_err
 
         canary_after = self.xcp_read_memory(canary_addr, 8)
         if canary_after != canary_before:
@@ -1391,6 +1435,7 @@ class MrrCanLink(J533CanLink):
         post_specs = [(f"post_0x{addr:06X}", addr, len(data)) for addr, data in sectors]
         post_reads = self.xcp_read_fast_regions(post_specs, profile=prof, reporter=reporter)
         for (addr, data), entry, (_, post_data, _, _) in zip(sectors, sector_reports, post_reads):
+            self.verify_region_checksum(addr, post_data)
             post_sha = hashlib.sha256(post_data).hexdigest()
             entry["post_sha256"] = post_sha
             entry["verified"] = post_data == data
@@ -1481,14 +1526,14 @@ def _managed_mrr_session(
             bus=bus,
             idle_limit=idle_limit,
             target_rx_filter=MRR_BRIDGE_RX_FILTER,
-            log_path=log_path,
+            log_path=None,
             reporter=reporter,
         ) as bridge:
             with MrrCanLink(
                 port,
                 interface=interface,
-                log_path=None,
-                bus=bridge.link.bus,
+                log_path=log_path,
+                bus=bridge.bus,
                 via_gateway=False,
                 sw_profile=sw_profile,
             ) as link:
@@ -1507,7 +1552,18 @@ def _managed_mrr_session(
         sw_profile=sw_profile,
     ) as link:
         if not needs_raw_extended_can and link._should_use_hw_uds():
-            with link.uds_session():
+            with link.uds_session() as active:
+                if not active and getattr(link.bus, "uds_only", False):
+                    refusal = str(getattr(link.bus, "uds_refusal", "") or "").strip()
+                    detail = f" ({refusal})" if refusal else ""
+                    raise TimeoutError(
+                        tr(
+                            f"Адаптер D-PDU не смог открыть аппаратный канал UDS ISO-TP для 13 ACC Radar "
+                            f"(0x{link.UDS_TX_ID:03X} → 0x{link.UDS_RX_ID:03X}){detail}.",
+                            f"D-PDU adapter could not open a hardware UDS ISO-TP link for 13 ACC Radar "
+                            f"(0x{link.UDS_TX_ID:03X} → 0x{link.UDS_RX_ID:03X}){detail}.",
+                        )
+                    )
                 yield link, False
             return
         yield link, False
@@ -1973,6 +2029,8 @@ def can_mrr_write_keys(
                 probe_st = probe_link.read_status_dids()
                 if (probe_st.get("cp_counter") or 0) >= 0x23:
                     needs_xcp = True
+        if bus is None and interface != "dpdu":
+            time.sleep(0.15)
 
     with _managed_mrr_session(
         port,
@@ -2540,11 +2598,20 @@ def _flash_mrr_cp_mode(
             ),
         )
         trigger_addr = prof.get("sram_auth_success_trigger_addr")
+        counter_addr = prof.get("sram_cp_counter_addr")
         ram_end = int(prof.get("ram_safe_end") or 0x4005E000)
         if trigger_addr:
             with contextlib.suppress(Exception):
                 link.xcp_write_ram(int(trigger_addr), (1).to_bytes(4, "big"), verify=False, ram_end=ram_end)
-                time.sleep(0.15)
+                fake_bus = getattr(link.bus, "__class__", None).__module__.startswith("tests")
+                if counter_addr:
+                    for _ in range(12):
+                        time.sleep(0.01 if fake_bus else 0.08)
+                        raw_cnt = link.xcp_read_memory(int(counter_addr), 2)
+                        if int.from_bytes(raw_cnt, "big") == 0:
+                            break
+                elif not fake_bus:
+                    time.sleep(0.15)
 
         with contextlib.suppress(Exception):
             link.request_uds(b"\x10\x03", 0x50, timeout=1.2)
@@ -3163,112 +3230,124 @@ def can_mrr_flash_frf(
             for w in soft_warns:
                 reporter.warning(w)
 
-            # Step 2: Enter Programming Session (10 02), unlock FBLv (27 11/12), write fingerprint (2E F1 5A)
-            reporter.step(
-                2,
-                6,
-                tr(
-                    "Вход в сессию программирования FBLv (10 02 → 27 11/12 → 2E F1 5A)…",
-                    "Entering FBLv Programming Session (10 02 → 27 11/12 → 2E F1 5A)…",
-                ),
-            )
-            if recovery_mode:
-                with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
-                    link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
-            else:
-                link.request_uds(b"\x10\x03", 0x50, timeout=3.0)
-            link.request_uds(b"\x10\x02", 0x50, timeout=30.0)
-
-            seed_resp = link.request_uds(b"\x27\x11", 0x67, timeout=5.0)
-            if len(seed_resp) != 6 or seed_resp[1] != 0x11:
-                raise UnexpectedUdsResponse(f"Unexpected FBLv SecurityAccess seed response: {seed_resp.hex()}")
-            seed = int.from_bytes(seed_resp[2:6], "big")
-            if seed != 0:
-                key = mrr_fblv_compute_key(seed)
-                link.request_uds(b"\x27\x12" + key.to_bytes(4, "big"), 0x67, timeout=5.0)
-            result["fblv_security_access"] = {"seed": f"0x{seed:08X}", "accepted": True}
-
-            fp_resp = link.request_uds(b"\x2E\xF1\x5A" + bytes(9), 0x6E, timeout=5.0)
-            if fp_resp != b"\x6E\xF1\x5A":
-                raise UnexpectedUdsResponse(f"Unexpected WriteFingerprint response: {fp_resp.hex()}")
-            result["fingerprint_written"] = True
-
-            # Step 3: Upload RAM Flash Driver DB_99ERASEROUTI & verify CheckMemory
-            reporter.step(
-                3,
-                6,
-                tr(
-                    "Загрузка flash-драйвера DB_99ERASEROUTI в SRAM (16 КиБ) и проверка RSA…",
-                    "Uploading DB_99ERASEROUTI flash driver into SRAM (16 KiB) & verifying RSA…",
-                ),
-            )
-            result["driver_upload"] = _mrr_upload_fblv_block(
-                link,
-                img.driver,
-                reporter=reporter,
-                progress_label="DB_99ERASEROUTI",
-            )
-            drv_chk = link.request_uds(b"\x31\x01\x02\x02" + img.driver.signature, 0x71, timeout=60.0)
-            _mrr_require_routine_ok(drv_chk, 0x0202, "DB_99ERASEROUTI CheckMemory")
-            result["driver_check_memory_response"] = drv_chk.hex()
-
-            # Step 4: Erase logical block 0x10 (Code Flash application)
-            reporter.step(
-                4,
-                6,
-                tr(
-                    "Стирание Code Flash приложения (31 01 FF 00 01 10) — НЕ ОТКЛЮЧАЙТЕ ПИТАНИЕ!",
-                    "Erasing Code Flash application (31 01 FF 00 01 10) — DO NOT CUT POWER!",
-                ),
-            )
-            erase_resp = link.request_uds(b"\x31\x01\xFF\x00\x01\x10", 0x71, timeout=180.0)
-            _mrr_require_routine_ok(erase_resp, 0xFF00, "EraseMemory (block 0x10)")
-            result["erase_response"] = erase_resp.hex()
-
-            # Step 5: Stream DB_10FLASHDATA, verify RSA-1024 + CRC-32 & ProgrammingDependencies
-            reporter.step(
-                5,
-                6,
-                tr(
-                    f"Запись приложения {img.part_number} {img.sw_version} "
-                    f"({len(img.app.stream) // 1024} КиБ поток → {img.app.uncompressed_size // 1024} КиБ) — НЕ ОТКЛЮЧАЙТЕ ПИТАНИЕ!",
-                    f"Programming application {img.part_number} {img.sw_version} "
-                    f"({len(img.app.stream) // 1024} KiB stream → {img.app.uncompressed_size // 1024} KiB) — DO NOT CUT POWER!",
-                ),
-            )
-            result["application_upload"] = _mrr_upload_fblv_block(
-                link,
-                img.app,
-                reporter=reporter,
-                progress_label=f"DB_10FLASHDATA ({img.sw_version})",
-            )
-
-            app_chk_req = b"\x31\x01\x02\x02" + img.app.signature + img.app.crc32.to_bytes(4, "big")
-            app_chk = link.request_uds(app_chk_req, 0x71, timeout=180.0)
-            result["application_check_memory_response"] = app_chk.hex()
-            _mrr_require_routine_ok(app_chk, 0x0202, "DB_10FLASHDATA CheckMemory (RSA-1024 + CRC-32)")
-            result["application_rsa_accepted"] = True
-
-            dep_resp = link.request_uds(b"\x31\x01\xFF\x01", 0x71, timeout=60.0)
-            _mrr_require_routine_ok(dep_resp, 0xFF01, "CheckProgrammingDependencies")
-            result["programming_dependencies_response"] = dep_resp.hex()
-
-            # Step 6: Hard Reset (11 01), wait for Application boot, clear DTCs & re-read passport/status
-            reporter.step(
-                6,
-                6,
-                tr(
-                    "Перезагрузка радара (11 01), проверка запуска ПО и опрос статуса…",
-                    "Resetting radar (11 01), verifying application boot & reading status…",
-                ),
-            )
-            reset_resp_hex = ""
+            in_programming_session = False
+            flash_erased = False
             try:
-                r_resp = link.request_uds(b"\x11\x01", 0x51, timeout=5.0, resend=False)
-                reset_resp_hex = r_resp.hex()
-            except (*TRANSPORT_ERRORS, UnexpectedUdsResponse):
-                reset_resp_hex = "sent_no_reply"
-            result["ecu_reset_response"] = reset_resp_hex
+                # Step 2: Enter Programming Session (10 02), unlock FBLv (27 11/12), write fingerprint (2E F1 5A)
+                reporter.step(
+                    2,
+                    6,
+                    tr(
+                        "Вход в сессию программирования FBLv (10 02 → 27 11/12 → 2E F1 5A)…",
+                        "Entering FBLv Programming Session (10 02 → 27 11/12 → 2E F1 5A)…",
+                    ),
+                )
+                if recovery_mode:
+                    with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
+                        link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
+                else:
+                    link.request_uds(b"\x10\x03", 0x50, timeout=3.0)
+                link.request_uds(b"\x10\x02", 0x50, timeout=30.0)
+                in_programming_session = True
+
+                seed_resp = link.request_uds(b"\x27\x11", 0x67, timeout=5.0)
+                if len(seed_resp) != 6 or seed_resp[1] != 0x11:
+                    raise UnexpectedUdsResponse(f"Unexpected FBLv SecurityAccess seed response: {seed_resp.hex()}")
+                seed = int.from_bytes(seed_resp[2:6], "big")
+                if seed != 0:
+                    key = mrr_fblv_compute_key(seed)
+                    link.request_uds(b"\x27\x12" + key.to_bytes(4, "big"), 0x67, timeout=5.0)
+                result["fblv_security_access"] = {"seed": f"0x{seed:08X}", "accepted": True}
+
+                fp_resp = link.request_uds(b"\x2E\xF1\x5A" + bytes(9), 0x6E, timeout=5.0)
+                if fp_resp != b"\x6E\xF1\x5A":
+                    raise UnexpectedUdsResponse(f"Unexpected WriteFingerprint response: {fp_resp.hex()}")
+                result["fingerprint_written"] = True
+
+                # Step 3: Upload RAM Flash Driver DB_99ERASEROUTI & verify CheckMemory
+                reporter.step(
+                    3,
+                    6,
+                    tr(
+                        "Загрузка flash-драйвера DB_99ERASEROUTI в SRAM (16 КиБ) и проверка RSA…",
+                        "Uploading DB_99ERASEROUTI flash driver into SRAM (16 KiB) & verifying RSA…",
+                    ),
+                )
+                result["driver_upload"] = _mrr_upload_fblv_block(
+                    link,
+                    img.driver,
+                    reporter=reporter,
+                    progress_label="DB_99ERASEROUTI",
+                )
+                drv_chk = link.request_uds(b"\x31\x01\x02\x02" + img.driver.signature, 0x71, timeout=60.0)
+                _mrr_require_routine_ok(drv_chk, 0x0202, "DB_99ERASEROUTI CheckMemory")
+                result["driver_check_memory_response"] = drv_chk.hex()
+
+                # Step 4: Erase logical block 0x10 (Code Flash application)
+                reporter.step(
+                    4,
+                    6,
+                    tr(
+                        "Стирание Code Flash приложения (31 01 FF 00 01 10) — НЕ ОТКЛЮЧАЙТЕ ПИТАНИЕ!",
+                        "Erasing Code Flash application (31 01 FF 00 01 10) — DO NOT CUT POWER!",
+                    ),
+                )
+                reporter.check_cancelled()
+                with reporter.uninterruptible():
+                    flash_erased = True
+                    erase_resp = link.request_uds(b"\x31\x01\xFF\x00\x01\x10", 0x71, timeout=180.0)
+                    _mrr_require_routine_ok(erase_resp, 0xFF00, "EraseMemory (block 0x10)")
+                    result["erase_response"] = erase_resp.hex()
+
+                    # Step 5: Stream DB_10FLASHDATA, verify RSA-1024 + CRC-32 & ProgrammingDependencies
+                    reporter.step(
+                        5,
+                        6,
+                        tr(
+                            f"Запись приложения {img.part_number} {img.sw_version} "
+                            f"({len(img.app.stream) // 1024} КиБ поток → {img.app.uncompressed_size // 1024} КиБ) — НЕ ОТКЛЮЧАЙТЕ ПИТАНИЕ!",
+                            f"Programming application {img.part_number} {img.sw_version} "
+                            f"({len(img.app.stream) // 1024} KiB stream → {img.app.uncompressed_size // 1024} KiB) — DO NOT CUT POWER!",
+                        ),
+                    )
+                    result["application_upload"] = _mrr_upload_fblv_block(
+                        link,
+                        img.app,
+                        reporter=reporter,
+                        progress_label=f"DB_10FLASHDATA ({img.sw_version})",
+                    )
+
+                    app_chk_req = b"\x31\x01\x02\x02" + img.app.signature + img.app.crc32.to_bytes(4, "big")
+                    app_chk = link.request_uds(app_chk_req, 0x71, timeout=180.0)
+                    result["application_check_memory_response"] = app_chk.hex()
+                    _mrr_require_routine_ok(app_chk, 0x0202, "DB_10FLASHDATA CheckMemory (RSA-1024 + CRC-32)")
+                    result["application_rsa_accepted"] = True
+
+                    dep_resp = link.request_uds(b"\x31\x01\xFF\x01", 0x71, timeout=60.0)
+                    _mrr_require_routine_ok(dep_resp, 0xFF01, "CheckProgrammingDependencies")
+                    result["programming_dependencies_response"] = dep_resp.hex()
+
+                    # Step 6: Hard Reset (11 01), wait for Application boot, clear DTCs & re-read passport/status
+                    reporter.step(
+                        6,
+                        6,
+                        tr(
+                            "Перезагрузка радара (11 01), проверка запуска ПО и опрос статуса…",
+                            "Resetting radar (11 01), verifying application boot & reading status…",
+                        ),
+                    )
+                    reset_resp_hex = ""
+                    try:
+                        r_resp = link.request_uds(b"\x11\x01", 0x51, timeout=5.0, resend=False)
+                        reset_resp_hex = r_resp.hex()
+                    except (*TRANSPORT_ERRORS, UnexpectedUdsResponse):
+                        reset_resp_hex = "sent_no_reply"
+                    in_programming_session = False
+                    result["ecu_reset_response"] = reset_resp_hex
+            finally:
+                if in_programming_session and not flash_erased and not recovery_mode:
+                    with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
+                        link.request_uds(b"\x11\x01", 0x51, timeout=3.0, resend=False)
 
             fake_bus = getattr(link.bus, "__class__", None).__module__.startswith("tests")
             if not fake_bus:

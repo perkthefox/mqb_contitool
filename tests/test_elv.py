@@ -202,7 +202,8 @@ def make_synth_elv_dflash(
         struct.pack_into("<HH", compact, cursor, va, vl)
         compact[cursor + 4 : cursor + 4 + vl] = payload
         struct.pack_into("<HH", compact, cursor + 4 + vl, va, vl)
-        markers[cursor // 4] = 0x00000000
+        for s in range(cursor // 4, (cursor + rec_size) // 4):
+            markers[s] = 0x00000000
 
     if format_64k:
         return elv_compact32k_to_raw64k(compact, markers)
@@ -1260,5 +1261,379 @@ def test_elv_unverified_pn_sw_allows_read_with_warning_and_banner(tmp_path: Path
         assert any("5Q0905861A" in t and "0040" in t and "официально не поддерживается" in t for t in texts)
     finally:
         win.close()
+
+
+def test_elv_review_bootloader_dflash_crc_and_unlearned_idac_restore() -> None:
+    """C.1: check_bootloader validates auto-read DFLASH CRC and restores unlearned IDac=0000 back to 0x00 via 2E 02E1."""
+    from contitool.i18n import set_lang
+
+    set_lang("en")
+
+    # 1. Corrupted auto-read DFLASH must raise RuntimeError before running WFS5
+    bad_df = bytearray(make_synth_elv_dflash(active_pool=1, format_64k=False))
+    info_b = elv_parse_dflash(bytes(bad_df))
+    rec34 = next(r for r in info_b["records"] if r["vaddr"] == 0x07D1)
+    bad_df[int(rec34["compact_offset_hex"], 16) + 12] ^= 0xFF
+    bus_bad = FakeElvBus(bytes(bad_df))
+    with pytest.raises(RuntimeError, match="DFLASH integrity check failed"):
+        can_elv_check_bootloader("fake", enter_programming=True, bus=bus_bad)
+    assert bus_bad.in_bootloader is False
+
+    # 2. Unlearned Mode 2 ELV (idac_state=0x00, idac=0000): simulate real firmware locking idac_state=0xAA on 0x01B!
+    class AutoLockIdacElvBus(FakeElvBus):
+        def __init__(self, dflash_32k: bytes) -> None:
+            super().__init__(dflash_32k)
+            self.saw_02e1_reset = False
+
+        def _handle_uds(self, req: bytes) -> None:
+            if req[:3] == b"\x2e\x02\xe1":
+                self.saw_02e1_reset = True
+            super()._handle_uds(req)
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            super().send(msg, timeout=timeout)
+            if msg.arbitration_id == ELV_WFS_KOMBI_CAN_ID and self.wfs5_type1_authed:
+                b34 = self.parsed["block34"]
+                if self.parsed["block04"]["idac_state"] == 0x00:
+                    # Simulate real hardware auto-locking IDac=0000 during WFS5 handshake
+                    self.dflash = bytearray(
+                        elv_adapt_dflash(
+                            bytes(self.dflash),
+                            vin=b34["vin"],
+                            k5=b34["slot_a_hex"],
+                            power_class=b34["power_class"],
+                            idac=b"\x00\x00",
+                            config_byte=b34["config"],
+                            brand_byte=b34["brand"],
+                        )
+                    )
+                    self.parsed = elv_parse_dflash(bytes(self.dflash))
+
+    unlearned_df = make_synth_elv_dflash(
+        active_pool=1, format_64k=False, idac_hex="0000", idac_state=0x00
+    )
+    # 2a. Auto-read DFLASH path
+    bus_auto = AutoLockIdacElvBus(unlearned_df)
+    res_auto = can_elv_check_bootloader("fake", enter_programming=True, bus=bus_auto)
+    assert res_auto["returned_to_app"] is True
+    assert res_auto.get("idac_auto_restored") is True
+    assert bus_auto.saw_02e1_reset is True
+    assert bus_auto.parsed["block04"]["idac_state"] == 0x00
+
+    # 2b. Explicit credentials path (DID 0x02EE idac_locked == False + idac="0000")
+    bus_exp = AutoLockIdacElvBus(unlearned_df)
+    res_exp = can_elv_check_bootloader(
+        "fake",
+        current_k5="102132435465768798A9BACBDCEDFE0F",
+        power_class=0x6F,
+        idac="0000",
+        enter_programming=True,
+        bus=bus_exp,
+    )
+    assert res_exp["returned_to_app"] is True
+    assert res_exp.get("idac_auto_restored") is True
+    assert bus_exp.saw_02e1_reset is True
+    assert bus_exp.parsed["block04"]["idac_state"] == 0x00
+
+
+def test_elv_review_31010203_multiframe_reassembly_and_pci_validation() -> None:
+    """C.2: _request_31_01_02_03_with_wfs5 must not discard multi-frame ISO-TP replies and must validate SF/FF framing."""
+    from contitool.can.elv import ElvCanLink, _request_31_01_02_03_with_wfs5
+
+    dflash = make_synth_elv_dflash(active_pool=1, format_64k=False)
+
+    class MultiFrame31Bus(FakeElvBus):
+        def _handle_uds(self, req: bytes) -> None:
+            if req[:4] == b"\x31\x01\x02\x03":
+                # Inject malformed SF (len=0) and malformed FF (len=4 <= 6, short DLC) first, then a real 10-byte multi-frame reply
+                self._enqueue(ELV_UDS_RX_ID, b"\x00\x71\x01\x02\x03\x55\x55\x55")
+                self._enqueue(ELV_UDS_RX_ID, b"\x10\x04\x71\x01")
+                self._enqueue(ELV_UDS_RX_ID, b"\x10\x0a\x71\x01\x02\x03\x01\x02")
+                return
+            super()._handle_uds(req)
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            if msg.arbitration_id == ELV_UDS_TX_ID and bytes(msg.data)[:1] == b"\x30":
+                # FlowControl received -> emit ConsecutiveFrame completing the 10-byte PDU: 71 01 02 03 + 01 02 05 81 09 0A
+                self._enqueue(ELV_UDS_RX_ID, b"\x21\x05\x81\x09\x0a\x55\x55\x55")
+                return
+            super().send(msg, timeout=timeout)
+
+    bus = MultiFrame31Bus(dflash)
+    with ElvCanLink("fake", bus=bus) as lnk:
+        body, _bz, _wfs_ok, _wfs_info = _request_31_01_02_03_with_wfs5(
+            lnk,
+            k5=bytes.fromhex("102132435465768798A9BACBDCEDFE0F"),
+            power_class=0x6F,
+            idac=bytes.fromhex("6BAB"),
+            timeout=1.5,
+        )
+    assert body == bytes([0x01, 0x02, 0x05, 0x81, 0x09, 0x0A])
+
+
+def test_elv_review_request_uds_hw_gateway_backup_bridge_warning_and_adapt_ok(tmp_path: Path, monkeypatch) -> None:
+    """C.3: ElvCanLink.request_uds() hw-UDS routing, gateway backup bridge engagement, _hw_uds guard, profile warning, adapt ok."""
+    import contextlib
+    from contitool.can.elv import ElvCanLink, _backup_and_resolve_current_k5
+    from contitool.i18n import set_lang
+    from contitool.progress import OperationReporter
+
+    set_lang("en")
+    dflash = make_synth_elv_dflash(active_pool=1, format_64k=False)
+    inner = FakeElvBus(dflash)
+
+    # 1. Direct ElvCanLink.request_uds() routes via uds_session(0x731, 0x79B) on uds_only/nonraw
+    class FakeDpduElvBus:
+        def __init__(self, *, uds_only: bool = True, allow_session: bool = True) -> None:
+            self.uds_only = uds_only
+            self.nonraw: dict[int, int] = {}
+            self.allow_session = allow_session
+            self.uds_refusal = "elv link refused"
+            self.session_calls: list[tuple[int, int]] = []
+
+        @contextlib.contextmanager
+        def uds_session(self, tx_id: int = 0x710, rx_id: int = 0x77A):
+            self.session_calls.append((tx_id, rx_id))
+            yield self.allow_session
+
+        def end_uds_session(self) -> None:
+            pass
+
+        def request_uds(self, req: bytes, *, timeout: float = 2.0, allow_pending: bool = True) -> bytes:
+            inner.rx_queue.clear()
+            inner._handle_uds(bytes(req))
+            first = inner.rx_queue.popleft()
+            raw0 = bytes(first.data)
+            if (raw0[0] >> 4) == 0:
+                return raw0[1 : 1 + (raw0[0] & 0x0F)]
+            total = ((raw0[0] & 0x0F) << 8) | raw0[1]
+            out = bytearray(raw0[2:])
+            while len(out) < total:
+                out.extend(bytes(inner.rx_queue.popleft().data)[1:])
+            return bytes(out[:total])
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            raise AssertionError("Raw send must not be used when hw_uds is active")
+
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            return None
+
+        def shutdown(self) -> None:
+            pass
+
+    dpdu_ok = FakeDpduElvBus(uds_only=True, allow_session=True)
+    with ElvCanLink("fake", interface="dpdu", bus=dpdu_ok) as lnk:
+        resp = lnk.request_uds(b"\x10\x03", 0x50)
+        assert resp[0] == 0x50
+    assert dpdu_ok.session_calls == [(ELV_UDS_TX_ID, ELV_UDS_RX_ID)]
+
+    dpdu_refuse = FakeDpduElvBus(uds_only=True, allow_session=False)
+    with ElvCanLink("fake", interface="dpdu", bus=dpdu_refuse) as lnk_r:
+        with pytest.raises(TimeoutError, match="elv link refused"):
+            lnk_r.request_uds(b"\x10\x03", 0x50)
+
+    # 2. _backup_and_resolve_current_k5 must NOT attempt 29-bit read_dflash_32k when link._hw_uds is True
+    with ElvCanLink("fake", interface="dpdu", bus=dpdu_ok) as lnk_hw:
+        with lnk_hw.uds_session():
+            assert lnk_hw._hw_uds is True
+            monkeypatch.setattr(
+                lnk_hw,
+                "read_dflash_32k",
+                lambda **_kw: (_ for _ in ()).throw(AssertionError("read_dflash_32k must be skipped on _hw_uds")),
+            )
+            cur_k5, parsed_hw, saved_hw = _backup_and_resolve_current_k5(
+                lnk_hw,
+                current_k5="102132435465768798A9BACBDCEDFE0F",
+                backup_dir=tmp_path / "hw_uds_bkp",
+                passport={"fazit": inner.parsed["identity"]["fazit"], "vin": inner.parsed["block34"]["vin"]},
+                status={},
+                raw_dids={},
+                reporter=OperationReporter(),
+            )
+            assert cur_k5 == bytes.fromhex("102132435465768798A9BACBDCEDFE0F")
+            assert parsed_hw is None and saved_hw == {}
+
+    # 3. backup_dir + via_gateway=True + gateway_bridge=True engages j533_can_bridge even when current_k5 is provided!
+    bridge_hits: list[str] = []
+    bus_br = FakeElvBus(dflash)
+
+    class _DummyBridge:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            self.bus = bus_br
+
+        def __enter__(self) -> _DummyBridge:
+            bridge_hits.append("enter")
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            bridge_hits.append("exit")
+
+    monkeypatch.setattr("contitool.can.bridge.j533_can_bridge", lambda *a, **kw: _DummyBridge(*a, **kw))
+    r_idac = can_elv_reset_idac(
+        "fake",
+        current_k5="102132435465768798A9BACBDCEDFE0F",
+        backup_dir=tmp_path / "gw_bkp_idac",
+        via_gateway=True,
+        gateway_bridge=True,
+        bus=bus_br,
+    )
+    assert bridge_hits == ["enter", "exit"]
+    assert r_idac["used_bridge"] is True
+    assert (tmp_path / "gw_bkp_idac" / "elv_dflash_32k_backup.bin").is_file()
+
+    bridge_hits.clear()
+    r_ad = can_elv_adapt(
+        "fake",
+        new_vin="WVWZZZAUZJW000011",
+        new_k5="11223344556677889900AABBCCDDEEFF",
+        new_power_class=0x77,
+        current_k5="102132435465768798A9BACBDCEDFE0F",
+        backup_dir=tmp_path / "gw_bkp_ad",
+        via_gateway=True,
+        gateway_bridge=True,
+        bus=bus_br,
+    )
+    assert bridge_hits == ["enter", "exit"]
+    assert r_ad["used_bridge"] is True and r_ad["ok"] is True
+
+    bridge_hits.clear()
+    r_vir = can_elv_virginize(
+        "fake",
+        current_k5="11223344556677889900AABBCCDDEEFF",
+        backup_dir=tmp_path / "gw_bkp_vir",
+        via_gateway=True,
+        gateway_bridge=True,
+        bus=bus_br,
+    )
+    assert bridge_hits == ["enter", "exit"]
+    assert r_vir["used_bridge"] is True and r_vir["ok"] is True
+    monkeypatch.undo()
+
+    # 4. Unverified ELV HW/SW emits warning in can_elv_adapt / can_elv_virginize / can_elv_reset_idac
+    bus_unv = FakeElvBus(dflash)
+    bus_unv.parsed["identity"]["part_number"] = "5Q0905861Z"
+    bus_unv.parsed["identity"]["sw_version"] = "0099"
+    warns: list[str] = []
+
+    class RecRep(OperationReporter):
+        def warning(self, message: str) -> None:
+            warns.append(message)
+
+    can_elv_reset_idac("fake", current_k5="102132435465768798A9BACBDCEDFE0F", bus=bus_unv, reporter=RecRep())
+    assert any("5Q0905861Z" in w and "0099" in w for w in warns)
+
+    # 5. can_elv_adapt 'ok' must be False if post VIN or post power_class doesn't match target (even when 02F9 matches)!
+    class StaleVinBus(FakeElvBus):
+        def _handle_uds(self, req: bytes) -> None:
+            if req[:3] == b"\x2e\x02\xe2" and len(req) == 55:
+                # Apply new K_5 & mode=2 so post 02F9 passes, but keep wrong VIN so post_passport['vin'] != norm_vin!
+                b34 = self.parsed["block34"]
+                cur_k5 = bytes.fromhex(b34["slot_a_hex"])
+                pt = elv_aes128_ecb_decrypt(cur_k5, req[3:51])
+                new_k5 = pt[17:33]
+                new_pc, new_cfg, new_brand = pt[33], pt[34], pt[35]
+                self.dflash = bytearray(
+                    elv_adapt_dflash(
+                        bytes(self.dflash),
+                        vin="WVWZZZAUZJW999999",
+                        k5=new_k5,
+                        power_class=new_pc,
+                        idac=None,
+                        config_byte=new_cfg,
+                        brand_byte=new_brand,
+                    )
+                )
+                self.parsed = elv_parse_dflash(bytes(self.dflash))
+                self._send_isotp(b"\x6e\x02\xe2")
+                return
+            super()._handle_uds(req)
+
+    bus_stale = StaleVinBus(dflash)
+    ad_stale = can_elv_adapt(
+        "fake",
+        new_vin="WVWZZZAUZJW000022",
+        new_k5="22334455667788990011AABBCCDDEEFF",
+        new_power_class=0x76,
+        current_k5="102132435465768798A9BACBDCEDFE0F",
+        bus=bus_stale,
+    )
+    assert ad_stale["verify_02f9"]["match"] is True
+    assert ad_stale["post_status"]["mode"] == 0x02
+    assert ad_stale["ok"] is False
+
+
+def test_elv_review_core_64k_trailer_marker_crc_valid_flags_empty_idac_and_kombi() -> None:
+    """C.4: 64K trailer marker check, CRC-valid sibling flags recovery, empty bytes idac auto-learn, Kombi dispatch."""
+    from contitool.core.elv import elv_raw64k_to_compact32k, elv_update_dflash_records
+    from contitool.core.kombi import EEL_KOMBI_0310_IDS, build_kombi_eel_dflash
+    from test_kombi import _build_synthetic_kombi_records
+
+    # 1. 64K dump: corrupting a record's trailer marker slot to 0xFFFFFFFF makes scanner skip that torn record
+    raw64 = make_synth_elv_dflash(active_pool=1, format_64k=True)
+    compact, markers = elv_raw64k_to_compact32k(raw64)
+    info64 = elv_parse_dflash(raw64)
+    rec04 = next(r for r in info64["records"] if r["vaddr"] == 0x0201)
+    pos04 = int(rec04["compact_offset_hex"], 16)
+    vl04 = int(rec04["vlen"])
+    markers[(pos04 + 4 + vl04) // 4] = 0xFFFFFFFF
+    torn64 = elv_compact32k_to_raw64k(compact, markers)
+    parsed_torn = elv_parse_dflash(torn64)
+    rec04_after = next(r for r in parsed_torn["records"] if r["vaddr"] == 0x0201)
+    assert rec04_after["present"] is False
+    # Sibling copies 0x0219 / 0x0231 still recover IDp cleanly!
+    assert parsed_torn["block04"]["idp_hex"] == "A956"
+
+    # 2. elv_update_dflash_records recovers valid flags from CRC-valid sibling copy when copy 0's flags byte is corrupted
+    raw32 = bytearray(make_synth_elv_dflash(active_pool=1, format_64k=False))
+    info32 = elv_parse_dflash(bytes(raw32))
+    r04 = next(r for r in info32["records"] if r["vaddr"] == 0x0201)
+    off04 = int(r04["compact_offset_hex"], 16)
+    vl = int(r04["vlen"])
+    # Corrupt the flags byte of copy 0 (0x0201) from 0x0B -> 0x00 (would disable AES if trusted!)
+    raw32[off04 + 4 + (vl - 8)] = 0x00
+    rebuilt = elv_adapt_dflash(
+        bytes(raw32),
+        vin="WVWZZZAUZJW000055",
+        k5="55" * 16,
+        power_class=0x6F,
+    )
+    parsed_reb = elv_parse_dflash(rebuilt)
+    assert parsed_reb["all_crc_ok"] is True
+    r04_reb = next(r for r in parsed_reb["records"] if r["vaddr"] == 0x0201)
+    assert r04_reb["flags"] == 0x0B  # recovered from CRC-valid sibling copy 0x0219!
+
+    # If ALL 3 copies of a block have corrupted CRC, elv_update_dflash_records must refuse instead of guessing flags
+    all_bad = bytearray(make_synth_elv_dflash(active_pool=1, format_64k=False))
+    for va in (0x0201, 0x0219, 0x0231):
+        rr = next(r for r in info32["records"] if r["vaddr"] == va)
+        all_bad[int(rr["compact_offset_hex"], 16) + 8] ^= 0xFF
+    with pytest.raises(ValueError, match="CRC-32|EEH flags"):
+        elv_update_dflash_records(bytes(all_bad), {0x0201: bytes(16)})
+
+    # 3. elv_adapt_dflash treats empty bytes / bytearray / memoryview idac as auto-learn (idac_state = 0x00)
+    clean32 = make_synth_elv_dflash(active_pool=1, format_64k=False)
+    for empty_idac in (b"", bytearray(), memoryview(b"")):
+        ad_empty = elv_adapt_dflash(
+            clean32,
+            vin="WVWZZZAUZJW000066",
+            k5="66" * 16,
+            power_class=0x6F,
+            idac=empty_idac,
+        )
+        pe = elv_parse_dflash(ad_empty)
+        assert pe["all_crc_ok"] is True
+        assert pe["block04"]["idac_state"] == 0x00
+        assert pe["block04"]["idac_hex"] == "0000"
+
+    # 4. elv_extract_cluster_material dispatches V850E2 Kombi dumps (logical EEL & 64K) to analyze_kombi_dflash
+    recs = _build_synthetic_kombi_records()
+    logical_kombi = b"".join(recs[i] for i in sorted(EEL_KOMBI_0310_IDS))
+    for kombi_blob in (logical_kombi, build_kombi_eel_dflash(recs)):
+        mat = elv_extract_cluster_material(kombi_blob)
+        assert mat["vin"] == "XW8ZZZ5NZJG235992"
+        assert mat["power_class"] == 0x49
+        assert mat["cluster_mac_id"] == "55BB"
+        assert len(mat["slot_a_hex"]) == 32
+
 
 

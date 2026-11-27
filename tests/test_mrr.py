@@ -462,10 +462,10 @@ class FakeMrrBus:
             self.reset_count += 1
             if self.in_fblv:
                 self.fblv_log.append(f"11_{pdu[1]:02X}")
-                if self.fblv_deps_ok:
+                if self.fblv_deps_ok or not self.fblv_erased:
                     self.in_fblv = False
                     self.session = 0x01
-                    if self.fblv_flash_sw_after:
+                    if self.fblv_deps_ok and self.fblv_flash_sw_after:
                         self.sw_profile = self.fblv_flash_sw_after
                         if self.sw_profile in MRR_PROFILES:
                             self.profile = MRR_PROFILES[self.sw_profile]
@@ -2799,5 +2799,345 @@ def test_mrr_unverified_sw_allows_all_reads_with_softer_pn_sw_notice() -> None:
     # Code Flash CP patching still refuses unknown SW
     with pytest.raises(RuntimeError):
         can_mrr_deactivate_cp("fake", bus=bus)
+
+
+def test_mrr_review_flash_frf_recovery_reset_and_uninterruptible(tmp_path: Path) -> None:
+    """B.1: FRF flash sends 11 01 on pre-erase abort (unless recovery_mode) and defers cancel across Erase..11 01."""
+    from contitool.progress import OperationCancelledError, OperationReporter
+
+    set_lang("en")
+    frf_0192 = _make_synth_mrr_frf_image(part_number="3Q0907572B", sw_version="0192", app_size=0x150000)
+
+    # 1. Cancel right before EraseMemory (at step 4) -> must send 11 01 reset in finally so radar exits FBLv!
+    bus_cancel = FakeMrrBus(sw_profile="0192", cp_counter=0x0000)
+
+    class CancelAtStep4(OperationReporter):
+        def step(self, index: int, total: int, title: str) -> None:
+            if index == 4:
+                self.cancel()
+            super().step(index, total, title)
+
+    with pytest.raises(OperationCancelledError):
+        can_mrr_flash_frf("fake", frf_0192, bus=bus_cancel, reporter=CancelAtStep4())
+    assert bus_cancel.fblv_erased is False
+    assert "31_FF00_10" not in bus_cancel.fblv_log
+    assert "11_01" in bus_cancel.fblv_log
+    assert bus_cancel.in_fblv is False
+
+    # 2. In recovery_mode=True, pre-erase failure must NOT send 11 01 reset
+    bus_rec = FakeMrrBus(sw_profile="0192", in_fblv=True)
+    with pytest.raises(OperationCancelledError):
+        can_mrr_flash_frf("fake", frf_0192, recovery_mode=True, bus=bus_rec, reporter=CancelAtStep4())
+    assert "11_01" not in bus_rec.fblv_log
+
+    # 3. Cancel triggered mid-Step 5 (after EraseMemory) must be deferred by uninterruptible() until AFTER 11 01 reset!
+    bus_mid = FakeMrrBus(sw_profile="0192", cp_counter=0x0000, fblv_flash_sw_after="0192")
+
+    class CancelDuringStep5(OperationReporter):
+        def step(self, index: int, total: int, title: str) -> None:
+            if index == 5:
+                self.cancel()
+            super().step(index, total, title)
+
+    with pytest.raises(OperationCancelledError):
+        can_mrr_flash_frf("fake", frf_0192, bus=bus_mid, reporter=CancelDuringStep5())
+    assert bus_mid.fblv_log == [
+        "10_02", "27_11", "27_12", "2E_F15A",
+        "34_99_00", "37_99", "31_0202_99",
+        "31_FF00_10",
+        "34_10_00", "37_10", "31_0202_10",
+        "31_FF01", "11_01",
+    ]
+    assert bus_mid.in_fblv is False
+
+
+def test_mrr_review_xcp_flash_uninterruptible_and_pre_post_checksum(tmp_path: Path, monkeypatch) -> None:
+    """B.2: xcp_flash_write_sectors verifies pre_data before backup, post_data after write, and wraps write in uninterruptible()."""
+    from contitool.core.mrr import mrr_get_profile
+    from contitool.progress import OperationCancelledError, OperationReporter
+
+    set_lang("en")
+    prof = mrr_get_profile("0192")
+    sec_addr, sec_size = prof["cp_affected_sectors"][0]
+
+    # 1. Corrupted pre_data fails verify_region_checksum BEFORE writing backup_sector_*.bin or erasing
+    bus_bad_pre = FakeMrrBus(sw_profile="0192", xcp_gate_open=True)
+    orig_sec = bytes(bus_bad_pre.cflash[sec_addr : sec_addr + sec_size])
+    target_sec = bytearray(orig_sec)
+    target_sec[0x10] ^= 0x55
+    real_fast = MrrCanLink.xcp_read_fast_regions
+
+    def _corrupt_pre(self, regions, **kw):
+        out = real_fast(self, regions, **kw)
+        name, data, calls, sec = out[0]
+        if name.startswith("pre_"):
+            mut = bytearray(data)
+            mut[0] ^= 0xFF
+            return [(name, bytes(mut), calls, sec), *out[1:]]
+        return out
+
+    monkeypatch.setattr(MrrCanLink, "xcp_read_fast_regions", _corrupt_pre)
+    bkp_dir = tmp_path / "bad_pre_bkp"
+    with MrrCanLink("fake", bus=bus_bad_pre) as lnk:
+        lnk.xcp_connect_and_unlock()
+        with pytest.raises(RuntimeError, match="BUILD_CHECKSUM mismatch"):
+            lnk.xcp_flash_write_sectors([(sec_addr, bytes(target_sec))], profile=prof, backup_dir=bkp_dir)
+    assert not (bkp_dir / f"backup_sector_0x{sec_addr:06X}.bin").exists()
+    assert bytes(bus_bad_pre.cflash[sec_addr : sec_addr + sec_size]) == orig_sec
+    monkeypatch.undo()
+
+    # 2. Verify post_data also calls verify_region_checksum AND cancel mid-sector-write defers until SRAM cleanup finishes!
+    bus_ok = FakeMrrBus(sw_profile="0192", xcp_gate_open=True)
+    orig_synch = bytes(bus_ok._read_mem(int(prof["xcp_synch_slot"]), 4))
+    verified_addrs: list[int] = []
+    real_vrc = MrrCanLink.verify_region_checksum
+
+    def _spy_vrc(self, address: int, data: bytes, **kw):
+        verified_addrs.append(address)
+        return real_vrc(self, address, data, **kw)
+
+    monkeypatch.setattr(MrrCanLink, "verify_region_checksum", _spy_vrc)
+
+    class CancelDuringWrite(OperationReporter):
+        def info(self, message: str) -> None:
+            if "Erasing and programming Code Flash sector" in message:
+                self.cancel()
+            super().info(message)
+
+    with MrrCanLink("fake", bus=bus_ok) as lnk:
+        lnk.xcp_connect_and_unlock()
+        with pytest.raises(OperationCancelledError):
+            lnk.xcp_flash_write_sectors(
+                [(sec_addr, bytes(target_sec))],
+                profile=prof,
+                reporter=CancelDuringWrite(),
+            )
+    # Pre-check verified before write, write completed cleanly, AND SYNCH handler was restored in finally despite cancel!
+    assert sec_addr in verified_addrs
+    assert bytes(bus_ok.cflash[sec_addr : sec_addr + sec_size]) == bytes(target_sec)
+    assert bytes(bus_ok._read_mem(int(prof["xcp_synch_slot"]), 4)) == orig_synch
+
+    # Normal run verifies BOTH pre_data and post_data via verify_region_checksum
+    verified_addrs.clear()
+    with MrrCanLink("fake", bus=bus_ok) as lnk:
+        lnk.xcp_connect_and_unlock()
+        lnk.xcp_flash_write_sectors([(sec_addr, orig_sec)], profile=prof)
+    assert verified_addrs.count(sec_addr) == 2
+
+
+def test_mrr_review_xcp_gate_nrc36_sw_guard_1003_restore_bridge_log_and_uds_only(tmp_path: Path, monkeypatch) -> None:
+    """B.3: NRC 0x36, no 10 4F retry after NRC 0x35 on SW!=0192, restore 10 03, raise if !unlocked, bridge log_path, uds_only."""
+    import contextlib
+    from contitool.can import mrr as mrr_can_mod
+
+    set_lang("en")
+
+    # 1. NRC 0x36 (exceededNumberOfAttempts) handled alongside 0x37
+    class Nrc36Bus(FakeMrrBus):
+        def _handle_uds(self, pdu: bytes) -> None:
+            if pdu[:2] == b"\x27\x04":
+                self._enqueue_isotp(MRR_UDS_RX_ID, b"\x7f\x27\x36")
+                return
+            super()._handle_uds(pdu)
+
+    with MrrCanLink("fake", bus=Nrc36Bus(sw_profile="0192", xcp_gate_open=False)) as lnk36:
+        with pytest.raises(RuntimeError, match="0x36.*exceededNumberOfAttempts"):
+            lnk36.enable_xcp_gate_uds()
+
+    # 2. On SW != 0192, after NRC 0x35 on 27 04 in 10 03, must NOT try 10 4F or send a second 27 04!
+    seen_reqs: list[bytes] = []
+
+    class Nrc35Non0192Bus(FakeMrrBus):
+        def _handle_uds(self, pdu: bytes) -> None:
+            seen_reqs.append(bytes(pdu))
+            if pdu[:2] == b"\x27\x04":
+                self._enqueue_isotp(MRR_UDS_RX_ID, b"\x7f\x27\x35")
+                return
+            super()._handle_uds(pdu)
+
+    with MrrCanLink("fake", bus=Nrc35Non0192Bus(sw_profile="0780", xcp_gate_open=False)) as lnk780:
+        with pytest.raises(RuntimeError, match="0x35.*invalidKey"):
+            lnk780.enable_xcp_gate_uds()
+    assert b"\x10\x4f" not in seen_reqs
+    assert sum(1 for r in seen_reqs if r[:2] == b"\x27\x04") == 1
+
+    # 3. On SW 0192, if 10 4F entered and failed to unlock, must restore 10 03 before raising!
+    seen_0192: list[bytes] = []
+
+    class Fail4F0192Bus(FakeMrrBus):
+        def _handle_uds(self, pdu: bytes) -> None:
+            seen_0192.append(bytes(pdu))
+            if pdu[:2] == b"\x10\x4f":
+                self._enqueue_isotp(MRR_UDS_RX_ID, b"\x50\x4f\x00\x32\x01\xf4")
+                return
+            if pdu[:2] == b"\x27\x04":
+                self._enqueue_isotp(MRR_UDS_RX_ID, b"\x7f\x27\x35")
+                return
+            super()._handle_uds(pdu)
+
+    with MrrCanLink("fake", bus=Fail4F0192Bus(sw_profile="0192", xcp_gate_open=False)) as lnk4f:
+        with pytest.raises(RuntimeError, match="0x35"):
+            lnk4f.enable_xcp_gate_uds()
+    assert b"\x10\x4f" in seen_0192
+    assert seen_0192[-1] == b"\x10\x03"
+
+    # 4. If neither 10 03 nor 10 4F unlocks (e.g. NRC 0x22 on 27 03), must raise BEFORE 2E 09 02!
+    seen_22: list[bytes] = []
+
+    class Nrc22SeedBus(FakeMrrBus):
+        def _handle_uds(self, pdu: bytes) -> None:
+            seen_22.append(bytes(pdu))
+            if pdu[:2] == b"\x27\x03":
+                self._enqueue_isotp(MRR_UDS_RX_ID, b"\x7f\x27\x22")
+                return
+            super()._handle_uds(pdu)
+
+    with MrrCanLink("fake", bus=Nrc22SeedBus(sw_profile="0192", xcp_gate_open=False)) as lnk22:
+        with pytest.raises(RuntimeError, match="SecurityAccess"):
+            lnk22.enable_xcp_gate_uds()
+    assert not any(r[:3] == b"\x2e\x09\x02" for r in seen_22)
+
+    # 5. _managed_mrr_session passes log_path=None to j533_can_bridge and log_path=log_path, bus=bridge.bus to MrrCanLink
+    bridge_kwargs: list[dict[str, Any]] = []
+    br_bus = FakeMrrBus(sw_profile="0192", xcp_gate_open=True)
+
+    class _SpyBridge:
+        def __init__(self, **kw: Any) -> None:
+            bridge_kwargs.append(kw)
+            self.bus = br_bus
+
+        def __enter__(self) -> _SpyBridge:
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            return None
+
+    monkeypatch.setattr(mrr_can_mod, "j533_can_bridge", lambda port, **kw: _SpyBridge(**kw))
+    trace_file = tmp_path / "mrr_bridge_trace.jsonl"
+    can_mrr_read_keys(
+        "fake",
+        via_gateway=True,
+        gateway_bridge=True,
+        log_path=trace_file,
+        bus=br_bus,
+    )
+    assert len(bridge_kwargs) == 1
+    assert bridge_kwargs[0]["log_path"] is None
+    assert trace_file.is_file() and trace_file.stat().st_size > 0
+    monkeypatch.undo()
+
+    # 6. uds_only=True with uds_session yielding False raises TimeoutError immediately
+    class RefusingDpduMrrBus:
+        uds_only = True
+        nonraw: dict[int, int] = {}
+        uds_refusal = "mrr link refused"
+
+        @contextlib.contextmanager
+        def uds_session(self, tx_id: int = 0x710, rx_id: int = 0x77A):
+            yield False
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            raise AssertionError("Must not fall back to raw send on uds_only bus")
+
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            return None
+
+        def shutdown(self) -> None:
+            pass
+
+    with pytest.raises(TimeoutError, match="mrr link refused"):
+        can_mrr_status("fake", interface="dpdu", bus=RefusingDpduMrrBus())
+    with MrrCanLink("fake", interface="dpdu", bus=RefusingDpduMrrBus()) as lnk_u:
+        with pytest.raises(TimeoutError, match="mrr link refused"):
+            lnk_u.request_uds(b"\x10\x03", 0x50)
+
+
+def test_mrr_review_core_prefixes_fee_bounds_redundant_copy_vle_and_zipbomb() -> None:
+    """B.4: 3QF/5QF907561 prefixes, Fee data_offset>=0x18, redundant 0x2C/computed boot_sum fallback, VLE bounds, zip bomb."""
+    import io
+    import zipfile
+    from contitool.core.mrr import (
+        MRR_FRF_MAX_BYTES,
+        _VleBuilder,
+        mrr_compute_ecu_boot_sum,
+        mrr_fee_directory,
+        mrr_support_info,
+    )
+
+    set_lang("en")
+
+    # 1. 3QF907561 / 5QF907561 recognized as Bosch MRR family
+    for pn in ("3QF907561D", "5QF907561A"):
+        sup = mrr_support_info({"part_number": pn, "sw_version": "0799"})
+        assert sup["bosch_family"] is True
+        assert sup["tone"] == "info"
+
+    # 2. mrr_fee_directory rejects entries with data_offset < 0x18 (header overlap)
+    bad_df = bytearray(b"\xff" * MRR_DFLASH_SIZE)
+    bad_df[0x7FF8:0x8000] = struct.pack(">HBBI", 0x0010, 0x2A, 0x00, 0x00000000)
+    bad_df[0x7FF0:0x7FF8] = struct.pack(">HBBI", 0x0018, 0x2B, 0x00, 0x00000000)
+    entries = mrr_fee_directory(bytes(bad_df), 0)
+    assert len(entries) == 1 and entries[0]["block_id"] == 0x2B and entries[0]["data_offset"] == 0x0018
+
+    # 3. mrr_parse_dflash_fee falls back to computed_boot_sum AND redundant Fee copy of 0x2C
+    boot_img = bytes((i * 13 + 7) & 0xFF for i in range(0x10000))
+    true_boot_sum = mrr_compute_ecu_boot_sum(boot_img)
+    ika = bytes.fromhex("112233445566778899aabbccddeeff00")
+    gfa = bytes.fromhex("aabbccddeeff00112233445566778899")
+    df_base = bytearray(_build_synthetic_mrr_dflash(ika=ika, gfa=gfa, ecu_boot_sum=true_boot_sum))
+    # Corrupt cached_boot_sum inside block 0x40 (5th block in _build_synthetic_mrr_dflash)
+    dir_entries = mrr_fee_directory(bytes(df_base), 0)
+    e40 = next(e for e in dir_entries if e["block_id"] == 0x40)
+    df_corrupt_40 = bytearray(df_base)
+    df_corrupt_40[e40["data_offset"] + 1] ^= 0xFF
+    parsed_comp = mrr_parse_dflash_fee(bytes(df_corrupt_40), cflash_or_boot_bytes=boot_img)
+    assert parsed_comp["encryption_scheme"] == "aes128-ecb-ecu-boot-sum"
+    assert parsed_comp["ika_hex"] == ika.hex()
+    assert parsed_comp["gfa_hex"] == gfa.hex()
+
+    # Corrupt newest copy (copy 1) of 0x2C while keeping valid copy 0 -> must recover via copy 0!
+    df_2c = bytearray(df_base)
+    lowest_dir = min(e["directory_offset"] for e in dir_entries)
+    new_dir = lowest_dir - 8
+    bad_2c_off = 0x0200
+    df_2c[bad_2c_off : bad_2c_off + 17] = b"\x01" + (b"\x00" * 16)
+    df_2c[new_dir : new_dir + 8] = struct.pack(">HBBI", bad_2c_off, (1 << 7) | 0x2C, 0x00, 0x00000000)
+    parsed_2c = mrr_parse_dflash_fee(bytes(df_2c))
+    assert parsed_2c["encryption_scheme"] == "aes128-ecb-ecu-boot-sum"
+    assert parsed_2c["ika_hex"] == ika.hex()
+
+    # 4. _VleBuilder.finish() validates alignment and signed range for 4-byte e_b/e_bl and e_bc
+    b_odd = _VleBuilder()
+    b_odd.ebranch("b", "t")
+    b_odd.labels["t"] = 3
+    with pytest.raises(ValueError, match="e_b/e_bl"):
+        b_odd.finish()
+
+    b_range_b = _VleBuilder()
+    b_range_b.ebranch("bl", "t")
+    b_range_b.labels["t"] = 1 << 24  # max is (1 << 24) - 2
+    with pytest.raises(ValueError, match="e_b/e_bl"):
+        b_range_b.finish()
+
+    b_range_bc = _VleBuilder()
+    b_range_bc.ebranch("bne", "t")
+    b_range_bc.labels["t"] = 1 << 15  # max is (1 << 15) - 2
+    with pytest.raises(ValueError, match="e_bc"):
+        b_range_bc.finish()
+
+    b_ok = _VleBuilder()
+    b_ok.ebranch("bne", "t")
+    b_ok.labels["t"] = (1 << 15) - 2
+    assert len(b_ok.finish()) == 4
+
+    # 5. mrr_read_frf rejects zip bomb (> MRR_FRF_MAX_BYTES uncompressed) before zf.read()
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("bomb.odx", b"A" * (MRR_FRF_MAX_BYTES + 1024))
+    bomb_frf = mrr_frf_decrypt(zbuf.getvalue())
+    assert len(bomb_frf) < MRR_FRF_MAX_BYTES  # highly compressed zeros/As
+    with pytest.raises(ValueError, match="too large"):
+        mrr_read_frf(bomb_frf, "bomb.frf")
+
 
 

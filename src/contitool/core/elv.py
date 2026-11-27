@@ -30,6 +30,7 @@ import zlib
 from contitool.core.dtc import describe_elv
 from contitool.core.dtc_elv import ELV_DTC_ORDER
 from contitool.core.fpke import analyze_fpke_dflash, fpke_verify_s0_s1
+from contitool.core.kombi import analyze_kombi_dflash, is_kombi_dflash, normalize_kombi_dflash_input
 from contitool.i18n import tr
 
 # ────────────────────────────── CAN IDs & Memory Constants ──────────────────────────────
@@ -580,6 +581,10 @@ def _scan_eeelib_pool(
                 continue
             va, vl = struct.unpack_from("<HH", compact, pos)
             if dir_map.get(va) == vl and pos + vl + 8 <= end - 8:
+                trailer_slot = (pos + 4 + vl) // 4
+                if markers is not None and markers[trailer_slot] != 0x00000000:
+                    pos += 4
+                    continue
                 t_va, t_vl = struct.unpack_from("<HH", compact, pos + 4 + vl)
                 if (t_va, t_vl) == (va, vl):
                     payload = bytes(compact[pos + 4 : pos + 4 + vl])
@@ -950,7 +955,52 @@ def elv_update_dflash_records(
     active = chosen["active_records"]
     all_instances: list[tuple[int, int, int, bytes]] = chosen["all_instances"]
 
+    siblings_by_vaddr: dict[int, tuple[int, ...]] = {}
+    for _gname, vaddrs in ELV_TRIPLE_COPY_GROUPS:
+        for v in vaddrs:
+            siblings_by_vaddr[v] = vaddrs
+
+    def _resolve_valid_flags_tail(va: int, vl: int, old_payload: bytes) -> tuple[int, bytes]:
+        candidates: list[tuple[int, bytes]] = []
+        if va in active and active[va][1] == vl:
+            candidates.append((va, active[va][2]))
+        if len(old_payload) == vl:
+            candidates.append((va, old_payload))
+        for _p, inst_va, inst_vl, inst_pl in all_instances:
+            if inst_va == va and inst_vl == vl:
+                candidates.append((va, inst_pl))
+        for sib_va in siblings_by_vaddr.get(va, ()):
+            if sib_va == va:
+                continue
+            if sib_va in active and active[sib_va][1] == vl:
+                candidates.append((sib_va, active[sib_va][2]))
+            for _p, inst_va, inst_vl, inst_pl in all_instances:
+                if inst_va == sib_va and inst_vl == vl:
+                    candidates.append((sib_va, inst_pl))
+
+        seen: set[tuple[int, bytes]] = set()
+        for cand_va, cand_pl in candidates:
+            key = (cand_va, cand_pl)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                _, cand_flags, _, _, ok = elv_decrypt_eeh_payload(cand_va, cand_pl, seed10=seed10)
+            except ValueError:
+                continue
+            if ok:
+                return cand_flags, cand_pl[vl - 3 : vl]
+        raise ValueError(
+            tr(
+                f"Ни одна копия записи vaddr 0x{va:04X} (включая дублирующие) не прошла проверку CRC-32 — "
+                "невозможно безопасно определить флаги EEH.",
+                f"No CRC-valid reference copy found for vaddr 0x{va:04X} (including siblings) — "
+                "refusing to guess EEH flags.",
+            )
+        )
+
     touched: set[int] = set()
+    resolved_meta: dict[int, tuple[int, bytes]] = {}
     for pos, va, vl, old_payload in all_instances:
         if va not in updates:
             continue
@@ -959,9 +1009,9 @@ def elv_update_dflash_records(
             raise ValueError(
                 f"Update length mismatch for vaddr 0x{va:04X}: expected {vl - 8} bytes, got {len(new_dec)}"
             )
-        ref_payload = active[va][2] if va in active else old_payload
-        flags = ref_payload[vl - 8]
-        tail3 = ref_payload[vl - 3 : vl]
+        if va not in resolved_meta:
+            resolved_meta[va] = _resolve_valid_flags_tail(va, vl, old_payload)
+        flags, tail3 = resolved_meta[va]
         new_payload = elv_build_eeh_payload(va, new_dec, flags, tail3, seed10=seed10)
         compact[pos + 4 : pos + 4 + vl] = new_payload
         touched.add(va)
@@ -1091,7 +1141,13 @@ def elv_adapt_dflash(
     new_dec2 = bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF]) + (b"\xff" * 8)
 
     new_dec4 = bytearray(dec4)
-    if idac is not None and str(idac).strip() != "":
+    has_idac = (
+        (len(idac) > 0)
+        if isinstance(idac, (bytes, bytearray, memoryview))
+        else (idac is not None and str(idac).strip() != "")
+    )
+    if has_idac:
+        assert idac is not None
         idac_bytes = _norm_hex_bytes(idac, 2, "idac")
         new_dec4[3:5] = idac_bytes
         new_dec4[5] = 0xAA  # Locked to target instrument cluster IDac
@@ -1451,8 +1507,11 @@ def elv_extract_cluster_material(
     s0_hex: str | None = None,
     s1_hex: str | None = None,
 ) -> dict[str, Any]:
-    """Extract target vehicle `VIN`, `Slot A / K_5`, `PowerClass`, `IDac`, and registered ELV `IDp` from an FPK_E dump."""
-    info = analyze_fpke_dflash(fpke_dflash, fpke_cflash)
+    """Extract target vehicle `VIN`, `Slot A / K_5`, `PowerClass`, `IDac`, and registered ELV `IDp` from an FPK_E or V850E2 Kombi dump."""
+    if is_kombi_dflash(fpke_dflash):
+        info = analyze_kombi_dflash(normalize_kombi_dflash_input(fpke_dflash), fpke_cflash)
+    else:
+        info = analyze_fpke_dflash(fpke_dflash, fpke_cflash)
     meta = info.get("metadata") or {}
     immo_cfg = info.get("immo_config") or {}
     slot_sec = info.get("slot_secrets") or {}

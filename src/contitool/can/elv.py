@@ -167,6 +167,44 @@ class ElvCanLink(J533CanLink):
             return False
         return bool(getattr(self.bus, "uds_only", False)) or bool(getattr(self.bus, "nonraw", None))
 
+    def request_uds(
+        self,
+        uds_payload: bytes,
+        expected_sid: int | None = None,
+        *,
+        timeout: float = 2.0,
+        allow_pending: bool = True,
+        resend: bool = True,
+    ) -> bytes:
+        """Send UDS request on `0x731/0x79B`, routing via `uds_session` on `uds_only`/`nonraw` D-PDU buses."""
+        if self._should_use_hw_uds():
+            with self.uds_session() as active:
+                if not active and getattr(self.bus, "uds_only", False):
+                    refusal = str(getattr(self.bus, "uds_refusal", "") or "").strip()
+                    detail = f" ({refusal})" if refusal else ""
+                    raise TimeoutError(
+                        tr(
+                            f"Адаптер D-PDU не смог открыть аппаратный канал UDS ISO-TP для 2B ELV "
+                            f"(0x{self.UDS_TX_ID:03X} → 0x{self.UDS_RX_ID:03X}){detail}.",
+                            f"D-PDU adapter could not open a hardware UDS ISO-TP link for 2B ELV "
+                            f"(0x{self.UDS_TX_ID:03X} → 0x{self.UDS_RX_ID:03X}){detail}.",
+                        )
+                    )
+                return super().request_uds(
+                    uds_payload,
+                    expected_sid,
+                    timeout=timeout,
+                    allow_pending=allow_pending,
+                    resend=resend,
+                )
+        return super().request_uds(
+            uds_payload,
+            expected_sid,
+            timeout=timeout,
+            allow_pending=allow_pending,
+            resend=resend,
+        )
+
     def send_frame(self, identifier: int, data: bytes | bytearray, pad: int | None = None) -> None:
         raw = bytes(data)
         if pad is not None and len(raw) < 8:
@@ -820,7 +858,7 @@ def _backup_and_resolve_current_k5(
     parsed: dict[str, Any] | None = None
     dflash_bytes: bytes | None = None
 
-    need_dflash = current_k5 is None or (backup_dir is not None and not link.via_gateway)
+    need_dflash = current_k5 is None or (backup_dir is not None and not link.via_gateway and not link._hw_uds)
     if need_dflash:
         try:
             dflash_bytes = link.read_dflash_32k(reporter=reporter)
@@ -932,7 +970,11 @@ def can_elv_adapt(
     brand_u8 = _validate_u8(brand_byte, "brand_byte")
     if current_k5 is not None:
         _norm_key_16b(current_k5, "current_k5")
-    needs_raw = current_k5 is None or (not via_gateway)
+    needs_raw = (
+        current_k5 is None
+        or (not via_gateway)
+        or (backup_dir is not None and via_gateway and gateway_bridge)
+    )
 
     with _managed_elv_session(
         port,
@@ -955,6 +997,9 @@ def can_elv_adapt(
     ) as (link, used_bridge):
         reporter.step(1, 4, tr("Чтение паспорта, бэкап и проверка текущего ключа K_5", "Reading passport, backup & verifying current K_5"))
         passport, status, raw_dids, _ = _read_elv_passport_and_status(link, read_dtcs=False)
+        prof = elv_detect_profile(passport)
+        if prof["warning"]:
+            reporter.warning(prof["warning"])
         if status.get("mode") == 0xFF:
             raise RuntimeError(
                 tr(
@@ -1002,9 +1047,18 @@ def can_elv_adapt(
         post_02f9 = _verify_live_02f9(link, target_k5, post_passport, post_raw)
 
     return {
-        "ok": bool(post_status.get("mode") == 0x02 and post_02f9.get("verified") is True and post_02f9.get("match") is True),
+        "ok": bool(
+            post_status.get("mode") == 0x02
+            and post_passport.get("vin") == norm_vin
+            and post_status.get("power_class") == pc_u8
+            and post_02f9.get("verified") is True
+            and post_02f9.get("match") is True
+        ),
         "operation": "adapt",
         "used_bridge": used_bridge,
+        "profile": prof,
+        "officially_supported": bool(prof["verified"]),
+        "support_warning": prof["warning"],
         "new_vin": norm_vin,
         "new_k5_hex": target_k5.hex().upper(),
         "new_power_class": pc_u8,
@@ -1091,7 +1145,11 @@ def can_elv_virginize(
         _norm_key_16b(current_k5, "current_k5")
     if virgin_k5 is not None:
         _norm_key_16b(virgin_k5, "virgin_k5")
-    needs_raw = current_k5 is None or (not via_gateway)
+    needs_raw = (
+        current_k5 is None
+        or (not via_gateway)
+        or (backup_dir is not None and via_gateway and gateway_bridge)
+    )
 
     with _managed_elv_session(
         port,
@@ -1114,6 +1172,9 @@ def can_elv_virginize(
     ) as (link, used_bridge):
         reporter.step(1, 4, tr("Чтение паспорта, бэкап и проверка текущего ключа K_5", "Reading passport, backup & verifying current K_5"))
         passport, status, raw_dids, _ = _read_elv_passport_and_status(link, read_dtcs=False)
+        prof = elv_detect_profile(passport)
+        if prof["warning"]:
+            reporter.warning(prof["warning"])
         if status.get("mode") == 0xFF:
             raise RuntimeError(
                 tr(
@@ -1158,6 +1219,9 @@ def can_elv_virginize(
         "ok": bool(post_status.get("mode") == 0x01 and post_02f9.get("verified") is True and post_02f9.get("match") is True),
         "operation": "virginize",
         "used_bridge": used_bridge,
+        "profile": prof,
+        "officially_supported": bool(prof["verified"]),
+        "support_warning": prof["warning"],
         "virgin_k5_hex": vk5.hex().upper(),
         "idp_hex": pre_parsed["block04"]["idp_hex"] if pre_parsed else "",
         "post_passport": post_passport,
@@ -1183,7 +1247,7 @@ def can_elv_reset_idac(
     """Reset learned cluster `IDac` (`0xAA -> 0x00`) in Mode 2 via `22 02E0 -> 2E 02E1` (`cmd=0x04, arg=0x80`)."""
     if current_k5 is not None:
         _norm_key_16b(current_k5, "current_k5")
-    needs_raw = current_k5 is None
+    needs_raw = current_k5 is None or (backup_dir is not None and via_gateway and gateway_bridge)
 
     with _managed_elv_session(
         port,
@@ -1206,6 +1270,9 @@ def can_elv_reset_idac(
     ) as (link, used_bridge):
         reporter.step(1, 3, tr("Чтение статуса и проверка текущего ключа K_5", "Reading status & verifying current K_5"))
         passport, status, raw_dids, _ = _read_elv_passport_and_status(link, read_dtcs=False)
+        prof = elv_detect_profile(passport)
+        if prof["warning"]:
+            reporter.warning(prof["warning"])
         if status.get("mode") != 0x02:
             raise RuntimeError(
                 tr(
@@ -1246,6 +1313,9 @@ def can_elv_reset_idac(
         "ok": not bool(post_status.get("idac_locked", True)),
         "operation": "reset_idac",
         "used_bridge": used_bridge,
+        "profile": prof,
+        "officially_supported": bool(prof["verified"]),
+        "support_warning": prof["warning"],
         "c_diag_hex": c_diag.hex().upper(),
         "payload_02e1_hex": payload_4.hex().upper(),
         "post_passport": post_passport,
@@ -1394,21 +1464,32 @@ def _request_31_01_02_03_with_wfs5(
         uds_pdu: bytes | None = None
         if pci_type == 0:
             sf_len = raw[0] & 0x0F
+            if not (1 <= sf_len <= 7) or len(raw) < 1 + sf_len:
+                continue
             uds_pdu = raw[1 : 1 + sf_len]
-        elif pci_type == 1 and len(raw) >= 2:
-            mf_expected = ((raw[0] & 0x0F) << 8) | raw[1]
+        elif pci_type == 1:
+            if len(raw) != 8:
+                continue
+            cand_expected = ((raw[0] & 0x0F) << 8) | raw[1]
+            if cand_expected <= 6:
+                continue
+            mf_expected = cand_expected
             mf_buf = bytearray(raw[2:])
             mf_next_sn = 1
             link.send_raw_frame(link.UDS_TX_ID, b"\x30\x00\x00", pad=link.UDS_FC_PAD)
             continue
         elif pci_type == 2 and mf_expected > 0:
             if (raw[0] & 0x0F) == (mf_next_sn & 0x0F):
-                mf_buf.extend(raw[1:])
+                need = min(7, mf_expected - len(mf_buf))
+                if len(raw) < 1 + need:
+                    continue
+                mf_buf.extend(raw[1 : 1 + need])
                 mf_next_sn = (mf_next_sn + 1) & 0x0F
                 if len(mf_buf) >= mf_expected:
                     uds_pdu = bytes(mf_buf[:mf_expected])
                     mf_expected = 0
-            continue
+            if uds_pdu is None:
+                continue
         else:
             continue
 
@@ -1541,6 +1622,14 @@ def can_elv_check_bootloader(
                 if bl_prof["warning"]:
                     reporter.warning(bl_prof["warning"])
 
+        pre_idac_state: int | None = None
+        pre_idac_locked: bool | None = None
+        if not in_bl and mode == 2:
+            with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
+                raw_02ee = link.request_uds(b"\x22\x02\xee", 0x62, timeout=0.9)[3:]
+                if len(raw_02ee) >= 2:
+                    pre_idac_locked = bool(raw_02ee[1] & 0x40)
+
         # In Adapted Mode 2, `10 02` strictly requires WFS5 `0x01A` Type 1 <-> `0x01B` with `KL15=1`.
         # If credentials were not passed (e.g. GUI before reading DFLASH, or CLI), auto-read DFLASH on raw Komfort CAN.
         if (
@@ -1566,6 +1655,16 @@ def can_elv_check_bootloader(
             )
             dflash_bytes = link.read_dflash_32k(reporter=reporter)
             parsed = elv_parse_dflash(dflash_bytes)
+            if not parsed["all_crc_ok"]:
+                raise RuntimeError(
+                    tr(
+                        f"Ошибка целостности считанного Data Flash ({parsed['crc_valid_count']}/{parsed['crc_total_count']} CRC) — "
+                        "авторизация WFS5 отменена.",
+                        f"DFLASH integrity check failed ({parsed['crc_valid_count']}/{parsed['crc_total_count']} CRCs) — "
+                        "WFS5 authorization aborted.",
+                    )
+                )
+            pre_idac_state = parsed["block04"]["idac_state"]
             slot_a_hex = parsed["block34"]["slot_a_hex"]
             if k5_b is None and len(slot_a_hex) == 32:
                 k5_b = bytes.fromhex(slot_a_hex)
@@ -1576,9 +1675,49 @@ def can_elv_check_bootloader(
             if len(parsed["block04"]["idp_hex"]) == 4:
                 idp_b = bytes.fromhex(parsed["block04"]["idp_hex"])
 
+        # Bench WFS5 0x01A/0x01B handshake with IDac=0000 on an unlearned Mode 2 ELV would auto-lock IDac=0x0000 (0xAA).
+        # Track this so we automatically reset IDac state back to 0x00 via 22 02E0 -> 2E 02E1 (04 80) after returning to App.
+        idac_was_unlearned = pre_idac_state == 0x00 or (pre_idac_state is None and pre_idac_locked is False)
+        should_restore_unlearned_idac = bool(
+            not in_bl
+            and mode == 2
+            and idac_was_unlearned
+            and idac_b == b"\x00\x00"
+            and k5_b is not None
+        )
+
+        def _restore_idac_unlearned() -> bool:
+            assert k5_b is not None
+            try:
+                with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
+                    link.request_uds(b"\x10\x03", 0x50, timeout=1.2)
+                c_diag = link.request_uds(b"\x22\x02\xe0", 0x62, timeout=1.5)[3:7]
+                if len(c_diag) != 4 or c_diag == b"\x00\x00\x00\x00":
+                    raise RuntimeError(f"Invalid DID 0x02E0 challenge: {c_diag.hex()}")
+                cmd, arg = ELV_CMD_RESET_IDAC
+                p4 = elv_build_02e1_payload(k5_b, c_diag, cmd=cmd, arg=arg)
+                link.request_uds(b"\x2e\x02\xe1" + p4, 0x6E, timeout=4.0)
+                reporter.info(
+                    tr(
+                        "Состояние IDac автоматически сброшено обратно в 0x00 (автообучение) после проверки загрузчика.",
+                        "Automatically restored IDac state back to 0x00 (auto-learn) after bootloader check.",
+                    )
+                )
+                return True
+            except Exception as exc:  # noqa: BLE001
+                reporter.warning(
+                    tr(
+                        f"Не удалось автоматически сбросить состояние IDac обратно в 0x00 после проверки загрузчика: {exc}",
+                        f"Could not automatically restore IDac state back to 0x00 after bootloader check: {exc}",
+                    )
+                )
+                return False
+
         bz = 0
         kl15_held = False
         reset_sent = False
+        wfs5_ran = False
+        idac_restored = False
         try:
             if not in_bl:
                 if enter_programming:
@@ -1595,6 +1734,14 @@ def can_elv_check_bootloader(
                     will_send_kl15 = enter_programming or (
                         use_wfs5_creds and k5_b is not None and pc_val is not None and idac_b is not None
                     )
+                    if (
+                        not link.via_gateway
+                        and use_wfs5_creds
+                        and k5_b is not None
+                        and pc_val is not None
+                        and idac_b is not None
+                    ):
+                        wfs5_ran = True
                     body, bz, wfs5_ok, wfs5_info = _request_31_01_02_03_with_wfs5(
                         link,
                         k5=k5_b if use_wfs5_creds else None,
@@ -1659,11 +1806,18 @@ def can_elv_check_bootloader(
                 time.sleep(0.05)
             post_ok, post_in_bl = link.probe_uds_channel(timeout=1.0)
             result["returned_to_app"] = bool(post_ok and not post_in_bl)
+            if should_restore_unlearned_idac and wfs5_ran and result["returned_to_app"]:
+                result["idac_auto_restored"] = _restore_idac_unlearned()
+                idac_restored = True
         finally:
             if result.get("programming_session_ok") is True and not reset_sent:
                 # Never leave ELV stuck in Bootloader Programming Session if 27 11/12 fails
                 with contextlib.suppress(*TRANSPORT_ERRORS, UdsNegativeResponse, UnexpectedUdsResponse):
                     link.request_uds(b"\x11\x01", 0x51, timeout=3.0)
+                if not _is_in_memory_bus(link):
+                    time.sleep(0.35)
+                    link.send_elv_wake_burst(2)
+                    time.sleep(0.05)
             if kl15_held and not link.via_gateway:
                 for _ in range(3):
                     with contextlib.suppress(*TRANSPORT_ERRORS):
@@ -1671,5 +1825,10 @@ def can_elv_check_bootloader(
                     bz = (bz + 1) & 0x0F
                     if not _is_in_memory_bus(link):
                         time.sleep(0.02)
+            if should_restore_unlearned_idac and wfs5_ran and not idac_restored:
+                post_ok, post_in_bl = link.probe_uds_channel(timeout=1.0)
+                if post_ok and not post_in_bl:
+                    result["idac_auto_restored"] = _restore_idac_unlearned()
+                    idac_restored = True
 
     return result

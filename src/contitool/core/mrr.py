@@ -1136,7 +1136,9 @@ def mrr_support_info(
         or (bool(asam) and not asam.startswith(("EV_ACCBOSCHVW48", "EV_ACCBOSCHVW416", "EV_ACCBOSCHVW372")))
     )
     bosch_family = (not alien_platform) and (
-        pn_norm.startswith(("3Q0907572", "3QF907572", "5QF907572", "5Q0907572", "5Q0907561", "561907567"))
+        pn_norm.startswith(
+            ("3Q0907572", "3QF907572", "3QF907561", "5QF907572", "5QF907561", "5Q0907572", "5Q0907561", "561907567")
+        )
         or "MRR" in sys_name
         or asam.startswith(("EV_ACCBOSCHVW48", "EV_ACCBOSCHVW416", "EV_ACCBOSCHVW372"))
     )
@@ -1235,7 +1237,7 @@ def mrr_fee_directory(dflash_64k: bytes, cluster_offset: int = 0) -> list[dict[s
         if raw == b"\xFF" * 8:
             break
         data_offset, block_and_copy, crc8, status = struct.unpack(">HBBI", raw)
-        if status == 0 and data_offset < 0x8000:
+        if status == 0 and 0x18 <= data_offset < 0x8000:
             entries.append({
                 "directory_offset": directory_offset,
                 "data_offset": data_offset,
@@ -1340,18 +1342,24 @@ def mrr_parse_dflash_fee(
                         shadow_valid = True
                         break
 
-    def _slot_payload(bid: int) -> bytes | None:
+    def _slot_payloads(bid: int) -> list[bytes]:
         copies = active_blocks.get(bid) or fallback_blocks.get(bid)
         if not copies:
-            return None
+            return []
         # Directory grows downward from +0x7FF8, so lowest directory_offset is the most recently written copy
-        best_copy = min(copies.items(), key=lambda kv: (kv[1]["directory_offset"], kv[0]))[1]
-        return best_copy["payload"]
+        ordered = sorted(copies.items(), key=lambda kv: (kv[1]["directory_offset"], kv[0]))
+        return [info["payload"] for _, info in ordered]
 
-    raw_40 = _slot_payload(0x40)
+    def _slot_payload(bid: int) -> bytes | None:
+        pls = _slot_payloads(bid)
+        return pls[0] if pls else None
+
+    raw_40_list = _slot_payloads(0x40)
+    raw_40 = raw_40_list[0] if raw_40_list else None
     raw_2a = _slot_payload(0x2A)
     raw_2b = _slot_payload(0x2B)
-    raw_2c = _slot_payload(0x2C)
+    raw_2c_list = _slot_payloads(0x2C)
+    raw_2c = raw_2c_list[0] if raw_2c_list else None
     raw_2d = _slot_payload(0x2D)
 
     computed_boot_sum: bytes | None = None
@@ -1370,17 +1378,37 @@ def mrr_parse_dflash_fee(
     ks_meta_bytes: bytes | None = None
     encryption_scheme = "unknown"
 
-    if ecu_boot_sum and len(ecu_boot_sum) == 16:
-        dec_2c = bcm_aes128_ecb_decrypt(ecu_boot_sum, raw_2c[1:17]) if (raw_2c and len(raw_2c) >= 17) else None
-        if dec_2c is not None and dec_2c.startswith(MRR_KS_META_MAGIC):
-            encryption_scheme = "aes128-ecb-ecu-boot-sum"
-            ks_meta_bytes = dec_2c
-            if raw_2a and len(raw_2a) >= 17:
-                ika_bytes = bcm_aes128_ecb_decrypt(ecu_boot_sum, raw_2a[1:17])
-            if raw_2b and len(raw_2b) >= 17:
-                prng_seed_bytes = bcm_aes128_ecb_decrypt(ecu_boot_sum, raw_2b[1:17])
-            if raw_2d and len(raw_2d) >= 17:
-                gfa_bytes = bcm_aes128_ecb_decrypt(ecu_boot_sum, raw_2d[1:17])
+    boot_sum_candidates: list[bytes] = []
+    for cand_40 in raw_40_list:
+        if len(cand_40) >= 17 and cand_40[1:17] not in boot_sum_candidates:
+            boot_sum_candidates.append(cand_40[1:17])
+    if computed_boot_sum is not None and len(computed_boot_sum) == 16 and computed_boot_sum not in boot_sum_candidates:
+        boot_sum_candidates.append(computed_boot_sum)
+
+    matched_boot_sum: bytes | None = None
+    for cand_sum in boot_sum_candidates:
+        if len(cand_sum) != 16:
+            continue
+        for cand_2c in raw_2c_list:
+            if len(cand_2c) < 17:
+                continue
+            dec_2c = bcm_aes128_ecb_decrypt(cand_sum, cand_2c[1:17])
+            if dec_2c.startswith(MRR_KS_META_MAGIC):
+                matched_boot_sum = cand_sum
+                ks_meta_bytes = dec_2c
+                break
+        if matched_boot_sum is not None:
+            break
+
+    if matched_boot_sum is not None:
+        ecu_boot_sum = matched_boot_sum
+        encryption_scheme = "aes128-ecb-ecu-boot-sum"
+        if raw_2a and len(raw_2a) >= 17:
+            ika_bytes = bcm_aes128_ecb_decrypt(ecu_boot_sum, raw_2a[1:17])
+        if raw_2b and len(raw_2b) >= 17:
+            prng_seed_bytes = bcm_aes128_ecb_decrypt(ecu_boot_sum, raw_2b[1:17])
+        if raw_2d and len(raw_2d) >= 17:
+            gfa_bytes = bcm_aes128_ecb_decrypt(ecu_boot_sum, raw_2d[1:17])
 
     if (
         encryption_scheme == "unknown"
@@ -3051,8 +3079,12 @@ class _VleBuilder:
                 self.data[offset + 1] = (delta // 2) & 0xFF
             else:
                 if base in (0x78000000, 0x78000001):
+                    if delta & 1 or not -(1 << 24) <= delta <= ((1 << 24) - 2):
+                        raise ValueError(f"Invalid e_b/e_bl branch distance {delta} at 0x{offset:x}")
                     word = base | (delta & 0x01FFFFFE)
                 else:
+                    if delta & 1 or not -(1 << 15) <= delta <= ((1 << 15) - 2):
+                        raise ValueError(f"Invalid e_bc branch distance {delta} at 0x{offset:x}")
                     word = base | (delta & 0xFFFE)
                 self.data[offset:offset + 4] = word.to_bytes(4, "big")
         return bytes(self.data)
@@ -4863,6 +4895,14 @@ def mrr_read_frf(data: bytes, name: str = "") -> MrrFrfImage:
     try:
         with zipfile.ZipFile(io.BytesIO(plain)) as zf:
             odx_name = next(n for n in zf.namelist() if n.lower().endswith((".odx", ".odx-f")))
+            odx_info = zf.getinfo(odx_name)
+            if odx_info.file_size > MRR_FRF_MAX_BYTES:
+                raise ValueError(
+                    tr(
+                        f"Распакованный ODX внутри FRF слишком велик: {odx_info.file_size:,} Б",
+                        f"Uncompressed ODX inside FRF is too large: {odx_info.file_size:,} B",
+                    )
+                )
             odx_raw = zf.read(odx_name)
         root = ET.fromstring(odx_raw.lstrip(_MRR_XML_LEAD))  # noqa: S314 - user-selected flash container
     except (zipfile.BadZipFile, StopIteration, ET.ParseError, KeyError, zlib.error) as exc:

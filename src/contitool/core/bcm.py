@@ -6,6 +6,7 @@ from typing import Any
 import zlib
 
 from contitool.core.fpke import FPKE_FFB_C16, analyze_fpke_dflash
+from contitool.core.kombi import analyze_kombi_dflash, is_kombi_dflash, normalize_kombi_dflash_input
 from contitool.i18n import tr
 
 # ────────────────────────────── CAN Identifiers & Constants ──────────────────────────────
@@ -172,13 +173,27 @@ BCM_PROFILES: dict[str, dict[str, Any]] = {
 def bcm_get_profile(profile_id: str) -> dict[str, Any]:
     """Return a copy of the BCM firmware profile dict (`'ea_0511'`, `'dd_0273'`, `'bq_0212'`, or `'bl_0175'`)."""
     key = (profile_id or "").strip().lower()
-    if key in ("ea", "0511", "ea_0511", "5q0937084ea", "5q0937086bh"):
+    if key in ("ea", "0511", "ea_0511", "5q0937084ea", "5q0937086bh", "5q0937085c"):
         return {**BCM_PROFILES["ea_0511"], "matched": True}
-    if key in ("dd", "0273", "dd_0273", "5q0937084dd", "5q0937084cg"):
+    if key in ("dd", "cg", "0273", "dd_0273", "5q0937084dd", "5q0937084cg", "5q0937085b"):
         return {**BCM_PROFILES["dd_0273"], "matched": True}
-    if key in ("bq", "0212", "bq_0212", "5q0937084bq", "5q0937084bc"):
+    if key in ("bq", "bc", "0212", "bq_0212", "5q0937084bq", "5q0937084bc"):
         return {**BCM_PROFILES["bq_0212"], "matched": True}
-    if key in ("bl", "cj", "0173", "0175", "bl_0175", "bl_0173", "cj_0175", "5q0937084bl", "5q0937084cj", "5q0937084an", "5q0937084al"):
+    if key in (
+        "bl",
+        "cj",
+        "an",
+        "al",
+        "0173",
+        "0175",
+        "bl_0175",
+        "bl_0173",
+        "cj_0175",
+        "5q0937084bl",
+        "5q0937084cj",
+        "5q0937084an",
+        "5q0937084al",
+    ):
         return {**BCM_PROFILES["bl_0175"], "matched": True}
     if key in BCM_PROFILES:
         return {**BCM_PROFILES[key], "matched": True}
@@ -186,7 +201,7 @@ def bcm_get_profile(profile_id: str) -> dict[str, Any]:
 
 
 def bcm_detect_profile(
-    ident: dict[str, Any] | None = None,
+    ident: dict[str, Any] | list[dict[str, str]] | None = None,
     *,
     sw_version: str = "",
     part_number: str = "",
@@ -196,12 +211,11 @@ def bcm_detect_profile(
     if sw_profile:
         return bcm_get_profile(sw_profile)
 
-    sw = (sw_version or (ident or {}).get("sw_version") or "").strip()
-    pn = (
-        part_number
-        or (ident or {}).get("part_number")
-        or (ident or {}).get("hw_part_number")
-        or ""
+    pn, sw = _extract_bcm_pn_sw(
+        ident,
+        sw_version=sw_version,
+        part_number=part_number,
+        include_hw_fallback=False,
     )
     pn_norm = "".join(pn.split()).upper()
 
@@ -210,7 +224,7 @@ def bcm_detect_profile(
             return {**prof, "matched": True}
     if not sw:
         for prof in BCM_PROFILES.values():
-            if pn_norm and any(pn_norm.startswith(pref) for pref in prof["part_prefixes"]):
+            if pn_norm and pn_norm in prof["part_prefixes"]:
                 return {**prof, "matched": True}
     return {**BCM_PROFILES["ea_0511"], "matched": False}
 
@@ -220,13 +234,14 @@ def _extract_bcm_pn_sw(
     *,
     sw_version: str = "",
     part_number: str = "",
+    include_hw_fallback: bool = True,
 ) -> tuple[str, str]:
     pn = part_number.strip()
     sw = sw_version.strip()
     if isinstance(ident_or_passport, list):
         vals = {str(it.get("did", "")).upper(): str(it.get("value", "")).strip() for it in ident_or_passport}
         if not pn:
-            pn = vals.get("F187") or vals.get("F191") or ""
+            pn = vals.get("F187") or (vals.get("F191") if include_hw_fallback else "") or ""
         if not sw:
             sw = vals.get("F189") or ""
     elif isinstance(ident_or_passport, dict):
@@ -234,8 +249,11 @@ def _extract_bcm_pn_sw(
             pn = str(
                 ident_or_passport.get("part_number")
                 or ident_or_passport.get("F187")
-                or ident_or_passport.get("hw_part_number")
-                or ident_or_passport.get("F191")
+                or (
+                    (ident_or_passport.get("hw_part_number") or ident_or_passport.get("F191"))
+                    if include_hw_fallback
+                    else ""
+                )
                 or ""
             ).strip()
         if not sw:
@@ -253,9 +271,9 @@ def bcm_support_info(
     """Return official support status and a clear `(PN + SW)` warning for a `09 BCM` unit without blocking UDS reads."""
     pn, sw = _extract_bcm_pn_sw(ident_or_passport, sw_version=sw_version, part_number=part_number)
     profile = bcm_detect_profile(
-        {"part_number": pn, "sw_version": sw} if (pn or sw) else None,
-        sw_version=sw,
-        part_number=pn,
+        ident_or_passport,
+        sw_version=sw_version,
+        part_number=part_number,
         sw_profile=sw_profile,
     )
     if not pn and not sw:
@@ -745,8 +763,11 @@ def bcm_extract_cluster_ffb_material(
     *,
     freq_code: int = 0x03,
 ) -> dict[str, Any]:
-    """Extract `K_c`, `GFA (/1)`, `K_ffb`, raw `EEL 0x6A` records, and synthesized FFB records from an `FPK_E` DataFlash dump."""
-    info = analyze_fpke_dflash(fpke_dflash, fpke_cflash)
+    """Extract `K_c`, `GFA (/1)`, `K_ffb`, raw `EEL 0x6A` records, and synthesized FFB records from an `FPK_E` or `V850E2 Kombi` DataFlash dump."""
+    if is_kombi_dflash(fpke_dflash):
+        info = analyze_kombi_dflash(normalize_kombi_dflash_input(fpke_dflash), fpke_cflash)
+    else:
+        info = analyze_fpke_dflash(fpke_dflash, fpke_cflash)
     items_by_id = {it.get("key_id"): it.get("hex", "") for it in info.get("items", []) if it.get("key_id")}
     kc_hex = items_by_id.get("kc", "")
     gfa_hex = items_by_id.get("cp1_bank_0", "")
@@ -921,7 +942,7 @@ def bcm_decode_status_dids(
             ser_u32 = int.from_bytes(ser_be[:4], "big") if len(ser_be) >= 4 else 0
             cnt_u32 = int.from_bytes(cnt_be[:4], "big") if len(cnt_be) >= 4 else 0
             sync_code = sync_raw[0] if len(sync_raw) >= 1 else None
-            populated = ser_be[:4] not in (b"", b"\x00" * 4, b"\xff" * 4)
+            populated = len(ser_be) >= 4 and ser_be[:4] not in (b"\x00" * 4, b"\xff" * 4)
             bit = 1 << slot_idx
             slots.append(
                 {

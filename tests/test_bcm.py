@@ -1108,7 +1108,9 @@ def test_bcm_pass2_failure_restores_ffb_and_persists_backup(monkeypatch, tmp_pat
     set_lang("en")
     bus = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
     bus.nvm_read_blocked = True  # force 2-pass Job 3 read (Pass 1 reads K_ffb, Pass 2 reads IKA)
+    bus.k_ffb = bytes.fromhex("5566778899aabbccddeeff0011223344")
     bus.ffb_serials[1] = bytes.fromhex("532B3512")
+    bus._sync_ffb_ram_mirror()
     orig_kffb = bytes(bus.k_ffb)
 
     real_job3 = bcm_can_mod._read_bcm_job3_target_in_session
@@ -1465,6 +1467,407 @@ def test_bcm_unverified_sw_allows_uds_read_with_pn_sw_warning_and_fixes_prefix_f
     assert res["support_warning"] and "5Q0937084EA" in res["support_warning"] and "0512" in res["support_warning"]
     assert any("5Q0937084EA" in w and "0512" in w for w in warns)
     assert bus.ffb_serials[1] == bytes.fromhex("532B3512")
+
+
+def test_bcm_review_xcp_connect_no_mutation_and_profile_gating() -> None:
+    """A.1: xcp_connect() must never mutate profile['matched'] or clobber profile IDs; XCP slot/key mirror gated on matched."""
+    from contitool.can.bcm import _read_bcm_status_in_session, _read_ffb_slots_via_xcp
+
+    dd_bus = FakeBcmBus(profile_id="dd_0273", freq_code=0x03)
+    dd_bus.allow_dev_session = False
+    dd_bus.ffb_serials[1] = bytes.fromhex("532B3512")
+    dd_bus._sync_ffb_ram_mirror()
+
+    unmatched_prof = bcm_detect_profile({"part_number": "5Q0937084CP", "sw_version": "0253"})
+    assert unmatched_prof["matched"] is False
+    orig_id = unmatched_prof["id"]
+    orig_xcp_tx = unmatched_prof["xcp_tx_id"]
+
+    with BcmCanLink("fake", bus=dd_bus) as link:
+        resp = link.xcp_connect(profile=unmatched_prof, timeout=0.5)
+        assert resp[0] == 0xFF
+        # Link switched to DD XCP IDs, but caller's profile dict must remain untouched!
+        assert link.xcp_tx_id == BCM_XCP_DD_TX_ID
+        assert unmatched_prof["matched"] is False
+        assert unmatched_prof["id"] == orig_id
+        assert unmatched_prof["xcp_tx_id"] == orig_xcp_tx
+
+        # Unmatched profile must NOT read FFB slots via XCP mirror
+        assert _read_ffb_slots_via_xcp(link, unmatched_prof) == {}
+        st = _read_bcm_status_in_session(link, include_nvm_slots=True, profile=unmatched_prof)
+        assert st["ffb_slots"] == []
+
+        # Also verify bq_0212 profile is never clobbered into ea_0511 on xcp_connect
+        bq_prof = bcm_detect_profile({"part_number": "5Q0937084BQ", "sw_version": "0212"})
+        link.xcp_connect(profile=bq_prof, timeout=0.5)
+        assert bq_prof["id"] == "bq_0212"
+
+
+def test_bcm_review_adapt_ffb_early_validation_precheck_and_unverified_gate(monkeypatch) -> None:
+    """A.2: validate inputs before _managed_bcm_session(), precheck before bridge when gfa=None, gate unverified SW."""
+    from contitool.can import bcm as bcm_can_mod
+
+    set_lang("en")
+    session_opened = False
+
+    def _forbid_session(*_a: Any, **_kw: Any) -> Any:
+        nonlocal session_opened
+        session_opened = True
+        raise AssertionError("_managed_bcm_session must not be entered on invalid inputs")
+
+    monkeypatch.setattr(bcm_can_mod, "_managed_bcm_session", _forbid_session)
+    with pytest.raises(ValueError, match="gfa"):
+        can_bcm_adapt_ffb("fake", gfa="not-hex", kc="11" * 16, clear_all=True)
+    with pytest.raises(ValueError, match="kc|k_ffb"):
+        can_bcm_adapt_ffb("fake", gfa="11" * 16, clear_all=True)
+    with pytest.raises(ValueError, match="entries, keys, or clear_all"):
+        can_bcm_adapt_ffb("fake", gfa="11" * 16, kc="22" * 16)
+    assert session_opened is False
+
+    monkeypatch.undo()
+
+    class UnknownSwBcmBus(FakeBcmBus):
+        def _handle_uds(self, payload: bytes) -> None:
+            if payload[:3] == b"\x22\xf1\x87":
+                self._enqueue_isotp(BCM_UDS_RX_ID, b"\x62\xf1\x87" + b"5Q0937084CP ")
+                return
+            if payload[:3] == b"\x22\xf1\x89":
+                self._enqueue_isotp(BCM_UDS_RX_ID, b"\x62\xf1\x89" + b"0253")
+                return
+            super()._handle_uds(payload)
+
+    bus = UnknownSwBcmBus(profile_id="ea_0511", freq_code=0x03)
+    monkeypatch.setattr(
+        "contitool.can.bridge.j533_can_bridge",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("bridge must not launch for unverified SW")),
+    )
+    # Gateway + bridge with gfa=None must precheck and refuse before bridge
+    with pytest.raises(RuntimeError, match="Unsupported 09 BCM firmware"):
+        can_bcm_adapt_ffb(
+            "fake",
+            gfa=None,
+            kc="33" * 16,
+            clear_all=True,
+            via_gateway=True,
+            gateway_bridge=True,
+            bus=bus,
+        )
+    # Direct with gfa=None must refuse before _read_bcm_gfa_in_session
+    monkeypatch.setattr(
+        bcm_can_mod,
+        "_read_bcm_gfa_in_session",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("_read_bcm_gfa_in_session must not be called")),
+    )
+    with pytest.raises(RuntimeError, match="Unsupported 09 BCM firmware"):
+        can_bcm_adapt_ffb("fake", gfa=None, kc="33" * 16, clear_all=True, bus=bus)
+
+
+def test_bcm_review_restore_rejects_invalid_kffb_and_read_all_bridge_precheck(monkeypatch) -> None:
+    """A.3: reject FF*16 and AES_DEC(GFA, 00*16) even with populated slots; can_bcm_read_all downgrades can_xcp before bridge."""
+    from contitool.can import bcm as bcm_can_mod
+    from contitool.can.bcm import _restore_bcm_ffb_after_read, can_bcm_read_all
+    from contitool.progress import OperationReporter
+
+    set_lang("en")
+    bus = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    gfa = bus.gfa
+    zero_dec = bcm_aes128_ecb_decrypt(gfa, bytes(16))
+    pop_slots = [{"slot": 1, "populated": True, "display_id": "532B3512", "rolling_counter": 5}]
+
+    for bad_kffb in (b"\xff" * 16, zero_dec):
+        warns: list[str] = []
+
+        class RecRep(OperationReporter):
+            def warning(self, message: str) -> None:
+                warns.append(message)
+
+        with BcmCanLink("fake", bus=bus) as link:
+            ok = _restore_bcm_ffb_after_read(
+                link,
+                gfa,
+                {"k_ffb": bad_kffb, "freq_code": 0x03, "populated_slots": pop_slots},
+                reporter=RecRep(),
+            )
+        assert ok is False
+        assert warns and any("invalid" in w.lower() for w in warns)
+
+    # can_bcm_read_all(include_keys=True, via_gateway=True, gateway_bridge=True) on unverified SW:
+    # must precheck, downgrade can_xcp=False without launching bridge, and complete Steps 1-3!
+    class UnverifiedBus(FakeBcmBus):
+        def _handle_uds(self, payload: bytes) -> None:
+            if payload[:3] == b"\x22\xf1\x87":
+                self._enqueue_isotp(BCM_UDS_RX_ID, b"\x62\xf1\x87" + b"5Q0937084EA ")
+                return
+            if payload[:3] == b"\x22\xf1\x89":
+                self._enqueue_isotp(BCM_UDS_RX_ID, b"\x62\xf1\x89" + b"0512")
+                return
+            super()._handle_uds(payload)
+
+    unv_bus = UnverifiedBus(profile_id="ea_0511", freq_code=0x03)
+    monkeypatch.setattr(
+        "contitool.can.bridge.j533_can_bridge",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("bridge must not launch for unverified SW")),
+    )
+    res = can_bcm_read_all(
+        "fake",
+        interface="slcan",
+        via_gateway=True,
+        gateway_bridge=True,
+        include_keys=True,
+        bus=unv_bus,
+    )
+    assert res["gateway_bridged"] is False
+    assert res["officially_supported"] is False
+    assert res["ika_hex"] == "" and res["gfa_working_hex"] == ""
+    assert res["passport"]["sw_version"] == "0512"
+    assert res["keys_warning"]
+
+    # Step 4 exception on verified BCM must NOT blindly fall back to _read_bcm_gfa_in_session
+    ver_bus = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    monkeypatch.setattr(
+        bcm_can_mod,
+        "_read_bcm_keys_in_session",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("simulated job3 error")),
+    )
+    monkeypatch.setattr(
+        bcm_can_mod,
+        "_read_bcm_gfa_in_session",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("blind GFA fallback must be removed")),
+    )
+    res_err = can_bcm_read_all("fake", interface="slcan", include_keys=True, bus=ver_bus)
+    assert "simulated job3 error" in res_err["keys_warning"]
+    assert res_err["gfa_working_hex"] == ""
+
+
+def test_bcm_review_pass1_zero_slots_fail_closed_and_pass2_hardreset(monkeypatch) -> None:
+    """A.4: preserve K_ffb even with 0 learned slots; fail closed when learned_count>0 & no slots; HardReset on Pass-2 fail."""
+    from contitool.can import bcm as bcm_can_mod
+
+    set_lang("en")
+    # 1. Zero learned slots, real K_ffb in NvM 0x02 (blocked on direct UDS/XCP) -> Pass 1 must preserve it!
+    orig_kffb = bytes.fromhex("deadbeefcafebabe1122334455667788")
+    bus0 = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    bus0.k_ffb = orig_kffb
+    bus0._sync_ffb_ram_mirror()
+
+    res_gfa = can_bcm_read_gfa("fake", interface="slcan", bus=bus0)
+    assert res_gfa["k_ffb_hex"] == orig_kffb.hex()
+    assert bus0.k_ffb == orig_kffb
+
+    res_keys = can_bcm_read_keys("fake", interface="slcan", bus=bus0)
+    assert res_keys["k_ffb_hex"] == orig_kffb.hex()
+    assert bus0.k_ffb == orig_kffb
+
+    # 2. Fail closed when DID 0x1983 reports ffb_learned_count > 0 but slots could not be backed up!
+    bus_fail = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    bus_fail.k_ffb = orig_kffb
+    bus_fail.ffb_serials[1] = bytes.fromhex("532B3512")
+    bus_fail.ffb_learned_mask = 1 << 1
+    bus_fail.allow_dev_session = False
+    bus_fail._sync_ffb_ram_mirror()
+    monkeypatch.setattr(bcm_can_mod, "_read_ffb_slots_via_xcp", lambda *_a, **_k: {})
+
+    with pytest.raises(RuntimeError, match="could not be backed up"):
+        can_bcm_read_keys("fake", interface="slcan", bus=bus_fail)
+    with pytest.raises(RuntimeError, match="could not be backed up"):
+        can_bcm_read_gfa("fake", interface="slcan", bus=bus_fail)
+    assert bus_fail.k_ffb == orig_kffb
+    assert bus_fail.ffb_serials[1] == bytes.fromhex("532B3512")
+
+    # 3. Pass-2 failure must capture gfa_restore BEFORE _hard_reset_and_wait_bcm and call HardReset BEFORE restore!
+    monkeypatch.undo()
+    bus_p2 = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    bus_p2.k_ffb = orig_kffb
+    bus_p2.ffb_serials[1] = bytes.fromhex("532B3512")
+    bus_p2.ffb_learned_mask = 1 << 1
+    bus_p2._sync_ffb_ram_mirror()
+
+    events: list[str] = []
+    real_job3 = bcm_can_mod._read_bcm_job3_target_in_session
+    real_reset = bcm_can_mod._hard_reset_and_wait_bcm
+    real_restore = bcm_can_mod._restore_bcm_ffb_after_read
+    call_n = {"n": 0}
+
+    def _job3_fail_p2(link, profile, *, target_addr, trigger_80_01_pdu=None):
+        call_n["n"] += 1
+        if call_n["n"] == 2:
+            raise TimeoutError("p2 fail")
+        return real_job3(link, profile, target_addr=target_addr, trigger_80_01_pdu=trigger_80_01_pdu)
+
+    def _track_reset(*a, **kw):
+        events.append("hard_reset")
+        return real_reset(*a, **kw)
+
+    def _track_restore(*a, **kw):
+        events.append("restore_ffb")
+        return real_restore(*a, **kw)
+
+    monkeypatch.setattr(bcm_can_mod, "_read_bcm_job3_target_in_session", _job3_fail_p2)
+    monkeypatch.setattr(bcm_can_mod, "_hard_reset_and_wait_bcm", _track_reset)
+    monkeypatch.setattr(bcm_can_mod, "_restore_bcm_ffb_after_read", _track_restore)
+    with pytest.raises(TimeoutError, match="p2 fail"):
+        can_bcm_read_keys("fake", interface="slcan", bus=bus_p2)
+    # Pass 1 reset, then Pass-2 exception reset, then restore_ffb
+    assert events == ["hard_reset", "hard_reset", "restore_ffb"]
+    assert bus_p2.k_ffb == orig_kffb
+
+
+def test_bcm_review_precheck_empty_passport_uds_only_failfast_and_key_masking(monkeypatch) -> None:
+    """A.5: precheck rejects empty passport & restores 10 01; adapt_ffb_from_cluster checks bridge first; uds_only failfast; masked logs."""
+    import contextlib
+    from contitool.can.bcm import _precheck_bcm_profile_before_bridge
+    from contitool.progress import OperationReporter
+
+    set_lang("en")
+
+    # 1. Silent bus -> _precheck_bcm_profile_before_bridge raises instead of returning {}
+    class SilentBus:
+        rx_queue: deque[can.Message] = deque()
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            pass
+
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            return None
+
+        def shutdown(self) -> None:
+            pass
+
+    monkeypatch.setattr("contitool.can.bcm._read_bcm_passport_in_session", lambda _lnk: {})
+    with pytest.raises(RuntimeError, match="did not answer UDS passport"):
+        _precheck_bcm_profile_before_bridge("fake", bus=SilentBus())
+    monkeypatch.undo()
+
+    # 2. _precheck_bcm_profile_before_bridge returns BCM to 10 01 before closing
+    bus = FakeBcmBus(profile_id="ea_0511", freq_code=0x03)
+    pre = _precheck_bcm_profile_before_bridge("fake", bus=bus)
+    assert pre["sw_version"] == "0511"
+    assert bus.session == 0x01
+
+    # 3. can_bcm_adapt_ffb_from_cluster(fpke_dflash=None, via_gateway=True, gateway_bridge=False) fails BEFORE probing FPK_E
+    with pytest.raises(RuntimeError, match="Aborted before modifying GFA"):
+        can_bcm_adapt_ffb_from_cluster(
+            "fake",
+            fpke_dflash=None,
+            via_gateway=True,
+            gateway_bridge=False,
+            bus=bus,
+        )
+
+    # 4. uds_only=True with uds_session yielding False raises TimeoutError immediately
+    class RefusingDpduBus:
+        uds_only = True
+        nonraw: dict[int, int] = {}
+        uds_refusal = "cannot open link"
+
+        @contextlib.contextmanager
+        def uds_session(self, tx_id: int = 0x710, rx_id: int = 0x77A):
+            yield False
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            raise AssertionError("Must not fall back to raw send on uds_only bus")
+
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            return None
+
+        def shutdown(self) -> None:
+            pass
+
+    with pytest.raises(TimeoutError, match="cannot open link"):
+        can_bcm_status("fake", interface="dpdu", bus=RefusingDpduBus())
+    with BcmCanLink("fake", interface="dpdu", bus=RefusingDpduBus()) as lnk:
+        with pytest.raises(TimeoutError, match="cannot open link"):
+            lnk.request_uds(b"\x10\x03", 0x50)
+
+    # 5. Plaintext IKA/GFA/K_ffb must be masked in reporter.info() and reporter.can_log()
+    log_lines: list[str] = []
+
+    class CapRep(OperationReporter):
+        def info(self, message: str) -> None:
+            log_lines.append(message)
+
+        def can_log(self, message: str) -> None:
+            log_lines.append(message)
+
+        def warning(self, message: str) -> None:
+            log_lines.append(message)
+
+    bus_m = FakeBcmBus(
+        profile_id="ea_0511",
+        ika=bytes.fromhex("112233445566778899aabbccddeeff01"),
+        gfa=bytes.fromhex("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"),
+        freq_code=0x03,
+    )
+    bus_m.k_ffb = bytes.fromhex("cafebabefeedface0123456789abcdef")
+    bus_m._sync_ffb_ram_mirror()
+    can_bcm_read_keys("fake", bus=bus_m, reporter=CapRep())
+    can_bcm_write_keys(
+        "fake",
+        current_ika=bus_m.ika,
+        new_ika="0123456789abcdef0123456789abcdef",
+        new_gfa="fedcba9876543210fedcba9876543210",
+        bus=bus_m,
+        reporter=CapRep(),
+    )
+    joined = "\n".join(log_lines).upper()
+    for secret in (
+        "112233445566778899AABBCCDDEEFF01",
+        "A0A1A2A3A4A5A6A7A8A9AAABACADAEAF",
+        "CAFEBABEFEEDFACE0123456789ABCDEF",
+        "0123456789ABCDEF0123456789ABCDEF",
+        "FEDCBA9876543210FEDCBA9876543210",
+    ):
+        assert secret not in joined
+    assert "1122...FF01" in joined
+    assert "A0A1...AEAF" in joined
+    assert "CAFE...CDEF" in joined
+
+
+def test_bcm_review_core_detect_aliases_short_serial_and_kombi_dispatch() -> None:
+    """A.6: list ident, exact part_prefixes match, hw_part_number non-match, aliases, short serial, Kombi dispatch."""
+    from contitool.core.bcm import bcm_get_profile
+    from contitool.core.kombi import EEL_KOMBI_0310_IDS, build_kombi_eel_dflash
+    from test_kombi import _build_synthetic_kombi_records
+
+    # 1. list[dict[str, str]] accepted by bcm_detect_profile
+    p_list = bcm_detect_profile([{"did": "F187", "value": "5Q0 937 084 EA"}, {"did": "F189", "value": "0511"}])
+    assert p_list["matched"] is True and p_list["id"] == "ea_0511"
+
+    # 2. Exact matching avoids 10-char prefix collision (5Q0937085B vs 5Q0937085BA, 5Q0937085C vs 5Q0937085CA)
+    assert bcm_detect_profile({"part_number": "5Q0937085B", "sw_version": ""})["id"] == "dd_0273"
+    assert bcm_detect_profile({"part_number": "5Q0937085B", "sw_version": ""})["matched"] is True
+    assert bcm_detect_profile({"part_number": "5Q0937085BA", "sw_version": ""})["matched"] is False
+    assert bcm_detect_profile({"part_number": "5Q0937085C", "sw_version": ""})["id"] == "ea_0511"
+    assert bcm_detect_profile({"part_number": "5Q0937085C", "sw_version": ""})["matched"] is True
+    assert bcm_detect_profile({"part_number": "5Q0937085CA", "sw_version": ""})["matched"] is False
+
+    # 3. hw_part_number-only without part_number / sw_version does NOT match
+    assert bcm_detect_profile({"hw_part_number": "5Q0937084EA"})["matched"] is False
+    assert bcm_detect_profile([{"did": "F191", "value": "5Q0937084EA"}])["matched"] is False
+
+    # 4. Missing aliases in bcm_get_profile
+    assert bcm_get_profile("5q0937085c")["id"] == "ea_0511"
+    assert bcm_get_profile("5q0937085b")["id"] == "dd_0273"
+    assert bcm_get_profile("cg")["id"] == "dd_0273"
+    assert bcm_get_profile("bc")["id"] == "bq_0212"
+    assert bcm_get_profile("an")["id"] == "bl_0175"
+    assert bcm_get_profile("al")["id"] == "bl_0175"
+
+    # 5. Short serial (< 4 bytes) must not mark FFB slot populated
+    dec = bcm_decode_status_dids({}, nvm_slots={1: (b"\x01\x02", b"\x00\x00\x00\x01", b"\x00")})
+    assert dec["ffb_slots"][0]["populated"] is False
+
+    # 6. bcm_extract_cluster_ffb_material dispatches V850E2 Kombi dumps (logical EEL & 64K) to analyze_kombi_dflash
+    recs = _build_synthetic_kombi_records()
+    logical_kombi = b"".join(recs[i] for i in sorted(EEL_KOMBI_0310_IDS))
+    for kombi_blob in (logical_kombi, build_kombi_eel_dflash(recs)):
+        mat = bcm_extract_cluster_ffb_material(kombi_blob, freq_code=0x03)
+        assert mat["kc_hex"] == "ea046275eea646ef01e6d703f77899db"
+        assert mat["gfa_hex"] == "e54e0aab8198ebcd8e781cceb0a3b33c"
+        assert mat["vin"] == "XW8ZZZ5NZJG235992"
+        assert mat["learned_keys"] == 2
+        assert len(mat["active_transponders"]) == 2
+
 
 
 
