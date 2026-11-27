@@ -1321,3 +1321,84 @@ def test_nonraw_slave_timeout_keeps_hw_uds_and_sw_isotp_validates_prefix() -> No
     assert scan_lear.gateway.support_warning == scan_lear.gateway.unsupported
 
 
+def test_direct_dpdu_rawmode_allowed_for_kombi_bcm_mrr_elv_and_blocked_for_fpke() -> None:
+    """Direct VAS 6154 / VNCI (RawMode `every_id_raw=True`) unlocks Kombi VDD, BCM, MRR, and ELV, while FPK_E still requires native CAN."""
+    from types import SimpleNamespace
+
+    from contitool.can.ecus import ECU_SPEC_BY_KIND, _build_slave_ecu
+    from contitool.can.fpke import FpkeCanLink
+    from contitool.gui.screens.kombi import KombiScreen
+    from contitool.gui.screens.mrr import MrrScreen
+
+    set_lang("en")
+    for kind in ("kombi", "bcm", "mrr", "elv"):
+        ecu_raw = _build_slave_ecu(
+            ECU_SPEC_BY_KIND[kind],
+            [],
+            via_gateway=False,
+            gateway_bridge_capable=False,
+            interface="dpdu",
+            bus_injected=False,
+            in_fbl=False,
+            bridge_adapter_ok=True,
+        )
+        assert "memory" in ecu_raw.capabilities, f"{kind} should allow memory over direct dpdu RawMode"
+        assert ecu_raw.memory_unavailable_reason is None
+
+        ecu_noraw = _build_slave_ecu(
+            ECU_SPEC_BY_KIND[kind],
+            [],
+            via_gateway=False,
+            gateway_bridge_capable=False,
+            interface="dpdu",
+            bus_injected=False,
+            in_fbl=False,
+            bridge_adapter_ok=False,
+        )
+        assert "memory" not in ecu_noraw.capabilities, f"{kind} must block direct memory on uds_only/nonraw dpdu"
+        assert ecu_noraw.memory_unavailable_reason
+
+    # Kombi behind any gateway uses pure 11-bit UDS (no bridge needed even on uds_only dpdu / j2534)
+    for iface in ("dpdu", "j2534"):
+        kombi_gw = _build_slave_ecu(
+            ECU_SPEC_BY_KIND["kombi"],
+            [],
+            via_gateway=True,
+            gateway_bridge_capable=False,
+            interface=iface,
+            bus_injected=False,
+            in_fbl=False,
+            bridge_adapter_ok=False,
+        )
+        assert "memory" in kombi_gw.capabilities
+
+    # Direct FPK_E still refuses dpdu because 0.35 ms/frame level-8 stream requires native CAN (or J533 bridge BURST-GO)
+    fpke_direct = _build_slave_ecu(
+        ECU_SPEC_BY_KIND["fpke"],
+        [],
+        via_gateway=False,
+        gateway_bridge_capable=False,
+        interface="dpdu",
+        bus_injected=False,
+        in_fbl=False,
+        bridge_adapter_ok=True,
+    )
+    assert fpke_direct.unsupported is not None
+    assert "native CAN adapter" in fpke_direct.unsupported
+
+    # Direct FpkeCanLink allows ecu_kind='kombi' over dpdu (with fake open_session), rejects fpke
+    with pytest.raises(RuntimeError, match="native CAN adapter"):
+        FpkeCanLink("VAS6154", interface="dpdu", via_gateway=False, ecu_kind="fpke")
+
+    # GUI screens: Kombi allows slcan/dpdu/j2534, MRR allows slcan/dpdu directly and rejects j2534
+    for iface in ("slcan", "dpdu", "j2534"):
+        k_scr = SimpleNamespace(conn=SimpleNamespace(interface=iface))
+        assert KombiScreen._memory_blocker(k_scr) is None  # type: ignore[arg-type]
+
+    m_dpdu = SimpleNamespace(conn=SimpleNamespace(interface="dpdu"), _via_gateway=False, _gateway_bridge=False)
+    m_j2534 = SimpleNamespace(conn=SimpleNamespace(interface="j2534"), _via_gateway=False, _gateway_bridge=False)
+    assert MrrScreen._xcp_available(m_dpdu) is True  # type: ignore[arg-type]
+    assert MrrScreen._xcp_available(m_j2534) is False  # type: ignore[arg-type]
+
+
+

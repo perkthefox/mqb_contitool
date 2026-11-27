@@ -863,7 +863,7 @@ class MrrScreen(QWidget):
         iface = self.conn.interface or "slcan"
         if self._via_gateway:
             return bool(self._gateway_bridge) and iface in (*BRIDGE_NATIVE_INTERFACES, "dpdu")
-        return iface in BRIDGE_NATIVE_INTERFACES
+        return iface in (*BRIDGE_NATIVE_INTERFACES, "dpdu")
 
     def _snapshot_routing(self) -> tuple[str, str, bool, bool, int, str | None]:
         return (

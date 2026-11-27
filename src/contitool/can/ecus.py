@@ -577,8 +577,9 @@ def _build_slave_ecu_raw(
     in_fbl: bool,
     bridge_adapter_ok: bool = False,
 ) -> DiscoveredEcu:
-    """`bridge_adapter_ok`: the scan found the adapter able to carry the J533 bridge (`bridge_bus_ok`)."""
+    """`bridge_adapter_ok`: the scan found the adapter able to carry arbitrary raw CAN (`bridge_bus_ok`)."""
     native_ok = bus_injected or (interface in BRIDGE_NATIVE_INTERFACES)
+    raw_ok = native_ok or bridge_adapter_ok
     if spec.kind == "fpke":
         if via_gateway:
             if gateway_bridge_capable:
@@ -635,10 +636,12 @@ def _build_slave_ecu_raw(
                 capabilities=("uds", "memory"),
             )
         fpke_unsupported = tr(
-            "Работа с панелью приборов Kombi / FPK_E поддерживается только через нативный CAN-адаптер "
-            "(CANable / SLCAN / candleLight). Чтение и запись через VNCI / D-PDU / J2534 для панели приборов не поддерживаются.",
-            "Kombi / FPK_E instrument cluster operations require a native CAN adapter "
-            "(CANable / SLCAN / candleLight). Reading/writing via VNCI / D-PDU / J2534 is not supported for FPK.",
+            "Прямое чтение/запись FPK_E без шлюза J533 требует нативный CAN-адаптер (CANable / SLCAN / candleLight): "
+            "поток уровня 8 (0.35 мс/кадр) не укладывается в тайминги D-PDU / J2534. "
+            "С VAS 6154 / VNCI подключите панель через шлюз 19 J533 (RAM-мост BURST-GO).",
+            "Direct FPK_E memory operations without a J533 gateway require a native CAN adapter "
+            "(CANable / SLCAN / candleLight): the 0.35 ms/frame level-8 stream exceeds D-PDU / J2534 pacing. "
+            "With VAS 6154 / VNCI, connect through a 19 J533 gateway (RAM-bridge BURST-GO).",
         )
         return DiscoveredEcu(
             kind="fpke",
@@ -656,7 +659,9 @@ def _build_slave_ecu_raw(
         )
 
     if spec.kind == "kombi":
-        if native_ok or (via_gateway and bridge_adapter_ok):
+        # Kombi VDD uses pure 11-bit UDS (0x714 -> 0x77E) at SL 7: works behind any gateway without a bridge,
+        # and directly on the bench with native CAN, VAS 6154 / VNCI RawMode, or J2534.
+        if via_gateway or raw_ok or interface == "j2534":
             return DiscoveredEcu(
                 kind="kombi",
                 diag_addr=spec.diag_addr,
@@ -670,10 +675,10 @@ def _build_slave_ecu_raw(
                 capabilities=("uds", "memory"),
             )
         kombi_mem_err = tr(
-            "Работа с памятью панели приборов Kombi VDD поддерживается через нативный CAN-адаптер "
-            "(CANable / SLCAN / candleLight) или RawMode VAS 6154 / VNCI через шлюз; по текущему адаптеру доступна диагностика UDS.",
-            "Kombi VDD memory operations require a native CAN adapter (CANable / SLCAN / candleLight) "
-            "or a RawMode VAS 6154 / VNCI behind the gateway; UDS diagnostics remain available over the current adapter.",
+            "Прямое подключение к Kombi VDD на столе требует адаптер с raw CAN (CANable / SLCAN / candleLight, "
+            "VAS 6154 / VNCI с RawMode или J2534) для удержания KL15; через шлюз J533 работает любой адаптер UDS.",
+            "Direct bench access to Kombi VDD requires a raw-CAN adapter (CANable / SLCAN / candleLight, "
+            "VAS 6154 / VNCI with RawMode, or J2534) for KL15 keepalive; behind a J533 gateway any UDS adapter works.",
         )
         return DiscoveredEcu(
             kind="kombi",
@@ -719,7 +724,7 @@ def _build_slave_ecu_raw(
                 memory_unavailable_reason=bcm_mem_err,
                 capabilities=bcm_caps,
             )
-        if native_ok:
+        if raw_ok:
             return DiscoveredEcu(
                 kind="bcm",
                 diag_addr=spec.diag_addr,
@@ -743,10 +748,10 @@ def _build_slave_ecu_raw(
             bridge_available=False,
             in_fbl=in_fbl,
             memory_unavailable_reason=tr(
-                "Работа с 29-битными протоколами BCM (XCP / WFS канал 3) требует нативный CAN-адаптер "
-                "(CANable / SLCAN / candleLight).",
-                "29-bit BCM protocols (XCP / WFS Channel 3) require a native CAN adapter "
-                "(CANable / SLCAN / candleLight).",
+                "Работа с 29-битными протоколами BCM (XCP / WFS канал 3) требует адаптер с произвольным raw CAN "
+                "(CANable / SLCAN / candleLight или VAS 6154 / VNCI с полным RawMode).",
+                "29-bit BCM protocols (XCP / WFS Channel 3) require an adapter with arbitrary raw CAN "
+                "(CANable / SLCAN / candleLight, or a VAS 6154 / VNCI with full RawMode).",
             ),
             capabilities=("uds", "dtc", "terminal"),
         )
@@ -779,7 +784,7 @@ def _build_slave_ecu_raw(
                 memory_unavailable_reason=mrr_mem_err,
                 capabilities=mrr_caps,
             )
-        if native_ok:
+        if raw_ok:
             return DiscoveredEcu(
                 kind="mrr",
                 diag_addr=spec.diag_addr,
@@ -803,10 +808,10 @@ def _build_slave_ecu_raw(
             bridge_available=False,
             in_fbl=in_fbl,
             memory_unavailable_reason=tr(
-                "Работа с 29-битным XCP радара MRRevo14F (0x1BFEBA00/01) требует нативный CAN-адаптер "
-                "(CANable / SLCAN / candleLight).",
-                "29-bit MRRevo14F XCP operations (0x1BFEBA00/01) require a native CAN adapter "
-                "(CANable / SLCAN / candleLight).",
+                "Работа с 29-битным XCP радара MRRevo14F (0x1BFEBA00/01) требует адаптер с произвольным raw CAN "
+                "(CANable / SLCAN / candleLight или VAS 6154 / VNCI с полным RawMode).",
+                "29-bit MRRevo14F XCP operations (0x1BFEBA00/01) require an adapter with arbitrary raw CAN "
+                "(CANable / SLCAN / candleLight, or a VAS 6154 / VNCI with full RawMode).",
             ),
             capabilities=("uds", "dtc", "terminal"),
         )
@@ -839,7 +844,7 @@ def _build_slave_ecu_raw(
                 memory_unavailable_reason=elv_mem_err,
                 capabilities=elv_caps,
             )
-        if native_ok:
+        if raw_ok:
             return DiscoveredEcu(
                 kind="elv",
                 diag_addr=spec.diag_addr,
@@ -863,10 +868,10 @@ def _build_slave_ecu_raw(
             bridge_available=False,
             in_fbl=in_fbl,
             memory_unavailable_reason=tr(
-                "Чтение 32 КБ Data Flash ELV (29-бит 0x1BFD8A0B/0A) требует нативный CAN-адаптер "
-                "(CANable / SLCAN / candleLight).",
-                "Reading 32 KB ELV Data Flash (29-bit 0x1BFD8A0B/0A) requires a native CAN adapter "
-                "(CANable / SLCAN / candleLight).",
+                "Чтение 32 КБ Data Flash ELV (29-бит 0x1BFD8A0B/0A) требует адаптер с произвольным raw CAN "
+                "(CANable / SLCAN / candleLight или VAS 6154 / VNCI с полным RawMode).",
+                "Reading 32 KB ELV Data Flash (29-bit 0x1BFD8A0B/0A) requires an adapter with arbitrary raw CAN "
+                "(CANable / SLCAN / candleLight, or a VAS 6154 / VNCI with full RawMode).",
             ),
             capabilities=("uds", "dtc", "terminal"),
         )
@@ -1137,6 +1142,11 @@ def can_scan_bus(
                     reporter.warning(note)
         else:
             # Direct CAN topology (no gateway answered on 0x710/0x77A)
+            direct_raw_ok = (
+                bridge_bus_ok(interface, link.bus)
+                if (bus is None or hasattr(link.bus, "every_id_raw"))
+                else True
+            )
             for spec in slave_targets:
                 reporter.check_cancelled()
                 step += 1
@@ -1150,7 +1160,7 @@ def can_scan_bus(
                 )
                 if spec.kind in ("fpke", "kombi"):
                     ok_s, fbl_s = _probe_fpke_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
-                    ka_direct = bus is None and interface in BRIDGE_NATIVE_INTERFACES
+                    ka_direct = bus is None and (direct_raw_ok or interface == "j2534")
                 elif spec.kind == "bcm":
                     ok_s, fbl_s = _probe_bcm_uds_with_wake(link, bus=bus, interface=interface, reporter=reporter)
                     ka_direct = False
@@ -1177,9 +1187,13 @@ def can_scan_bus(
                     interface=interface,
                     bus_injected=(bus is not None),
                     in_fbl=fbl_s,
+                    bridge_adapter_ok=direct_raw_ok,
                 )
                 ecus.append(ecu)
-                if ecu.kind in ("fpke", "kombi") and ka_direct:
+                if ka_direct and (
+                    (ecu.kind == "kombi")
+                    or (ecu.kind == "fpke" and interface in BRIDGE_NATIVE_INTERFACES)
+                ):
                     keep_direct_fpke_alive = True
                 reporter.info(
                     tr(
@@ -1212,7 +1226,7 @@ def can_scan_bus(
 
     if keep_direct_fpke_alive and len(ecus) == 1 and ecus[0].kind in ("fpke", "kombi"):
         with contextlib.suppress(Exception):
-            fpke_link = open_or_reuse_fpke_link(port, interface=interface)
+            fpke_link = open_or_reuse_fpke_link(port, interface=interface, ecu_kind=ecus[0].kind)
             fpke_link.start_keepalive()
 
     wanted_addrs = {ECU_SPEC_BY_KIND[k].diag_addr for k in wanted}

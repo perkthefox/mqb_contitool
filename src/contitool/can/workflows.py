@@ -48,6 +48,7 @@ from contitool.can.payloads import (
     fbl_sa2,
     verify_payload_self_tests,
 )
+from contitool.can.bridge import bridge_bus_ok
 from contitool.can.fpke import (
     FPKE_KEEPALIVE_PATTERN,
     FPKE_NATIVE_INTERFACES,
@@ -1314,6 +1315,13 @@ def _send_elv_nm_wake(link: J533CanLink) -> None:
         time.sleep(0.015)
 
 
+def _can_send_direct_wake(link: J533CanLink, interface: str, *, bus: Any | None) -> bool:
+    """True when direct bench wake/keepalive raw CAN frames can be sent on this live adapter."""
+    if bus is not None:
+        return False
+    return interface in FPKE_NATIVE_INTERFACES or interface == "j2534" or bridge_bus_ok(interface, link.bus)
+
+
 def _probe_elv_uds_with_wake(
     link: J533CanLink,
     *,
@@ -1321,9 +1329,9 @@ def _probe_elv_uds_with_wake(
     interface: str,
     reporter: OperationReporter,
 ) -> tuple[bool, bool]:
-    """Probe `2B` ELV (`0x731 -> 0x79B`), sending OSEK-NM wakeup on direct native CAN if needed."""
+    """Probe `2B` ELV (`0x731 -> 0x79B`), sending OSEK-NM wakeup on direct raw CAN if needed."""
     ok, fbl = _probe_elv_uds_once(link, timeout=0.35 if bus is not None else 0.7)
-    if ok or bus is not None or interface not in FPKE_NATIVE_INTERFACES:
+    if ok or not _can_send_direct_wake(link, interface, bus=bus):
         return ok, fbl
     reporter.can_log(
         tr(
@@ -1374,9 +1382,9 @@ def _probe_bcm_uds_with_wake(
     interface: str,
     reporter: OperationReporter,
 ) -> tuple[bool, bool]:
-    """Probe `09` BCM (`0x70E -> 0x778`), sending short NM + KL15 wake pulses on direct native CAN if needed."""
+    """Probe `09` BCM (`0x70E -> 0x778`), sending short NM + KL15 wake pulses on direct raw CAN if needed."""
     ok, fbl = _probe_bcm_uds_once(link, timeout=0.35 if bus is not None else 0.7)
-    if ok or bus is not None or interface not in FPKE_NATIVE_INTERFACES:
+    if ok or not _can_send_direct_wake(link, interface, bus=bus):
         return ok, fbl
     reporter.info(
         tr(
@@ -1405,7 +1413,7 @@ def _probe_fpke_uds_with_wake(
     link.UDS_TX_ID = FPKE_UDS_TX_ID
     link.UDS_RX_ID = FPKE_UDS_RX_ID
     link.UDS_FC_PAD = J533CanLink.UDS_FC_PAD
-    if bus is not None or interface not in FPKE_NATIVE_INTERFACES:
+    if not _can_send_direct_wake(link, interface, bus=bus):
         try:
             link.request_uds(b"\x10\x03", 0x50, timeout=0.4 if bus is not None else 1.0)
             return True, False
@@ -1604,7 +1612,7 @@ def can_identify(
                                     in_fbl = fbl_fpke
                                 else:
                                     # Retry 09 BCM / 2B ELV once after NM wake pulses in case asleep on direct bench CAN
-                                    if bus is None and interface in FPKE_NATIVE_INTERFACES:
+                                    if _can_send_direct_wake(link, interface, bus=bus):
                                         _send_bcm_nm_wake(link)
                                         _send_elv_nm_wake(link)
                                     ok_bcm, fbl_bcm = _probe_bcm_uds_once(link, timeout=0.2 if bus is not None else 0.45)
@@ -1632,8 +1640,9 @@ def can_identify(
                                             ) from exc
         result["responding"] = True
         reporter.step(2, 2, tr("Чтение идентификации блока", "Reading the ECU identification"))
+        send_fpke_ka = probed_fpke and _can_send_direct_wake(link, interface, bus=bus)
         for did, ru, en in ECU_IDENT_DIDS:
-            if probed_fpke and bus is None and interface in FPKE_NATIVE_INTERFACES:
+            if send_fpke_ka:
                 for arb_id, ka_data in FPKE_KEEPALIVE_PATTERN:
                     with contextlib.suppress(*LINK_ERRORS):
                         link.send_frame(arb_id, ka_data)
@@ -1648,18 +1657,25 @@ def can_identify(
             result["ident"].append({"did": f"{did:04X}", "label_ru": ru, "label_en": en, "value": value})
             reporter.info(f"{did:04X} {tr(ru, en)}: {value}")
 
+        direct_raw_ok = (
+            bridge_bus_ok(interface, link.bus)
+            if (bus is None or hasattr(link.bus, "every_id_raw"))
+            else True
+        )
         if probed_bcm:
             result["ecu_kind"] = "bcm"
             result["diag_addr"] = "09"
             result["uds_tx_id"] = f"0x{BCM_UDS_TX_ID:03X}"
             result["uds_rx_id"] = f"0x{BCM_UDS_RX_ID:03X}"
-            if bus is None and interface not in FPKE_NATIVE_INTERFACES:
+            if not direct_raw_ok:
                 result["capabilities"] = ["uds", "dtc", "terminal"]
                 result["memory_unavailable_reason"] = tr(
-                    "Работа с 29-битными протоколами BCM (XCP / WFS канал 3) требует нативный CAN-адаптер "
-                    "(CANable / SLCAN / candleLight). По UDS доступны паспорт, статус, DTC и запись IKA/GFA.",
-                    "29-bit BCM protocols (XCP / WFS Channel 3) require a native CAN adapter "
-                    "(CANable / SLCAN / candleLight). UDS passport, status, DTCs, and IKA/GFA writes remain available.",
+                    "Работа с 29-битными протоколами BCM (XCP / WFS канал 3) требует адаптер с произвольным raw CAN "
+                    "(CANable / SLCAN / candleLight или VAS 6154 / VNCI с полным RawMode). "
+                    "По UDS доступны паспорт, статус, DTC и запись IKA/GFA.",
+                    "29-bit BCM protocols (XCP / WFS Channel 3) require an adapter with arbitrary raw CAN "
+                    "(CANable / SLCAN / candleLight, or a VAS 6154 / VNCI with full RawMode). "
+                    "UDS passport, status, DTCs, and IKA/GFA writes remain available.",
                 )
             else:
                 result["capabilities"] = ["uds", "memory", "dtc", "terminal"]
@@ -1675,13 +1691,15 @@ def can_identify(
             result["diag_addr"] = "13"
             result["uds_tx_id"] = f"0x{MRR_UDS_TX_ID:03X}"
             result["uds_rx_id"] = f"0x{MRR_UDS_RX_ID:03X}"
-            if bus is None and interface not in FPKE_NATIVE_INTERFACES:
+            if not direct_raw_ok:
                 result["capabilities"] = ["uds", "dtc", "terminal"]
                 result["memory_unavailable_reason"] = tr(
-                    "Работа с 29-битным XCP радара 13 ACC (0x1BFEBA00/01) требует нативный CAN-адаптер "
-                    "(CANable / SLCAN / candleLight). По UDS доступны чтение паспорта, статуса, ошибок DTC и запись IKA/GFA.",
-                    "29-bit 13 ACC radar XCP operations (0x1BFEBA00/01) require a native CAN adapter "
-                    "(CANable / SLCAN / candleLight). UDS passport, status, DTCs, and IKA/GFA writes remain available.",
+                    "Работа с 29-битным XCP радара 13 ACC (0x1BFEBA00/01) требует адаптер с произвольным raw CAN "
+                    "(CANable / SLCAN / candleLight или VAS 6154 / VNCI с полным RawMode). "
+                    "По UDS доступны чтение паспорта, статуса, ошибок DTC и запись IKA/GFA.",
+                    "29-bit 13 ACC radar XCP operations (0x1BFEBA00/01) require an adapter with arbitrary raw CAN "
+                    "(CANable / SLCAN / candleLight, or a VAS 6154 / VNCI with full RawMode). "
+                    "UDS passport, status, DTCs, and IKA/GFA writes remain available.",
                 )
             else:
                 result["capabilities"] = ["uds", "memory", "dtc", "terminal"]
@@ -1697,13 +1715,15 @@ def can_identify(
             result["diag_addr"] = "2B"
             result["uds_tx_id"] = f"0x{ELV_UDS_TX_ID:03X}"
             result["uds_rx_id"] = f"0x{ELV_UDS_RX_ID:03X}"
-            if bus is None and interface not in FPKE_NATIVE_INTERFACES:
+            if not direct_raw_ok:
                 result["capabilities"] = ["uds", "dtc", "terminal"]
                 result["memory_unavailable_reason"] = tr(
-                    "Чтение 32 КБ Data Flash ELV (29-бит 0x1BFD8A0B/0A) требует нативный CAN-адаптер "
-                    "(CANable / SLCAN / candleLight). По UDS доступны паспорт, статус, DTC и адаптация 2E 02E2 (при известном K_5).",
-                    "Reading 32 KB ELV Data Flash (29-bit 0x1BFD8A0B/0A) requires a native CAN adapter "
-                    "(CANable / SLCAN / candleLight). UDS passport, status, DTCs, and 2E 02E2 adaptation (with known K_5) remain available.",
+                    "Чтение 32 КБ Data Flash ELV (29-бит 0x1BFD8A0B/0A) требует адаптер с произвольным raw CAN "
+                    "(CANable / SLCAN / candleLight или VAS 6154 / VNCI с полным RawMode). "
+                    "По UDS доступны паспорт, статус, DTC и адаптация 2E 02E2 (при известном K_5).",
+                    "Reading 32 KB ELV Data Flash (29-bit 0x1BFD8A0B/0A) requires an adapter with arbitrary raw CAN "
+                    "(CANable / SLCAN / candleLight, or a VAS 6154 / VNCI with full RawMode). "
+                    "UDS passport, status, DTCs, and 2E 02E2 adaptation (with known K_5) remain available.",
                 )
             else:
                 result["capabilities"] = ["uds", "memory", "dtc", "terminal"]
@@ -1724,12 +1744,12 @@ def can_identify(
             if sup["warning"]:
                 result["support_warning"] = sup["warning"]
                 result["support_warning_tone"] = sup["tone"]
-            if interface not in FPKE_NATIVE_INTERFACES:
+            if not (direct_raw_ok or interface == "j2534"):
                 kombi_unsupported = tr(
-                    "Работа с панелью приборов Kombi VDD поддерживается только через нативный CAN-адаптер "
-                    "(CANable / SLCAN / candleLight).",
-                    "Kombi VDD instrument cluster operations require a native CAN adapter "
-                    "(CANable / SLCAN / candleLight).",
+                    "Прямое подключение к Kombi VDD на столе требует адаптер с raw CAN (CANable / SLCAN / candleLight, "
+                    "VAS 6154 / VNCI с RawMode или J2534) для удержания KL15; через шлюз J533 работает любой адаптер UDS.",
+                    "Direct bench access to Kombi VDD requires a raw-CAN adapter (CANable / SLCAN / candleLight, "
+                    "VAS 6154 / VNCI with RawMode, or J2534) for KL15 keepalive; behind a J533 gateway any UDS adapter works.",
                 )
                 result["unsupported"] = kombi_unsupported
                 reporter.warning(kombi_unsupported)
@@ -1749,10 +1769,12 @@ def can_identify(
                 result["support_warning_tone"] = sup["tone"]
             if interface not in FPKE_NATIVE_INTERFACES:
                 fpke_unsupported = tr(
-                    "Работа с панелью приборов Kombi / FPK_E поддерживается только через нативный CAN-адаптер "
-                    "(CANable / SLCAN / candleLight). Чтение и запись через VNCI / D-PDU / J2534 для панели приборов не поддерживаются.",
-                    "Kombi / FPK_E instrument cluster operations require a native CAN adapter "
-                    "(CANable / SLCAN / candleLight). Reading/writing via VNCI / D-PDU / J2534 is not supported for FPK.",
+                    "Прямое подключение к FPK_E без шлюза J533 требует нативный CAN-адаптер (CANable / SLCAN / candleLight): "
+                    "поток уровня 8 (0.35 мс/кадр) не укладывается в тайминги D-PDU / J2534. "
+                    "С VAS 6154 / VNCI подключите панель через шлюз 19 J533 (RAM-мост BURST-GO).",
+                    "Direct FPK_E operations without a J533 gateway require a native CAN adapter "
+                    "(CANable / SLCAN / candleLight): the 0.35 ms/frame level-8 stream exceeds D-PDU / J2534 pacing. "
+                    "With VAS 6154 / VNCI, connect through a 19 J533 gateway (RAM-bridge BURST-GO).",
                 )
                 result["unsupported"] = fpke_unsupported
                 reporter.warning(fpke_unsupported)
@@ -1792,7 +1814,7 @@ def can_identify(
                 )
     if keep_fpke_alive:
         with contextlib.suppress(Exception):
-            fpke_link = open_or_reuse_fpke_link(port, interface=interface)
+            fpke_link = open_or_reuse_fpke_link(port, interface=interface, ecu_kind=result["ecu_kind"])
             fpke_link.start_keepalive()
     return result
 

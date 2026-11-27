@@ -218,9 +218,9 @@ class KombiScreen(FpkeScreen):
         return _kombi_nav_title(key)
 
     def _memory_blocker(self) -> str | None:
-        """Kombi SL 7 uses pure 11-bit UDS (`0x714 -> 0x77E`) and works through any gateway without a 29-bit RAM bridge."""
+        """Kombi SL 7 uses pure 11-bit UDS (`0x714 -> 0x77E`) and works directly or via any gateway on native CAN, VAS 6154 / VNCI (D-PDU), and J2534."""
         iface = self.conn.interface or "slcan"
-        if iface not in FPKE_NATIVE_INTERFACES:
+        if iface not in (*FPKE_NATIVE_INTERFACES, "dpdu", "j2534"):
             return "adapter"
         return None
 
@@ -379,16 +379,16 @@ class KombiScreen(FpkeScreen):
     def _build_read_page(self, lay: QVBoxLayout) -> None:
         busy = self.runner.is_busy
         iface = self.conn.interface or "slcan"
-        native_ok = iface in FPKE_NATIVE_INTERFACES
+        native_ok = self._memory_blocker() is None
 
         if not native_ok:
             warn = Callout("warn")
             warn.label.setText(
                 tr(
-                    f"<b>Выбран адаптер «{iface}».</b> Для чтения приборной панели Kombi VDD требуется нативный CAN-адаптер "
-                    "(CANable / SLCAN / candleLight).",
-                    f"<b>Adapter “{iface}” is selected.</b> Reading this Kombi VDD instrument cluster requires a native CAN adapter "
-                    "(CANable / SLCAN / candleLight).",
+                    f"<b>Выбран адаптер «{iface}».</b> Для чтения приборной панели Kombi VDD требуется CAN-адаптер "
+                    "(CANable / SLCAN / candleLight, VAS 6154 / VNCI или J2534).",
+                    f"<b>Adapter “{iface}” is selected.</b> Reading this Kombi VDD instrument cluster requires a CAN adapter "
+                    "(CANable / SLCAN / candleLight, VAS 6154 / VNCI, or J2534).",
                 )
             )
             lay.addWidget(warn)

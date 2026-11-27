@@ -763,13 +763,15 @@ class FpkeCanLink:
         via_gateway: bool = False,
         ecu_kind: str = "fpke",
     ) -> None:
-        if bus is None and not via_gateway and interface not in FPKE_NATIVE_INTERFACES:
+        if bus is None and not via_gateway and ecu_kind != "kombi" and interface not in FPKE_NATIVE_INTERFACES:
             raise RuntimeError(
                 tr(
-                    f"Работа с приборной панелью FPK поддерживается только через нативный CAN-адаптер "
-                    f"(CANable / SLCAN / candleLight). Интерфейс «{interface}» (VNCI / D-PDU / J2534) для FPK не поддерживается.",
-                    f"FPK instrument cluster operations require a native CAN adapter (CANable / SLCAN / candleLight). "
-                    f"Interface “{interface}” (VNCI / D-PDU / J2534) is not supported for FPK.",
+                    f"Прямое подключение к приборной панели FPK_E (без шлюза J533) требует нативный CAN-адаптер "
+                    f"(CANable / SLCAN / candleLight): поток уровня 8 (0.35 мс/кадр) быстрее, чем пропускает D-PDU/J2534. "
+                    f"Через VAS 6154 / VNCI («{interface}») подключайтесь через шлюз 19 J533 (RAM-мост BURST-GO).",
+                    f"Direct FPK_E bench operations (without a J533 gateway) require a native CAN adapter "
+                    f"(CANable / SLCAN / candleLight): the level-8 stream (0.35 ms/frame) is faster than D-PDU/J2534. "
+                    f"With VAS 6154 / VNCI (“{interface}”), connect through a 19 J533 gateway (RAM-bridge BURST-GO).",
                 )
             )
         self.port = port
@@ -1340,7 +1342,7 @@ class FpkeCanLink:
             yield True
             return
         bus_ctx = getattr(self.bus, "uds_session", None)
-        if not self.via_gateway or not callable(bus_ctx):
+        if not (self.via_gateway or self.ecu_kind == "kombi") or not callable(bus_ctx):
             yield False
             return
         with bus_ctx(self.UDS_TX_ID, self.UDS_RX_ID) as active:
@@ -1353,7 +1355,7 @@ class FpkeCanLink:
     def _needs_hw_uds(self) -> bool:
         if self._hw_uds:
             return True
-        if not self.via_gateway:
+        if not (self.via_gateway or self.ecu_kind == "kombi"):
             return False
         if getattr(self.bus, "uds_only", False):
             return True
