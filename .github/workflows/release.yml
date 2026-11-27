@@ -74,6 +74,8 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Platform smoke test (transport & updater)
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: pytest tests/openpdu/test_openpdu_session.py tests/test_updates.py -q
 
       - name: Build standalone GUI executable (.exe / .app / .dmg)
