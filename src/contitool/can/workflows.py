@@ -669,6 +669,8 @@ def enter_ram_loader(
         return _enter_ram_loader_once(link, reporter)
     except LINK_ERRORS as first_err:
         if isinstance(first_err, (FblKeyLockedError, Stage1SilentError)):
+            with contextlib.suppress(*LINK_ERRORS):
+                link.request_uds(b"\x11\x01", 0x51, timeout=1.5, resend=False)
             raise  # a retry would only stage another entry: another key attempt, or the same silence
         if isinstance(first_err, UdsNegativeResponse):
             _abort_if_unsupported_ecu(link)
@@ -718,7 +720,12 @@ def enter_ram_loader(
                 "Switch the gateway off for 10 seconds, on again, and check ECU identification. "
                 "If communication is still unavailable, reconnect the adapter. Attach a problem report if this repeats.",
             )) from recovery_err
-        return _enter_ram_loader_once(link, reporter)
+        try:
+            return _enter_ram_loader_once(link, reporter)
+        except LINK_ERRORS:
+            with contextlib.suppress(*LINK_ERRORS):
+                _reset_to_application(link, reporter=reporter, allow_fbl=True, loader_reset_attempts=1)
+            raise
 
 
 def _stream_loader_read_payload(
@@ -3252,6 +3259,13 @@ def can_write_dflash(
             raise
         except Exception as exc:
             result["error"] = str(exc)
+            if not result.get("flash_commands_sent"):
+                _hand_back_after_read_error(
+                    link,
+                    reporter,
+                    active_loader=bool(result.get("loader_session") or result.get("beacon")),
+                    return_to_app=return_to_app,
+                )
             raise
         finally:
             _write_json(out_dir / "dflash_write_result.json", result)
@@ -3383,7 +3397,6 @@ def _note_hw_fallback(link: Any, info: dict[str, Any], reporter: OperationReport
     link.on_hw_fallback = note
 
 
-@_uninterruptible
 def _program_application_uds(
     link: J533CanLink,
     app_bytes: bytes,
@@ -3450,112 +3463,114 @@ def _program_application_uds(
                 "Reconnect the adapter and try again; if ISO-TP still does not work, update the D-PDU driver or "
                 "write the ECU with another adapter.",
             ))
-        reporter.can_log(
-            tr(
-                "Стирание прикладной области CodeFlash (31 01 FF 00 01 01: 0x0000C000..0x0017FFFF)…",
-                "Erasing Application CodeFlash block (31 01 FF 00 01 01: 0x0000C000..0x0017FFFF)…",
-            )
-        )
-        erase_resp = link.request_uds(bytes.fromhex("3101ff000101"), 0x71, timeout=120.0, allow_pending=True)
-        try:
-            _routine_ok(erase_resp, "EraseMemory (FF00)")
-        except RuntimeError as exc:
-            raise FblEraseFailedError(str(exc)) from exc
-        info["erase_completed"] = True
-        info["erase_response"] = erase_resp.hex()
-
-        req_dl = b"\x34\x00\x44" + APP_BASE.to_bytes(4, "big") + APP_SIZE.to_bytes(4, "big")
-        dl_resp = link.request_uds(req_dl, 0x74, timeout=5.0)
-        len_bytes = dl_resp[1] >> 4
-        if not (1 <= len_bytes <= 4) or len(dl_resp) < 2 + len_bytes:
-            raise RuntimeError(f"Malformed RequestDownload response: {dl_resp.hex()}")
-        max_block_len = int.from_bytes(dl_resp[2 : 2 + len_bytes], "big")
-        # FBL ISO-TP RX buffer cap is 0x202 (514 bytes = 2-byte `36 <seq>` header + 512 payload bytes)
-        chunk_size = min(512, ((max_block_len - 2) // 256) * 256)
-        if chunk_size < 256:
-            raise RuntimeError(f"FBL reported invalid maxNumberOfBlockLength={max_block_len}")
-        info["download_accepted"] = True
-        info["max_block_length"] = max_block_len
-        info["chunk_size"] = chunk_size
-
-        reporter.reset_stage_timer()
-        reporter.progress(0, APP_SIZE, unit="B", detail="UDS TransferData (0x36)")
-        total_blocks = (APP_SIZE + chunk_size - 1) // chunk_size
-        for blk_idx, offset in enumerate(range(0, APP_SIZE, chunk_size)):
-            reporter.check_cancelled()
-            chunk = app_bytes[offset : offset + chunk_size]
-            seq = (blk_idx + 1) & 0xFF
-            block_req = bytes([0x36, seq]) + chunk
-            for td_try in range(2):
-                try:
-                    link.request_uds(block_req, 0x76, timeout=30.0, allow_pending=True)
-                    break
-                except TimeoutError as exc:
-                    if td_try == 1 or getattr(getattr(link, "bus", None), "spent", False):
-                        raise
-                    reporter.warning(tr(
-                        f"TransferData: таймаут на блоке {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X}: {exc}) — повтор блока…",
-                        f"TransferData: timeout on block {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X}: {exc}) — retrying block…",
-                    ))
-                    time.sleep(0.25)
-                    with contextlib.suppress(*LINK_ERRORS):
-                        link.drain_rx(max_frames=256, quick=True)
-            done = offset + len(chunk)
-            info["bytes_transferred"] = done
-            if blk_idx % 8 == 0 or done == APP_SIZE:
-                reporter.progress(
-                    done,
-                    APP_SIZE,
-                    unit="B",
-                    detail=f"Block {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X})",
-                )
-            if (blk_idx + 1) % 250 == 0 or done == APP_SIZE:
-                reporter.can_log(
-                    tr(
-                        f"TransferData: передано {done:,} / {APP_SIZE:,} Б (блок {blk_idx + 1}/{total_blocks})",
-                        f"TransferData: sent {done:,} / {APP_SIZE:,} B (block {blk_idx + 1}/{total_blocks})",
-                    )
-                )
-
-        link.request_uds(b"\x37", 0x77, timeout=5.0)
-        info["transfer_exit_ok"] = True
-        info["blocks"] = total_blocks
-
-        sig = signature_128b if (signature_128b and len(signature_128b) == 128) else (b"\x00" * 128)
-        chk_mem_req = (
-            bytes.fromhex("3101020244")
-            + APP_BASE.to_bytes(4, "big")
-            + APP_SIZE.to_bytes(4, "big")
-            + (128).to_bytes(2, "big")
-            + sig
-        )
-        reporter.can_log(tr("Проверка контрольной суммы и подписи в FBL (31 01 02 02)…", "Running FBL CheckMemory (31 01 02 02)…"))
-        chk_resp = link.request_uds(chk_mem_req, 0x71, timeout=120.0, allow_pending=True)
-        try:
-            _routine_ok(chk_resp, "CheckMemory (0202)")
-        except RuntimeError as exc:
-            # With the engineering bootloader this always passes; the factory one checks the RSA signature, and
-            # ContiTool has none to give. The application is now invalid, so the ECU stays in its bootloader.
-            raise FblRejectedAppError(
+        reporter.check_cancelled()
+        with reporter.uninterruptible():
+            reporter.can_log(
                 tr(
-                    f"Загрузчик не принял приложение ({chk_resp.hex()}): в блоке заводской загрузчик, ему нужна "
-                    "подпись. Сначала нужен инженерный загрузчик.",
-                    f"The bootloader rejected the application ({chk_resp.hex()}): the ECU has the factory "
-                    "bootloader, which wants a signature. The engineering bootloader is needed first.",
+                    "Стирание прикладной области CodeFlash (31 01 FF 00 01 01: 0x0000C000..0x0017FFFF)…",
+                    "Erasing Application CodeFlash block (31 01 FF 00 01 01: 0x0000C000..0x0017FFFF)…",
                 )
-            ) from exc
-        info["check_memory_response"] = chk_resp.hex()
+            )
+            erase_resp = link.request_uds(bytes.fromhex("3101ff000101"), 0x71, timeout=120.0, allow_pending=True)
+            try:
+                _routine_ok(erase_resp, "EraseMemory (FF00)")
+            except RuntimeError as exc:
+                raise FblEraseFailedError(str(exc)) from exc
+            info["erase_completed"] = True
+            info["erase_response"] = erase_resp.hex()
 
-        reporter.can_log(tr("Проверка зависимостей и запись маркера присутствия (31 01 FF 01)…", "Running CheckProgrammingDependencies (31 01 FF 01)…"))
-        dep_resp = link.request_uds(bytes.fromhex("3101ff01"), 0x71, timeout=60.0, allow_pending=True)
-        _routine_ok(dep_resp, "CheckProgrammingDependencies (FF01)")
-        info["dependencies_response"] = dep_resp.hex()
+            req_dl = b"\x34\x00\x44" + APP_BASE.to_bytes(4, "big") + APP_SIZE.to_bytes(4, "big")
+            dl_resp = link.request_uds(req_dl, 0x74, timeout=5.0)
+            len_bytes = dl_resp[1] >> 4
+            if not (1 <= len_bytes <= 4) or len(dl_resp) < 2 + len_bytes:
+                raise RuntimeError(f"Malformed RequestDownload response: {dl_resp.hex()}")
+            max_block_len = int.from_bytes(dl_resp[2 : 2 + len_bytes], "big")
+            # FBL ISO-TP RX buffer cap is 0x202 (514 bytes = 2-byte `36 <seq>` header + 512 payload bytes)
+            chunk_size = min(512, ((max_block_len - 2) // 256) * 256)
+            if chunk_size < 256:
+                raise RuntimeError(f"FBL reported invalid maxNumberOfBlockLength={max_block_len}")
+            info["download_accepted"] = True
+            info["max_block_length"] = max_block_len
+            info["chunk_size"] = chunk_size
 
-        try:
-            info["reset_response"] = link.request_uds(b"\x11\x01", 0x51, timeout=2.0, resend=False).hex()
-        except TRANSPORT_ERRORS:
-            # the ECU is rebooting: on a hardware link that can surface as an error event, not only as silence
-            info["reset_response"] = "no response after reset"
+            reporter.reset_stage_timer()
+            reporter.progress(0, APP_SIZE, unit="B", detail="UDS TransferData (0x36)")
+            total_blocks = (APP_SIZE + chunk_size - 1) // chunk_size
+            for blk_idx, offset in enumerate(range(0, APP_SIZE, chunk_size)):
+                reporter.check_cancelled()
+                chunk = app_bytes[offset : offset + chunk_size]
+                seq = (blk_idx + 1) & 0xFF
+                block_req = bytes([0x36, seq]) + chunk
+                for td_try in range(2):
+                    try:
+                        link.request_uds(block_req, 0x76, timeout=30.0, allow_pending=True)
+                        break
+                    except TimeoutError as exc:
+                        if td_try == 1 or getattr(getattr(link, "bus", None), "spent", False):
+                            raise
+                        reporter.warning(tr(
+                            f"TransferData: таймаут на блоке {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X}: {exc}) — повтор блока…",
+                            f"TransferData: timeout on block {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X}: {exc}) — retrying block…",
+                        ))
+                        time.sleep(0.25)
+                        with contextlib.suppress(*LINK_ERRORS):
+                            link.drain_rx(max_frames=256, quick=True)
+                done = offset + len(chunk)
+                info["bytes_transferred"] = done
+                if blk_idx % 8 == 0 or done == APP_SIZE:
+                    reporter.progress(
+                        done,
+                        APP_SIZE,
+                        unit="B",
+                        detail=f"Block {blk_idx + 1}/{total_blocks} (seq 0x{seq:02X})",
+                    )
+                if (blk_idx + 1) % 250 == 0 or done == APP_SIZE:
+                    reporter.can_log(
+                        tr(
+                            f"TransferData: передано {done:,} / {APP_SIZE:,} Б (блок {blk_idx + 1}/{total_blocks})",
+                            f"TransferData: sent {done:,} / {APP_SIZE:,} B (block {blk_idx + 1}/{total_blocks})",
+                        )
+                    )
+
+            link.request_uds(b"\x37", 0x77, timeout=5.0)
+            info["transfer_exit_ok"] = True
+            info["blocks"] = total_blocks
+
+            sig = signature_128b if (signature_128b and len(signature_128b) == 128) else (b"\x00" * 128)
+            chk_mem_req = (
+                bytes.fromhex("3101020244")
+                + APP_BASE.to_bytes(4, "big")
+                + APP_SIZE.to_bytes(4, "big")
+                + (128).to_bytes(2, "big")
+                + sig
+            )
+            reporter.can_log(tr("Проверка контрольной суммы и подписи в FBL (31 01 02 02)…", "Running FBL CheckMemory (31 01 02 02)…"))
+            chk_resp = link.request_uds(chk_mem_req, 0x71, timeout=120.0, allow_pending=True)
+            try:
+                _routine_ok(chk_resp, "CheckMemory (0202)")
+            except RuntimeError as exc:
+                # With the engineering bootloader this always passes; the factory one checks the RSA signature, and
+                # ContiTool has none to give. The application is now invalid, so the ECU stays in its bootloader.
+                raise FblRejectedAppError(
+                    tr(
+                        f"Загрузчик не принял приложение ({chk_resp.hex()}): в блоке заводской загрузчик, ему нужна "
+                        "подпись. Сначала нужен инженерный загрузчик.",
+                        f"The bootloader rejected the application ({chk_resp.hex()}): the ECU has the factory "
+                        "bootloader, which wants a signature. The engineering bootloader is needed first.",
+                    )
+                ) from exc
+            info["check_memory_response"] = chk_resp.hex()
+
+            reporter.can_log(tr("Проверка зависимостей и запись маркера присутствия (31 01 FF 01)…", "Running CheckProgrammingDependencies (31 01 FF 01)…"))
+            dep_resp = link.request_uds(bytes.fromhex("3101ff01"), 0x71, timeout=60.0, allow_pending=True)
+            _routine_ok(dep_resp, "CheckProgrammingDependencies (FF01)")
+            info["dependencies_response"] = dep_resp.hex()
+
+            try:
+                info["reset_response"] = link.request_uds(b"\x11\x01", 0x51, timeout=2.0, resend=False).hex()
+            except TRANSPORT_ERRORS:
+                # the ECU is rebooting: on a hardware link that can surface as an error event, not only as silence
+                info["reset_response"] = "no response after reset"
     return info
 
 
@@ -3695,7 +3710,15 @@ def can_write_cflash(
         ))
         result["flash_commands_sent"] = True
         try:
-            result["uds_first"] = _restore_app_over_uds(port, raw_cand, interface, out_dir / "uds_first", reporter)
+            result["uds_first"] = _restore_app_over_uds(
+                port,
+                raw_cand,
+                interface,
+                out_dir / "uds_first",
+                reporter,
+                signature_128b=signature_128b,
+            )
+            time.sleep(3.0)
         except FblEraseFailedError as erase_exc:
             raw_faci = True
             result["raw_faci"] = True
@@ -3708,11 +3731,15 @@ def can_write_cflash(
                     "restoring CodeFlash directly via FACI in RAM-Loader.",
                 )
             )
+        except Exception as outer_exc:
+            result["error"] = str(outer_exc)
+            _write_json(out_dir / "cflash_write_result.json", result)
+            raise
 
     with J533CanLink(port, interface=interface, log_path=out_dir / "can.jsonl") as link:
         try:
             reporter.step(1, total_steps, tr("Вход в RAM-Loader и проверка загрузчика (RSA Probe)", "Entering RAM-Loader & probing bootloader state"))
-            enter_ram_loader(link, reporter=reporter)
+            result["loader_session"] = enter_ram_loader(link, reporter=reporter)
             if raw_faci:
                 rsa_res = {"skipped": True, "reason": "raw_faci"}
             else:
@@ -4047,6 +4074,13 @@ def can_write_cflash(
             raise
         except Exception as exc:
             result["error"] = str(exc)
+            if not result.get("flash_commands_sent"):
+                _hand_back_after_read_error(
+                    link,
+                    reporter,
+                    active_loader=bool(result.get("loader_session") or result.get("beacon")),
+                    return_to_app=return_to_app,
+                )
             raise
         finally:
             _write_json(out_dir / "cflash_write_result.json", result)
@@ -4301,7 +4335,13 @@ def _ecu_stuck_in_fbl(port: str, interface: str, out_dir: Path) -> bool:
 
 
 def _restore_app_over_uds(
-    port: str, cflash_file: Path | bytes, interface: str, out_dir: Path, reporter: OperationReporter
+    port: str,
+    cflash_file: Path | bytes,
+    interface: str,
+    out_dir: Path,
+    reporter: OperationReporter,
+    *,
+    signature_128b: bytes | None = None,
 ) -> dict[str, Any]:
     """Program the backup's application through the FBL's own UDS download — no RAM-loader involved.
 
@@ -4323,7 +4363,7 @@ def _restore_app_over_uds(
         except LINK_ERRORS:
             # A RAM-loader left running (after the engineering bootloader went in) does not speak UDS: leave it.
             _reset_to_application(link, reporter=reporter, allow_fbl=True)
-        return _program_application_uds(link, bytes(app), reporter=reporter)
+        return _program_application_uds(link, bytes(app), signature_128b=signature_128b, reporter=reporter)
 
 
 def can_cure_fbl_fingerprint(
@@ -4535,130 +4575,143 @@ def can_turnkey_read_patch_flash(
             "═══ PHASE A: FULL GATEWAY BACKUP (Cflash + Uflash + Dflash) ═══",
         )
     )
-    bkp = can_backup(
-        port,
-        interface=interface,
-        session_dir=backup_dir,
-        return_to_app=False,
-        reporter=reporter,
-    )
-    summary["backup"] = bkp
-
-    orig_cf = (backup_dir / "Cflash.bin").read_bytes()
-    orig_uf = (backup_dir / "Uflash.bin").read_bytes()
-    orig_df = (backup_dir / "Dflash.bin").read_bytes()
-
-    need_cflash = bool(patch_cp_hybrid or patch_engineering_cflash or cp_updates)
-    use_raw_faci = False
-    if unlock_engineering_uflash or need_cflash:
-        reporter.info(
-            tr(
-                "═══ ШАГ B: РАЗБЛОКИРОВКА ИНЖЕНЕРНОГО ЗАГРУЗЧИКА UFLASH ═══",
-                "═══ PHASE B: UNLOCKING ENGINEERING RSA-FREE UFLASH ═══",
-            )
+    try:
+        bkp = can_backup(
+            port,
+            interface=interface,
+            session_dir=backup_dir,
+            return_to_app=False,
+            reporter=reporter,
         )
-        try:
-            uf_res = can_write_uflash(
-                port,
-                input_uflash=orig_uf,
-                restore_stock=False,
-                interface=interface,
-                session_dir=out_dir / "02_uflash_unlock",
-                skip_full_backup=True,
-                return_to_app=not bool(cp_updates),
-                reporter=reporter,
-            )
-            summary["uflash_unlock"] = uf_res
-        except (UflashProtectedError, UnrecognisedUflashError) as uf_exc:
-            if not need_cflash:
-                raise
-            use_raw_faci = True
-            summary["uflash_unlock_skipped"] = str(uf_exc)
-            reporter.warning(
+        summary["backup"] = bkp
+        left_in_loader = True
+
+        orig_cf = (backup_dir / "Cflash.bin").read_bytes()
+        orig_uf = (backup_dir / "Uflash.bin").read_bytes()
+        orig_df = (backup_dir / "Dflash.bin").read_bytes()
+
+        need_cflash = bool(patch_cp_hybrid or patch_engineering_cflash or cp_updates)
+        use_raw_faci = False
+        if unlock_engineering_uflash or need_cflash:
+            reporter.info(
                 tr(
-                    f"Загрузчик Uflash не может быть изменён ({uf_exc}) — записываем CodeFlash напрямую через FACI.",
-                    f"The Uflash bootloader cannot be modified ({uf_exc}) — programming CodeFlash directly via FACI.",
+                    "═══ ШАГ B: РАЗБЛОКИРОВКА ИНЖЕНЕРНОГО ЗАГРУЗЧИКА UFLASH ═══",
+                    "═══ PHASE B: UNLOCKING ENGINEERING RSA-FREE UFLASH ═══",
                 )
             )
+            try:
+                uf_res = can_write_uflash(
+                    port,
+                    input_uflash=orig_uf,
+                    restore_stock=False,
+                    interface=interface,
+                    session_dir=out_dir / "02_uflash_unlock",
+                    skip_full_backup=True,
+                    return_to_app=not bool(cp_updates),
+                    reporter=reporter,
+                )
+                summary["uflash_unlock"] = uf_res
+                left_in_loader = bool(cp_updates)
+            except (UflashProtectedError, UnrecognisedUflashError) as uf_exc:
+                if not need_cflash:
+                    raise
+                use_raw_faci = True
+                summary["uflash_unlock_skipped"] = str(uf_exc)
+                reporter.warning(
+                    tr(
+                        f"Загрузчик Uflash не может быть изменён ({uf_exc}) — записываем CodeFlash напрямую через FACI.",
+                        f"The Uflash bootloader cannot be modified ({uf_exc}) — programming CodeFlash directly via FACI.",
+                    )
+                )
 
-    if cp_updates:
-        reporter.info(
-            tr(
-                "═══ ШАГ B2: ЗАПИСЬ КЛЮЧЕЙ IKA В DATAFLASH ЧЕРЕЗ FACI ═══",
-                "═══ PHASE B2: WRITING IKA KEYS TO DATAFLASH VIA FACI ═══",
+        if cp_updates:
+            reporter.info(
+                tr(
+                    "═══ ШАГ B2: ЗАПИСЬ КЛЮЧЕЙ IKA В DATAFLASH ЧЕРЕЗ FACI ═══",
+                    "═══ PHASE B2: WRITING IKA KEYS TO DATAFLASH VIA FACI ═══",
+                )
             )
-        )
-        mod_df, _ = write_dflash_slots(orig_df, cp_updates, reporter=reporter)
-        patched_df_path = out_dir / "Dflash_patched.bin"
-        patched_df_path.write_bytes(mod_df)
-        summary["patched_dflash_path"] = str(patched_df_path)
-        df_res = can_write_dflash(
-            port,
-            mod_df,
-            expected_before_dflash=orig_df,
-            interface=interface,
-            session_dir=out_dir / "02b_dflash_flash",
-            skip_full_backup=True,
-            return_to_app=True,
-            reporter=reporter,
-        )
-        summary["dflash_flash"] = df_res
+            mod_df, _ = write_dflash_slots(orig_df, cp_updates, reporter=reporter)
+            patched_df_path = out_dir / "Dflash_patched.bin"
+            patched_df_path.write_bytes(mod_df)
+            summary["patched_dflash_path"] = str(patched_df_path)
+            df_res = can_write_dflash(
+                port,
+                mod_df,
+                expected_before_dflash=orig_df,
+                interface=interface,
+                session_dir=out_dir / "02b_dflash_flash",
+                skip_full_backup=True,
+                return_to_app=True,
+                reporter=reporter,
+            )
+            summary["dflash_flash"] = df_res
+            left_in_loader = False
 
-    if need_cflash:
-        reporter.info(
-            tr(
-                "═══ ШАГ C: ПАТЧИНГ И ПРОШИВКА CODEFLASH ПО CAN ═══",
-                "═══ PHASE C: PATCHING & FLASHING CODEFLASH OVER CAN ═══",
+        if need_cflash:
+            reporter.info(
+                tr(
+                    "═══ ШАГ C: ПАТЧИНГ И ПРОШИВКА CODEFLASH ПО CAN ═══",
+                    "═══ PHASE C: PATCHING & FLASHING CODEFLASH OVER CAN ═══",
+                )
             )
-        )
-        mod_cf = orig_cf
-        applied_descriptions: list[str] = []
-        if patch_cp_hybrid or cp_updates:
-            mod_cf, desc_cp, _ = apply_cflash_patch(
+            mod_cf = orig_cf
+            applied_descriptions: list[str] = []
+            if patch_cp_hybrid or cp_updates:
+                mod_cf, desc_cp, _ = apply_cflash_patch(
+                    mod_cf,
+                    mode="hybrid",
+                    bypass_eeprom_mask=bypass_eeprom_mask,
+                    preserve_existing_mask_bypass=True,
+                )
+                applied_descriptions.append(desc_cp)
+            if patch_engineering_cflash:
+                mod_cf, desc_eng, _ = apply_engineering_patch(mod_cf)
+                applied_descriptions.append(desc_eng)
+
+            patched_path = out_dir / "Cflash_patched.bin"
+            patched_path.write_bytes(mod_cf)
+            summary["patched_cflash_path"] = str(patched_path)
+            summary["applied_patches"] = applied_descriptions
+
+            cf_res = can_write_cflash(
+                port,
                 mod_cf,
-                mode="hybrid",
-                bypass_eeprom_mask=bypass_eeprom_mask,
-                preserve_existing_mask_bypass=True,
+                expected_before_cflash=orig_cf,
+                raw_faci=use_raw_faci,
+                interface=interface,
+                session_dir=out_dir / "03_cflash_flash",
+                skip_backup=True,
+                reporter=reporter,
             )
-            applied_descriptions.append(desc_cp)
-        if patch_engineering_cflash:
-            mod_cf, desc_eng, _ = apply_engineering_patch(mod_cf)
-            applied_descriptions.append(desc_eng)
+            summary["cflash_flash"] = cf_res
+            left_in_loader = False
 
-        patched_path = out_dir / "Cflash_patched.bin"
-        patched_path.write_bytes(mod_cf)
-        summary["patched_cflash_path"] = str(patched_path)
-        summary["applied_patches"] = applied_descriptions
-
-        cf_res = can_write_cflash(
+        reporter.info(
+            tr(
+                "═══ ШАГ D: ФИНАЛЬНАЯ ПРОВЕРКА ШЛЮЗА И ОШИБОК DTC ═══",
+                "═══ PHASE D: FINAL GATEWAY HEALTH & DTC CHECK ═══",
+            )
+        )
+        hlth = can_health_check(
             port,
-            mod_cf,
-            expected_before_cflash=orig_cf,
-            raw_faci=use_raw_faci,
             interface=interface,
-            session_dir=out_dir / "03_cflash_flash",
-            skip_backup=True,
+            session_dir=out_dir / "04_health",
+            clear_dtc=clear_dtc_after,
             reporter=reporter,
         )
-        summary["cflash_flash"] = cf_res
-
-    reporter.info(
-        tr(
-            "═══ ШАГ D: ФИНАЛЬНАЯ ПРОВЕРКА ШЛЮЗА И ОШИБОК DTC ═══",
-            "═══ PHASE D: FINAL GATEWAY HEALTH & DTC CHECK ═══",
-        )
-    )
-    hlth = can_health_check(
-        port,
-        interface=interface,
-        session_dir=out_dir / "04_health",
-        clear_dtc=clear_dtc_after,
-        reporter=reporter,
-    )
-    summary["health"] = hlth
-    summary["complete"] = True
-    _write_json(out_dir / "turnkey_summary.json", summary)
-    return summary
+        summary["health"] = hlth
+        summary["complete"] = True
+        return summary
+    except Exception as exc:
+        summary["error"] = str(exc)
+        if locals().get("left_in_loader"):
+            with contextlib.suppress(*LINK_ERRORS, can.CanError):
+                with J533CanLink(port, interface=interface) as rec_link:
+                    _reset_to_application(rec_link, reporter=reporter, allow_fbl=True)
+        raise
+    finally:
+        _write_json(out_dir / "turnkey_summary.json", summary)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4789,125 +4842,130 @@ def can_upload_zdc_datasets(
     if out_dir is not None:
         result["session_dir"] = str(out_dir)
 
-    with J533CanLink(port, interface=interface, bus=bus, log_path=log_path) as link, _uds_session(link):
-        _note_hw_fallback(link, result, reporter)
-        reporter.step(1, total_steps, tr("Вход в EOL-сессию (UDS 10 40) и авторизация 20103", "Entering EOLSession (UDS 10 40) & SecurityAccess 20103"))
-        link.request_uds(b"\x10\x40", 0x50, timeout=3.0)
-        _uds_security_20103(link, reporter=reporter)
-        _uds_write_workshop_fingerprint(link)
-        reporter.progress(12, 100)
+    try:
+        with J533CanLink(port, interface=interface, bus=bus, log_path=log_path) as link, _uds_session(link):
+            _note_hw_fallback(link, result, reporter)
+            reporter.step(1, total_steps, tr("Вход в EOL-сессию (UDS 10 40) и авторизация 20103", "Entering EOLSession (UDS 10 40) & SecurityAccess 20103"))
+            link.request_uds(b"\x10\x40", 0x50, timeout=3.0)
+            _uds_security_20103(link, reporter=reporter)
+            _uds_write_workshop_fingerprint(link)
+            reporter.progress(12, 100)
 
-        with reporter.uninterruptible():  # a dataset left half-uploaded stays erased
-            for pos, (idx, code, uds_addr, uds_len, payload) in enumerate(to_upload, start=2):
-                reporter.step(
-                    pos,
-                    total_steps,
-                    tr(
-                        f"Передача и проверка CRC-32 ZDC #{idx} ({code}, {uds_len} Б -> 0x{uds_addr:08X})",
-                        f"Uploading & verifying CRC-32 for ZDC #{idx} ({code}, {uds_len} B -> 0x{uds_addr:08X})",
-                    ),
-                )
-                req34 = b"\x34\x00\x44" + uds_addr.to_bytes(4, "big") + uds_len.to_bytes(4, "big")
-                try:
-                    dl_resp = link.request_uds(req34, 0x74, timeout=3.0, allow_pending=True)
-                except UdsNegativeResponse as exc:
-                    if exc.sid == 0x34 and exc.nrc in (0x31, 0x70):
-                        raise RuntimeError(
-                            tr(
-                                f"Прошивка этого шлюза отклонила загрузку ZDC #{idx} ({code}, 0x{uds_addr:08X}, "
-                                f"{uds_len} Б) по UDS (7F 34 {exc.nrc:02X}) — в этой версии ПО таблица адресов/размеров "
-                                "ZDC отличается. Прочитайте память блока целиком (чтобы программа взяла таблицу ZDC из "
-                                "его Cflash.bin) или запишите параметрию через «Записать DataFlash целиком…».",
-                                f"This gateway's firmware rejected the UDS download of ZDC #{idx} ({code}, "
-                                f"0x{uds_addr:08X}, {uds_len} B) with 7F 34 {exc.nrc:02X} — its ZDC address/size table "
-                                "differs from standard. Read the full ECU memory first (so ContiTool takes the ZDC map "
-                                "from its Cflash.bin) or write the dataset via “Write the whole DataFlash…”.",
-                            )
-                        ) from exc
-                    raise
-                # Full-size blocks, as ODIS sends them (1022 + 1022 + 794 after `74 20 04 00`): the gateway answered a
-                # 240-byte block after `74 10 FE` with 7F 36 31 and left the dataset half erased (bench 2026-11-09).
-                chunk_size = _transfer_chunk(dl_resp)
-                seq = 1
-                for off in range(0, len(payload), chunk_size):
-                    chunk = payload[off : off + chunk_size]
-                    link.request_uds(bytes([0x36, seq & 0xFF]) + chunk, 0x76, timeout=5.0, allow_pending=True)
-                    seq = (seq + 1) & 0xFF
-                link.request_uds(b"\x37", 0x77, timeout=5.0, allow_pending=True)
-
-                # Continental J533 requires per-block CheckMemory (0x02EF) right after each 0x37:
-                # clears transfer-complete latch (preventing NRC 0x22 on next 0x34) and validates block CRC-32.
-                # On real hardware: 71 03 02 EF 02 FF FF = CRC PASS; 71 03 02 EF 02 00 00 = CRC FAIL.
-                link.request_uds(bytes.fromhex("310102EF031000"), 0x71, timeout=5.0, allow_pending=True)
-                for _ in range(25):
-                    r_poll = link.request_uds(bytes.fromhex("310302EF"), 0x71, timeout=3.0, allow_pending=True)
-                    if len(r_poll) < 5:
-                        raise RuntimeError(f"Malformed 31 03 02 EF response: {r_poll.hex()}")
-                    if r_poll[4] == 0x01:
-                        if bus is None:
-                            time.sleep(0.05)
-                        continue
-                    if r_poll[4] == 0x02:
-                        if len(r_poll) < 7 or r_poll[5:7] != b"\xff\xff":
-                            err_hex = r_poll[5:7].hex().upper() if len(r_poll) >= 7 else r_poll.hex().upper()
+            with reporter.uninterruptible():  # a dataset left half-uploaded stays erased
+                for pos, (idx, code, uds_addr, uds_len, payload) in enumerate(to_upload, start=2):
+                    reporter.step(
+                        pos,
+                        total_steps,
+                        tr(
+                            f"Передача и проверка CRC-32 ZDC #{idx} ({code}, {uds_len} Б -> 0x{uds_addr:08X})",
+                            f"Uploading & verifying CRC-32 for ZDC #{idx} ({code}, {uds_len} B -> 0x{uds_addr:08X})",
+                        ),
+                    )
+                    req34 = b"\x34\x00\x44" + uds_addr.to_bytes(4, "big") + uds_len.to_bytes(4, "big")
+                    try:
+                        dl_resp = link.request_uds(req34, 0x74, timeout=3.0, allow_pending=True)
+                    except UdsNegativeResponse as exc:
+                        if exc.sid == 0x34 and exc.nrc in (0x31, 0x70):
                             raise RuntimeError(
                                 tr(
-                                    f"Шлюз отклонил CRC-32 блока ZDC #{idx} ({code}) при проверке 02EF (статус {err_hex})",
-                                    f"Gateway CheckMemory 02EF rejected CRC-32 for ZDC #{idx} ({code}) (status {err_hex})",
+                                    f"Прошивка этого шлюза отклонила загрузку ZDC #{idx} ({code}, 0x{uds_addr:08X}, "
+                                    f"{uds_len} Б) по UDS (7F 34 {exc.nrc:02X}) — в этой версии ПО таблица адресов/размеров "
+                                    "ZDC отличается. Прочитайте память блока целиком (чтобы программа взяла таблицу ZDC из "
+                                    "его Cflash.bin) или запишите параметрию через «Записать DataFlash целиком…».",
+                                    f"This gateway's firmware rejected the UDS download of ZDC #{idx} ({code}, "
+                                    f"0x{uds_addr:08X}, {uds_len} B) with 7F 34 {exc.nrc:02X} — its ZDC address/size table "
+                                    "differs from standard. Read the full ECU memory first (so ContiTool takes the ZDC map "
+                                    "from its Cflash.bin) or write the dataset via “Write the whole DataFlash…”.",
                                 )
-                            )
-                        break
-                    raise RuntimeError(f"Unexpected 31 03 02 EF status: {r_poll.hex()}")
-                else:
-                    raise TimeoutError(f"CheckMemory routine 0x02EF timed out in status 0x01 for ZDC #{idx}")
+                            ) from exc
+                        raise
+                    # Full-size blocks, as ODIS sends them (1022 + 1022 + 794 after `74 20 04 00`): the gateway answered a
+                    # 240-byte block after `74 10 FE` with 7F 36 31 and left the dataset half erased (bench 2026-11-09).
+                    chunk_size = _transfer_chunk(dl_resp)
+                    seq = 1
+                    for off in range(0, len(payload), chunk_size):
+                        chunk = payload[off : off + chunk_size]
+                        link.request_uds(bytes([0x36, seq & 0xFF]) + chunk, 0x76, timeout=5.0, allow_pending=True)
+                        seq = (seq + 1) & 0xFF
+                    link.request_uds(b"\x37", 0x77, timeout=5.0, allow_pending=True)
 
-                result["uploaded_blocks"].append({"idx": idx, "code": code, "uds_addr": f"0x{uds_addr:08X}", "size": uds_len})
-                reporter.info(tr(f"ZDC #{idx} ({code}) принят, проверен 02EF (FFFF) и сохранён в DataFlash", f"ZDC #{idx} ({code}) accepted, verified by 02EF (FFFF), and committed to DataFlash"))
-                reporter.progress(12 + int(76 * (pos - 1) / len(to_upload)), 100)
+                    # Continental J533 requires per-block CheckMemory (0x02EF) right after each 0x37:
+                    # clears transfer-complete latch (preventing NRC 0x22 on next 0x34) and validates block CRC-32.
+                    # On real hardware: 71 03 02 EF 02 FF FF = CRC PASS; 71 03 02 EF 02 00 00 = CRC FAIL.
+                    link.request_uds(bytes.fromhex("310102EF031000"), 0x71, timeout=5.0, allow_pending=True)
+                    for _ in range(25):
+                        r_poll = link.request_uds(bytes.fromhex("310302EF"), 0x71, timeout=3.0, allow_pending=True)
+                        if len(r_poll) < 5:
+                            raise RuntimeError(f"Malformed 31 03 02 EF response: {r_poll.hex()}")
+                        if r_poll[4] == 0x01:
+                            if bus is None:
+                                time.sleep(0.05)
+                            continue
+                        if r_poll[4] == 0x02:
+                            if len(r_poll) < 7 or r_poll[5:7] != b"\xff\xff":
+                                err_hex = r_poll[5:7].hex().upper() if len(r_poll) >= 7 else r_poll.hex().upper()
+                                raise RuntimeError(
+                                    tr(
+                                        f"Шлюз отклонил CRC-32 блока ZDC #{idx} ({code}) при проверке 02EF (статус {err_hex})",
+                                        f"Gateway CheckMemory 02EF rejected CRC-32 for ZDC #{idx} ({code}) (status {err_hex})",
+                                    )
+                                )
+                            break
+                        raise RuntimeError(f"Unexpected 31 03 02 EF status: {r_poll.hex()}")
+                    else:
+                        raise TimeoutError(f"CheckMemory routine 0x02EF timed out in status 0x01 for ZDC #{idx}")
 
-        if write_passport:
-            pp = parse_zdc_passport(dflash_bytes)
-            pn_str = (pp.dataset_pn or "V03935256AA")[:11]
-            ver_str = pp.dataset_ver if zdc_ver_ok(pp.dataset_ver) else "0001"
-            eq_12 = pp.equip_bytes if len(pp.equip_bytes) == 12 else (b"\xff" * 12)
+                    result["uploaded_blocks"].append({"idx": idx, "code": code, "uds_addr": f"0x{uds_addr:08X}", "size": uds_len})
+                    reporter.info(tr(f"ZDC #{idx} ({code}) принят, проверен 02EF (FFFF) и сохранён в DataFlash", f"ZDC #{idx} ({code}) accepted, verified by 02EF (FFFF), and committed to DataFlash"))
+                    reporter.progress(12 + int(76 * (pos - 1) / len(to_upload)), 100)
 
-            reporter.step(
-                len(to_upload) + 2,
-                total_steps,
-                tr(f"Фиксация паспорта датасета F1A0={pn_str} / F1A1={ver_str}", f"Sealing dataset passport F1A0={pn_str} / F1A1={ver_str}"),
-            )
-            link.request_uds(b"\x2E\xF1\xA0" + pn_str.encode("ascii").ljust(11, b" "), 0x6E, timeout=5.0, allow_pending=True)
-            link.request_uds(b"\x2E\xF1\xA1" + ver_str.encode("ascii"), 0x6E, timeout=5.0, allow_pending=True)
-            link.request_uds(b"\x2E\xF1\xA4" + eq_12, 0x6E, timeout=5.0, allow_pending=True)
-            result["passport_written"] = True
-            result["dataset_pn"] = pn_str
-            result["dataset_ver"] = ver_str
+            if write_passport:
+                pp = parse_zdc_passport(dflash_bytes)
+                pn_str = (pp.dataset_pn or "V03935256AA")[:11]
+                ver_str = pp.dataset_ver if zdc_ver_ok(pp.dataset_ver) else "0001"
+                eq_12 = pp.equip_bytes if len(pp.equip_bytes) == 12 else (b"\xff" * 12)
 
-        # Each uploaded block is used only with its enable bit in 0x0600 set; a coding change restarts the gateway.
-        result["auto_coding"] = _sync_coding_for_zdc(link, dflash_bytes, [u[0] for u in to_upload], reporter)
-        if reset_after and "after" not in result["auto_coding"]:
-            reporter.step(total_steps, total_steps, tr("Перезагрузка шлюза для применения датасета (UDS 11 02)", "Resetting gateway to reload dataset tables (UDS 11 02)"))
-            try:
-                link.request_uds(b"\x11\x02", 0x51, timeout=2.0, allow_pending=True, resend=False)
-            except LINK_ERRORS:
+                reporter.step(
+                    len(to_upload) + 2,
+                    total_steps,
+                    tr(f"Фиксация паспорта датасета F1A0={pn_str} / F1A1={ver_str}", f"Sealing dataset passport F1A0={pn_str} / F1A1={ver_str}"),
+                )
+                link.request_uds(b"\x2E\xF1\xA0" + pn_str.encode("ascii").ljust(11, b" "), 0x6E, timeout=5.0, allow_pending=True)
+                link.request_uds(b"\x2E\xF1\xA1" + ver_str.encode("ascii"), 0x6E, timeout=5.0, allow_pending=True)
+                link.request_uds(b"\x2E\xF1\xA4" + eq_12, 0x6E, timeout=5.0, allow_pending=True)
+                result["passport_written"] = True
+                result["dataset_pn"] = pn_str
+                result["dataset_ver"] = ver_str
+
+            # Each uploaded block is used only with its enable bit in 0x0600 set; a coding change restarts the gateway.
+            result["auto_coding"] = _sync_coding_for_zdc(link, dflash_bytes, [u[0] for u in to_upload], reporter)
+            if reset_after and "after" not in result["auto_coding"]:
+                reporter.step(total_steps, total_steps, tr("Перезагрузка шлюза для применения датасета (UDS 11 02)", "Resetting gateway to reload dataset tables (UDS 11 02)"))
                 try:
-                    link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
+                    link.request_uds(b"\x11\x02", 0x51, timeout=2.0, allow_pending=True, resend=False)
                 except LINK_ERRORS:
-                    pass
-            if bus is None:
-                time.sleep(1.2)
+                    try:
+                        link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
+                    except LINK_ERRORS:
+                        pass
+                if bus is None:
+                    time.sleep(1.2)
 
-        result["complete"] = True
-        reporter.progress(100, 100)
-        reporter.success(
-            tr(
-                f"Параметрия ZDC успешно загружена по CAN (блоков: {len(to_upload)})!",
-                f"ZDC parameterization uploaded over CAN ({len(to_upload)} block(s))!",
+            result["complete"] = True
+            reporter.progress(100, 100)
+            reporter.success(
+                tr(
+                    f"Параметрия ZDC успешно загружена по CAN (блоков: {len(to_upload)})!",
+                    f"ZDC parameterization uploaded over CAN ({len(to_upload)} block(s))!",
+                )
             )
-        )
-    if out_dir is not None:
-        _write_json(out_dir / "zdc_upload_result.json", result)
-    return result
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        raise
+    finally:
+        if out_dir is not None:
+            _write_json(out_dir / "zdc_upload_result.json", result)
 
 
 def _gra_button_signature(data8: bytes) -> bytes:
@@ -4964,6 +5022,7 @@ def can_learn_mfl_button(
         deadline = time.monotonic() + max(0.5, float(timeout_s))
 
         while time.monotonic() < deadline:
+            reporter.check_cancelled()
             mfl = link.request_uds(b"\x22\x1F\x07", 0x62, timeout=2.0)[3:]
             kc1 = mfl[1] if len(mfl) > 1 else 0
             kc2 = mfl[2] if len(mfl) > 2 else 0

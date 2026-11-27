@@ -497,6 +497,8 @@ def _build_gateway_ecu(link: J533CanLink, in_fbl: bool, reporter: OperationRepor
         app_valid=app_valid,
         f1df=f1df_hex,
         unsupported=unsupported,
+        officially_supported=unsupported is None,
+        support_warning=unsupported,
         capabilities=caps,
     )
 
@@ -525,7 +527,7 @@ def _apply_slave_support(ecu: DiscoveredEcu) -> DiscoveredEcu:
 
         sup = elv_detect_profile(ecu.ident)
     if sup is not None:
-        ecu.officially_supported = bool(sup.get("verified", True))
+        ecu.officially_supported = bool(sup.get("verified", True)) and not ecu.unsupported
         ecu.support_warning = sup.get("warning")
         ecu.support_warning_tone = str(sup.get("tone") or "warn")
     return ecu
@@ -654,7 +656,7 @@ def _build_slave_ecu_raw(
         )
 
     if spec.kind == "kombi":
-        if native_ok:
+        if native_ok or (via_gateway and bridge_adapter_ok):
             return DiscoveredEcu(
                 kind="kombi",
                 diag_addr=spec.diag_addr,
@@ -667,11 +669,11 @@ def _build_slave_ecu_raw(
                 in_fbl=in_fbl,
                 capabilities=("uds", "memory"),
             )
-        kombi_unsupported = tr(
-            "Работа с панелью приборов Kombi VDD поддерживается только через нативный CAN-адаптер "
-            "(CANable / SLCAN / candleLight).",
-            "Kombi VDD instrument cluster operations require a native CAN adapter "
-            "(CANable / SLCAN / candleLight).",
+        kombi_mem_err = tr(
+            "Работа с памятью панели приборов Kombi VDD поддерживается через нативный CAN-адаптер "
+            "(CANable / SLCAN / candleLight) или RawMode VAS 6154 / VNCI через шлюз; по текущему адаптеру доступна диагностика UDS.",
+            "Kombi VDD memory operations require a native CAN adapter (CANable / SLCAN / candleLight) "
+            "or a RawMode VAS 6154 / VNCI behind the gateway; UDS diagnostics remain available over the current adapter.",
         )
         return DiscoveredEcu(
             kind="kombi",
@@ -683,8 +685,7 @@ def _build_slave_ecu_raw(
             gateway_channel=spec.gateway_channel if via_gateway else None,
             bridge_available=False,
             in_fbl=in_fbl,
-            unsupported=kombi_unsupported,
-            memory_unavailable_reason=kombi_unsupported,
+            memory_unavailable_reason=kombi_mem_err,
             capabilities=("uds",),
         )
 
@@ -1328,7 +1329,14 @@ def can_uds_read_dtc(
             and (tx_id, rx_id) != (0x710, 0x77A)
             and callable(getattr(link.bus, "uds_session", None))
         )
-        with (link.uds_session() if use_hw_session else contextlib.nullcontext()):
+        with (link.uds_session() if use_hw_session else contextlib.nullcontext(True)) as hw_active:
+            if use_hw_session and not hw_active:
+                raise TimeoutError(
+                    tr(
+                        f"Блок (0x{tx_id:03X} → 0x{rx_id:03X}) не ответил по каналу UDS адаптера.",
+                        f"ECU (0x{tx_id:03X} → 0x{rx_id:03X}) did not respond on the adapter UDS channel.",
+                    )
+                )
             with contextlib.suppress(Exception):
                 link.request_uds(b"\x10\x03", 0x50, timeout=1.5)
             resp = link.request_uds(b"\x19\x02\xff", 0x59, timeout=3.0)
@@ -1421,7 +1429,14 @@ def can_uds_clear_dtc(
             and (tx_id, rx_id) != (0x710, 0x77A)
             and callable(getattr(link.bus, "uds_session", None))
         )
-        with (link.uds_session() if use_hw_session else contextlib.nullcontext()):
+        with (link.uds_session() if use_hw_session else contextlib.nullcontext(True)) as hw_active:
+            if use_hw_session and not hw_active:
+                raise TimeoutError(
+                    tr(
+                        f"Блок (0x{tx_id:03X} → 0x{rx_id:03X}) не ответил по каналу UDS адаптера.",
+                        f"ECU (0x{tx_id:03X} → 0x{rx_id:03X}) did not respond on the adapter UDS channel.",
+                    )
+                )
             with contextlib.suppress(Exception):
                 link.request_uds(b"\x10\x03", 0x50, timeout=1.5)
             link.request_uds(b"\x14\xff\xff\xff", 0x54, timeout=3.0)

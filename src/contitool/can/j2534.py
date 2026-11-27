@@ -182,14 +182,23 @@ class J2534Bus(can.BusABC):
             self._call("PassThruConnect", self._dev.value, PROTOCOL_CAN, CAN_ID_BOTH, self._bitrate, ctypes.byref(self._chan))
         except can.CanError:
             self._call("PassThruConnect", self._dev.value, PROTOCOL_CAN, 0, self._bitrate, ctypes.byref(self._chan))
-        for flags in (0, CAN_29BIT_ID):  # J2534 drops every frame until a pass filter is set
-            mask, pattern = PassThruMsg(PROTOCOL_CAN, 0, flags, 0, 4), PassThruMsg(PROTOCOL_CAN, 0, flags, 0, 4)
-            try:
-                self._call("PassThruStartMsgFilter", self._chan.value, PASS_FILTER, ctypes.byref(mask),
-                           ctypes.byref(pattern), None, ctypes.byref(ctypes.c_uint32()))
-            except can.CanError:
-                if not flags:
-                    raise
+        try:
+            for flags in (0, CAN_29BIT_ID):  # J2534 drops every frame until a pass filter is set
+                mask, pattern = PassThruMsg(PROTOCOL_CAN, 0, flags, 0, 4), PassThruMsg(PROTOCOL_CAN, 0, flags, 0, 4)
+                try:
+                    self._call("PassThruStartMsgFilter", self._chan.value, PASS_FILTER, ctypes.byref(mask),
+                               ctypes.byref(pattern), None, ctypes.byref(ctypes.c_uint32()))
+                except can.CanError:
+                    if not flags:
+                        raise
+        except BaseException:
+            if self._chan.value:
+                try:
+                    self._dll.PassThruDisconnect(self._chan.value)
+                except Exception:
+                    pass
+                self._chan.value = 0
+            raise
 
     def _call(self, fn: str, *args: Any) -> int:
         rc = getattr(self._dll, fn)(*args)
@@ -280,7 +289,13 @@ class J2534Bus(can.BusABC):
     def uds_session(self, tx_id: int = 0x710, rx_id: int = 0x77A) -> Iterator[bool]:
         """Temporarily switch the PassThru device to hardware PROTOCOL_ISO15765 for bulk UDS flashing."""
         if self._uds_chan:
-            yield True
+            if (self._uds_tx_id, self._uds_rx_id) == (tx_id, rx_id):
+                yield True
+            else:
+                self.uds_refusal = (
+                    f"ISO15765 channel already active for 0x{self._uds_tx_id:03X}/0x{self._uds_rx_id:03X}"
+                )
+                yield False
             return
         if self._chan.value:
             self._dll.PassThruDisconnect(self._chan.value)
@@ -305,6 +320,19 @@ class J2534Bus(can.BusABC):
         except Exception as exc:  # noqa: BLE001 - any driver refusal or mock assertion falls back to raw CAN + send_batch
             self.uds_refusal = f"{type(exc).__name__}: {exc}"
             opened = False
+        except BaseException:
+            bad = self._uds_chan or chan.value
+            self._uds_chan = 0
+            if bad:
+                try:
+                    self._dll.PassThruDisconnect(bad)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                self._connect_raw_can()
+            except Exception:  # noqa: BLE001
+                self._chan.value = 0
+            raise
         if not opened:
             bad = self._uds_chan or chan.value
             self._uds_chan = 0
@@ -364,7 +392,9 @@ class J2534Bus(can.BusABC):
             now = time.monotonic()
             if now >= deadline or now >= slice_end:
                 raise TimeoutError(f"UDS response timeout ({timeout:.1f}s) for {payload[:8].hex()}")
-            n_rx = ctypes.c_uint32(_RX_BATCH)
+            # Ask for 1 message so PassThruReadMsgs returns immediately when a response arrives instead of
+            # waiting out the full 250 ms slice trying to fill a 256-message batch.
+            n_rx = ctypes.c_uint32(1)
             self._call("PassThruReadMsgs", self._uds_chan, ctypes.byref(self._rx_buf), ctypes.byref(n_rx),
                        max(1, int(min(slice_end - now, 0.25) * 1000)))
             for m in self._rx_buf[: n_rx.value]:

@@ -75,11 +75,19 @@ def positive_prefix(req: bytes) -> bytes:
 
     The adapters' own ISO-TP paths match on this, as ODIS does on the same VCI (its flash, PDUAPI_VW_#48:
     `76 <seq>`, `71 01 FF 00`, `6E F1 5A`, `62 <DID>`), so a late answer to an earlier request — a `76` for the
-    previous block — is never taken for this one."""
+    previous block — is never taken for this one. Multi-DID `0x22` requests (`len(req) != 3`) may omit
+    unsupported leading DIDs and match only on `0x62`."""
+    if req[0] == 0x22 and len(req) != 3:
+        return b"\x62"
     return bytes([(req[0] + 0x40) & 0xFF]) + bytes(req[1 : 1 + ECHO_BYTES.get(req[0], 0)])
 
 
-def _checked_response(req_sid: int, resp: bytes, expected_sid: int | None) -> bytes:
+def _checked_response(
+    req_sid: int,
+    resp: bytes,
+    expected_sid: int | None,
+    req: bytes | None = None,
+) -> bytes:
     if len(resp) >= 3 and resp[0] == 0x7F and resp[1] == req_sid:
         raise UdsNegativeResponse(req_sid, resp[2], resp)
     if resp and resp[0] == 0x7F:  # a refusal, but of some other request
@@ -88,6 +96,12 @@ def _checked_response(req_sid: int, resp: bytes, expected_sid: int | None) -> by
         raise UnexpectedUdsResponse(
             f"Unexpected UDS response for 0x{req_sid:02X} (expected 0x{expected_sid:02X}): {resp.hex()}"
         )
+    if req and (expected_sid is None or expected_sid == ((req_sid + 0x40) & 0xFF)):
+        want = positive_prefix(req)
+        if not resp.startswith(want):
+            raise UnexpectedUdsResponse(
+                f"Unexpected UDS response prefix for {req[:4].hex()} (expected {want.hex()}): {resp.hex()}"
+            )
     return resp
 
 _win_timer_lock = threading.Lock()
@@ -656,12 +670,18 @@ class J533CanLink:
             finally:
                 self._hw_uds = False
 
+    def _cannot_fallback_to_sw_uds(self) -> bool:
+        if getattr(self.bus, "uds_only", False):
+            return True
+        nonraw = getattr(self.bus, "nonraw", None)
+        return bool(nonraw) and self.UDS_TX_ID not in nonraw
+
     def drop_hw_uds(self) -> bool:
         """Leave the hardware ISO-TP path mid-transfer and finish on the verified software one.
 
         The adapter only proves it can segment once a real multi-block transfer runs, and by then the application
         is already erased — so a failure there must be recoverable, not fatal. Returns True if it was active."""
-        if getattr(self.bus, "uds_only", False) or not self._hw_uds:
+        if self._cannot_fallback_to_sw_uds() or not self._hw_uds:
             return False
         self._hw_uds = False
         end = getattr(self.bus, "end_uds_session", None)
@@ -687,6 +707,7 @@ class J533CanLink:
             raise ValueError("Empty UDS payload")
         req_sid = req[0]
         is_uds_only_bus = bool(getattr(self.bus, "uds_only", False))
+        no_sw_fallback = self._cannot_fallback_to_sw_uds()
         uds_only = is_uds_only_bus and (self.UDS_TX_ID, self.UDS_RX_ID) == (0x710, 0x77A)
         if self._hw_uds or uds_only:
             # TransferData (0x36) with the same sequence counter is idempotent per ISO 14229: on a single-block
@@ -712,14 +733,14 @@ class J533CanLink:
                 else:
                     self._write_trace("uds_rx", self.UDS_RX_ID, len(resp), resp[:16])
                     self.rx_frames += 1
-                    return _checked_response(req_sid, resp, expected_sid)
+                    return _checked_response(req_sid, resp, expected_sid, req)
             assert last_hw_exc is not None
             exc = last_hw_exc
             # The adapter's ISO-TP failed. Mid-flash the application may already be erased, so this request
             # goes again on the verified software path instead of ending the operation. The ECU refusing
             # (a 7F answer) is not caught here: that is its answer, and no transport would change it.
             self.drop_hw_uds()
-            if not is_uds_only_bus:
+            if not no_sw_fallback:
                 self._write_trace("uds_hw_fallback", self.UDS_TX_ID, len(req), req[:16])
             if getattr(self.bus, "spent", False):
                 # The VCI itself is gone (it reboots, #19-#22): the software path would only fail on the next
@@ -744,7 +765,7 @@ class J533CanLink:
                     "FBL bootloader without an application — which can be fixed: power-cycle the ECU and the VCI, "
                     f"{again}",
                 )) from exc
-            if is_uds_only_bus:
+            if no_sw_fallback:
                 raise exc
             if self.on_hw_fallback is not None:
                 self.on_hw_fallback(f"{req[:3].hex(' ').upper()}: {exc}")
@@ -753,6 +774,7 @@ class J533CanLink:
             self.send_uds(req)
             deadline = time.monotonic() + timeout
             wait = 2.5
+            want_prefix = positive_prefix(req) if (expected_sid is None or expected_sid == ((req_sid + 0x40) & 0xFF)) else b""
             while True:
                 rem = deadline - time.monotonic()
                 if rem <= 0:
@@ -769,7 +791,10 @@ class J533CanLink:
                     # 78 every ~2.5 s, so waiting only 2.5 s raced it and broke an erase over a slower adapter.
                     wait = P2_STAR_WAIT
                     continue
-                return _checked_response(req_sid, resp, expected_sid)
+                if want_prefix and resp and resp[0] == want_prefix[0] and len(want_prefix) > 1 and not resp.startswith(want_prefix):
+                    # Late positive reply to a previous DID / routine / TransferData block: keep reading until deadline
+                    continue
+                return _checked_response(req_sid, resp, expected_sid, req)
         except TimeoutError:
             fb = (
                 getattr(self.bus, "fallback_from_silent_raw", None)

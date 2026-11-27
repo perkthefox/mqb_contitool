@@ -1243,3 +1243,81 @@ def test_slave_support_warnings_do_not_block_reads_while_gateway_stays_strict() 
     finally:
         win.close()
 
+
+def test_nonraw_slave_timeout_keeps_hw_uds_and_sw_isotp_validates_prefix() -> None:
+    from contextlib import contextmanager
+
+    from contitool.can import J533CanLink
+
+    # 1. On a nonraw bus (raw CAN only allows 0x710), a slave UDS timeout must NOT tear down hardware ISO-TP
+    class NonRawTimeoutBus:
+        nonraw = frozenset({0x710})
+
+        def __init__(self) -> None:
+            self.uds_sessions = 0
+            self.raw_sends = 0
+            self.ended = 0
+
+        @contextmanager
+        def uds_session(self, *_a: Any, **_kw: Any):
+            self.uds_sessions += 1
+            yield True
+
+        def end_uds_session(self) -> None:
+            self.ended += 1
+
+        def request_uds(self, _req: bytes, *, timeout: float = 2.0, allow_pending: bool = True) -> bytes:
+            raise TimeoutError("no response from slave")
+
+        def send(self, _msg: Any, timeout: float | None = None) -> None:
+            self.raw_sends += 1
+
+        def recv(self, timeout: float | None = None) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            pass
+
+    nr_bus = NonRawTimeoutBus()
+    with J533CanLink("fake", bus=nr_bus) as link:
+        link.UDS_TX_ID, link.UDS_RX_ID = 0x714, 0x77E
+        with link.uds_session() as active:
+            assert active is True
+            with pytest.raises(TimeoutError):
+                link.request_uds(b"\x22\xf1\x87", 0x62, timeout=0.05)
+            # Hardware ISO-TP must remain active and raw CAN must never have been used
+            assert link._hw_uds is True
+            assert nr_bus.ended == 0
+            assert nr_bus.raw_sends == 0
+
+    # 2. Software ISO-TP must skip stale 76 01 response when waiting for 36 02 -> 76 02
+    class StaleSwIsoTpBus:
+        def __init__(self) -> None:
+            self._rx: list[can.Message] = []
+
+        def send(self, msg: can.Message, timeout: float | None = None) -> None:
+            if msg.arbitration_id == 0x710 and msg.data[0] == 0x03 and msg.data[1:3] == b"\x36\x02":
+                self._rx.append(can.Message(arbitration_id=0x77A, data=bytes.fromhex("027601AAAAAAAAAA"), is_extended_id=False))
+                self._rx.append(can.Message(arbitration_id=0x77A, data=bytes.fromhex("027602AAAAAAAAAA"), is_extended_id=False))
+
+        def recv(self, timeout: float | None = None) -> can.Message | None:
+            return self._rx.pop(0) if self._rx else None
+
+        def shutdown(self) -> None:
+            pass
+
+    with J533CanLink("fake", bus=StaleSwIsoTpBus()) as link:
+        assert link.request_uds(b"\x36\x02\xaa", 0x76, timeout=0.5) == b"\x76\x02"
+
+    # 3. Unsupported gateway (Lear) must set officially_supported=False and mirror support_warning
+    lear_bus = FakeMultiEcuBus(has_j533=True, has_fpke=False, has_bcm=False)
+    lear_bus.j533_ident[0xF187] = b"3Q0907530L "
+    lear_bus.j533_ident[0xF189] = b"4344"
+    lear_bus.j533_ident[0xF19E] = b"EV_GatewLear"
+    scan_lear = can_scan_bus("fake", interface="slcan", target_kind="j533", bus=lear_bus)
+    assert scan_lear.gateway is not None
+    assert scan_lear.gateway.unsupported is not None
+    assert scan_lear.gateway.officially_supported is False
+    assert scan_lear.gateway.support_warning == scan_lear.gateway.unsupported
+
+

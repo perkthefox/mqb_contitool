@@ -371,3 +371,78 @@ def test_j2534_buffer_overflow_clears_rx_and_steps_down_read_burst(monkeypatch, 
     assert seen_sizes[1:] == [4096] * 16  # stepped down to 4 KB after 0x12
     assert (7, IOCTL_CLEAR_RX_BUFFER) in dll.ioctls
     bus.shutdown()
+
+
+def test_j2534_request_uds_reads_one_pdu_and_nested_uds_session_checks_ids() -> None:
+    from contitool.can import J533CanLink
+    from contitool.can.j2534 import PROTOCOL_ISO15765
+
+    class CheckingIsoTpPassThru(FakePassThru):
+        def __init__(self) -> None:
+            super().__init__(FakeGateway())
+            self.iso_rx: list[PassThruMsg] = []
+            self.iso_read_counts: list[int] = []
+            self.disconnected: list[int] = []
+            self.fail_raw_filter = False
+
+        def PassThruConnect(self, _dev, proto, flags, baud, chan) -> int:  # noqa: N802
+            if proto == PROTOCOL_ISO15765:
+                chan._obj.value = 9
+                return 0
+            return super().PassThruConnect(_dev, proto, flags, baud, chan)
+
+        def PassThruDisconnect(self, chan) -> int:  # noqa: N802
+            self.disconnected.append(chan)
+            return super().PassThruDisconnect(chan)
+
+        def PassThruStartMsgFilter(self, chan, ftype, mask, pattern, flow, fid) -> int:  # noqa: N802
+            if chan == 9:
+                return 0
+            if self.fail_raw_filter:
+                return 0x08
+            return super().PassThruStartMsgFilter(chan, ftype, mask, pattern, flow, fid)
+
+        def PassThruWriteMsgs(self, chan, msg, n, _timeout) -> int:  # noqa: N802
+            if chan != 9:
+                return super().PassThruWriteMsgs(chan, msg, n, _timeout)
+            m = msg._obj
+            req = bytes(m.Data[: m.DataSize])[4:]
+            resp = b"\x7e\x00" if req == b"\x3e\x00" else b"\x50\x03\x00\x32\x01\xf4"
+            raw = (0x77A).to_bytes(4, "big") + resp
+            out = PassThruMsg(PROTOCOL_ISO15765, 0, 0, 0, len(raw))
+            out.Data[: len(raw)] = list(raw)
+            self.iso_rx.append(out)
+            return 0
+
+        def PassThruReadMsgs(self, chan, buf, n, timeout) -> int:  # noqa: N802
+            if chan != 9:
+                return super().PassThruReadMsgs(chan, buf, n, timeout)
+            if timeout > 0:
+                self.iso_read_counts.append(n._obj.value)
+            count = min(n._obj.value, len(self.iso_rx))
+            for i in range(count):
+                ctypes.memmove(ctypes.byref(buf._obj[i]), ctypes.byref(self.iso_rx.pop(0)), ctypes.sizeof(PassThruMsg))
+            n._obj.value = count
+            return 0 if count else 0x10
+
+    dll = CheckingIsoTpPassThru()
+    bus = J2534Bus("fake.dll", dll=dll)
+    with J533CanLink("fake.dll", bus=bus) as link, link.uds_session() as active:
+        assert active is True
+        assert link.request_uds(b"\x10\x03", 0x50, timeout=1.0).startswith(b"\x50\x03")
+        # Same IDs re-entry succeeds; mismatched IDs must yield False and report refusal rather than talking to wrong ECU
+        with bus.uds_session(tx_id=0x710, rx_id=0x77A) as same_ok:
+            assert same_ok is True
+        with bus.uds_session(tx_id=0x714, rx_id=0x77E) as diff_ok:
+            assert diff_ok is False
+        assert "0x710/0x77A" in bus.uds_refusal
+    assert dll.iso_read_counts and all(c == 1 for c in dll.iso_read_counts)
+    bus.shutdown()
+
+    # Partial raw CAN connect must disconnect its channel if PassThruStartMsgFilter fails
+    dll2 = CheckingIsoTpPassThru()
+    dll2.fail_raw_filter = True
+    with pytest.raises(can.CanOperationError, match="PassThruStartMsgFilter"):
+        J2534Bus("fake.dll", dll=dll2)
+    assert 7 in dll2.disconnected
+

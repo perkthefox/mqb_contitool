@@ -188,13 +188,13 @@ class J533CanBridge:
                     f"Uploading CAN-bridge RAM applet ({len(applet)} B, ch3 ↔ ch{self.target_channel}{filter_note})…",
                 )
             )
-            self._applet_sent = True
             link.send_loader_payload(
                 applet,
                 inter_frame_delay=0.0 if self._injected_bus is not None else 0.003,
                 reporter=self.reporter,
                 progress_label=f"J533 bridge ch{self.target_channel}",
             )
+            self._applet_sent = True
             if not self._wait_beacon(J533_BRIDGE_READY_ID, J533_BRIDGE_READY_DATA, self.ready_timeout):
                 raise TimeoutError(
                     tr(

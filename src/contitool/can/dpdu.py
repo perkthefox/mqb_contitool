@@ -889,7 +889,14 @@ class DPduBus(can.BusABC):
                     self.uds_refusal = ""
                     return True
                 self.uds_refusal = f"3E 00 answered {(probe or b'').hex(' ')}"
-            except (can.CanError, TimeoutError) as exc:
+            except TimeoutError as exc:
+                self.uds_refusal = f"3E 00: {exc}"
+                self.spent = False
+                self._close_uds_link()
+                if started:
+                    return False
+                continue
+            except can.CanError as exc:
                 self.uds_refusal = f"3E 00: {exc}"
             self.spent = False
             self._close_uds_link()
@@ -1665,10 +1672,14 @@ class DPduBus(can.BusABC):
             self._links.remove(old_tx)
         self.h_tx = 0
         self._tx_cop_count = 0
-        self.h_tx = self._create((0x80, 0, 0, 0))
-        self._call("PDUConnect", self.hmod, self.h_tx)
-        self._start(self.h_tx, COPT_STARTCOMM, b"", 0, 0)
-        self._tx_started = True
+        try:
+            self.h_tx = self._create((0x80, 0, 0, 0))
+            self._call("PDUConnect", self.hmod, self.h_tx)
+            self._start(self.h_tx, COPT_STARTCOMM, b"", 0, 0)
+            self._tx_started = True
+        except BaseException:
+            self.spent = True
+            raise
 
     def send(self, msg: can.Message, timeout: float | None = None) -> None:
         if self.spent:
