@@ -9,7 +9,7 @@
 <br>
 
 [![English](https://img.shields.io/badge/English-README-2563EB?style=for-the-badge)](README.en.md)
-[![Stable v2.2.1](https://img.shields.io/badge/Stable-v2.2.1-16A34A?style=for-the-badge)](https://github.com/perkthefox/mqb_contitool/releases/latest)
+[![Stable v2.2.1a](https://img.shields.io/badge/Stable-v2.2.1a-16A34A?style=for-the-badge)](https://github.com/perkthefox/mqb_contitool/releases/latest)
 [![Next v2.3.0-rc1](https://img.shields.io/badge/Next%20RC-v2.3.0--rc1-D97706?style=for-the-badge)](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)
 [![Platforms](https://img.shields.io/badge/GUI%20%2B%20CLI-Windows%20%7C%20macOS%20%7C%20Linux-0F172A?style=for-the-badge)](#быстрый-запуск)
 [![License](https://img.shields.io/badge/License-PolyForm%20NC-0284C7?style=for-the-badge)](#лицензия)
@@ -24,11 +24,11 @@
 
 <br>
 
-| Стабильный релиз · **`v2.2.1`** *(основной)* | Релиз-кандидат · **`v2.3.0-rc1`** *(ветка 2.3)* |
+| Стабильный релиз · **`v2.2.1a`** *(основной)* | Релиз-кандидат · **`v2.3.0-rc1`** *(ветка 2.3)* |
 | :--- | :--- |
 | Основная рабочая версия для шлюзов **`19 J533`** (`3Q0 907 530`). Проверена на реальных блоках и адаптерах. | Крупное обновление на **все шесть ЭБУ MQB**: приборки `17 FPK_E` и `17 Kombi VDD`, `09 BCM`, `13 ACC MRR`, `2B ELV`, сканер шины и прозрачный RAM-мост `J533`. |
-| **Выбирайте её**, если нужна спокойная ежедневная работа со шлюзами J533. | **Нестабильный канал:** часть функций может не работать, вести себя криво или быть сломана. Работайте только на столе с полным бэкапом и присылайте баги в [Issues](https://github.com/perkthefox/mqb_contitool/issues). |
-| 👉 **[Скачать стабильный v2.2.1](https://github.com/perkthefox/mqb_contitool/releases/latest)** | 👉 **[Попробовать v2.3.0-rc1](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)** |
+| **Выбирайте её**, если нужна спокойная ежедневная работа со шлюзами J533. В «Настройках» можно в любой момент переключиться на канал `candidate`. | **Нестабильный канал:** часть функций может не работать, вести себя криво или быть сломана. Работайте только на столе с полным бэкапом и присылайте баги в [Issues](https://github.com/perkthefox/mqb_contitool/issues). |
+| 👉 **[Скачать стабильный v2.2.1a](https://github.com/perkthefox/mqb_contitool/releases/latest)** | 👉 **[Попробовать v2.3.0-rc1](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)** |
 
 <p align="center">
   <img src="assets/screenshots/ru_features.png" alt="ContiTool: открытый блок, активация функций SWaP с ответом самого шлюза" width="100%">
@@ -117,11 +117,11 @@
 
 Все архивы лежат в **[GitHub Releases](https://github.com/perkthefox/mqb_contitool/releases)**. В Windows-сборку уже вложен проверенный драйвер D-PDU `27.2` (`dpdu/VW_PDUAPI_27.2`).
 
-| ОС | Стабильный **`v2.2.1`** *(основной)* | Релиз-кандидат **`v2.3.0-rc1`** *(нестабильный)* |
+| ОС | Стабильный **`v2.2.1a`** *(основной)* | Релиз-кандидат **`v2.3.0-rc1`** *(нестабильный)* |
 | :--- | :--- | :--- |
-| **Windows x64** | `ContiTool-v2.2.1-windows-amd64.zip` → `ContiTool.exe` | `ContiTool-v2.3.0-rc1-windows-amd64.zip` → `ContiTool.exe` |
-| **macOS Apple Silicon** | `ContiTool-v2.2.1-macos-arm64.dmg` → `ContiTool.app` | `ContiTool-v2.3.0-rc1-macos-arm64.dmg` → `ContiTool.app` |
-| **Linux x86_64** | `ContiTool-v2.2.1-linux-x86_64.tar.gz` → `ContiTool/ContiTool` | `ContiTool-v2.3.0-rc1-linux-x86_64.tar.gz` → `ContiTool/ContiTool` |
+| **Windows x64** | `ContiTool-v2.2.1a-windows-amd64.zip` → `ContiTool.exe` | `ContiTool-v2.3.0-rc1-windows-amd64.zip` → `ContiTool.exe` |
+| **macOS Apple Silicon** | `ContiTool-v2.2.1a-macos-arm64.dmg` → `ContiTool.app` | `ContiTool-v2.3.0-rc1-macos-arm64.dmg` → `ContiTool.app` |
+| **Linux x86_64** | `ContiTool-v2.2.1a-linux-x86_64.tar.gz` → `ContiTool/ContiTool` | `ContiTool-v2.3.0-rc1-linux-x86_64.tar.gz` → `ContiTool/ContiTool` |
 
 ### Запуск из исходного кода (`Python 3.12+`)
 
@@ -237,8 +237,8 @@ python3 conti_cp_tool.py elv status --port /dev/ttyACM0
 
 ## Частые вопросы (FAQ)
 
-**Какую версию ставить: `v2.2.1` или `v2.3.0-rc1`?**
-Для спокойной работы со шлюзами **`19 J533`** — стабильный **[`v2.2.1`](https://github.com/perkthefox/mqb_contitool/releases/latest)**. Если нужны приборки `FPK_E` / `Kombi VDD`, `BCM`, `MRR`, `ELV` или RAM-мост `J533` — пробуйте релиз-кандидат **[`v2.3.0-rc1`](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)**, но помните, что это тестовая сборка и бэкапы обязательны.
+**Какую версию ставить: `v2.2.1a` или `v2.3.0-rc1`?**
+Для спокойной работы со шлюзами **`19 J533`** — стабильный **[`v2.2.1a`](https://github.com/perkthefox/mqb_contitool/releases/latest)** (в окне **«Настройки»** можно выбрать канал автообновлений `stable` или `candidate`). Если нужны приборки `FPK_E` / `Kombi VDD`, `BCM`, `MRR`, `ELV` или RAM-мост `J533` — пробуйте релиз-кандидат **[`v2.3.0-rc1`](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)**, но помните, что это тестовая сборка и бэкапы обязательны.
 
 **Можно ли залить `Dflash.bin` от `FPK_E / AID`, считанный ContiTool, внешним программатором (VVDI / Multiprog / UPA)?**
 Да, начиная с `2.3.0-rc1`. При чтении `FPK_E` ContiTool прогоняет аппаратный RV40F FACI Blank-Check (`0x71`) по всем 64 КБ и очищает пустые ячейки в честный `0xFF` (`fpke_report.json` → `dflash.blank_checked: true`). Если на неподтверждённом ПО Blank-Check был пропущен (`blank_checked: false`), программа прямо предупредит — такой сырой дамп программатором лить нельзя (обратно через ContiTool по CAN всё равно безопасно).

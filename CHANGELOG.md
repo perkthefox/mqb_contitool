@@ -9,7 +9,7 @@
 >
 > - **Что-то может не работать, вести себя криво, отваливаться на отдельных версиях ПО/адаптеров или вообще быть сломано.**
 > - **Только на столе со стабилизированным питанием — и всегда с полным бэкапом до любых записей.**
-> - Для спокойной повседневной работы со шлюзом `19 J533` оставайтесь на стабильном **[`v2.2.1`](https://github.com/perkthefox/mqb_contitool/releases/latest)**.
+> - Для спокойной повседневной работы со шлюзом `19 J533` оставайтесь на стабильном **[`v2.2.1a`](https://github.com/perkthefox/mqb_contitool/releases/latest)**.
 > - Поймали баг? Откройте **[GitHub Issue](https://github.com/perkthefox/mqb_contitool/issues)** и приложите архив из кнопки **«Создать отчёт…»** — секретные ключи, `VIN` и `FAZIT` теперь вырезаются автоматически, если не отмечена галочка дампов.
 >
 > ---
@@ -20,7 +20,7 @@
 >
 > - **Things may fail, misbehave, choke on specific firmware/adapters, or be outright broken.**
 > - **Bench use on a regulated power supply only — always save a full backup before writing anything.**
-> - For rock-solid daily `19 J533` gateway work, stay on stable **[`v2.2.1`](https://github.com/perkthefox/mqb_contitool/releases/latest)**.
+> - For rock-solid daily `19 J533` gateway work, stay on stable **[`v2.2.1a`](https://github.com/perkthefox/mqb_contitool/releases/latest)**.
 > - Hit a bug? Open a **[GitHub Issue](https://github.com/perkthefox/mqb_contitool/issues)** with a **Problem Report** archive (keys, `VIN`, and `FAZIT` are automatically redacted whenever dumps are unchecked).
 
 ### Что внутри `2.3.0-rc1` / ECU Matrix
@@ -75,6 +75,7 @@
 - **Экспериментальный пакет `openpdu`:** кроссплатформенный TCP-клиент протокола VAS 6154 (порт `4500`, без проприетарного драйвера D-PDU — работает на macOS и Linux; в GUI пока не подключён).
 
 #### Приватность, стабильность и аудит (640+ автотестов)
+- **Окно «Настройки» и каналы автообновлений (`stable` / `candidate`):** выбор канала обновлений прямо в интерфейсе (с жёсткой изоляцией каналов — стабильные и старые версии никогда не поймают кандидат-релиз, а релиз-кандидаты автоматически переходят на финальный релиз после выхода).
 - **Безопасный «Отчёт о проблеме»:** при снятой галочке «Приложить дампы» из логов и JSON автоматически вырезаются ключи (`IKA`, `GFA`, `K_ffb`, `K_c`, `K_5`, `S0`, `S1`, `IDCODE`), `VIN` и `FAZIT`, а файлы с ключами и трассами не попадают в архив.
 - **Ускорение J2534 и стабильность транспорта:** убрана задержка 250 мс на каждый UDS-кадр в `J2534Bus`, усилена проверка префиксов UDS, защищён аппаратный ISO-TP на `nonraw` D-PDU, усилены RH850-апплеты (`PSW.ID | PSW.NP`, раздельный вход/выход FACI P/E).
 - **Надёжность GUI:** защита всех фоновых коллбэков при переключении/закрытии экранов, подтверждения перед записью `BCM FFB` и `FPK_E 2E 02F7`, запрет случайного закрытия окна посреди CAN-операции.
@@ -122,6 +123,7 @@
 - **Experimental `openpdu` package:** standalone pure-Python TCP client for the VAS 6154 protocol (port `4500`, runs on macOS/Linux without vendor D-PDU drivers; not wired into the GUI yet).
 
 #### Privacy, Transport & Hardening (640+ Automated Tests)
+- **Settings dialog & auto-update channels (`stable` / `candidate`):** switch update channels inside the app with strict channel isolation (stable and legacy builds never catch candidate releases, and RC users seamlessly graduate to final stable releases once published).
 - **Privacy-safe Problem Reports:** keys (`IKA`, `GFA`, `K_ffb`, `K_c`, `K_5`, `S0`, `S1`, `IDCODE`), `VIN`, and `FAZIT` are automatically redacted and secret-bearing files excluded whenever "Attach dumps" is unchecked.
 - **Transport & applet reliability:** eliminated 250 ms/frame batch stalls in `J2534Bus`, hardened UDS prefix validation and `nonraw` D-PDU ISO-TP sessions, and tightened RH850 applets (`PSW.ID | PSW.NP`, split FACI P/E transitions).
 - **GUI safety:** async callback lifecycle guards on screen close/switch, destructive confirmations for `BCM FFB` and `FPK_E 2E 02F7`, and close-block protection while a CAN task is active.
@@ -130,6 +132,22 @@
 - Not every hardware/software revision of the new ECUs has been bench-verified yet; unverified `PN + SW` pairs display a warning banner.
 - `BURST-GO` over `VAS 6154 / VNCI`, 29-bit D-PDU RawMode TX (`BCM` / `MRR` / `ELV`), `openpdu`, and several `MRR` / `ELV` / `Kombi SW 2220` paths need live community bench testing.
 - **Direct `17 FPK_E` bench access** (without a `19 J533` gateway) physically requires a native CAN adapter (`CANable / SLCAN / candleLight`) because the level-8 stream needs `0.35 ms/frame` pacing. With a `VAS 6154 / VNCI`, connect `FPK_E` **through a `19 J533` gateway** (`BURST-GO`).
+
+## 2.2.1a — 2026-11-27
+
+### 🇷🇺 Добавлено
+- **Окно «Настройки» и выбор канала автообновлений (`stable` / `candidate`):**
+  - В шапку программы и меню **«Файл → Настройки…»** (`Ctrl+,` / `⌘,`) добавлен диалог настроек с выбором канала обновлений и кнопкой немедленной проверки.
+  - **`stable` (по умолчанию):** получает только проверенные основные релизы из `main` (`/releases/latest`) — кандидат-релизы (`-rc`) и пререлизы жёстко отсеиваются и никогда не пересекаются со стабильной веткой. Старые версии ContiTool (до `2.2.1a`) также видят только стабильный канал и не поймают кандидат-релиз.
+  - **`candidate`:** открывает получение ранних релиз-кандидатов новых веток (например, `2.3.0-rc1` с поддержкой `17 FPK_E / AID`, `17 Kombi VDD`, `09 BCM`, `13 ACC MRR`, `2B ELV` и RAM-моста `J533`), а после выхода финальной версии автоматически переводит на неё.
+- **Улучшенный подбор архива при обновлении:** проверка архитектуры CPU (`arm64` / `x86_64`) и строгая фильтрация только `https://`-ссылок релизов.
+
+### 🇬🇧 Added
+- **Settings dialog & auto-update channel switcher (`stable` / `candidate`):**
+  - Added a **Settings** button in the header and **File → Settings…** (`Ctrl+,` / `⌘,`) to choose the update channel and trigger an immediate update check.
+  - **`stable` (default):** tracks verified `main` releases only (`/releases/latest`) — release candidates (`-rc`) and pre-releases are strictly filtered out and never leak into the stable channel. Older ContiTool builds (prior to `2.2.1a`) also stay isolated on stable releases only.
+  - **`candidate`:** opts into early release candidates ahead of `main` (such as `2.3.0-rc1` with `17 FPK_E / AID`, `17 Kombi VDD`, `09 BCM`, `13 ACC MRR`, `2B ELV`, and the `J533` RAM-Bridge) and seamlessly upgrades to the final release once it ships.
+- **Hardened update asset matching:** CPU architecture matching (`arm64` / `x86_64`) and strict `https://` URL validation for release downloads.
 
 ## 2.2.1 — 2026-11-23
 
