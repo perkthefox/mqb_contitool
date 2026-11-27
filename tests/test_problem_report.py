@@ -10,11 +10,13 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QSettings, QTimer  # noqa: E402
+from PySide6.QtCore import QEventLoop, QSettings, Qt, QTimer  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+from PySide6.QtWidgets import QLabel, QPushButton  # noqa: E402
 
 from contitool import __version__  # noqa: E402
 from contitool import report  # noqa: E402
-from contitool.i18n import set_lang  # noqa: E402
+from contitool.i18n import get_lang, set_lang  # noqa: E402
 
 VIN, FAZIT = "WVWZZZAUZNW000001", "TST-SYN01.01.2400000001"  # test values the hygiene check allows
 
@@ -155,6 +157,57 @@ def test_disclaimer_needs_consent_and_can_stay_quiet_until_the_next_version() ->
             s.remove(disclaimer._SETTING)
         else:
             s.setValue(disclaimer._SETTING, saved)
+
+
+def test_disclaimer_can_switch_languages_before_consent() -> None:
+    from contitool.gui.app import create_window
+    from contitool.gui.dialogs.disclaimer import DisclaimerDialog
+
+    previous_lang = get_lang()
+    set_lang("ru")
+    app, win = create_window()
+    dlg = DisclaimerDialog(win)
+    try:
+        win.show()
+        dlg.show()
+        app.processEvents()
+        assert app.activeModalWidget() is dlg
+        buttons = {b.text(): b for b in dlg.findChildren(QPushButton)}
+        assert {"RU", "EN"} <= buttons.keys()
+        ru, en = buttons["RU"], buttons["EN"]
+        assert ru.isChecked() and en.isVisible()
+        assert not dlg.btn_ok.isEnabled()
+        assert dlg.windowTitle() == "Прочитайте перед началом работы"
+
+        QTest.mouseClick(en, Qt.MouseButton.LeftButton)
+        assert app.activeModalWidget() is dlg
+        assert en.isChecked() and not ru.isChecked()
+        assert dlg.windowTitle() == "Read this before you start"
+        labels = [label.text() for label in dlg.findChildren(QLabel)]
+        for text in (dlg.windowTitle(), "ContiTool reads and rewrites", "Do NOT use this program",
+                     "Why not in a working car", "Liability."):
+            assert any(text in label for label in labels)
+        assert dlg.chk_agree.text().startswith("I have read")
+        assert dlg.chk_quiet.text() == "Do not show again until the next version"
+        assert dlg.btn_ok.text() == "Continue" and not dlg.btn_ok.isEnabled()
+        assert buttons["Выйти"].text() == "Quit"
+        assert win.menu_file.title() == "File"
+        assert win._lang_buttons["en"].isChecked()
+
+        dlg.chk_agree.setChecked(True)
+        dlg.chk_quiet.setChecked(True)
+        QTest.mouseClick(ru, Qt.MouseButton.LeftButton)
+        assert dlg.windowTitle() == "Прочитайте перед началом работы"
+        assert ru.isChecked() and not en.isChecked()
+        assert dlg.chk_agree.isChecked() and dlg.chk_quiet.isChecked() and dlg.btn_ok.isEnabled()
+        assert dlg.btn_ok.text() == "Продолжить"
+        assert win.menu_file.title() == "Файл"
+        QTest.mouseClick(buttons["Выйти"], Qt.MouseButton.LeftButton)
+        assert not dlg.isVisible() and dlg.result() == 0
+    finally:
+        dlg.close()
+        win.close()
+        set_lang(previous_lang)
 
 
 def test_the_newest_driver_log_is_always_collected(tmp_path: Path, monkeypatch) -> None:
