@@ -410,6 +410,8 @@ def kombi_support_info(
 
     if non_conti:
         verified = False
+    elif sw_norm and pn_norm:
+        verified = sw_norm in KOMBI_VERIFIED_SW_VERSIONS and pn_norm in KOMBI_VERIFIED_PART_NUMBERS
     elif sw_norm:
         verified = sw_norm in KOMBI_VERIFIED_SW_VERSIONS
     else:
@@ -500,7 +502,7 @@ def _build_empty_eel_t01_pool(first_rec_1: bytes, n_vb: int = 28, vb_size: int =
     df = bytearray(b"\xff" * KOMBI_DFLASH_SYNTH_SIZE)
     ec_word = eel_cs24(1)
     struct.pack_into("<5I", df, 0, 0xFFFFFFFF, EEL_MARK, EEL_MARK, EEL_MARK, ec_word)
-    sz1 = EEL_KOMBI_0310_IDS[1]
+    sz1 = len(first_rec_1)
     padded1 = (sz1 + 3) & ~3
     rec1 = (struct.pack("<H", sz1) + bytes(first_rec_1[2:sz1])).ljust(padded1, b"\xff")
     top1 = vb_size - 8
@@ -562,40 +564,64 @@ def unpack_kombi_logical_eel(blob: bytes) -> dict[int, bytes]:
     return records
 
 
+def _kombi_physical_active_vbs(raw_32k: bytes) -> list[tuple[int, int]]:
+    """Return ring-rotated `(erase_counter, vb_index)` entries for verified active V850E2 physical DataFlash VBs."""
+    vb_size = 0x800
+    n_vb = KOMBI_DFLASH_POOL_SIZE // vb_size
+    valid_vbs: list[tuple[int, int]] = []
+    for blk in range(n_vb):
+        base = blk * vb_size
+        hdr = struct.unpack_from("<8I", raw_32k, base)
+        i0 = hdr[0]
+        i1 = struct.unpack_from("<I", raw_32k, base + vb_size - 4)[0]
+        ec_raw = hdr[7]
+        # Skip erased, invalidated (I0 == I1 == EEL_MARK), or non-EEL blocks (e.g., Uflash code)
+        if i0 == EEL_MARK and i1 == EEL_MARK:
+            continue
+        if i0 not in (0xFFFFFFFF, EEL_MARK):
+            continue
+        if EEL_MARK not in hdr[:7]:
+            continue
+        if ec_raw == 0xFFFFFFFF:
+            continue
+        if (ec_raw >> 24) != 0 and eel_cs24(ec_raw) != ec_raw:
+            continue
+        ec = ec_raw & 0x00FFFFFF
+        if ec == 0x00FFFFFF:
+            continue
+        valid_vbs.append((ec, blk))
+
+    active_nums = {blk for _ec, blk in valid_vbs}
+    ring_start = 0
+    if 0 in active_nums and (n_vb - 1) in active_nums and len(active_nums) < n_vb:
+        ring_start = n_vb - 1
+        while ((ring_start - 1) % n_vb) in active_nums:
+            ring_start = (ring_start - 1) % n_vb
+    return sorted(valid_vbs, key=lambda item: (item[0], (item[1] - ring_start) % n_vb))
+
+
 def unpack_kombi_physical_dflash(raw_32k: bytes) -> dict[int, bytes]:
     """Parse a raw `32,768`-byte (`0x02000000..0x02007FFF`) V850E2 physical DataFlash image into `{eel_id: raw_record}`."""
     if len(raw_32k) != KOMBI_DFLASH_POOL_SIZE:
         raise ValueError(f"Expected {KOMBI_DFLASH_POOL_SIZE}-byte physical V850E2 DataFlash, got {len(raw_32k)} bytes")
 
     vb_size = 0x800
-    n_vb = KOMBI_DFLASH_POOL_SIZE // vb_size
-    block_order: list[tuple[int, int]] = []
-    for blk in range(n_vb):
-        base = blk * vb_size
-        w0 = int.from_bytes(raw_32k[base : base + 4], "little")
-        ec_raw = int.from_bytes(raw_32k[base + 0x1C : base + 0x20], "little")
-        if w0 == 0xFFFFFFFF and ec_raw == 0xFFFFFFFF:
-            continue
-        ec = ec_raw & 0x00FFFFFF
-        if ec == 0x00FFFFFF:
-            ec = 0
-        block_order.append((ec, blk))
-    block_order.sort()
+    block_order = _kombi_physical_active_vbs(raw_32k)
+    if not block_order:
+        return {}
 
-    def _extract_payload(top_word_off: int, exp_size: int) -> tuple[bytes, int] | None:
+    def _extract_payload(top_word_off: int, exp_size: int, vb_blk: int) -> tuple[bytes, int] | None:
         top_off = top_word_off * 4
-        if top_off < 0x20 or top_off + 4 > KOMBI_DFLASH_POOL_SIZE:
-            return None
+        vb_base = vb_blk * vb_size
+        vb_min = vb_base + 0x20
+        vb_max = vb_base + vb_size - 4
         padded = (exp_size + 3) & ~3
+        bottom_off = top_off - padded + 4
+        if top_off < vb_min or top_off + 4 > vb_max or bottom_off < vb_min:
+            return None
         out = bytearray()
         cur_off = top_off
-        cur_blk = cur_off // vb_size
         for _ in range(padded // 4):
-            if cur_off < cur_blk * vb_size + 0x20:
-                cur_blk = (cur_blk - 1) % n_vb
-                cur_off = (cur_blk + 1) * vb_size - 4
-            if cur_off < 0 or cur_off + 4 > KOMBI_DFLASH_POOL_SIZE:
-                return None
             out.extend(raw_32k[cur_off : cur_off + 4])
             cur_off -= 4
         rec = bytes(out[:exp_size])
@@ -618,16 +644,16 @@ def unpack_kombi_physical_dflash(raw_32k: bytes) -> dict[int, bytes]:
                 if ident not in id_table and (w1 & 0xFFFF) in id_table:
                     ident = w1 & 0xFFFF
                     top_w = (w1 >> 16) & 0xFFFF
-                if ident > 130 and ident <= 132:
-                    has_high = True
                 exp_sz = id_table.get(ident)
                 if exp_sz is not None and 0 < top_w < (KOMBI_DFLASH_POOL_SIZE // 4):
-                    ext = _extract_payload(top_w, exp_sz)
+                    ext = _extract_payload(top_w, exp_sz, blk)
                     if ext is not None:
                         rec, raw_hdr = ext
-                        recs[ident] = rec
                         if raw_hdr == exp_sz:
+                            recs[ident] = rec
                             hdr_matches += 1
+                            if 130 < ident <= 132:
+                                has_high = True
                 drp_off += 8
         return recs, hdr_matches, has_high
 
@@ -669,6 +695,8 @@ def is_kombi_dflash(data: bytes) -> bool:
         return valid_headers >= 115
     if len(data) == KOMBI_DFLASH_POOL_SIZE:
         try:
+            if not _kombi_physical_active_vbs(data):
+                return False
             recs = unpack_kombi_physical_dflash(data)
             return len(recs) >= 60
         except Exception:
@@ -1041,7 +1069,7 @@ def extract_kombi_immo_passport(dflash: bytes, cflash: bytes | None = None) -> d
     cs_state = "missing"
     if r68 is not None and len(r68) >= 0x38:
         cs_bytes = r68[0x28:0x38]
-        if cs_bytes == b"\xff" * 16:
+        if cs_bytes in (b"\xff" * 16, b"\x00" * 16, b"\xaa" * 16):
             cs_state = "empty"
         else:
             cs_val = cs_bytes.hex().upper()
@@ -1053,7 +1081,7 @@ def extract_kombi_immo_passport(dflash: bytes, cflash: bytes | None = None) -> d
     vdo_state = "missing"
     if r68 is not None and len(r68) >= 0x40:
         vdo_bytes = r68[0x38:0x40]
-        if vdo_bytes == b"\xff" * 8:
+        if vdo_bytes in (b"\xff" * 8, b"\x00" * 8):
             vdo_state = "empty"
         else:
             vdo_cs_plus = vdo_bytes.hex().upper()
@@ -1249,8 +1277,16 @@ def apply_kombi_dflash_edits(
                     )
                 )
             r68[0x40] = pc_val
+        is_2220 = (
+            len(lay["ids"]) == len(EEL_KOMBI_2220_IDS)
+            or (len(r68) >= 0x80 and bytes(r68[0x4D:0x80]) == b"\xff" * 51)
+        )
         if partners_mask is not None:
-            r68[0x41] = int(partners_mask) & 0xFF
+            if is_2220:
+                cur_kessy = 0x00 if r68[0x41] == 0xFF else (r68[0x41] & 0x80)
+                r68[0x41] = cur_kessy | (int(partners_mask) & 0x7F)
+            else:
+                r68[0x41] = int(partners_mask) & 0xFF
         if clear_lockouts:
             r68[0x45:0x4B] = b"\x00" * 6
         if immo_mode is not None:
@@ -1258,8 +1294,14 @@ def apply_kombi_dflash_edits(
             if r68[0x4C] == 0xFF:
                 r68[0x4C] = 1
         if key_over_can is not None:
-            cur_kt = 0x00 if r68[0x4D] == 0xFF else r68[0x4D]
-            r68[0x4D] = (cur_kt | 0x80) if key_over_can else (cur_kt & ~0x80)
+            if is_2220:
+                cur_p = 0x00 if r68[0x41] == 0xFF else (r68[0x41] & 0x7F)
+                r68[0x41] = cur_p | (0x80 if key_over_can else 0x00)
+            else:
+                cur_kt = 0x00 if r68[0x4D] == 0xFF else r68[0x4D]
+                r68[0x4D] = (cur_kt | 0x80) if key_over_can else (cur_kt & ~0x80)
+        if is_2220 and len(r68) >= 0x80:
+            r68[0x4D:0x80] = b"\xff" * 51
         updates[0x68] = bytes(r68)
 
     # 2. EEL 0x66 (22 B on 0310 / 17 B on 2220): Cluster WFS MAC + Partner MAC IDs
@@ -2024,7 +2066,6 @@ __all__ = [
     "EEL_KOMBI_2220_IDS",
     "KOMBI_2220_FDE3_AFFECTED_EEL_IDS",
     "KOMBI_2220_RAM_EEL_PHYS_TABLE_ADDR",
-    "KOMBI_2220_RAM_EEL_STATE_ADDR",
     "KOMBI_2220_RAM_FD11_STATE_ADDR",
     "KOMBI_2220_RAM_IMMO_MODE_ADDR",
     "KOMBI_2220_RAM_LEVEL_ADDR",
@@ -2085,6 +2126,7 @@ __all__ = [
     "KOMBI_REQUIRED_SL",
     "KOMBI_RETAIN_ODO_DPOOL_ADDR",
     "KOMBI_SA1_DELTA",
+    "KOMBI_SA1_LOCKOUT_RESET_DELTA",
     "KOMBI_SECDATA_SCAN_RANGE",
     "KOMBI_UDS_RX_ID",
     "KOMBI_UDS_TX_ID",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 import contextlib
 from datetime import datetime, timezone
 import hashlib
@@ -38,8 +38,10 @@ from contitool.can.transport import (
     _checked_response,
     _release_win_timer,
     _tune_slcan_bus,
+    positive_prefix,
 )
 from contitool.core.fpke import (
+    EEL_MARK,
     FPKE_BFLASH_ADDR,
     FPKE_BFLASH_SIZE,
     FPKE_CFLASH_ADDR,
@@ -433,8 +435,6 @@ FPKE_UFLASH_BUF_PAYLOAD = bytes.fromhex(
 def build_fpke_bflash_buf_applet(profile: str = "83a") -> bytes:
     """Return 256-byte BFlash / Extra Area RAM-buffer reader applet for `profile` (`'83a'`, `'1703'`, or `'1711'`)."""
     prof = fpke_get_profile(profile)
-    if prof["name"] == "83a":
-        return FPKE_BFLASH_BUF_PAYLOAD
     src_param = int(prof["source_param"])
     result_addr = int(prof["result_addr"])
     marker_addr = int(prof["marker_addr"])
@@ -619,6 +619,8 @@ def build_fpke_can_stream_applet(mode: str = "direct", *, profile: str = "83a") 
 
 def flood_payload(index: int, *, profile: str = "83a") -> bytes:
     """Return 8-byte payload for block-stream frame `index` (0..1023), patching `pointer_frame` with `forged_ptr`."""
+    if index < 0:
+        raise ValueError(f"Invalid flood frame index: {index}")
     prof = fpke_get_profile(profile)
     tpl = prof["template"]
     ptr_frame = int(prof["pointer_frame"])
@@ -674,8 +676,8 @@ def verify_fpke_self_tests() -> None:
         raise RuntimeError("FPK_E UFlash buffer applet SHA-256 mismatch")
     for prof_name, prof in FPKE_PROFILES.items():
         bf_app = build_fpke_bflash_buf_applet(prof_name)
-        if not (64 <= len(bf_app) <= 256) or (prof_name == "83a" and len(bf_app) != 234):
-            raise RuntimeError(f"Invalid BFlash buffer applet size for {prof_name}: {len(bf_app)}")
+        if not (64 <= len(bf_app) <= 256) or not bf_app.startswith(bytes.fromhex("e59740009236a000e62f2000")):
+            raise RuntimeError(f"Invalid BFlash buffer applet for {prof_name}: len={len(bf_app)}")
         uf_app = build_fpke_uflash_buf_applet(prof_name)
         if not (64 <= len(uf_app) <= 256):
             raise RuntimeError(f"Invalid UFlash buffer applet size for {prof_name}: {len(uf_app)}")
@@ -759,6 +761,7 @@ class FpkeCanLink:
         bus: Any | None = None,
         sw_profile: str | None = None,
         via_gateway: bool = False,
+        ecu_kind: str = "fpke",
     ) -> None:
         if bus is None and not via_gateway and interface not in FPKE_NATIVE_INTERFACES:
             raise RuntimeError(
@@ -772,6 +775,7 @@ class FpkeCanLink:
         self.port = port
         self.interface = interface
         self.via_gateway = bool(via_gateway)
+        self.ecu_kind = str(ecu_kind or "fpke")
         self.sw_profile: str | None = sw_profile.strip().lower() if sw_profile else None
         self._explicit_sw_profile: str | None = self.sw_profile
         self._stack_profile_verified: bool = False
@@ -787,6 +791,10 @@ class FpkeCanLink:
         self._rx_trace_suspended = 0
         self._log_file = None
         self._borrowed: Any = None
+        self.bus: Any = None
+        self._owns_bus = False
+        self._timer_held = False
+        self._hw_uds = False
         self._keepalive_stop: threading.Event | None = None
         self._keepalive_thread: threading.Thread | None = None
         self._keepalive_started_at: float | None = None
@@ -802,36 +810,43 @@ class FpkeCanLink:
         self.gateway_burst: Any = None
         self.gateway_burst_profile: str | None = None
 
-        self.attach_log(log_path)
+        if bus is None:
+            close_active_fpke_link()
 
-        if bus is not None:
-            self.bus = bus
-            self._owns_bus = False
-        elif interface == "dpdu":
-            from contitool.can import dpdu
+        try:
+            self.attach_log(log_path)
 
-            self._borrowed = dpdu.open_session(port or "", bitrate)
-            self.bus = self._borrowed
-            self._owns_bus = False
-        elif interface == "j2534":
-            from contitool.can.j2534 import J2534Bus
+            if bus is not None:
+                self.bus = bus
+                self._owns_bus = False
+            elif interface == "dpdu":
+                from contitool.can import dpdu
 
-            self.bus = J2534Bus(port, bitrate)
-            self._owns_bus = True
-        else:
-            kwargs: dict[str, Any] = {
-                "interface": interface,
-                "channel": port,
-                "bitrate": bitrate,
-                "timeout": 0.1,
-            }
-            if interface == "slcan":
-                kwargs["tty_baudrate"] = tty_baudrate
-            self.bus = can.interface.Bus(**kwargs)
-            if interface == "slcan":
-                _tune_slcan_bus(self.bus)
-            self._owns_bus = True
-        self._timer_held = _acquire_win_timer()
+                self._borrowed = dpdu.open_session(port or "", bitrate)
+                self.bus = self._borrowed
+                self._owns_bus = False
+            elif interface == "j2534":
+                from contitool.can.j2534 import J2534Bus
+
+                self.bus = J2534Bus(port, bitrate)
+                self._owns_bus = True
+            else:
+                kwargs: dict[str, Any] = {
+                    "interface": interface,
+                    "channel": port,
+                    "bitrate": bitrate,
+                    "timeout": 0.1,
+                }
+                if interface == "slcan":
+                    kwargs["tty_baudrate"] = tty_baudrate
+                self.bus = can.interface.Bus(**kwargs)
+                if interface == "slcan":
+                    _tune_slcan_bus(self.bus)
+                self._owns_bus = True
+            self._timer_held = _acquire_win_timer()
+        except BaseException:
+            self.close()
+            raise
 
     def attach_log(self, log_path: Path | None) -> None:
         with self._log_lock:
@@ -1233,6 +1248,8 @@ class FpkeCanLink:
         if not payload:
             raise ValueError("Empty UDS payload")
         length = len(payload)
+        if length > 4095:
+            raise ValueError(f"UDS payload too large for ISO-TP ({length} > 4095 B)")
         if length <= 7:
             self.send_frame(self.UDS_TX_ID, bytes([length]) + payload, extended=False, pad=0xAA)
             return
@@ -1316,6 +1333,33 @@ class FpkeCanLink:
                     seq += 1
                 return bytes(output[:total])
 
+    @contextlib.contextmanager
+    def uds_session(self) -> Iterator[bool]:
+        """Use hardware ISO-TP (D-PDU ISO_15765 / J2534 ISO15765) when routing UDS through a gateway."""
+        if self._hw_uds:
+            yield True
+            return
+        bus_ctx = getattr(self.bus, "uds_session", None)
+        if not self.via_gateway or not callable(bus_ctx):
+            yield False
+            return
+        with bus_ctx(self.UDS_TX_ID, self.UDS_RX_ID) as active:
+            self._hw_uds = bool(active)
+            try:
+                yield self._hw_uds
+            finally:
+                self._hw_uds = False
+
+    def _needs_hw_uds(self) -> bool:
+        if self._hw_uds:
+            return True
+        if not self.via_gateway:
+            return False
+        if getattr(self.bus, "uds_only", False):
+            return True
+        nonraw = getattr(self.bus, "nonraw", None)
+        return bool(nonraw) and self.UDS_TX_ID not in nonraw
+
     def request_uds(
         self,
         uds_payload: bytes,
@@ -1331,8 +1375,15 @@ class FpkeCanLink:
         req_sid = req[0]
         if expected_sid is None:
             expected_sid = (req_sid + 0x40) & 0xFF
+        if self._needs_hw_uds():
+            with self.uds_session() as active:
+                if not active:
+                    raise TimeoutError(f"UDS response timeout ({timeout:.1f}s) for {req[:8].hex()}")
+                resp = self.bus.request_uds(req, timeout=timeout, allow_pending=allow_pending)
+                return _checked_response(req_sid, resp, expected_sid, req=req)
         self.drain_rx(quick=True)
         self.send_uds(req)
+        want = positive_prefix(req) if expected_sid == ((req_sid + 0x40) & 0xFF) else bytes([expected_sid])
         deadline = time.monotonic() + timeout
         wait = max(timeout, 2.5)
         while True:
@@ -1340,17 +1391,19 @@ class FpkeCanLink:
             if rem <= 0:
                 raise TimeoutError(f"UDS response timeout ({timeout:.1f}s) for {req[:8].hex()}")
             resp = self.receive_uds(timeout=min(wait, rem))
-            if (
-                allow_pending
-                and len(resp) >= 3
-                and resp[0] == 0x7F
-                and resp[1] == req_sid
-                and resp[2] == 0x78
-            ):
-                deadline = max(deadline, time.monotonic() + P2_STAR_WAIT)
-                wait = P2_STAR_WAIT
+            if not resp:
                 continue
-            return _checked_response(req_sid, resp, expected_sid)
+            if resp[0] == 0x7F:
+                if len(resp) >= 2 and resp[1] != req_sid:
+                    continue
+                if allow_pending and len(resp) >= 3 and resp[1] == req_sid and resp[2] == 0x78:
+                    deadline = max(deadline, time.monotonic() + P2_STAR_WAIT)
+                    wait = P2_STAR_WAIT
+                    continue
+                return _checked_response(req_sid, resp, expected_sid, req=req)
+            if not resp.startswith(want):
+                continue
+            return _checked_response(req_sid, resp, expected_sid, req=req)
 
 
 # ────────────────────────────── Active Session Registry ──────────────────────────────
@@ -1359,8 +1412,13 @@ _ACTIVE_LINK_LOCK = threading.Lock()
 _ACTIVE_LINK: FpkeCanLink | None = None
 
 
-def get_active_fpke_link(port: str | None = None, interface: str | None = None) -> FpkeCanLink | None:
-    """Return the currently open `FpkeCanLink` if it is alive (and matches `port`/`interface` when specified)."""
+def get_active_fpke_link(
+    port: str | None = None,
+    interface: str | None = None,
+    *,
+    ecu_kind: str | None = None,
+) -> FpkeCanLink | None:
+    """Return the currently open `FpkeCanLink` if it is alive (and matches `port`/`interface`/`ecu_kind` when specified)."""
     with _ACTIVE_LINK_LOCK:
         link = _ACTIVE_LINK
         if link is None or link.is_closed:
@@ -1368,6 +1426,8 @@ def get_active_fpke_link(port: str | None = None, interface: str | None = None) 
         if port is not None and link.port != port:
             return None
         if interface is not None and link.interface != interface:
+            return None
+        if ecu_kind is not None and getattr(link, "ecu_kind", "fpke") != ecu_kind:
             return None
         return link
 
@@ -1394,8 +1454,9 @@ def open_or_reuse_fpke_link(
     log_path: Path | None = None,
     bus: Any | None = None,
     via_gateway: bool = False,
+    ecu_kind: str = "fpke",
 ) -> FpkeCanLink:
-    """Reuse the open `FpkeCanLink` for `(port, interface, via_gateway)` if available, or open a new persistent link."""
+    """Reuse the open `FpkeCanLink` for `(port, interface, via_gateway, ecu_kind)` if available, or open a new persistent link."""
     global _ACTIVE_LINK
     with _ACTIVE_LINK_LOCK:
         cur = _ACTIVE_LINK
@@ -1405,6 +1466,7 @@ def open_or_reuse_fpke_link(
             and cur.port == port
             and cur.interface == interface
             and cur.via_gateway == bool(via_gateway)
+            and getattr(cur, "ecu_kind", "fpke") == ecu_kind
             and (bus is None or cur.bus is bus)
         ):
             if log_path is not None:
@@ -1413,7 +1475,14 @@ def open_or_reuse_fpke_link(
         _ACTIVE_LINK = None
     if cur is not None and not cur.is_closed:
         cur.close()
-    new_link = FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway)
+    new_link = FpkeCanLink(
+        port,
+        interface=interface,
+        log_path=log_path,
+        bus=bus,
+        via_gateway=via_gateway,
+        ecu_kind=ecu_kind,
+    )
     superseded: FpkeCanLink | None = None
     with _ACTIVE_LINK_LOCK:
         superseded = _ACTIVE_LINK
@@ -1433,18 +1502,33 @@ def _managed_fpke_link(
     bus: Any | None = None,
     keep_open: bool = False,
     via_gateway: bool = False,
+    ecu_kind: str = "fpke",
 ) -> Iterator[FpkeCanLink]:
     """Yield an `FpkeCanLink`, keeping it open on exit when `keep_open=True` or when reusing an active session."""
-    active = get_active_fpke_link(port, interface)
+    active = get_active_fpke_link(port, interface, ecu_kind=ecu_kind)
     reused = (
         active is not None
         and active.via_gateway == bool(via_gateway)
         and (bus is None or getattr(active, "bus", None) is bus)
     )
     if keep_open or reused:
-        yield open_or_reuse_fpke_link(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway)
+        yield open_or_reuse_fpke_link(
+            port,
+            interface=interface,
+            log_path=log_path,
+            bus=bus,
+            via_gateway=via_gateway,
+            ecu_kind=ecu_kind,
+        )
     else:
-        with FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway) as link:
+        with FpkeCanLink(
+            port,
+            interface=interface,
+            log_path=log_path,
+            bus=bus,
+            via_gateway=via_gateway,
+            ecu_kind=ecu_kind,
+        ) as link:
             yield link
 
 
@@ -1498,31 +1582,31 @@ def _managed_fpke_session(
 
     # Probe whether vendor level 8 is already active over normal J533 UDS before disrupting the gateway
     close_active_fpke_link()
-    probe = FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus, via_gateway=True)
-    already_l8 = False
-    try:
-        already_l8 = fpke_check_level8(probe, timeout=0.6) is not None
-    except Exception:
-        already_l8 = False
-    if already_l8:
-        reporter.info(
-            tr(
-                "Уровень доступа 8 уже открыт — работаем напрямую по UDS через шлюз J533 без запуска моста.",
-                "Vendor level 8 is already active — running directly over J533 UDS without starting the bridge.",
-            )
-        )
-        try:
-            yield probe, False
-        finally:
-            probe.close()
-        return
-
-    # A VAS 6154 sends one frame per 3-7 ms, too slow for the level-8 stream: the gateway sends it instead, so the
-    # table (which depends on the firmware profile) goes into its RAM with the bridge applet. It is built only for
-    # the profile the cluster reports itself: a guessed one forges the wrong pointer into its RAM.
     gateway_sends_stream = gateway_bridge and bus is None and interface not in FPKE_NATIVE_INTERFACES
-    burst_profile = _read_sw_profile(probe) if gateway_sends_stream else None
-    probe.close()
+    burst_profile: str | None = None
+    probe = FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus, via_gateway=True)
+    try:
+        already_l8 = False
+        try:
+            already_l8 = fpke_check_level8(probe, timeout=0.6) is not None
+        except Exception:
+            already_l8 = False
+        if already_l8:
+            reporter.info(
+                tr(
+                    "Уровень доступа 8 уже открыт — работаем напрямую по UDS через шлюз J533 без запуска моста.",
+                    "Vendor level 8 is already active — running directly over J533 UDS without starting the bridge.",
+                )
+            )
+            yield probe, False
+            return
+
+        # A VAS 6154 sends one frame per 3-7 ms, too slow for the level-8 stream: the gateway sends it instead, so the
+        # table (which depends on the firmware profile) goes into its RAM with the bridge applet. It is built only for
+        # the profile the cluster reports itself: a guessed one forges the wrong pointer into its RAM.
+        burst_profile = _read_sw_profile(probe) if gateway_sends_stream else None
+    finally:
+        probe.close()
     if gateway_sends_stream and burst_profile is None:
         raise RuntimeError(
             tr(
@@ -1703,6 +1787,9 @@ def _check_fpke_link_support(
     if ident:
         sup = fpke_support_info(ident)
     else:
+        if not getattr(link, "_last_ident_sw", "") and not getattr(link, "_last_ident_pn", ""):
+            with contextlib.suppress(Exception):
+                _read_sw_profile(link)
         sup = fpke_support_info(
             f189=getattr(link, "_last_ident_sw", ""),
             f187=getattr(link, "_last_ident_pn", ""),
@@ -1882,8 +1969,9 @@ def fpke_establish_level8(
     if len(seed_resp) != 6:
         raise RuntimeError(f"Unexpected SecurityAccess 27 03 response: {seed_resp.hex()}")
     seed_int = int.from_bytes(seed_resp[2:6], "big")
-    key_bytes = ((seed_int + 0xB80B) & 0xFFFFFFFF).to_bytes(4, "big")
-    link.request_uds(b"\x27\x04" + key_bytes, 0x67, timeout=2.0)
+    if seed_int != 0:
+        key_bytes = ((seed_int + 0xB80B) & 0xFFFFFFFF).to_bytes(4, "big")
+        link.request_uds(b"\x27\x04" + key_bytes, 0x67, timeout=2.0)
     link.request_uds(bytes.fromhex("2ef198010203040506"), 0x6E, timeout=2.0)
     link.request_uds(bytes.fromhex("2e051401"), 0x6E, timeout=4.0, allow_pending=True)
     link.request_uds(b"\x3e\x00", 0x7E, timeout=2.0)
@@ -2016,9 +2104,11 @@ def _applet_ram_guard(
     param_size: int = 4,
     save_result: bool = True,
     check_bfaselr: bool = False,
+    payload_factory: Callable[[dict[str, Any]], bytes] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Save SX RAM (`applet_entry`, `source_param`, `result_addr`), upload `payload`, and guarantee RAM restoration."""
     prof = _resolve_link_profile(link)
+    orig_prof_name = str(prof["name"])
     app_entry = int(prof["applet_entry"])
     src_param = int(prof["source_param"])
     res_addr = int(prof["result_addr"])
@@ -2026,13 +2116,6 @@ def _applet_ram_guard(
     saved_ret_addr = int(prof["saved_return"])
     exp_caller_ret = int(prof["caller_return"]).to_bytes(4, "little")
 
-    orig_entry = fpke_read_memory_0x23(link, app_entry, len(payload))
-    orig_param = fpke_read_memory_0x23(link, src_param, param_size)
-    orig_result = (
-        fpke_read_memory_0x23(link, res_addr, FPKE_RESULT_SIZE)
-        if save_result
-        else fpke_read_memory_0x23(link, mark_addr, 32)
-    )
     saved_return = fpke_read_memory_0x23(link, saved_ret_addr, 4)
     if saved_return != exp_caller_ret and prof["name"] in ("1703", "1711"):
         if saved_return == FPKE_1711_CALLER_RETURN.to_bytes(4, "little"):
@@ -2048,13 +2131,31 @@ def _applet_ram_guard(
             f"Unexpected saved return at 0x{saved_ret_addr:08X}: {saved_return.hex()} "
             f"(expected {exp_caller_ret.hex()})"
         )
+    if str(prof["name"]) != orig_prof_name:
+        if payload_factory is None:
+            raise RuntimeError(
+                f"Applet payload was built for profile {orig_prof_name}, but live stack matched {prof['name']}"
+            )
+        payload = payload_factory(prof)
+        app_entry = int(prof["applet_entry"])
+        src_param = int(prof["source_param"])
+        res_addr = int(prof["result_addr"])
+        mark_addr = int(prof["marker_addr"])
+
+    orig_entry = fpke_read_memory_0x23(link, app_entry, len(payload))
+    orig_param = fpke_read_memory_0x23(link, src_param, param_size)
+    orig_result = (
+        fpke_read_memory_0x23(link, res_addr, FPKE_RESULT_SIZE)
+        if save_result
+        else fpke_read_memory_0x23(link, mark_addr, 32)
+    )
     if check_bfaselr:
         init_bfaselr = fpke_read_memory_0x23(link, BFASELR_ADDR, 1)
         if init_bfaselr != b"\x00":
             raise RuntimeError(f"Unexpected initial BFASELR: {init_bfaselr.hex()}")
 
     fpke_write_memory_0x3d(link, app_entry, payload)
-    state: dict[str, Any] = {"ram_restored": False}
+    state: dict[str, Any] = {"ram_restored": False, "payload": payload}
     try:
         yield state
     finally:
@@ -2141,6 +2242,7 @@ def _stream_chunk_via_rscan(
                                 break
                             deadline = min(deadline, time.monotonic() + 0.08)
                         elif len(uds_reply) >= 3 and uds_reply[0] == 0x7F and uds_reply[2] == 0x78:
+                            deadline = max(deadline, time.monotonic() + P2_STAR_WAIT)
                             continue
                         elif uds_reply[:1] == b"\x7f":
                             raise RuntimeError(f"Trigger 0x3D rejected: {uds_reply.hex()}")
@@ -2156,11 +2258,12 @@ def _stream_chunk_via_rscan(
                             break
                         deadline = min(deadline, time.monotonic() + 0.08)
         link.write_stream_summary(address, size, len(collected), rx_count)
-    if len(collected) != size:
+    if len(collected) != size or not got_7d:
         if stream_state is not None:
             stream_state.clear()
         raise TimeoutError(
-            f"RSCAN0 stream from 0x{link.STREAM_RX_ID:03X} @ 0x{address:08X} incomplete: {len(collected)}/{size} B"
+            f"RSCAN0 stream from 0x{link.STREAM_RX_ID:03X} @ 0x{address:08X} incomplete: "
+            f"{len(collected)}/{size} B (got_7d={got_7d})"
         )
     if stream_state is not None:
         stream_state["next_addr"] = (addr_u32 + size) & 0xFFFFFFFF
@@ -2205,7 +2308,9 @@ def fpke_read_region_in_session(
                 param_size=8,
                 save_result=False,
                 check_bfaselr=(mode == "bflash"),
+                payload_factory=lambda p: build_fpke_can_stream_applet(mode, profile=str(p["name"])),
             ) as guard_state:
+                stream_payload = bytes(guard_state.get("payload", stream_payload))
                 prof = _resolve_link_profile(link)
                 mark_addr = int(prof["marker_addr"])
                 offset = 0
@@ -2305,7 +2410,13 @@ def fpke_read_region_in_session(
         param_size=4,
         save_result=True,
         check_bfaselr=(mode == "bflash"),
+        payload_factory=lambda p: (
+            build_fpke_uflash_buf_applet(str(p["name"]))
+            if mode == "uflash"
+            else build_fpke_bflash_buf_applet(str(p["name"]))
+        ),
     ) as guard_state:
+        buf_sha = hashlib.sha256(bytes(guard_state.get("payload", buf_payload))).hexdigest()
         prof = _resolve_link_profile(link)
         app_entry = int(prof["applet_entry"])
         src_param = int(prof["source_param"])
@@ -2441,6 +2552,110 @@ def _read_verified_dflash(
     return raw, meta
 
 
+def _apply_dflash_hardware_blank_check(
+    link: FpkeCanLink,
+    dflash_raw: bytes,
+    dflash_meta: dict[str, Any],
+    *,
+    cflash_bytes: bytes | None = None,
+    reporter: OperationReporter = NULL_REPORTER,
+) -> bytes:
+    """Clean erased RV40F DataFlash cells to deterministic `0xFF` using hardware FACI Blank-Check (`0x71`).
+
+    Direct CPU reads of erased RV40F DataFlash words return floating-gate noise instead of `0xFF`. Flashing such a
+    raw CPU dump with an external programmer programs noise into blank EEL cells and corrupts the EEL pool.
+    Must be called while hardware `IDAUTH` is unlocked (`IDST == 0`).
+    """
+    dflash_clean, bc_mask = fpke_read_dflash_blank_checked(
+        link,
+        offset=0,
+        length=FPKE_DFLASH_SIZE,
+        cpu_dflash=dflash_raw,
+        reporter=reporter,
+    )
+
+    # Guard against the rare race where background `R_EEL_Handler` programmed a new word in `VB_head` between the
+    # initial CPU read and the FACI Blank-Check pass: re-read `VB_head` (2 KiB) and refresh it if any BCST=1 word moved.
+    with contextlib.suppress(Exception):
+        lay = fpke_eel_layout(cflash_bytes, dflash_clean)
+        vb_sz = int(lay["vb"])
+        n_vb = int(lay["n_vb"])
+        blocks, _ = eel_parse_pool(lay, dflash_clean, bc_mask)
+        active_nums = {b["vb"] for b in blocks if b["state"] == "active"}
+        ring_start = 0
+        if 0 in active_nums and (n_vb - 1) in active_nums and len(active_nums) < n_vb:
+            ring_start = n_vb - 1
+            while ((ring_start - 1) % n_vb) in active_nums:
+                ring_start = (ring_start - 1) % n_vb
+        active_sorted = sorted(
+            (b for b in blocks if b["state"] == "active"),
+            key=lambda blk: (blk["ec"] or 0, (blk["vb"] - ring_start) % n_vb),
+        )
+        if active_sorted:
+            head_vb = int(active_sorted[-1]["vb"])
+            head_off = int(lay["base"]) + head_vb * vb_sz
+            head_after, _ = fpke_read_region_in_session(
+                link,
+                mode="direct",
+                source=FPKE_DFLASH_ADDR + head_off,
+                length=vb_sz,
+                use_stream=False,
+                label="DataFlash (head verify)",
+                reporter=NULL_REPORTER,
+            )
+            head_changed = any(
+                any(bc_mask[head_off + rel : head_off + rel + 4])
+                and head_after[rel : rel + 4] != dflash_clean[head_off + rel : head_off + rel + 4]
+                for rel in range(0, vb_sz, 4)
+            )
+            if head_changed:
+                patched_full = bytearray(dflash_clean)
+                patched_full[head_off : head_off + vb_sz] = head_after
+                refreshed_slice, refreshed_mask = fpke_read_dflash_blank_checked(
+                    link,
+                    offset=head_off,
+                    length=vb_sz,
+                    cpu_dflash=bytes(patched_full),
+                    reporter=reporter,
+                )
+                clean_mut = bytearray(dflash_clean)
+                clean_mut[head_off : head_off + vb_sz] = refreshed_slice
+                bc_mask[head_off : head_off + vb_sz] = refreshed_mask
+                dflash_clean = bytes(clean_mut)
+                dflash_meta["blank_check_head_refreshed"] = True
+
+    total_words = FPKE_DFLASH_SIZE // 4
+    blank_words = 0
+    cleaned_noise_words = 0
+    for pos in range(0, FPKE_DFLASH_SIZE, 4):
+        if not any(bc_mask[pos : pos + 4]):
+            blank_words += 1
+            if dflash_raw[pos : pos + 4] != b"\xff\xff\xff\xff":
+                cleaned_noise_words += 1
+
+    dflash_meta["blank_checked"] = True
+    dflash_meta["blank_check_method"] = "faci_0x71"
+    dflash_meta["blank_words"] = blank_words
+    dflash_meta["programmed_words"] = total_words - blank_words
+    dflash_meta["cleaned_noise_words"] = cleaned_noise_words
+    dflash_meta["sha256"] = hashlib.sha256(dflash_clean).hexdigest()
+    reporter.can_log(
+        tr(
+            f"Аппаратный FACI Blank-Check (0x71) завершён: стёртых слов {blank_words:,} / {total_words:,} "
+            f"(очищено от шума плавающего затвора: {cleaned_noise_words:,}) — Dflash.bin безопасен для программатора.",
+            f"Hardware FACI Blank-Check (0x71) completed: {blank_words:,} / {total_words:,} blank words "
+            f"(cleaned floating-gate noise: {cleaned_noise_words:,}) — Dflash.bin is programmer-ready.",
+        )
+    )
+    reporter.info(
+        tr(
+            f"DataFlash проверен аппаратным Blank-Check (очищено шумовых слов: {cleaned_noise_words:,})",
+            f"DataFlash hardware Blank-Check verified ({cleaned_noise_words:,} noise words cleaned)",
+        )
+    )
+    return dflash_clean
+
+
 def can_fpke_full_read(
     port: str,
     *,
@@ -2450,6 +2665,7 @@ def can_fpke_full_read(
     wake_seconds: float = 4.0,
     dflash_chunk: int = 500,
     use_stream: bool = False,
+    blank_check_dflash: bool = True,
     read_uflash: bool = False,
     read_bflash: bool = False,
     read_cflash: bool = False,
@@ -2528,62 +2744,121 @@ def can_fpke_full_read(
                 total_steps,
                 tr("Чтение конфигурации процессора и проверка IDCODE", "Reading MCU configuration & verifying IDCODE"),
             )
-            initial_extra, initial_extra_meta = _read_verified_extra_area(
-                link,
-                label="Extra Area (initial)",
-                reporter=reporter,
-            )
-            candidate_idcode = bytes(initial_extra[0x50:0x60])
-
-            idst_before = fpke_read_memory_0x23(link, IDST_ADDR, 4)
-            idst_after = fpke_idauth(link, candidate_idcode)
-            if idst_after != b"\x00\x00\x00\x00":
-                with contextlib.suppress(Exception):
-                    fpke_idauth(link, b"\x00" * 16)
-                raise RuntimeError(f"Hardware IDAUTH rejected candidate IDCODE: IDST={idst_after.hex()}")
+            extra_bytes: bytes | None = None
+            extra_read_meta: dict[str, Any] = {}
+            extra_info: dict[str, Any] | None = None
+            idauth_info: dict[str, Any] = {}
+            idauth_unlocked = False
             try:
-                extra_bytes, extra_read_meta = _read_verified_extra_area(
+                try:
+                    initial_extra, initial_extra_meta = _read_verified_extra_area(
+                        link,
+                        label="Extra Area (initial)",
+                        reporter=reporter,
+                    )
+                    candidate_idcode = bytes(initial_extra[0x50:0x60])
+
+                    idst_before = fpke_read_memory_0x23(link, IDST_ADDR, 4)
+                    idst_after = fpke_idauth(link, candidate_idcode)
+                    if idst_after != b"\x00\x00\x00\x00":
+                        with contextlib.suppress(Exception):
+                            fpke_idauth(link, b"\x00" * 16)
+                        raise RuntimeError(f"Hardware IDAUTH rejected candidate IDCODE: IDST={idst_after.hex()}")
+                    idauth_unlocked = True
+                    try:
+                        extra_bytes, extra_read_meta = _read_verified_extra_area(
+                            link,
+                            label="Extra Area",
+                            reporter=reporter,
+                        )
+                    except RuntimeError:
+                        # `initial_extra` already passed structural validation and hardware IDAUTH accepted its IDCODE
+                        extra_bytes, extra_read_meta = initial_extra, dict(initial_extra_meta, fallback_to_initial=True)
+                    validate_fpke_extra_area(extra_bytes)
+                    atomic_write(extra_path, extra_bytes)
+                    extra_info = analyze_fpke_extra_area(extra_bytes)
+                    idauth_info = {
+                        "candidate_idcode": candidate_idcode.hex(),
+                        "accepted": True,
+                        "idst_before": idst_before.hex(),
+                        "idst_after_idcode": idst_after.hex(),
+                        "idst_after_relock": "",
+                    }
+                    reporter.can_log(
+                        tr(
+                            f"Extra Area считана и проверена: IDCODE={extra_info['idcode_spaced']} (IDAUTH принят: {idst_before.hex()} -> {idst_after.hex()})",
+                            f"Extra Area read & verified: IDCODE={extra_info['idcode_spaced']} (IDAUTH accepted: {idst_before.hex()} -> {idst_after.hex()})",
+                        )
+                    )
+                    reporter.info(tr("Конфигурация процессора считана, IDCODE подтверждён", "MCU configuration read, IDCODE verified"))
+                except Exception as extra_exc:
+                    if sup["verified"]:
+                        raise
+                    idauth_info = {"accepted": False, "skipped": True, "error": str(extra_exc)}
+                    reporter.warning(
+                        tr(
+                            f"Чтение Extra Area пропущено на неподтверждённой версии ПО ({extra_exc}) — продолжаем чтение DataFlash по UDS 0x23…",
+                            f"Skipping Extra Area on unverified software version ({extra_exc}) — continuing DataFlash read via UDS 0x23…",
+                        )
+                    )
+
+                step_no += 1
+                reporter.step(
+                    step_no,
+                    total_steps,
+                    tr(
+                        "Чтение DataFlash (64 КБ) и аппаратный Blank-Check" if (blank_check_dflash and idauth_unlocked) else "Чтение DataFlash (64 КБ)",
+                        "Reading DataFlash (64 KB) & hardware Blank-Check" if (blank_check_dflash and idauth_unlocked) else "Reading DataFlash (64 KB)",
+                    ),
+                )
+                dflash_bytes, dflash_read_meta = _read_verified_dflash(
                     link,
-                    label="Extra Area",
+                    chunk_size=dflash_chunk,
+                    use_stream=eff_stream,
+                    label="DataFlash",
                     reporter=reporter,
                 )
-            except RuntimeError:
-                # `initial_extra` already passed structural validation and hardware IDAUTH accepted its IDCODE
-                extra_bytes, extra_read_meta = initial_extra, dict(initial_extra_meta, fallback_to_initial=True)
+                if blank_check_dflash and idauth_unlocked:
+                    try:
+                        dflash_bytes = _apply_dflash_hardware_blank_check(
+                            link,
+                            dflash_bytes,
+                            dflash_read_meta,
+                            cflash_bytes=cflash_bytes,
+                            reporter=reporter,
+                        )
+                    except Exception as bc_exc:
+                        if sup["verified"]:
+                            raise
+                        dflash_read_meta["blank_checked"] = False
+                        dflash_read_meta["blank_check_error"] = str(bc_exc)
+                        reporter.warning(
+                            tr(
+                                f"Аппаратный Blank-Check DataFlash не выполнен на неподтверждённой версии ПО ({bc_exc}). "
+                                "Сохранён сырой CPU-дамп — НЕ записывайте его напрямую программатором в MCU (запись через ContiTool безопасна).",
+                                f"Hardware DataFlash Blank-Check failed on unverified SW ({bc_exc}). "
+                                "Saved raw CPU dump — DO NOT flash it directly with an external programmer (ContiTool CAN write remains safe).",
+                            )
+                        )
+                else:
+                    dflash_read_meta["blank_checked"] = False
+                    if blank_check_dflash and not idauth_unlocked:
+                        reporter.warning(
+                            tr(
+                                "Аппаратный Blank-Check DataFlash пропущен (IDAUTH не разблокирован). "
+                                "Сохранён сырой CPU-дамп — НЕ записывайте его напрямую программатором в MCU (запись через ContiTool безопасна).",
+                                "Hardware DataFlash Blank-Check skipped (IDAUTH not unlocked). "
+                                "Saved raw CPU dump — DO NOT flash it directly with an external programmer (ContiTool CAN write remains safe).",
+                            )
+                        )
+                atomic_write(dflash_path, dflash_bytes)
             finally:
-                idst_relock = fpke_idauth(link, b"\x00" * 16)
-            validate_fpke_extra_area(extra_bytes)
-            atomic_write(extra_path, extra_bytes)
-            extra_info = analyze_fpke_extra_area(extra_bytes)
-            idauth_info = {
-                "candidate_idcode": candidate_idcode.hex(),
-                "accepted": True,
-                "idst_before": idst_before.hex(),
-                "idst_after_idcode": idst_after.hex(),
-                "idst_after_relock": idst_relock.hex(),
-            }
-            reporter.can_log(
-                tr(
-                    f"Extra Area считана и проверена: IDCODE={extra_info['idcode_spaced']} (IDAUTH принят: {idst_before.hex()} -> {idst_after.hex()} -> {idst_relock.hex()})",
-                    f"Extra Area read & verified: IDCODE={extra_info['idcode_spaced']} (IDAUTH accepted: {idst_before.hex()} -> {idst_after.hex()} -> {idst_relock.hex()})",
-                )
-            )
-            reporter.info(tr("Конфигурация процессора считана, IDCODE подтверждён", "MCU configuration read, IDCODE verified"))
-
-            step_no += 1
-            reporter.step(
-                step_no,
-                total_steps,
-                tr("Чтение DataFlash (64 КБ)", "Reading DataFlash (64 KB)"),
-            )
-            dflash_bytes, dflash_read_meta = _read_verified_dflash(
-                link,
-                chunk_size=dflash_chunk,
-                use_stream=eff_stream,
-                label="DataFlash",
-                reporter=reporter,
-            )
-            atomic_write(dflash_path, dflash_bytes)
+                if idauth_unlocked:
+                    idst_relock = b""
+                    with contextlib.suppress(Exception):
+                        idst_relock = fpke_idauth(link, b"\x00" * 16)
+                    if idauth_info:
+                        idauth_info["idst_after_relock"] = idst_relock.hex()
 
             opt_results: dict[str, Any] = {}
             if read_uflash:
@@ -2653,8 +2928,34 @@ def can_fpke_full_read(
             atomic_write(immo_passport_path, (json.dumps(immo_passport, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
             prof = _resolve_link_profile(link)
+            live_pn = str(sup.get("part_number") or getattr(link, "_last_ident_pn", "") or "").strip()
+            live_sw = str(sup.get("sw_version") or getattr(link, "_last_ident_sw", "") or "").strip()
+            eff_sw = (
+                str(prof["name"])
+                if (
+                    str(prof["name"]) == "1711"
+                    and getattr(link, "_stack_profile_verified", False)
+                    and live_sw == "1703"
+                )
+                else live_sw
+            )
+            target_label = (
+                f"VAG FPK_E ({live_pn} SW {eff_sw})"
+                if live_pn and eff_sw
+                else (f"VAG FPK_E ({live_pn})" if live_pn else prof["target_label"])
+            )
+            extra_section: dict[str, Any] | None = (
+                {
+                    **extra_read_meta,
+                    **extra_info,
+                    "idauth": idauth_info,
+                    "output": str(extra_path),
+                }
+                if extra_info is not None
+                else None
+            )
             report: dict[str, Any] = {
-                "target": prof["target_label"],
+                "target": target_label,
                 "sw_profile": prof["name"],
                 "officially_supported": bool(sup["verified"]),
                 "support_warning": sup["warning"],
@@ -2671,12 +2972,7 @@ def can_fpke_full_read(
                 "exploit": exploit_info,
                 "idauth": idauth_info,
                 "extra_area": extra_info,
-                "extra": {
-                    **extra_read_meta,
-                    **extra_info,
-                    "idauth": idauth_info,
-                    "output": str(extra_path),
-                },
+                "extra": extra_section,
                 "dflash": {
                     **dflash_read_meta,
                     "first_16": dflash_bytes[:16].hex(),
@@ -2714,6 +3010,7 @@ def can_fpke_read_region(
     frame_delay: float = FPKE_DEFAULT_FRAME_DELAY,
     wake_seconds: float = 4.0,
     use_stream: bool = False,
+    blank_check_dflash: bool = False,
     idcode_hex: str | None = None,
     fd11_key_hex: str | None = None,
     output_path: Path | None = None,
@@ -2796,11 +3093,30 @@ def can_fpke_read_region(
                 )
 
             idauth_meta: dict[str, Any] | None = None
-            if idcode_bytes is not None:
+            idauth_unlocked = False
+            needs_dflash_bc = (
+                blank_check_dflash
+                and mode != "known-key"
+                and eff_source == FPKE_DFLASH_ADDR
+                and eff_length == FPKE_DFLASH_SIZE
+                and hw_mode == "direct"
+            )
+            eff_idcode = idcode_bytes
+            if needs_dflash_bc and eff_idcode is None:
+                extra_for_id, _ = _read_verified_extra_area(
+                    link,
+                    label="Extra Area (IDCODE)",
+                    reporter=reporter,
+                )
+                eff_idcode = bytes(extra_for_id[0x50:0x60])
+            if eff_idcode is not None:
                 idst_before = fpke_read_memory_0x23(link, IDST_ADDR, 4)
-                idst_after = fpke_idauth(link, idcode_bytes)
+                idst_after = fpke_idauth(link, eff_idcode)
                 if idst_after != b"\x00\x00\x00\x00":
+                    with contextlib.suppress(Exception):
+                        fpke_idauth(link, b"\x00" * 16)
                     raise RuntimeError(f"IDCODE rejected by hardware IDAUTH: IDST={idst_after.hex()}")
+                idauth_unlocked = True
                 idauth_meta = {"idst_before": idst_before.hex(), "idst_after_idcode": idst_after.hex()}
 
             reporter.step(2, 2, tr(f"Чтение памяти 0x{eff_source:08X} ({eff_length:,} Б)", f"Reading memory 0x{eff_source:08X} ({eff_length:,} B)"))
@@ -2820,6 +3136,15 @@ def can_fpke_read_region(
                         label=mode.upper(),
                         reporter=reporter,
                     )
+                    if needs_dflash_bc and idauth_unlocked:
+                        data = _apply_dflash_hardware_blank_check(
+                            link,
+                            data,
+                            read_meta,
+                            reporter=reporter,
+                        )
+                    else:
+                        read_meta["blank_checked"] = False
                 else:
                     data, read_meta = fpke_read_region_in_session(
                         link,
@@ -2832,8 +3157,10 @@ def can_fpke_read_region(
                         reporter=reporter,
                     )
             finally:
-                if idcode_bytes is not None and idauth_meta is not None:
-                    idst_relock = fpke_idauth(link, b"\x00" * 16)
+                if idauth_unlocked and idauth_meta is not None:
+                    idst_relock = b""
+                    with contextlib.suppress(Exception):
+                        idst_relock = fpke_idauth(link, b"\x00" * 16)
                     idauth_meta["idst_after_relock"] = idst_relock.hex()
 
             if eff_source == FPKE_EXTRA_ADDR and len(data) >= 0x80:
@@ -3198,12 +3525,18 @@ def fpke_extract_live_s0_s1_from_coil(
             coil_key_id = r_02e4[3:7].hex().upper()
     link.request_uds(b"\x10\x60", 0x50, timeout=2.0)
 
-    candidates: tuple[tuple[str, int, int | None, int | None, int | None], ...] = (
-        ("SW 83A Slot RAM (0xFEDF2D44)", FPKE_83A_RAM_S0_ADDR, FPKE_83A_RAM_SLOTS_FLAG_ADDR, FPKE_83A_RAM_RECOG_STATE_ADDR, FPKE_83A_RAM_LAST_KEY_ID_ADDR),
-        ("SW 83A EEL 0x69 RAM (0xFEDF1E2C)", FPKE_83A_RAM_EEL69_ADDR, None, None, None),
-        ("SW 1703 Slot RAM (0xFEDF5650)", FPKE_1703_RAM_S0_ADDR, FPKE_1703_RAM_SLOTS_FLAG_ADDR, FPKE_1703_RAM_RECOG_STATE_ADDR, FPKE_1703_RAM_LAST_KEY_ID_ADDR),
-        ("SW 1703 EEL 0x69 RAM (0xFEDF4A58)", FPKE_1703_RAM_EEL69_ADDR, None, None, None),
-    )
+    _, detected_r68_base, _ = _detect_fpke_nvm_ram_bases(link)
+    is_17xx = getattr(link, "sw_profile", None) in ("1703", "1711") or detected_r68_base == FPKE_1703_RAM_EEL68_ADDR
+    if is_17xx:
+        candidates: tuple[tuple[str, int, int | None, int | None, int | None], ...] = (
+            ("SW 1703 Slot RAM (0xFEDF5650)", FPKE_1703_RAM_S0_ADDR, FPKE_1703_RAM_SLOTS_FLAG_ADDR, FPKE_1703_RAM_RECOG_STATE_ADDR, FPKE_1703_RAM_LAST_KEY_ID_ADDR),
+            ("SW 1703 EEL 0x69 RAM (0xFEDF4A58)", FPKE_1703_RAM_EEL69_ADDR, None, None, None),
+        )
+    else:
+        candidates = (
+            ("SW 83A Slot RAM (0xFEDF2D44)", FPKE_83A_RAM_S0_ADDR, FPKE_83A_RAM_SLOTS_FLAG_ADDR, FPKE_83A_RAM_RECOG_STATE_ADDR, FPKE_83A_RAM_LAST_KEY_ID_ADDR),
+            ("SW 83A EEL 0x69 RAM (0xFEDF1E2C)", FPKE_83A_RAM_EEL69_ADDR, None, None, None),
+        )
 
     deadline = time.monotonic() + max(0.3, poll_timeout)
     last_recog_state: int | None = None
@@ -3234,7 +3567,12 @@ def fpke_extract_live_s0_s1_from_coil(
                             coil_key_id = raw_kid[::-1].hex().upper()
 
                     ver = fpke_verify_s0_s1(s0, s1, expected_crc_a_le, expected_crc_b_le)
-                    if ver["valid"] and (expected_crc_a_le is not None or fl_val == 0x03 or flag_addr is None):
+                    eel69_present = False
+                    if flag_addr is None and expected_crc_a_le is None:
+                        with contextlib.suppress(Exception):
+                            immo_flags = fpke_read_memory_0x23(link, detected_r68_base + 0x42, 1)[0]
+                            eel69_present = immo_flags != 0xFF and bool(immo_flags & 0x01)
+                    if ver["valid"] and (expected_crc_a_le is not None or fl_val == 0x03 or (flag_addr is None and eel69_present)):
                         msg = tr(
                             f"Секрет S0/S1 считан из {src_label} и подтверждён по CRC-32 (A={ver['crc_a_le_hex']}, B={ver['crc_b_le_hex']}).",
                             f"Secret S0/S1 extracted from {src_label} and verified by CRC-32 (A={ver['crc_a_le_hex']}, B={ver['crc_b_le_hex']}).",
@@ -3403,6 +3741,8 @@ def fpke_prepare_additive_coil_learning(
         if 0 < ram_learned <= 8:
             cur_learned = ram_learned
             target_allowed = max(cur_learned + 1, min(8, int(allowed_keys)))
+            if target_allowed > 8:
+                raise RuntimeError(tr("Все 8 слотов ключей уже заняты.", "All 8 key slots are already full."))
         # Ensure free slots [cur_learned..7] are 0xFFFFFFFF so 0x13DFA6 treats new blank key as unlearned
         for slot in range(cur_learned, 8):
             r67_raw[slot * 4 : (slot + 1) * 4] = b"\xff\xff\xff\xff"
@@ -3602,8 +3942,9 @@ def fpke_finish_coil_key_learning(
     # Restore KESSY key_over_can flag (0x5303 bit 7) in RAM before 80 00 flushes EEL 0x68 to DataFlash
     saved_pair = link._saved_coil_key_flags
     eff_restore_flags = restore_key_flags if restore_key_flags is not None else (saved_pair[1] if saved_pair else None)
+    needs_kessy_restore = eff_restore_flags is not None and bool(eff_restore_flags & 0x80)
     kessy_restored = False
-    if eff_restore_flags is not None and (eff_restore_flags & 0x80):
+    if needs_kessy_restore and eff_restore_flags is not None:
         has_l8 = link.level8_active or fpke_check_level8(link) is not None
         if not has_l8 and not link.via_gateway:
             with contextlib.suppress(Exception):
@@ -3621,7 +3962,6 @@ def fpke_finish_coil_key_learning(
                 base_b = 0x00 if cur_b in (0xAA, 0xFF) else (cur_b & 0x3F)
                 fpke_write_memory_0x3d(link, flag_addr, bytes([base_b | (eff_restore_flags & 0xC0)]))
                 kessy_restored = True
-    link._saved_coil_key_flags = None
 
     link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
     param = 0x01 if sync_channel3 else 0x00
@@ -3669,6 +4009,9 @@ def fpke_finish_coil_key_learning(
             )
             link.request_uds(build_fpke_02e1_request(0x80, 0x00), 0x6E, timeout=8.0)
             used_fallback_80_00 = True
+
+    if not needs_kessy_restore or kessy_restored:
+        link._saved_coil_key_flags = None
 
     key_crc_hex: str | None = None
     with contextlib.suppress(Exception):
@@ -3735,7 +4078,17 @@ def fpke_read_dflash_blank_checked(
         caller_r29=int(prof["caller_r29"]),
     )
 
-    with _applet_ram_guard(link, bc_payload, param_size=8, save_result=True) as guard_state:
+    with _applet_ram_guard(
+        link,
+        bc_payload,
+        param_size=8,
+        save_result=True,
+        payload_factory=lambda p: build_fpke_dflash_bc_applet(
+            applet_entry=int(p["applet_entry"]),
+            caller_return=int(p["caller_return"]),
+            caller_r29=int(p["caller_r29"]),
+        ),
+    ) as guard_state:
         prof = _resolve_link_profile(link)
         app_entry = int(prof["applet_entry"])
         src_param = int(prof["source_param"])
@@ -3829,19 +4182,88 @@ def _build_faci_block_jobs(
             }
         )
 
-    def _sort_key(job: dict[str, Any]) -> tuple[int, int, int]:
+    # Compute the actual DRP/data separator per VB from target EEL DRPs (each DRP is 16 B from +0x18)
+    drp_sep_by_vb: dict[int, int] = {}
+    for v_idx in range(pool_end // vb_size):
+        vb_off = v_idx * vb_size
+        pos = 0x18
+        while pos + 0x10 <= vb_size - 4:
+            if not any(target_mask[vb_off + pos : vb_off + pos + 4]):
+                break
+            if struct.unpack_from("<I", target_clean_df, vb_off + pos)[0] != EEL_MARK:
+                break
+            if not (
+                (
+                    any(target_mask[vb_off + pos + 8 : vb_off + pos + 12])
+                    and struct.unpack_from("<I", target_clean_df, vb_off + pos + 8)[0] == EEL_MARK
+                )
+                or (
+                    any(target_mask[vb_off + pos + 4 : vb_off + pos + 8])
+                    and struct.unpack_from("<I", target_clean_df, vb_off + pos + 4)[0] == EEL_MARK
+                )
+            ):
+                break
+            pos += 0x10
+        drp_sep_by_vb[v_idx] = max(0x40, (pos + 63) & ~63)
+
+    # On recycled VBs where both block 0x000 (A0/I0) and block (vb_size - 64) (I1) are erased,
+    # erase block 0x000 first (clearing A0 before I1) so a mid-write power loss never revives stale data.
+    jobs_by_off = {int(j["blk_off"]): j for j in raw_jobs}
+    tagged_jobs: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+    recycled_vbs: set[int] = set()
+    for v_idx in range(pool_end // vb_size):
+        hdr_off = v_idx * vb_size
+        tail_off = hdr_off + vb_size - 64
+        j_hdr = jobs_by_off.get(hdr_off)
+        j_tail = jobs_by_off.get(tail_off)
+        if j_hdr is not None and j_tail is not None and j_hdr["do_erase"] and j_tail["do_erase"]:
+            recycled_vbs.add(v_idx)
+
+    for job in raw_jobs:
         off = int(job["blk_off"])
         if off >= pool_end:
-            return (1000, 0, off)
+            tagged_jobs.append(((1000, 0, off), job))
+            continue
         vb_idx = off // vb_size
         in_vb = off % vb_size
-        # Write record data blocks (high-to-low offset inside VB) BEFORE DRP/header blocks (low-to-high)
-        is_hdr_or_drp = 1 if in_vb < 0x180 else 0
-        order_in_vb = in_vb if is_hdr_or_drp else -in_vb
-        return (vb_idx, is_hdr_or_drp, order_in_vb)
+        sep = drp_sep_by_vb.get(vb_idx, 0x180)
+        if vb_idx in recycled_vbs and in_vb == 0:
+            if int(job["prog_mask"]) == 0:
+                tagged_jobs.append(((vb_idx, 0, 0), job))
+            else:
+                tagged_jobs.append(
+                    (
+                        (vb_idx, 0, 0),
+                        {
+                            "blk_off": off,
+                            "do_erase": True,
+                            "prog_mask": 0,
+                            "target_mask16": 0,
+                            "data": b"\xff" * 64,
+                        },
+                    )
+                )
+                tagged_jobs.append(
+                    (
+                        (vb_idx, 2, 0),
+                        {
+                            "blk_off": off,
+                            "do_erase": False,
+                            "prog_mask": int(job["prog_mask"]),
+                            "target_mask16": int(job["target_mask16"]),
+                            "data": bytes(job["data"]),
+                        },
+                    )
+                )
+            continue
+        # Phase 1: record data blocks (high-to-low); Phase 2: DRP/header blocks (low-to-high)
+        if in_vb < sep:
+            tagged_jobs.append(((vb_idx, 2, in_vb), job))
+        else:
+            tagged_jobs.append(((vb_idx, 1, -in_vb), job))
 
-    raw_jobs.sort(key=_sort_key)
-    return raw_jobs
+    tagged_jobs.sort(key=lambda item: item[0])
+    return [job for _, job in tagged_jobs]
 
 
 def _refuse_slow_adapter_write(interface: str, blocks: int) -> None:
@@ -3892,7 +4314,17 @@ def fpke_write_dflash_blocks_in_session(
     reporter.reset_stage_timer()
     reporter.progress(0, len(block_jobs), unit="blk", detail="FACI DataFlash Write")
 
-    with _applet_ram_guard(link, wr_payload, param_size=72, save_result=True) as guard_state:
+    with _applet_ram_guard(
+        link,
+        wr_payload,
+        param_size=72,
+        save_result=True,
+        payload_factory=lambda p: build_fpke_dflash_write_applet(
+            applet_entry=int(p["applet_entry"]),
+            caller_return=int(p["caller_return"]),
+        ),
+    ) as guard_state:
+        wr_payload = bytes(guard_state.get("payload", wr_payload))
         prof = _resolve_link_profile(link)
         app_entry = int(prof["applet_entry"])
         src_param = int(prof["source_param"])
@@ -4049,9 +4481,19 @@ def can_fpke_write_dflash(
          `NvM_WriteAll` overwriting them from stale RAM.
     """
     from contitool.can.workflows import default_session_dir
+    from contitool.core.kombi import is_kombi_dflash
 
     verify_fpke_self_tests()
     cand_bytes = Path(candidate_dflash).read_bytes() if isinstance(candidate_dflash, (str, Path)) else bytes(candidate_dflash)
+    if is_kombi_dflash(cand_bytes):
+        raise ValueError(
+            tr(
+                "Обнаружен дамп приборной панели Kombi VDD (0310 / 2220), а не FPK_E. "
+                "Запись дампа Kombi VDD в FPK_E заблокирована.",
+                "Detected a Kombi VDD (0310 / 2220) dump rather than FPK_E. "
+                "Refusing to write a Kombi VDD dump into an FPK_E cluster.",
+            )
+        )
     if len(cand_bytes) != FPKE_DFLASH_SIZE or not is_fpke_dflash(cand_bytes):
         raise ValueError(
             tr(
@@ -4140,13 +4582,13 @@ def can_fpke_write_dflash(
             # Foreign cluster safety check (FD11 identifier & vendor keys in EEL 0x63)
             live_fd11 = before_info.get("fd11_identifier")
             cand_fd11 = cand_info.get("fd11_identifier")
-            if live_fd11 and cand_fd11 and live_fd11 != cand_fd11 and not allow_foreign:
+            if live_fd11 and (not cand_fd11 or live_fd11 != cand_fd11) and not allow_foreign:
                 raise RuntimeError(
                     tr(
-                        f"Отказано в прямой записи чужого дампа DataFlash: идентификатор FD11 в дампе ({cand_fd11}) "
+                        f"Отказано в прямой записи чужого дампа DataFlash: идентификатор FD11 в дампе ({cand_fd11 or 'отсутствует'}) "
                         f"не совпадает с подключённой приборной панелью ({live_fd11}). "
                         "Для переноса иммо, ключей, пробега и CP используйте вкладку «Перенос из донора».",
-                        f"Refusing to write a foreign cluster DataFlash dump directly: candidate FD11 ({cand_fd11}) "
+                        f"Refusing to write a foreign cluster DataFlash dump directly: candidate FD11 ({cand_fd11 or 'missing'}) "
                         f"does not match connected cluster ({live_fd11}). "
                         "Use the “Donor transfer” tab to transfer immo, keys, odometer, and CP safely.",
                     )
@@ -4171,10 +4613,21 @@ def can_fpke_write_dflash(
             eel_updates = extract_fpke_eel_updates(ref_base, cand_bytes, cflash_bytes)
             ref_clean_df, ref_mask = normalize_fpke_dflash_for_faci(ref_base, cflash_bytes)
             cand_clean_df, cand_mask = normalize_fpke_dflash_for_faci(cand_bytes, cflash_bytes)
+            can_smart_append_without_base = False
+            if base_bytes is None and not full_rewrite and eel_updates:
+                cand_lay = fpke_eel_layout(cflash_bytes, cand_bytes)
+                if cand_lay["base"] == lay["base"] and cand_lay["vb"] == vb_sz and cand_lay["n_vb"] == n_vb and cand_lay["ids"] == lay["ids"]:
+                    _, live_latest_ids = eel_parse_pool(lay, ref_clean_df, ref_mask)
+                    _, cand_latest_ids = eel_parse_pool(cand_lay, cand_clean_df, cand_mask)
+                    if live_latest_ids and set(live_latest_ids).issubset(set(cand_latest_ids)):
+                        can_smart_append_without_base = True
             has_eel_append = (
                 (not full_rewrite)
                 and bool(eel_updates)
-                and bool(change_summary.get("eel_pool_append_only") or change_summary.get("is_pure_eel_update"))
+                and (
+                    bool(change_summary.get("eel_pool_append_only") or change_summary.get("is_pure_eel_update"))
+                    or can_smart_append_without_base
+                )
             )
             eel_pool_unchanged = (
                 (not full_rewrite)
@@ -4407,7 +4860,10 @@ def can_fpke_write_dflash(
                     "Readback & byte-for-byte DataFlash verification",
                 ),
             )
-            verified_pages: set[int] = {int(j["blk_off"]) & ~0x7F for j in block_jobs}
+            final_jobs_by_off: dict[int, dict[str, Any]] = {}
+            for j in block_jobs:
+                final_jobs_by_off[int(j["blk_off"])] = j
+            verified_pages: set[int] = {bo & ~0x7F for bo in final_jobs_by_off}
             for page_off in sorted(verified_pages):
                 rb_slice, rb_mask = fpke_read_dflash_blank_checked(
                     link,
@@ -4416,8 +4872,7 @@ def can_fpke_write_dflash(
                     cpu_dflash=None,
                     reporter=reporter,
                 )
-                for j in block_jobs:
-                    bo = int(j["blk_off"])
+                for bo, j in sorted(final_jobs_by_off.items()):
                     if not (page_off <= bo < page_off + 128):
                         continue
                     rel_bo = bo - page_off
@@ -4437,6 +4892,13 @@ def can_fpke_write_dflash(
                 link,
                 use_stream=False,
                 label="DataFlash (verify)",
+                reporter=reporter,
+            )
+            dflash_readback = _apply_dflash_hardware_blank_check(
+                link,
+                dflash_readback,
+                readback_meta,
+                cflash_bytes=cflash_bytes,
                 reporter=reporter,
             )
             atomic_write(readback_path, dflash_readback)

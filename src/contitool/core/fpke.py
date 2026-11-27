@@ -580,6 +580,8 @@ def fpke_support_info(
 
     if non_conti:
         verified = False
+    elif sw_norm and pn_norm:
+        verified = sw_norm in FPKE_VERIFIED_SW_VERSIONS and pn_norm in FPKE_VERIFIED_PART_NUMBERS
     elif sw_norm:
         verified = sw_norm in FPKE_VERIFIED_SW_VERSIONS
     else:
@@ -676,7 +678,9 @@ def detect_fpke_files(paths: list[Path]) -> dict[str, Path]:
                 found.setdefault("extra", p)
         elif sz == FPKE_DFLASH_SIZE:
             raw = p.read_bytes()
-            if is_fpke_dflash(raw):
+            from contitool.core.kombi import is_kombi_dflash
+
+            if is_fpke_dflash(raw) and not is_kombi_dflash(raw):
                 found.setdefault("dflash", p)
         elif sz == FPKE_CFLASH_SIZE:
             raw = p.read_bytes()
@@ -1150,7 +1154,7 @@ def eel_parse_pool(
             a = b + 0x18
             min_bottom = b + lay["vb"] - 4
             refs_in_block: list[tuple[int, int, int]] = []
-            while a + 0x10 <= b + lay["vb"] - 4 and written(a):
+            while a + 0x10 <= b + lay["vb"] - 4 and mark(a):
                 drp = word(a + 0x0C)
                 if not (mark(a + 8) or mark(a + 4)):
                     break
@@ -1217,7 +1221,17 @@ def eel_read_record_any(lay: dict[str, Any], df: bytes, ident: int) -> tuple[byt
             rejected_current = source
 
     active = [b for b in blocks if b["state"] == "active"]
-    head = max(active, key=lambda b: (b["ec"] or 0, b["vb"]))["vb"] if active else 0
+    active_nums = {b["vb"] for b in active}
+    ring_start = 0
+    if 0 in active_nums and (lay["n_vb"] - 1) in active_nums and len(active_nums) < lay["n_vb"]:
+        ring_start = lay["n_vb"] - 1
+        while ((ring_start - 1) % lay["n_vb"]) in active_nums:
+            ring_start = (ring_start - 1) % lay["n_vb"]
+    head = (
+        max(active, key=lambda b: (b["ec"] or 0, (b["vb"] - ring_start) % lay["n_vb"]))["vb"]
+        if active
+        else 0
+    )
     padded = (size + 3) & ~3
     candidates: list[tuple[int, int, dict[str, Any], bytes]] = []
     for vb in range(lay["n_vb"]):
@@ -1347,16 +1361,30 @@ def parse_fpke_immo_config(
     has_68 = r68 is not None and len(r68) >= 0x4E
     has_66 = r66 is not None and len(r66) >= 0x16
     cs_raw = r68[0x28:0x38] if (r68 is not None and len(r68) >= 0x38) else None
-    cs_personalized = cs_raw is not None and cs_raw != b"\xff" * 16
+    cs_personalized = cs_raw is not None and cs_raw not in (b"\xff" * 16, b"\x00" * 16, b"\xaa" * 16)
     k_ffb_hex = fpke_derive_k_ffb(cs_raw).hex().upper() if (cs_personalized and cs_raw is not None) else ""
     power_class = r68[0x40] if (r68 is not None and len(r68) > 0x40) else None
-    partners_mask = r68[0x41] if (r68 is not None and len(r68) > 0x41 and r68[0x41] != 0xFF) else 0
+    is_sw2220_layout = (
+        r68 is not None
+        and len(r68) >= 0x4E
+        and r68[0x4D:] == b"\xff" * (len(r68) - 0x4D)
+    )
+    raw_41 = r68[0x41] if (r68 is not None and len(r68) > 0x41 and r68[0x41] != 0xFF) else 0
+    if is_sw2220_layout:
+        partners_mask = raw_41 & 0x7F
+        key_transport = None
+        key_over_can = bool(raw_41 & 0x80)
+        restart_window_disabled = False
+    else:
+        partners_mask = raw_41
+        key_transport = r68[0x4D] if (r68 is not None and len(r68) > 0x4D and r68[0x4D] != 0xFF) else None
+        key_over_can = bool(key_transport & 0x80) if key_transport is not None else False
+        restart_window_disabled = bool(key_transport & 0x40) if key_transport is not None else False
     lf_cfg = r68[0x42] if (r68 is not None and len(r68) > 0x42) else None
     immo_flags = r68[0x44] if (r68 is not None and len(r68) > 0x44) else None
     lockouts = list(r68[0x45:0x4B]) if (r68 is not None and len(r68) >= 0x4B) else []
     immo_mode = r68[0x4B] if (r68 is not None and len(r68) > 0x4B and r68[0x4B] != 0xFF) else None
     identity_cnt = r68[0x4C] if (r68 is not None and len(r68) > 0x4C and r68[0x4C] != 0xFF) else None
-    key_transport = r68[0x4D] if (r68 is not None and len(r68) > 0x4D and r68[0x4D] != 0xFF) else None
     status_5b = (
         bytes([r68[4], r68[3], r68[2], r68[0x40], r68[5]]).hex().upper()
         if (r68 is not None and len(r68) > 0x40)
@@ -1419,8 +1447,8 @@ def parse_fpke_immo_config(
         "immo_mode": immo_mode,
         "identity_counter": identity_cnt,
         "key_transport_raw": key_transport,
-        "key_over_can": bool(key_transport & 0x80) if key_transport is not None else False,
-        "restart_window_disabled": bool(key_transport & 0x40) if key_transport is not None else False,
+        "key_over_can": key_over_can,
+        "restart_window_disabled": restart_window_disabled,
         "lf_reader_config": lf_cfg if (lf_cfg is not None and lf_cfg != 0xFF) else None,
         "immo_flags": immo_flags if (immo_flags is not None and immo_flags != 0xFF) else None,
         "s0_s1_stored_in_0x69": bool(immo_flags & 0x01) if (immo_flags is not None and immo_flags != 0xFF) else False,
@@ -2090,6 +2118,19 @@ def apply_fpke_cflash_rsa_patch(
                 f"(pass allow_custom=True to force overwrite).",
             )
         )
+    if not before["memcheck_bolo_entry"]["valid"] and not allow_custom:
+        raise ValueError(
+            tr(
+                f"Контрольная сумма загрузчика BOLO в .MemCheckCrcTblApp[0] не совпадает "
+                f"(хранимо {before['memcheck_bolo_entry']['stored_crc']}, "
+                f"вычислено {before['memcheck_bolo_entry']['calculated_crc']}). "
+                f"Патч заблокирован (передайте allow_custom=True для принудительного патча).",
+                f"BOLO bootloader checksum in .MemCheckCrcTblApp[0] is invalid "
+                f"(stored {before['memcheck_bolo_entry']['stored_crc']}, "
+                f"calculated {before['memcheck_bolo_entry']['calculated_crc']}). "
+                f"Refusing to patch bootloader with invalid CRC (pass allow_custom=True to force).",
+            )
+        )
     c_offs = before["patch_cflash_offsets_int"]
     target_bytes = (
         (_FPKE_BOLO_RSA_STOCK_BNE + _FPKE_BOLO_RSA_STOCK_CMOV)
@@ -2262,7 +2303,7 @@ def extract_fpke_immo_passport(
     cs_state = "missing"
     if r68 is not None and len(r68) >= 0x38:
         cs_bytes = r68[0x28:0x38]
-        if cs_bytes == b"\xff" * 16:
+        if cs_bytes in (b"\xff" * 16, b"\x00" * 16, b"\xaa" * 16):
             cs_state = "empty"
         else:
             cs_val = cs_bytes.hex().upper()
@@ -2275,7 +2316,7 @@ def extract_fpke_immo_passport(
     vdo_state = "missing"
     if r68 is not None and len(r68) >= 0x40:
         vdo_bytes = r68[0x38:0x40]
-        if vdo_bytes == b"\xff" * 8:
+        if vdo_bytes in (b"\xff" * 8, b"\x00" * 8):
             vdo_state = "empty"
         else:
             vdo_cs_plus = vdo_bytes.hex().upper()
@@ -3030,11 +3071,16 @@ def transfer_fpke_donor_to_target(
     Always preserves Target B's hardware records (`0x45` part number/SW, `0x46` dataset, `0x30` coding, `0x63` FD11 keys,
     and calibration records `0x01..0x2F`).
     """
-    donor_passport = (
-        extract_fpke_immo_passport(donor, donor_cflash)
-        if isinstance(donor, (bytes, bytearray))
-        else donor
-    )
+    if isinstance(donor, (bytes, bytearray)):
+        from contitool.core.kombi import extract_kombi_immo_passport, is_kombi_dflash
+
+        donor_bytes = bytes(donor)
+        if is_kombi_dflash(donor_bytes):
+            donor_passport = extract_kombi_immo_passport(donor_bytes, donor_cflash)
+        else:
+            donor_passport = extract_fpke_immo_passport(donor_bytes, donor_cflash)
+    else:
+        donor_passport = donor
     im_a = donor_passport.get("immo") or {}
     cnt_a = im_a.get("counts") or {}
     mf_a = im_a.get("mode_and_flags") or {}
@@ -3082,6 +3128,9 @@ def transfer_fpke_donor_to_target(
     donor_gfa = cp_a.get("cp1_gfa") or None
     has_donor_cp = bool(donor_ika or donor_gfa)
 
+    raw_donor_odo = meta_a.get("odometer_km")
+    donor_odo = (int(raw_donor_odo) & ~1) if raw_donor_odo is not None else None
+
     updated_df = apply_fpke_dflash_edits(
         target_dflash,
         vin=donor_vin if copy_immo else None,
@@ -3099,7 +3148,7 @@ def transfer_fpke_donor_to_target(
         allowed_keys=donor_allowed if copy_keys else None,
         learned_keys=donor_learned if copy_keys else None,
         session_xor_flags=donor_xor_flags if copy_keys else None,
-        odometer_km=meta_a.get("odometer_km") if (copy_odometer and meta_a.get("odometer_km") is not None) else None,
+        odometer_km=donor_odo if copy_odometer else None,
         ika_key_hex=donor_ika if copy_cp else None,
         gfa_key_hex=donor_gfa if copy_cp else None,
         reset_cp_counter=bool(copy_cp and has_donor_cp),
@@ -3111,7 +3160,7 @@ def transfer_fpke_donor_to_target(
         "copied_sections": {
             "immo": bool(copy_immo and has_donor_immo),
             "keys": bool(copy_keys and has_donor_keys),
-            "odometer": copy_odometer and (meta_a.get("odometer_km") is not None),
+            "odometer": copy_odometer and (donor_odo is not None),
             "cp": bool(copy_cp and has_donor_cp),
         },
         "donor_part_number": meta_a.get("part_number"),

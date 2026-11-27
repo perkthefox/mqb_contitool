@@ -98,7 +98,7 @@ from contitool.core.kombi import (
     summarize_kombi_dflash_changes,
 )
 from contitool.i18n import tr
-from contitool.progress import NULL_REPORTER, OperationReporter
+from contitool.progress import NULL_REPORTER, OperationCancelledError, OperationReporter
 
 KombiCanLink = FpkeCanLink
 
@@ -114,16 +114,30 @@ def _managed_kombi_session(
     via_gateway: bool = False,
 ) -> Iterator[FpkeCanLink]:
     """Open or reuse a `0x714/0x77E` CAN link for `17 Kombi VDD` (works both directly and behind a J533 gateway over 11-bit UDS)."""
-    active = get_active_fpke_link(port, interface)
+    active = get_active_fpke_link(port, interface, ecu_kind="kombi")
     reused = (
         active is not None
         and active.via_gateway == bool(via_gateway)
         and (bus is None or getattr(active, "bus", None) is bus)
     )
     if keep_open or reused:
-        yield open_or_reuse_fpke_link(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway)
+        yield open_or_reuse_fpke_link(
+            port,
+            interface=interface,
+            log_path=log_path,
+            bus=bus,
+            via_gateway=via_gateway,
+            ecu_kind="kombi",
+        )
     else:
-        with FpkeCanLink(port, interface=interface, log_path=log_path, bus=bus, via_gateway=via_gateway) as link:
+        with FpkeCanLink(
+            port,
+            interface=interface,
+            log_path=log_path,
+            bus=bus,
+            via_gateway=via_gateway,
+            ecu_kind="kombi",
+        ) as link:
             yield link
 
 
@@ -260,7 +274,7 @@ def kombi_clear_sa1_delay_timer(
         link.request_uds(b"\x27\x04" + reset_payload, 0x67, timeout=2.0)
         return {"cleared": True, "stage": "direct", "needs_restage": False}
     except UdsNegativeResponse as exc:
-        if not allow_session_reset or exc.sid != 0x27 or exc.nrc != 0x24:
+        if not allow_session_reset or exc.sid != 0x27 or exc.nrc not in (0x24, 0x35, 0x36, 0x37):
             raise
 
     if s3_wait_s > 0:
@@ -276,7 +290,7 @@ def kombi_clear_sa1_delay_timer(
         link.request_uds(b"\x27\x04" + reset_payload, 0x67, timeout=2.0)
         return {"cleared": True, "stage": "s3_timeout", "needs_restage": True}
     except UdsNegativeResponse as exc:
-        if exc.sid != 0x27 or exc.nrc != 0x24:
+        if exc.sid != 0x27 or exc.nrc not in (0x24, 0x35, 0x36, 0x37):
             raise
 
     reporter.can_log(
@@ -326,14 +340,14 @@ def kombi_extract_sl7_key(
         with contextlib.suppress(UdsNegativeResponse, Exception):
             link.request_uds(b"\x2e\xfd\x11\x04" + bytes(32), 0x6E, timeout=2.5)
 
-    def _unlock_sa1(*, allow_session_reset: bool = True) -> bool:
+    def _unlock_sa1(*, allow_session_reset: bool = True, clear_delay_timer: bool = True) -> bool:
         nonlocal timer_reset_info
         link.request_uds(b"\x10\x4f", 0x50, timeout=2.0)
         needs_restage = False
         try:
             seed_resp = link.request_uds(b"\x27\x03", 0x67, timeout=2.0)
         except UdsNegativeResponse as exc:
-            if exc.sid != 0x27 or exc.nrc not in (0x36, 0x37):
+            if not clear_delay_timer or exc.sid != 0x27 or exc.nrc not in (0x36, 0x37):
                 raise
             try:
                 timer_reset_info = kombi_clear_sa1_delay_timer(
@@ -356,11 +370,19 @@ def kombi_extract_sl7_key(
             link.request_uds(b"\x27\x04" + sa1_key, 0x67, timeout=2.0)
         return needs_restage
 
-    def _unlock_sa1_and_read_20(*, allow_session_reset: bool = True, restage_on_reset: bool = False) -> tuple[bytes, int, int]:
-        needs_restage = _unlock_sa1(allow_session_reset=allow_session_reset)
+    def _unlock_sa1_and_read_20(
+        *,
+        allow_session_reset: bool = True,
+        restage_on_reset: bool = False,
+        clear_delay_timer: bool = True,
+    ) -> tuple[bytes, int, int]:
+        needs_restage = _unlock_sa1(
+            allow_session_reset=allow_session_reset,
+            clear_delay_timer=clear_delay_timer,
+        )
         if needs_restage and restage_on_reset:
             _stage_eel63()
-            _unlock_sa1(allow_session_reset=False)
+            _unlock_sa1(allow_session_reset=False, clear_delay_timer=False)
         staged_20 = fpke_read_memory_0x23(link, sl7_key_addr, 20, timeout=2.0)
         k16 = bytes(staged_20[:16])
         c_stored = int.from_bytes(staged_20[16:20], "little")
@@ -369,8 +391,12 @@ def kombi_extract_sl7_key(
 
     # On SW 2220 (8V0 920 860 E), check 0xFEDD2480 in 10 4F + SA1 first in case EEL 0x0063 is already staged in RAM
     if prof["sw_profile"] == "2220":
-        with contextlib.suppress(Exception):
-            k16_pre, c_st_pre, c_ca_pre = _unlock_sa1_and_read_20(allow_session_reset=True, restage_on_reset=False)
+        try:
+            k16_pre, c_st_pre, c_ca_pre = _unlock_sa1_and_read_20(
+                allow_session_reset=False,
+                restage_on_reset=False,
+                clear_delay_timer=False,
+            )
             if c_st_pre == c_ca_pre and k16_pre not in (b"\xff" * 16, b"\x00" * 16):
                 meta_pre: dict[str, Any] = {
                     "staging_addr": f"0x{sl7_key_addr:08X}",
@@ -381,6 +407,10 @@ def kombi_extract_sl7_key(
                 if timer_reset_info is not None:
                     meta_pre["sa1_delay_timer_reset"] = timer_reset_info
                 return k16_pre, meta_pre
+        except OperationCancelledError:
+            raise
+        except Exception:
+            pass
 
     _stage_eel63()
 
@@ -748,6 +778,7 @@ def can_kombi_run_sl7_action(
 def kombi_read_raw_physical_dflash_in_session(
     link: FpkeCanLink,
     *,
+    state_out: dict[str, Any] | None = None,
     reporter: OperationReporter = NULL_REPORTER,
 ) -> tuple[bytes, dict[int, bytes]]:
     """Read the full `32 KiB` (`32,768` B) raw physical DataFlash (`0x02000000..0x02007FFF`, `RD_tbl0[5]`) and full
@@ -758,6 +789,8 @@ def kombi_read_raw_physical_dflash_in_session(
     direct_eel: dict[int, bytes] = {}
     phys_data = bytearray()
     with kombi_temporary_immo_mode0(link, reporter=reporter) as mode0_state:
+        if state_out is not None:
+            state_out.update(mode0_state)
         # 1. Read full EEL 0x0063 and EEL 0x0064 directly via 0xEF006300 / 0xEF006400 (RD_tbl0[12])
         for eid in (0x0063, 0x0064):
             reporter.check_cancelled()
@@ -777,6 +810,8 @@ def kombi_read_raw_physical_dflash_in_session(
             restore_val = int(mode0_state.get("restore_mode", 0x01)) & 0xFF
             fpke_write_memory_0x3d(link, KOMBI_EEL_IMMO_MODE_VADDR, bytes([restore_val]), timeout=4.0)
             mode0_state["eel68_written"] = True
+            if state_out is not None:
+                state_out.update(mode0_state)
 
         # 3. Read all 32,768 bytes of physical DataFlash (0x02000000..0x02007FFF, RD_tbl0[5]) in 500-byte chunks
         chunks = partition_chunks(KOMBI_DFLASH_POOL_SIZE, 500)
@@ -939,6 +974,7 @@ def kombi_read_all_eel_in_session(
 
     physical_dflash_bytes: bytes | None = None
     eel_0063_0064_direct = False
+    mode0_switched = False
     if read_physical_dflash:
         r68_cur = records.get(0x0068, b"")
         cur_immo_mode = r68_cur[0x4B] if len(r68_cur) > 0x4B else 0x01
@@ -947,8 +983,14 @@ def kombi_read_all_eel_in_session(
             bool(prof["can_switch_immo_mode0_at_sl7"]) and unlock_method == "direct_0x3d_ef00684b"
         ) or cur_immo_mode == 0x00
         if can_read_phys:
+            phys_mode0_state: dict[str, Any] = {}
             try:
-                phys_raw, direct_63_64 = kombi_read_raw_physical_dflash_in_session(link, reporter=reporter)
+                phys_raw, direct_63_64 = kombi_read_raw_physical_dflash_in_session(
+                    link,
+                    state_out=phys_mode0_state,
+                    reporter=reporter,
+                )
+                mode0_switched = bool(phys_mode0_state.get("switched"))
                 if len(phys_raw) == KOMBI_DFLASH_POOL_SIZE:
                     physical_dflash_bytes = phys_raw
                 if direct_63_64:
@@ -960,6 +1002,7 @@ def kombi_read_all_eel_in_session(
                     for eid in sorted(eel_ids):
                         logical_concat.extend(records[eid])
             except Exception as exc:
+                mode0_switched = bool(phys_mode0_state.get("switched"))
                 reporter.warning(
                     tr(
                         f"Чтение сырого физического DataFlash 0x02000000..0x02007FFF пропущено ({exc}); используются {n_blocks} бл. EEL.",
@@ -991,7 +1034,7 @@ def kombi_read_all_eel_in_session(
         "sha256": hashlib.sha256(dflash_64k).hexdigest(),
         "fd11_subblocks": subblocks_meta,
         "eel_phys_offsets": phys_map,
-        "flash_writes": False,
+        "flash_writes": bool(mode0_switched),
     }
     if physical_dflash_bytes is not None:
         meta["physical_dflash_bytes"] = physical_dflash_bytes
@@ -1008,7 +1051,7 @@ def can_kombi_full_read(
     session_dir: Path | None = None,
     wake_seconds: float = 2.0,
     read_cflash: bool = False,
-    read_physical_dflash: bool = True,
+    read_physical_dflash: bool = False,
     cflash_bytes: bytes | None = None,
     ident: list[dict[str, str]] | None = None,
     keep_open: bool = False,
@@ -1131,7 +1174,7 @@ def can_kombi_full_read(
                 "gateway_bridged": False,
                 "can_only": True,
                 "target_keys_used": False,
-                "flash_writes": False,
+                "flash_writes": bool(dflash_meta.get("flash_writes", False)),
                 "ident": list(ident) if ident else [],
                 "access": sl7_info,
                 "dflash": {
@@ -1167,6 +1210,7 @@ def kombi_nvm_reload_block(
     *,
     retries: int = 5,
     timeout: float = 2.0,
+    strict: bool = False,
 ) -> bool:
     """Reload an NVM block from EEL DataFlash into its RAM mirror via `2E FD 3A <block_id:2BE>` (`op = 3`)."""
     cmd = bytes([0x2E, 0xFD, 0x3A, (nvm_block_id >> 8) & 0xFF, nvm_block_id & 0xFF])
@@ -1176,6 +1220,13 @@ def kombi_nvm_reload_block(
             return True
         if attempt + 1 < retries:
             time.sleep(0.05)
+    if strict:
+        raise RuntimeError(
+            tr(
+                f"Не удалось перезагрузить блок NvM 0x{nvm_block_id:04X} (2E FD 3A вернул 0x00 после {max(1, retries)} попыток).",
+                f"Failed to reload NvM block 0x{nvm_block_id:04X} (2E FD 3A returned 0x00 after {max(1, retries)} attempt(s)).",
+            )
+        )
     return False
 
 
@@ -1235,6 +1286,47 @@ def _poll_ram_immo_mode_restored(
         time.sleep(0.05)
 
 
+_KOMBI_EEL63_CRC_SUBBLOCKS: tuple[tuple[int, int, str], ...] = (
+    (0x02, 20, "FD11 ID (+0x02)"),
+    (0x16, 20, "SL 0..6 key (+0x16)"),
+    (0x2A, 20, "SL 7 key (+0x2A)"),
+    (0x3E, 20, "slot 3 key (+0x3E)"),
+    (0x76, 8, "FD11 flags (+0x76)"),
+)
+
+
+def _validate_eel63_subblock_crcs(rec_63: bytes) -> None:
+    """Verify CRC-32 checksums on all required `EEL 0x0063` sub-blocks (`+0x02`, `+0x16`, `+0x2A`, `+0x3E`, `+0x76`)."""
+    for off, sz, label in _KOMBI_EEL63_CRC_SUBBLOCKS:
+        if len(rec_63) < off + sz:
+            raise RuntimeError(
+                tr(
+                    f"Невозможно безопасно выполнить 2E FD E3: запись EEL 0x0063 слишком коротка для {label}.",
+                    f"Cannot safely execute 2E FD E3: EEL 0x0063 record is too short for {label}.",
+                )
+            )
+        sub = rec_63[off : off + sz]
+        crc_stored = int.from_bytes(sub[-4:], "little")
+        crc_calc = zlib.crc32(sub[:-4]) & 0xFFFFFFFF
+        if crc_stored != crc_calc:
+            raise RuntimeError(
+                tr(
+                    f"Невозможно безопасно выполнить 2E FD E3: ошибка CRC-32 в подблоке EEL 0x0063 {label} "
+                    f"(0x{crc_stored:08X} != 0x{crc_calc:08X}).",
+                    f"Cannot safely execute 2E FD E3: CRC-32 mismatch in EEL 0x0063 sub-block {label} "
+                    f"(0x{crc_stored:08X} != 0x{crc_calc:08X}).",
+                )
+            )
+    sl7_k16 = rec_63[0x2A:0x3A]
+    if sl7_k16 in (b"\xff" * 16, b"\x00" * 16):
+        raise RuntimeError(
+            tr(
+                "Невозможно безопасно выполнить 2E FD E3: ключ SL 7 в резервной копии EEL 0x0063 пуст.",
+                "Cannot safely execute 2E FD E3: SL 7 key in backup EEL 0x0063 is empty.",
+            )
+        )
+
+
 def _read_fde3_affected_records_in_session(
     link: FpkeCanLink,
     prof: dict[str, Any],
@@ -1253,25 +1345,36 @@ def _read_fde3_affected_records_in_session(
         if isinstance(sl7_key, bytes) and len(sl7_key) == 16:
             kombi_authenticate_fd11(link, sl7_key, level=KOMBI_REQUIRED_SL, reporter=reporter)
             id_15b = getattr(link, "_kombi_fd11_id_15b", None)
-        else:
-            with contextlib.suppress(UdsNegativeResponse, Exception):
-                link.request_uds(b"\x2e\xfd\x11\x08\x00", 0x6E, timeout=1.5)
-            raw_id20 = fpke_read_memory_0x23(link, staging_addr, 20, timeout=2.0)
-            id_15b = bytes(raw_id20[:15])
-            link._kombi_fd11_id_15b = id_15b
-
-    id_payload_16 = bytes(id_15b) + b"\xff"
-    id_crc32 = zlib.crc32(id_payload_16) & 0xFFFFFFFF
-    eel_0063[0x02:0x16] = id_payload_16 + struct.pack("<I", id_crc32)
+    if isinstance(id_15b, bytes) and len(id_15b) == 15:
+        id_payload_16 = bytes(id_15b) + b"\xff"
+        id_crc32 = zlib.crc32(id_payload_16) & 0xFFFFFFFF
+        eel_0063[0x02:0x16] = id_payload_16 + struct.pack("<I", id_crc32)
+    else:
+        link.request_uds(b"\x2e\xfd\x11\x08\x00", 0x6E, timeout=1.5)
+        raw_id20 = fpke_read_memory_0x23(link, staging_addr, 20, timeout=2.0)
+        id_crc_stored = int.from_bytes(raw_id20[16:20], "little")
+        id_crc_calc = zlib.crc32(raw_id20[:16]) & 0xFFFFFFFF
+        if id_crc_stored != id_crc_calc:
+            raise RuntimeError(
+                tr(
+                    f"Некорректный CRC-32 в буфере RAM для EEL 0x0063+0x02 (FD11 ID): "
+                    f"0x{id_crc_stored:08X} != 0x{id_crc_calc:08X}.",
+                    f"Invalid RAM staging CRC-32 for EEL 0x0063+0x02 (FD11 ID): "
+                    f"0x{id_crc_stored:08X} != 0x{id_crc_calc:08X}.",
+                )
+            )
+        link._kombi_fd11_id_15b = bytes(raw_id20[:15])
+        eel_0063[0x02:0x16] = bytes(raw_id20)
 
     for _name, cmd, sz, eid, eoff in KOMBI_FD11_STAGED_SUBBLOCKS:
         if eid != 0x0063:
             continue
         reporter.check_cancelled()
-        with contextlib.suppress(UdsNegativeResponse, Exception):
-            link.request_uds(cmd, 0x6E, timeout=2.0)
+        link.request_uds(cmd, 0x6E, timeout=2.0)
         staged = fpke_read_memory_0x23(link, staging_addr, sz, timeout=2.0)
         eel_0063[eoff : eoff + sz] = staged
+
+    _validate_eel63_subblock_crcs(bytes(eel_0063))
 
     records: dict[int, bytes] = {0x0063: bytes(eel_0063)}
     for afeid in KOMBI_2220_FDE3_AFFECTED_EEL_IDS:
@@ -1289,7 +1392,7 @@ def _read_fde3_affected_records_in_session(
                 raw_rec = struct.pack("<H", eel_size) + payload
             except Exception:
                 nvm_blk, nvm_len = KOMBI_NVM_STAGED_EEL_MAP[afeid]
-                kombi_nvm_reload_block(link, nvm_blk)
+                kombi_nvm_reload_block(link, nvm_blk, strict=True)
                 staged_payload = _read_chunked_0x23(link, staging_addr, nvm_len, chunk_size=128)
                 padded_payload = bytes(staged_payload).ljust(eel_size - 2, b"\xff")[: eel_size - 2]
                 raw_rec = struct.pack("<H", eel_size) + padded_payload
@@ -1404,70 +1507,94 @@ def kombi_temporary_immo_mode0(
                     saved_fde3_records[afeid] = bytes(r68_mut)
                 else:
                     saved_fde3_records[afeid] = bytes(rec_b)
-            rec_63 = saved_fde3_records[0x0063]
-            sl7_k16 = rec_63[0x2A:0x3A]
-            sl7_crc = int.from_bytes(rec_63[0x3A:0x3E], "little")
-            if sl7_k16 in (b"\xff" * 16, b"\x00" * 16) or (zlib.crc32(sl7_k16) & 0xFFFFFFFF) != sl7_crc:
-                raise RuntimeError(
-                    tr(
-                        "Невозможно безопасно выполнить 2E FD E3: в резервной копии EEL 0x0063 не прошёл проверку CRC-32 ключа SL 7.",
-                        "Cannot safely execute 2E FD E3: backup EEL 0x0063 failed SL 7 key CRC-32 check.",
-                    )
-                )
-            reporter.can_log(
-                tr(
-                    f"Временное открытие WR_tbl0 на SL 7 (ПО 2220): 2E FD E3 (immo_mode 0x{orig_mode:02X} → 0x00) с восстановлением EEL 0x0063/0x0065..0x006B…",
-                    f"Temporarily unlocking WR_tbl0 at SL 7 (SW 2220): 2E FD E3 (immo_mode 0x{orig_mode:02X} → 0x00) with immediate EEL 0x0063/0x0065..0x006B restore…",
-                )
-            )
-            link.request_uds(b"\x2e\xfd\xe3", 0x6E, timeout=12.0)
-            state["switched"] = True
-            pending_fde3_restore.update(KOMBI_2220_FDE3_AFFECTED_EEL_IDS)
-            cur_val = _poll_ram_immo_mode_zero(link, timeout_s=2.5)
-            if cur_val != 0x00:
-                raise RuntimeError(
-                    tr(
-                        f"Не удалось переключить RAM 0x{ram_immo_addr:08X} в 0x00 через 2E FD E3 (ответ: 0x{cur_val & 0xFF:02X}).",
-                        f"Failed to switch RAM 0x{ram_immo_addr:08X} to 0x00 via 2E FD E3 (got: 0x{cur_val & 0xFF:02X}).",
-                    )
-                )
-            for afeid in KOMBI_2220_FDE3_AFFECTED_EEL_IDS:
-                if afeid not in skip_restore_eids:
-                    _restore_fde3_block(afeid)
-        else:
-            reporter.can_log(
-                tr(
-                    f"Временное открытие WR_tbl0 на SL 7: 0xEF00684B ← 0x00 + 2E FD 3A 00 4D (immo_mode 0x{orig_mode:02X} → 0x00)…",
-                    f"Temporarily unlocking WR_tbl0 at SL 7: 0xEF00684B ← 0x00 + 2E FD 3A 00 4D (immo_mode 0x{orig_mode:02X} → 0x00)…",
-                )
-            )
-            fpke_write_memory_0x3d(link, KOMBI_EEL_IMMO_MODE_VADDR, b"\x00", timeout=4.0)
-            state["switched"] = True
-            kombi_nvm_reload_block(link, KOMBI_NVM_BLOCK_IMMO)
-            cur_val = _poll_ram_immo_mode_zero(link, timeout_s=2.5)
-            if cur_val != 0x00:
-                with contextlib.suppress(Exception):
-                    fpke_write_memory_0x3d(link, KOMBI_EEL_IMMO_MODE_VADDR, bytes([orig_mode]), timeout=4.0)
-                    kombi_nvm_reload_block(link, KOMBI_NVM_BLOCK_IMMO)
-                raise RuntimeError(
-                    tr(
-                        f"Не удалось переключить RAM 0x{ram_immo_addr:08X} в 0x00 через 2E FD 3A 00 4D (ответ: 0x{cur_val & 0xFF:02X}).",
-                        f"Failed to switch RAM 0x{ram_immo_addr:08X} to 0x00 via 2E FD 3A 00 4D (got: 0x{cur_val & 0xFF:02X}).",
-                    )
-                )
+            _validate_eel63_subblock_crcs(saved_fde3_records[0x0063])
+
+    entered_yield = False
     try:
+        if orig_mode != 0x00:
+            if unlock_method == "fde3_sl7_restore":
+                reporter.can_log(
+                    tr(
+                        f"Временное открытие WR_tbl0 на SL 7 (ПО 2220): 2E FD E3 (immo_mode 0x{orig_mode:02X} → 0x00) с восстановлением EEL 0x0063/0x0065..0x006B…",
+                        f"Temporarily unlocking WR_tbl0 at SL 7 (SW 2220): 2E FD E3 (immo_mode 0x{orig_mode:02X} → 0x00) with immediate EEL 0x0063/0x0065..0x006B restore…",
+                    )
+                )
+                link.request_uds(b"\x2e\xfd\xe3", 0x6E, timeout=12.0)
+                state["switched"] = True
+                pending_fde3_restore.update(KOMBI_2220_FDE3_AFFECTED_EEL_IDS)
+                cur_val = _poll_ram_immo_mode_zero(link, timeout_s=2.5)
+                if cur_val != 0x00:
+                    raise RuntimeError(
+                        tr(
+                            f"Не удалось переключить RAM 0x{ram_immo_addr:08X} в 0x00 через 2E FD E3 (ответ: 0x{cur_val & 0xFF:02X}).",
+                            f"Failed to switch RAM 0x{ram_immo_addr:08X} to 0x00 via 2E FD E3 (got: 0x{cur_val & 0xFF:02X}).",
+                        )
+                    )
+                for afeid in KOMBI_2220_FDE3_AFFECTED_EEL_IDS:
+                    if afeid not in skip_restore_eids:
+                        _restore_fde3_block(afeid)
+            else:
+                reporter.can_log(
+                    tr(
+                        f"Временное открытие WR_tbl0 на SL 7: 0xEF00684B ← 0x00 + 2E FD 3A 00 4D (immo_mode 0x{orig_mode:02X} → 0x00)…",
+                        f"Temporarily unlocking WR_tbl0 at SL 7: 0xEF00684B ← 0x00 + 2E FD 3A 00 4D (immo_mode 0x{orig_mode:02X} → 0x00)…",
+                    )
+                )
+                fpke_write_memory_0x3d(link, KOMBI_EEL_IMMO_MODE_VADDR, b"\x00", timeout=4.0)
+                state["switched"] = True
+                kombi_nvm_reload_block(link, KOMBI_NVM_BLOCK_IMMO)
+                cur_val = _poll_ram_immo_mode_zero(link, timeout_s=2.5)
+                if cur_val != 0x00:
+                    raise RuntimeError(
+                        tr(
+                            f"Не удалось переключить RAM 0x{ram_immo_addr:08X} в 0x00 через 2E FD 3A 00 4D (ответ: 0x{cur_val & 0xFF:02X}).",
+                            f"Failed to switch RAM 0x{ram_immo_addr:08X} to 0x00 via 2E FD 3A 00 4D (got: 0x{cur_val & 0xFF:02X}).",
+                        )
+                    )
+        entered_yield = True
         yield state
     finally:
+        restore_val_eff = target_restore if entered_yield else orig_mode
+        failed_fde3: list[int] = []
         if pending_fde3_restore:
             for afeid in list(KOMBI_2220_FDE3_AFFECTED_EEL_IDS):
-                if afeid in pending_fde3_restore:
-                    with contextlib.suppress(Exception):
+                if afeid not in pending_fde3_restore:
+                    continue
+                if afeid == 0x0068 and not entered_yield and afeid in saved_fde3_records and len(saved_fde3_records[afeid]) > 0x4B:
+                    r68_orig_m = bytearray(saved_fde3_records[afeid])
+                    r68_orig_m[0x4B] = orig_mode
+                    saved_fde3_records[afeid] = bytes(r68_orig_m)
+                restored_ok = False
+                for attempt in range(3):
+                    try:
                         _restore_fde3_block(afeid)
-        if state["switched"] or (target_restore != 0x00 and not state["eel68_written"] and prof["can_switch_immo_mode0_at_sl7"]):
-            if not state["eel68_written"]:
-                fpke_write_memory_0x3d(link, KOMBI_EEL_IMMO_MODE_VADDR, bytes([target_restore]), timeout=4.0)
+                        restored_ok = True
+                        break
+                    except Exception as exc:
+                        if attempt + 1 < 3:
+                            time.sleep(0.1)
+                        else:
+                            reporter.warning(
+                                tr(
+                                    f"Не удалось восстановить блок безопасности EEL 0x{afeid:04X} после 3 попыток: {exc}",
+                                    f"Failed to restore security block EEL 0x{afeid:04X} after 3 attempts: {exc}",
+                                )
+                            )
+                if not restored_ok:
+                    failed_fde3.append(afeid)
+        if failed_fde3:
+            ids_hex = ", ".join(f"0x{eid:04X}" for eid in failed_fde3)
+            raise RuntimeError(
+                tr(
+                    f"Критическая ошибка восстановления после 2E FD E3: не удалось восстановить блоки EEL {ids_hex}!",
+                    f"Critical restore failure after 2E FD E3: failed to restore EEL security block(s) {ids_hex}!",
+                )
+            )
+        if state["switched"] or state["eel68_written"] or (target_restore != 0x00 and prof["can_switch_immo_mode0_at_sl7"]):
+            if not state["eel68_written"] and 0x0068 not in pending_fde3_restore:
+                fpke_write_memory_0x3d(link, KOMBI_EEL_IMMO_MODE_VADDR, bytes([restore_val_eff]), timeout=4.0)
             kombi_nvm_reload_block(link, KOMBI_NVM_BLOCK_IMMO)
-            restored_val = _poll_ram_immo_mode_restored(link, target_restore, timeout_s=2.5)
+            restored_val = _poll_ram_immo_mode_restored(link, restore_val_eff, timeout_s=2.5)
             reporter.can_log(
                 tr(
                     f"Статус immo_mode восстановлен: EEL 0x0068+0x4B / RAM 0x{ram_immo_addr:08X} = 0x{restored_val:02X}",
@@ -1613,14 +1740,9 @@ def can_kombi_write_dflash(
                 if eid in KOMBI_ALIGN4_EEL_IDS and rec_bytes[2:4] == b"\xff\xff":
                     payload = bytes(rec_bytes[4:])
                     vaddr = KOMBI_EEL_VIRTUAL_BASE | (eid << 8) | 0x04
-                elif (
-                    prof["sw_profile"] == "2220"
-                    and eid in KOMBI_NVM_STAGED_EEL_MAP
-                    and KOMBI_NVM_STAGED_EEL_MAP[eid][1] < len(rec_bytes) - 2
-                    and rec_bytes[2 + KOMBI_NVM_STAGED_EEL_MAP[eid][1] :]
-                    == b"\xff" * (len(rec_bytes) - 2 - KOMBI_NVM_STAGED_EEL_MAP[eid][1])
-                ):
-                    payload = bytes(rec_bytes[2 : 2 + KOMBI_NVM_STAGED_EEL_MAP[eid][1]])
+                elif prof["sw_profile"] == "2220" and eid in KOMBI_NVM_STAGED_EEL_MAP:
+                    nvm_len = KOMBI_NVM_STAGED_EEL_MAP[eid][1]
+                    payload = bytes(rec_bytes[2 : 2 + nvm_len])
                     vaddr = KOMBI_EEL_VIRTUAL_BASE | (eid << 8) | 0x02
                 else:
                     payload = bytes(rec_bytes[2:])
@@ -1656,16 +1778,14 @@ def can_kombi_write_dflash(
                                 pending_fde3.discard(eid)
                             if eid == 0x0068:
                                 mode_state["eel68_written"] = True
+                                if not needs_mode0:
+                                    kombi_nvm_reload_block(link, KOMBI_NVM_BLOCK_IMMO)
                             elif eid == 0x0065:
                                 kombi_nvm_reload_block(link, 0x004A)
                                 fd11_state_addr = prof.get("ram_fd11_state_addr")
                                 if fd11_state_addr and len(rec_bytes) >= 14:
                                     fpke_write_memory_0x3d(link, int(fd11_state_addr), bytes(rec_bytes[2:14]), timeout=3.0)
-                            elif (
-                                mode_state.get("switched")
-                                and prof.get("immo_mode0_unlock_method") == "fde3_sl7_restore"
-                                and eid in KOMBI_NVM_STAGED_EEL_MAP
-                            ):
+                            elif eid in KOMBI_NVM_STAGED_EEL_MAP:
                                 kombi_nvm_reload_block(link, KOMBI_NVM_STAGED_EEL_MAP[eid][0])
 
                         if 0x0060 in eel_updates:
@@ -1712,7 +1832,16 @@ def can_kombi_write_dflash(
             lay_rb = kombi_eel_layout(dflash_readback)
             for eid, expected_rec in eel_updates.items():
                 got_rec, got_src = eel_read_record_any(lay_rb, dflash_readback, eid)
-                if got_src.get("generation") != "current" or got_rec != expected_rec:
+                if (
+                    prof["sw_profile"] == "2220"
+                    and eid in KOMBI_NVM_STAGED_EEL_MAP
+                    and not readback_meta.get("eel_0063_0064_direct")
+                ):
+                    cmp_len = 2 + KOMBI_NVM_STAGED_EEL_MAP[eid][1]
+                    rec_match = got_rec[:cmp_len] == expected_rec[:cmp_len]
+                else:
+                    rec_match = got_rec == expected_rec
+                if got_src.get("generation") != "current" or not rec_match:
                     raise RuntimeError(
                         tr(
                             f"Контрольная проверка записи EEL 0x{eid:02X} после чтения DataFlash не пройдена!",
@@ -2114,6 +2243,8 @@ def kombi_prepare_additive_coil_learning(
         if 0 < ram_learned <= 8:
             cur_learned = ram_learned
             target_allowed = max(cur_learned + 1, min(8, int(allowed_keys)))
+            if target_allowed > 8:
+                raise RuntimeError(tr("Все 8 слотов ключей уже заняты.", "All 8 key slots are already full."))
         for slot in range(cur_learned, 8):
             r67_payload[slot * 4 : (slot + 1) * 4] = b"\xff\xff\xff\xff"
         r67_payload[0x20] = target_allowed
@@ -2223,7 +2354,6 @@ def kombi_finish_coil_key_learning(
 
     saved_pair = getattr(link, "_saved_coil_key_flags", None)
     eff_restore_flags = restore_key_flags if restore_key_flags is not None else (saved_pair[1] if saved_pair else None)
-    link._saved_coil_key_flags = None
 
     link.request_uds(b"\x10\x03", 0x50, timeout=2.0)
     param = 0x01 if sync_channel3 else 0x00
@@ -2277,7 +2407,8 @@ def kombi_finish_coil_key_learning(
             used_fallback_80_00 = True
 
     kessy_restored = False
-    if eff_restore_flags is not None and (eff_restore_flags & 0x80):
+    needs_kessy_restore = eff_restore_flags is not None and bool(eff_restore_flags & 0x80)
+    if needs_kessy_restore:
         with contextlib.suppress(Exception):
             kombi_ensure_sl7(
                 link,
@@ -2292,9 +2423,12 @@ def kombi_finish_coil_key_learning(
             rec_68 = bytearray(affected[0x0068])
             if 2 + kessy_off < len(rec_68):
                 cur_b = rec_68[2 + kessy_off]
-                base_b = 0x00 if cur_b in (0xAA, 0xFF) else (cur_b & 0x3F)
-                rec_68[2 + kessy_off] = base_b | (eff_restore_flags & 0xC0)
-                r68_plen = KOMBI_NVM_STAGED_EEL_MAP[0x0068][1] if prof["sw_profile"] == "2220" else ( len(rec_68) - 2 )
+                restore_mask = 0x80 if prof["sw_profile"] == "2220" else 0xC0
+                base_b = 0x00 if cur_b in (0xAA, 0xFF) else (cur_b & ~restore_mask)
+                rec_68[2 + kessy_off] = base_b | (eff_restore_flags & restore_mask)
+                if len(rec_68) > 0x4B:
+                    rec_68[0x4B] = 0x01
+                r68_plen = KOMBI_NVM_STAGED_EEL_MAP[0x0068][1] if prof["sw_profile"] == "2220" else (len(rec_68) - 2)
                 with kombi_temporary_immo_mode0(
                     link,
                     restore_mode=1,
@@ -2312,6 +2446,10 @@ def kombi_finish_coil_key_learning(
                     if isinstance(pending_fde3, set):
                         pending_fde3.discard(0x0068)
                 kessy_restored = True
+        if kessy_restored:
+            link._saved_coil_key_flags = None
+    else:
+        link._saved_coil_key_flags = None
 
     poll = fpke_coil_poll_transponder(link, reporter=reporter)
     learned = poll["learned_keys"]
@@ -2367,6 +2505,7 @@ __all__ = [
     "get_active_fpke_link",
     "kombi_authenticate_fd11",
     "kombi_check_sl7",
+    "kombi_clear_sa1_delay_timer",
     "kombi_ensure_sl7",
     "kombi_extract_live_s0_s1_from_coil",
     "kombi_extract_sl7_key",

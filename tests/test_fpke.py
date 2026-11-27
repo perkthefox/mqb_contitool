@@ -80,9 +80,10 @@ def _put_eel_record(df: bytearray, vb: int, ref_idx: int, top_off: int, ident: i
     """Write one EEL T01 virtual block header, DRP reference entry, and top-down word-reversed record."""
     base = vb * 0x800
     if active:
-        # Active VB: p=0x55555555 (+4), a0=0x55555555 (+8), a1=0x55555555 (+0xC), ec=eel_cs24(10+vb) (+0x10)
+        # Active VB: p=0x55555555 (+4), a0=0x55555555 (+8), a1=0x55555555 (+0xC), ec=eel_cs24(10+vb) (+0x10), i1=blank (+0x7FC)
         struct.pack_into("<5I", df, base, 0xFFFFFFFF, EEL_MARK, EEL_MARK, EEL_MARK, eel_cs24(10 + vb))
         struct.pack_into("<I", df, base + 0x14, eel_cs24(0x7FC))
+        struct.pack_into("<I", df, base + 0x7FC, 0xFFFFFFFF)
     else:
         # Invalidated historical VB: i0=0x55555555 (+0), a0=0x55555555 (+8), i1=0x55555555 (+0x7FC)
         struct.pack_into("<5I", df, base, EEL_MARK, EEL_MARK, EEL_MARK, EEL_MARK, eel_cs24(5 + vb))
@@ -845,8 +846,8 @@ def test_fpke_fast_stream_0x6f1_and_automatic_fallback_to_uds_0x23(tmp_path: Pat
     assert FPKE_STREAM_CHUNK_BYTES == 1024
     for mode in ("direct", "bflash", "uflash"):
         app_blob = build_fpke_can_stream_applet(mode)
-        # Must save PSW into caller-saved r18 (`stsr 5, r18, 0; di` = e5974000e0076001) and restore r29 + PSW from r18
-        assert app_blob.startswith(bytes.fromhex("e5974000e0076001"))
+        # Must save PSW into caller-saved r18 and mask PSW.ID|PSW.NP (`stsr 5, r18, 0; ori 0x00A0, r18, r6; ldsr r6, 5, 0`)
+        assert app_blob.startswith(bytes.fromhex("e59740009236a000e62f2000"))
         assert bytes.fromhex("3d06c831dffe3f060ecf09000052f22f20007f00") in app_blob
         assert bytes.fromhex("edff") not in app_blob
 
@@ -3530,6 +3531,152 @@ def test_fpke_unverified_sw_allows_read_and_shows_pn_sw_warning(tmp_path: Path) 
         assert any("83A920700B" in t and "0295" in t and "официально не поддерживается" in t for t in texts)
     finally:
         win.close()
+
+
+def test_fpke_review_fixes_applets_guards_faci_order_and_kombi_reject(tmp_path: Path) -> None:
+    from contitool.can.fpke import (
+        FPKE_BFLASH_BUF_PAYLOAD,
+        FpkeCanLink,
+        _build_faci_block_jobs,
+        build_fpke_bflash_buf_applet,
+        can_fpke_full_read,
+        can_fpke_write_dflash,
+        close_active_fpke_link,
+        flood_payload,
+    )
+    from contitool.core.kombi import EEL_KOMBI_0310_IDS, build_kombi_eel_dflash
+
+    # 1. SW 83A bflash buffer applet uses builder with PSW.ID|PSW.NP masking (not old broken hex constant)
+    bf_83a = build_fpke_bflash_buf_applet("83a")
+    assert bf_83a != FPKE_BFLASH_BUF_PAYLOAD
+    assert bf_83a.startswith(bytes.fromhex("e59740009236a000e62f2000"))
+
+    # 2. Negative flood index and oversized ISO-TP UDS payload are rejected
+    with pytest.raises(ValueError, match="Invalid flood frame index"):
+        flood_payload(-1)
+    with FpkeCanLink("fake", bus=FakeFpkeBus()) as link:
+        with pytest.raises(ValueError, match="4095"):
+            link.send_uds(bytes(4096))
+
+    # 3. can_fpke_write_dflash explicitly rejects Kombi VDD dumps
+    kombi_recs = {eid: struct.pack("<H", sz) + b"\xaa" * (sz - 2) for eid, sz in EEL_KOMBI_0310_IDS.items()}
+    kombi_df = build_kombi_eel_dflash(kombi_recs)
+    with pytest.raises(ValueError, match="Kombi VDD"):
+        can_fpke_write_dflash("fake", kombi_df, bus=FakeFpkeBus(), wake_seconds=0.0, frame_delay=0.0)
+
+    # 4. _build_faci_block_jobs erases recycled VB block 0x000 (clearing A0) BEFORE erasing 0x7C0 (I1), then programs 0x000 last
+    vb_sz = 0x800
+    live_df = bytearray(b"\xff" * FPKE_DFLASH_SIZE)
+    live_mask = bytearray(FPKE_DFLASH_SIZE)
+    tgt_df = bytearray(b"\xff" * FPKE_DFLASH_SIZE)
+    tgt_mask = bytearray(FPKE_DFLASH_SIZE)
+    # VB 0 recycled: live has I0+A0 at 0x000 and I1 at 0x7FC; target has new A0+EC at 0x000 and blank 0x7FC + data at 0x7C0
+    struct.pack_into("<IIII", live_df, 0x000, 0, 0, 0, 0x11111111)
+    live_mask[0x000:0x010] = b"\xff" * 16
+    struct.pack_into("<I", live_df, 0x7FC, 0)
+    live_mask[0x7FC:0x800] = b"\xff" * 4
+    struct.pack_into("<IIII", tgt_df, 0x000, 0xFFFFFFFF, 0, 0, 0x22222222)
+    tgt_mask[0x004:0x010] = b"\xff" * 12
+    struct.pack_into("<I", tgt_df, 0x7C0, 0xCAFEBABE)
+    tgt_mask[0x7C0:0x7C4] = b"\xff" * 4
+    jobs = _build_faci_block_jobs(bytes(live_df), live_mask, bytes(tgt_df), tgt_mask, vb_size=vb_sz, pool_end=28 * vb_sz)
+    offs = [(j["blk_off"], j["do_erase"], j["prog_mask"]) for j in jobs]
+    assert offs[0] == (0x000, True, 0)  # erase A0 first
+    assert offs[1][0] == 0x7C0 and offs[1][1] is True  # then erase/program 0x7C0 (clearing I1)
+    assert offs[2][0] == 0x000 and offs[2][1] is False and offs[2][2] != 0  # finally program new A0 + EC
+
+    # 5. Verified 5NA920790D SW 1701 formats dynamic target label; unverified SW 1799 survives ExtraArea failure
+    close_active_fpke_link()
+    bus_1701 = FakeFpkeBus(sw_profile="1703")
+    bus_1701.ident_map[0xF187] = b"5NA920790D "
+    bus_1701.ident_map[0xF189] = b"1701"
+    rep_1701 = can_fpke_full_read(
+        "fake",
+        session_dir=tmp_path / "fpke_1701",
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        bus=bus_1701,
+    )
+    assert rep_1701["target"] == "VAG FPK_E (5NA920790D SW 1701)"
+    assert rep_1701["officially_supported"] is True
+
+    close_active_fpke_link()
+    bus_unver = FakeFpkeBus(sw_profile="1703")
+    bus_unver.ident_map[0xF187] = b"5NA920790D "
+    bus_unver.ident_map[0xF189] = b"1799"
+    bus_unver.extra = b"\xff" * 256  # invalid ExtraArea forces ExtraArea failure on unverified SW
+    rep_unver = can_fpke_full_read(
+        "fake",
+        session_dir=tmp_path / "fpke_1799",
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        bus=bus_unver,
+    )
+    assert rep_unver["target"] == "VAG FPK_E (5NA920790D SW 1799)"
+    assert rep_unver["officially_supported"] is False
+    assert rep_unver["idauth"]["skipped"] is True
+    assert rep_unver["dflash"]["blank_checked"] is False
+    assert (tmp_path / "fpke_1799" / "Dflash.bin").read_bytes() == bus_unver.dflash
+
+
+def test_fpke_dflash_read_runs_hardware_blank_check_and_cleans_floating_gate_noise(tmp_path: Path) -> None:
+    """RV40F DataFlash erased cells read back as random floating-gate noise over CPU 0x23.
+    `can_fpke_full_read()` and `can_fpke_read_region(mode='dflash', blank_check_dflash=True)` must run
+    hardware FACI Blank-Check (0x71) and overwrite every BCST==0 word with deterministic 0xFF so the
+    saved `Dflash.bin` is safe to flash directly with an external programmer."""
+    import hashlib
+
+    from contitool.can.fpke import can_fpke_full_read, can_fpke_read_region, close_active_fpke_link
+    from contitool.core.fpke import eel_faci_word_mask, fpke_eel_layout
+
+    close_active_fpke_link()
+    bus = FakeFpkeBus()
+    clean_expected = bytes(bus.dflash)
+    bus.faci_mask = eel_faci_word_mask(fpke_eel_layout(None, clean_expected), clean_expected)
+
+    # Inject non-FF floating-gate noise into EVERY genuinely erased word (faci_mask == 0)
+    noisy = bytearray(clean_expected)
+    injected_noise_words = 0
+    for pos in range(0, FPKE_DFLASH_SIZE, 4):
+        if not any(bus.faci_mask[pos : pos + 4]):
+            noisy[pos : pos + 4] = bytes([(pos >> 2) & 0xFE, 0x5A, 0xA5, 0x3C])
+            injected_noise_words += 1
+    assert injected_noise_words > 1000
+    bus.dflash = bytes(noisy)
+
+    # 1. can_fpke_full_read() runs hardware FACI Blank-Check by default and strips ALL floating-gate noise
+    rep = can_fpke_full_read(
+        "fake",
+        session_dir=tmp_path / "full_bc",
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        bus=bus,
+    )
+    saved_full = (tmp_path / "full_bc" / "Dflash.bin").read_bytes()
+    assert saved_full == clean_expected
+    assert rep["dflash"]["blank_checked"] is True
+    assert rep["dflash"]["blank_check_method"] == "faci_0x71"
+    assert rep["dflash"]["cleaned_noise_words"] == injected_noise_words
+    assert rep["dflash"]["sha256"] == hashlib.sha256(clean_expected).hexdigest()
+    assert rep["idauth"]["idst_after_relock"] == "01000000"
+    assert bus.idst == b"\x01\x00\x00\x00"  # IDAUTH relocked cleanly
+
+    # 2. can_fpke_read_region(mode="dflash", blank_check_dflash=True) also cleans all noise and relocks IDAUTH
+    rep_reg = can_fpke_read_region(
+        "fake",
+        mode="dflash",
+        frame_delay=0.0,
+        wake_seconds=0.0,
+        blank_check_dflash=True,
+        session_dir=tmp_path / "region_bc",
+        bus=bus,
+    )
+    assert (tmp_path / "region_bc" / "Dflash.bin").read_bytes() == clean_expected
+    assert rep_reg["read"]["blank_checked"] is True
+    assert rep_reg["read"]["cleaned_noise_words"] == injected_noise_words
+    assert bus.idst == b"\x01\x00\x00\x00"
+
+
 
 
 

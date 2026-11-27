@@ -1097,5 +1097,67 @@ def test_kombi_2220_8v0920860e_sl7_extraction_and_130_record_staged_read(tmp_pat
     assert meta_s3["sa1_delay_timer_reset"]["needs_restage"] is True
 
 
+def test_kombi_2220_75byte_eel68_kessy_bit7_and_uflash_guard() -> None:
+    from contitool.core.fpke import parse_fpke_immo_config
+    from contitool.core.kombi import (
+        EEL_KOMBI_2220_IDS,
+        apply_kombi_dflash_edits,
+        build_kombi_eel_dflash,
+        is_kombi_dflash,
+    )
+
+    # 1. 32 KiB random/Uflash-like bytes must NOT false-positive as Kombi physical DataFlash
+    assert is_kombi_dflash(bytes(range(256)) * 128) is False
+
+    # 2. SW 2220 75-byte EEL 0x0068 layout: rec[0x41] bit 7 = key_over_can, bits 0..6 = partners_mask, rec[0x4D:0x80] == 0xFF*51
+    base_recs = _build_synthetic_kombi_records()
+    recs_2220: dict[int, bytes] = {}
+    for eid, sz in sorted(EEL_KOMBI_2220_IDS.items()):
+        if eid in base_recs and len(base_recs[eid]) == sz:
+            recs_2220[eid] = base_recs[eid]
+        elif eid in base_recs:
+            recs_2220[eid] = struct.pack("<H", sz) + base_recs[eid][2:sz].ljust(sz - 2, b"\xff")
+        else:
+            recs_2220[eid] = struct.pack("<H", sz) + (b"\xff" * (sz - 2))
+    r68 = bytearray(recs_2220[0x0068])
+    r68[0x40] = 0x42  # power_class
+    r68[0x41] = 0x83  # bit 7 = key_over_can (True), bits 0..6 = 0x03 (MSG_1 + GSG)
+    r68[0x4B] = 0x01  # immo_mode
+    r68[0x4C] = 0x01  # identity_counter
+    r68[0x4D:0x80] = b"\xff" * 51
+    recs_2220[0x0068] = bytes(r68)
+
+    cfg = parse_fpke_immo_config(recs_2220[0x0066], recs_2220[0x0068])
+    assert cfg["power_class"] == 0x42
+    assert cfg["key_over_can"] is True
+    assert cfg["partners_mask"] == 0x03
+
+    df_2220 = build_kombi_eel_dflash(recs_2220)
+    edited_df = apply_kombi_dflash_edits(
+        df_2220,
+        key_over_can=False,
+        partners_mask=0x23,
+    )
+    from contitool.core.fpke import eel_read_record_any
+    from contitool.core.kombi import analyze_kombi_dflash, kombi_eel_layout
+
+    lay_2220 = kombi_eel_layout(edited_df)
+    r68_after, _ = eel_read_record_any(lay_2220, edited_df, 0x0068)
+    assert r68_after is not None
+    assert r68_after[0x41] == 0x23  # bit 7 cleared, bits 0..6 = 0x23
+    assert r68_after[0x4D:0x80] == b"\xff" * 51  # 51-byte tail untouched
+    an = analyze_kombi_dflash(edited_df)
+    assert an["immo_config"]["key_over_can"] is False
+    assert an["immo_config"]["partners_mask"] == 0x23
+
+    # Toggling key_over_can back to True must set bit 7 while preserving partners_mask=0x23
+    edited_df2 = apply_kombi_dflash_edits(edited_df, key_over_can=True)
+    r68_after2, _ = eel_read_record_any(lay_2220, edited_df2, 0x0068)
+    assert r68_after2 is not None
+    assert r68_after2[0x41] == 0xA3
+    assert r68_after2[0x4D:0x80] == b"\xff" * 51
+
+
+
 
 
