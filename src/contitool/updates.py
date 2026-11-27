@@ -18,7 +18,7 @@ RELEASES_PAGE = "https://github.com/perkthefox/mqb_contitool/releases/latest"
 RELEASES_ALL_PAGE = "https://github.com/perkthefox/mqb_contitool/releases"
 CHECK_EVERY = 20 * 3600  # seconds between automatic checks
 
-_VERSION_RE = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?([a-z]?)(?:-rc(\d+))?")
+_VERSION_RE = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?([a-z]?)(?:-rc(\d+)([a-z]?))?")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,7 +56,7 @@ def releases_api_url(channel: str) -> str:
 def version_key(version: str) -> tuple[int, ...]:
     """Parse a release version into a comparable tuple.
 
-    `2.0.1` < `2.0.1a` < `2.0.1e` < `2.0.2` < `2.3.0-rc1` < `2.3.0-rc2` < `2.3.0-rc10` < `2.3.0`.
+    `2.0.1` < `2.0.1a` < `2.0.1e` < `2.0.2` < `2.3.0-rc1` < `2.3.0-rc1a` < `2.3.0-rc2` < `2.3.0-rc10` < `2.3.0`.
     `2.1` is `2.1.0`. Anything else (e.g. `nightly`, `2.0.3-dev`, `2.0.3rc1`) gives `()`, which is never newer.
     """
     m = _VERSION_RE.fullmatch(version.strip().lower())
@@ -65,8 +65,9 @@ def version_key(version: str) -> tuple[int, ...]:
     major, minor, patch = int(m[1]), int(m[2]), int(m[3] or 0)
     letter = (ord(m[4]) - 96) if m[4] else 0
     if m[5] is not None:
-        return major, minor, patch, letter, 0, int(m[5])
-    return major, minor, patch, letter, 1, 0
+        rc_letter = (ord(m[6]) - 96) if m[6] else 0
+        return major, minor, patch, letter, 0, int(m[5]), rc_letter
+    return major, minor, patch, letter, 1, 0, 0
 
 
 def _arch_tokens(machine: str) -> tuple[str, ...]:

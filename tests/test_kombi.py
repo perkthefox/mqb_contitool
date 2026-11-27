@@ -1255,6 +1255,55 @@ def test_kombi_6p0920740a_sw1422_auto_discovers_ram_staging_and_fe30_eel_layout(
     assert info_from_logical["metadata"]["vin"] == "XW8ZZZ5NZJG235992"
 
 
+def test_kombi_ram_scanner_edge_cases_tail_l06_and_range2_scoring() -> None:
+    """Verify RAM scanner disambiguates L0..6 at chunk tail (+468) vs SL 7 (+488) and prefers score>=2 in range 2 over score==1 decoy in range 1."""
+    import zlib
+    from contitool.can.kombi import _scan_ram_for_sl7_key
+    from contitool.can.transport import UdsNegativeResponse
+
+    l06_key = bytes(range(0x10, 0x20))
+    l06_rec = l06_key + struct.pack("<I", zlib.crc32(l06_key) & 0xFFFFFFFF)
+    sl7_key = bytes(range(0x40, 0x50))
+    sl7_rec = sl7_key + struct.pack("<I", zlib.crc32(sl7_key) & 0xFFFFFFFF)
+    decoy_key = bytes(range(0x80, 0x90))
+    decoy_rec = decoy_key + struct.pack("<I", zlib.crc32(decoy_key) & 0xFFFFFFFF)
+
+    # Place decoy (score=1, no NvM header) in range 1 @ 0xFEDD0400, and real staging buffer in range 2
+    # with L0..6 landing right at chunk tail (0xFEDD8000 + 468) and SL 7 at +488!
+    real_staging = 0xFEDD8000 + 468 - 0x14  # 0xFEDD81C0
+    real_sl7 = real_staging + 0x28          # 0xFEDD81E8
+
+    class EdgeScanLink:
+        def __init__(self) -> None:
+            self.mem: dict[int, int] = {}
+            for i, b in enumerate(decoy_rec):
+                self.mem[0xFEDD0400 + i] = b
+            for i, b in enumerate(bytes.fromhex("1800000000080000")):
+                self.mem[real_staging - 8 + i] = b
+            for i, b in enumerate(l06_rec):
+                self.mem[real_staging + 0x14 + i] = b
+            for i, b in enumerate(sl7_rec):
+                self.mem[real_sl7 + i] = b
+
+        def request_uds(self, req: bytes, expected_first_byte: int | None = None, *, timeout: float = 2.0) -> bytes:  # noqa: ARG002
+            if req == b"\x3e\x00":
+                return b"\x7e\x00"
+            if req[:2] == b"\x23\x44":
+                addr, size = struct.unpack(">II", req[2:10])
+                # Simulate a protected hole at 0xFEDD4000..0xFEDD4080 inside range 1
+                if addr < 0xFEDD4080 and addr + size > 0xFEDD4000:
+                    raise UdsNegativeResponse(0x23, 0x33, "protected")
+                return b"\x63" + bytes(self.mem.get(addr + i, 0) for i in range(size))
+            raise UdsNegativeResponse(req[0], 0x11, "unsupported")
+
+    found = _scan_ram_for_sl7_key(EdgeScanLink(), checked_addrs={KOMBI_RAM_SL7_KEY_ADDR})  # type: ignore[arg-type]
+    assert found is not None
+    found_key, found_crc, found_addr = found
+    assert found_addr == real_sl7
+    assert found_key == sl7_key
+    assert found_crc == (zlib.crc32(sl7_key) & 0xFFFFFFFF)
+
+
 
 
 

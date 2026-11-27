@@ -470,12 +470,15 @@ def kombi_eel_layout(
             chosen_ids = dict(EEL_KOMBI_0310_IDS)
             lat_win = lat_0310
         # Adapt to self-describing `<H` record headers from other V850E2 SW revisions (e.g. 6P0 920 740 A SW 1422)
-        if max(ok_0310, ok_2220) >= 32:
+        if max(ok_0310, ok_2220) >= 32 and lat_win:
             for ident, (_vb, top, _ref) in lat_win.items():
                 if top + 2 <= len(dflash):
                     hdr_sz = int.from_bytes(dflash[top : top + 2], "little")
                     if 3 <= hdr_sz <= 512:
                         chosen_ids[ident] = hdr_sz
+            max_present = max(lat_win)
+            for extra_id in [k for k in chosen_ids if k > max_present]:
+                del chosen_ids[extra_id]
     if chosen_ids is None:
         chosen_ids = dict(EEL_KOMBI_0310_IDS)
     return {
@@ -747,7 +750,7 @@ def is_kombi_dflash(data: bytes) -> bool:
     if len(data) == KOMBI_DFLASH_SYNTH_SIZE and is_fpke_dflash(data):
         lay = kombi_eel_layout(data)
         _blocks, latest = eel_parse_pool(lay, data)
-        if not latest or any(ident > 160 for ident in latest):
+        if not latest or any(ident > 200 for ident in latest):
             return False
         ok_cnt = sum(
             1

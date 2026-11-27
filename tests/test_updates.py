@@ -38,6 +38,8 @@ def test_letter_fixes_and_rc_order_between_releases() -> None:
         < version_key("2.2.1")
         < version_key("2.2.1a")
         < version_key("v2.3.0-rc1")
+        < version_key("2.3.0-rc1a")
+        < version_key("2.3.0-rc1b")
         < version_key("2.3.0-rc2")
         < version_key("2.3.0-rc10")
         < version_key("2.3.0")
@@ -47,9 +49,14 @@ def test_letter_fixes_and_rc_order_between_releases() -> None:
     assert version_key("2.0.3-dev") == ()
     assert version_key("2.0.3rc1") == ()
     assert is_candidate_version("2.3.0-rc1") is True
+    assert is_candidate_version("2.3.0-rc1a") is True
     assert is_candidate_version("v2.3.0-rc12") is True
     assert is_candidate_version("2.2.1a") is False
     assert is_candidate_version("2.3.0") is False
+    assert default_channel("2.3.0-rc1a") == CHANNEL_CANDIDATE
+    assert newer_release(_release("v2.3.0-rc1a", prerelease=True), "2.2.1a", channel=CHANNEL_STABLE) is None
+    rel_rc1a = newer_release([_release("v2.3.0-rc1a", prerelease=True)], "2.3.0-rc1", channel=CHANNEL_CANDIDATE)
+    assert rel_rc1a is not None and rel_rc1a.version == "2.3.0-rc1a"
 
 
 def test_only_a_newer_release_is_offered_with_this_os_archive() -> None:

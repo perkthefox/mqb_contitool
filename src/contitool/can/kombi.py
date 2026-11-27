@@ -54,7 +54,6 @@ from contitool.core.kombi import (
     KOMBI_2220_FDE3_AFFECTED_EEL_IDS,
     KOMBI_2220_RAM_FD11_STATE_ADDR,
     KOMBI_2220_RAM_SL7_KEY_ADDR,
-    KOMBI_2220_RAM_STAGING_ADDR,
     KOMBI_ALIGN4_EEL_IDS,
     KOMBI_CFLASH_ADDR,
     KOMBI_CFLASH_SIZE,
@@ -312,8 +311,7 @@ def kombi_clear_sa1_delay_timer(
 KOMBI_SL7_SCAN_RANGES: tuple[tuple[int, int], ...] = (
     (0xFEDD0000, 0xFEDD8000),  # Primary NvM .bss region (SW 2220 @ 0xFEDD2480, SW 0310 @ 0xFEDD5530)
     (0xFEDD8000, 0xFEDE0000),  # Upper 0xFEDDxxxx RAM
-    (0xFEDC9600, 0xFEDD0000),  # RAM immediately above protected Immo/CP mirror window
-    (0xFEDC0000, 0xFEDC8900),  # Lower RAM below protected Immo/CP mirror window
+    (0xFEDC0000, 0xFEDD0000),  # Lower RAM (protected Immo/CP hole is skipped dynamically via 128 B fallback)
     (0xFEDE0000, 0xFEE00000),  # Upper V850E2 RAM fallback
 )
 
@@ -358,24 +356,73 @@ def _scan_ram_for_sl7_key(
     chunk_size = 500
     stride = 432  # 68-byte 4-byte-aligned overlap holds full [8B NvM header + 40B prefix + 20B SL7 record]
     reqs_done = 0
+    best_fallback: tuple[int, bytes, int, int] | None = None
+
+    def _scan_segment(buf: bytes, base_addr: int) -> tuple[bytes, int, int] | None:
+        nonlocal best_fallback
+        if len(buf) < 20:
+            return None
+        limit = len(buf) - 20
+        for pos in range(0, limit + 1, 4):
+            cand_addr = base_addr + pos
+            if cand_addr in already:
+                continue
+            ok, k16, c_st, _ = _is_valid_kombi_sl7_record(buf[pos : pos + 20])
+            if not ok:
+                continue
+            # Disambiguate L0..6 (+0x14) vs SL 7 (+0x28): if cand_addr + 20 is ALSO a valid [16B key + 4B CRC32],
+            # then cand_addr is L0..6 and cand_addr + 20 is SL 7!
+            if pos + 40 <= len(buf):
+                ok_next, _, _, _ = _is_valid_kombi_sl7_record(buf[pos + 20 : pos + 40])
+                if ok_next:
+                    continue
+            else:
+                with contextlib.suppress(UdsNegativeResponse, Exception):
+                    peek_next = fpke_read_memory_0x23(link, cand_addr + 20, 20, timeout=1.2)
+                    ok_next, _, _, _ = _is_valid_kombi_sl7_record(peek_next)
+                    if ok_next:
+                        continue
+
+            score = 1
+            if pos >= 20:
+                ok_prev, _, _, _ = _is_valid_kombi_sl7_record(buf[pos - 20 : pos])
+                if ok_prev:
+                    score += 3
+            if (
+                pos >= 0x28
+                and isinstance(fd11_id_15b, bytes)
+                and len(fd11_id_15b) == 15
+                and buf[pos - 0x28 : pos - 0x28 + 15] == fd11_id_15b
+            ):
+                score += 4
+            if pos >= 0x30:
+                hdr = buf[pos - 0x30 : pos - 0x28]
+                blk_id = int.from_bytes(hdr[0:2], "little")
+                if hdr[2] in (0, 1) and hdr[3] == 0 and hdr[5] == 0x08 and 1 <= blk_id <= 0x0100:
+                    score += 3 if blk_id in (0x0018, 0x005C) else 2
+
+            if score >= 2:
+                return k16, c_st, cand_addr
+            if best_fallback is None or score > best_fallback[0]:
+                best_fallback = (score, k16, c_st, cand_addr)
+        return None
 
     for start_addr, end_addr in KOMBI_SL7_SCAN_RANGES:
-        best_region_match: tuple[int, bytes, int, int] | None = None
         addr = start_addr
         while addr < end_addr:
             reporter.check_cancelled()
             read_len = min(chunk_size, end_addr - addr)
             if read_len < 20:
                 break
-            buf: bytes | None = None
-            base_addr = addr
+            segments: list[tuple[int, bytes]] = []
             try:
-                buf = fpke_read_memory_0x23(link, addr, read_len, timeout=1.5)
+                segments.append((addr, fpke_read_memory_0x23(link, addr, read_len, timeout=1.5)))
             except UdsNegativeResponse:
-                # Near a protected RAM boundary, try smaller 128-byte sub-reads before moving on
+                # Near a protected RAM boundary, split into 128-byte sub-reads and keep EVERY readable segment
                 sub_buf = bytearray()
                 sub_base: int | None = None
                 for sub_off in range(0, read_len, 128):
+                    reporter.check_cancelled()
                     sub_sz = min(128, read_len - sub_off)
                     if sub_sz < 20:
                         break
@@ -384,14 +431,15 @@ def _scan_ram_for_sl7_key(
                         if sub_base is None:
                             sub_base = addr + sub_off
                         sub_buf.extend(part)
+                    except OperationCancelledError:
+                        raise
                     except Exception:
-                        if len(sub_buf) >= 20:
-                            break
+                        if sub_base is not None and len(sub_buf) >= 20:
+                            segments.append((sub_base, bytes(sub_buf)))
                         sub_buf.clear()
                         sub_base = None
                 if sub_base is not None and len(sub_buf) >= 20:
-                    buf = bytes(sub_buf)
-                    base_addr = sub_base
+                    segments.append((sub_base, bytes(sub_buf)))
             except OperationCancelledError:
                 raise
             except Exception:
@@ -402,50 +450,16 @@ def _scan_ram_for_sl7_key(
                 with contextlib.suppress(Exception):
                     link.request_uds(b"\x3e\x00", 0x7E, timeout=1.0)
 
-            if buf is not None and len(buf) >= 20:
-                limit = len(buf) - 20
-                for pos in range(0, limit + 1, 4):
-                    cand_addr = base_addr + pos
-                    if cand_addr in already:
-                        continue
-                    ok, k16, c_st, _ = _is_valid_kombi_sl7_record(buf[pos : pos + 20])
-                    if not ok:
-                        continue
-                    # Disambiguate L0..6 (+0x14) vs SL 7 (+0x28): if pos+20 is ALSO a valid [16B key + 4B CRC32],
-                    # then pos is L0..6 and pos+20 is SL 7!
-                    if pos + 40 <= len(buf):
-                        ok_next, _, _, _ = _is_valid_kombi_sl7_record(buf[pos + 20 : pos + 40])
-                        if ok_next:
-                            continue
-
-                    score = 1
-                    if pos >= 20:
-                        ok_prev, _, _, _ = _is_valid_kombi_sl7_record(buf[pos - 20 : pos])
-                        if ok_prev:
-                            score += 3
-                    if (
-                        pos >= 0x28
-                        and isinstance(fd11_id_15b, bytes)
-                        and len(fd11_id_15b) == 15
-                        and buf[pos - 0x28 : pos - 0x28 + 15] == fd11_id_15b
-                    ):
-                        score += 4
-                    if pos >= 0x30:
-                        hdr = buf[pos - 0x30 : pos - 0x28]
-                        blk_id = int.from_bytes(hdr[0:2], "little")
-                        if hdr[2] in (0, 1) and hdr[3] == 0 and hdr[5] == 0x08 and 1 <= blk_id <= 0x0100:
-                            score += 3 if blk_id in (0x0018, 0x005C) else 2
-
-                    if score >= 2:
-                        return k16, c_st, cand_addr
-                    if best_region_match is None or score > best_region_match[0]:
-                        best_region_match = (score, k16, c_st, cand_addr)
+            for seg_base, seg_buf in segments:
+                hit = _scan_segment(seg_buf, seg_base)
+                if hit is not None:
+                    return hit
 
             addr += stride
 
-        if best_region_match is not None:
-            _, b_k16, b_crc, b_addr = best_region_match
-            return b_k16, b_crc, b_addr
+    if best_fallback is not None:
+        _, b_k16, b_crc, b_addr = best_fallback
+        return b_k16, b_crc, b_addr
 
     return None
 
@@ -572,6 +586,7 @@ def kombi_extract_sl7_key(
             reporter=reporter,
         )
         if scanned is not None:
+            orig_sl7_addr = sl7_key_addr
             key_16b, crc_stored, found_sl7_addr = scanned
             crc_calc = crc_stored
             found_staging_addr = found_sl7_addr - 0x28
@@ -579,7 +594,7 @@ def kombi_extract_sl7_key(
             staging_addr = found_staging_addr
             prof["ram_sl7_key_addr"] = found_sl7_addr
             prof["ram_staging_addr"] = found_staging_addr
-            if found_sl7_addr not in (KOMBI_RAM_SL7_KEY_ADDR, KOMBI_2220_RAM_SL7_KEY_ADDR):
+            if found_sl7_addr != orig_sl7_addr:
                 prof["auto_discovered_ram"] = True
             link._kombi_sw_profile = prof
             reporter.can_log(
@@ -1130,7 +1145,12 @@ def kombi_read_all_eel_in_session(
     if eel_ids[0x0064] > 0x2A:
         tail_sz = eel_ids[0x0064] - 0x2A
         with contextlib.suppress(Exception):
-            tail_64 = _read_chunked_0x23(link, KOMBI_EEL_VIRTUAL_BASE | (0x0064 << 8) | 0x2A, tail_sz, chunk_size=tail_sz)
+            tail_64 = _read_chunked_0x23(
+                link,
+                KOMBI_EEL_VIRTUAL_BASE | (0x0064 << 8) | 0x2A,
+                tail_sz,
+                chunk_size=min(tail_sz, 128),
+            )
             eel_0064[0x2A : 0x2A + tail_sz] = tail_64
 
     # 2. Read live EEL physical word-offset table in RAM (n_blocks x 2 bytes)
