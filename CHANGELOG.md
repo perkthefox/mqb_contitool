@@ -1,5 +1,30 @@
 # Changelog / История изменений
 
+## 2.3.0-rc2 — 2026-11-27
+
+> [!WARNING]
+> **🇷🇺 Релиз-кандидат `2.3.0-rc2` — тестовая сборка ветки `2.3.0`, не основной релиз.**
+> Для повседневной работы со шлюзом `19 J533` оставайтесь на стабильном **[`v2.2.1a`](https://github.com/perkthefox/mqb_contitool/releases/latest)**. Все изменения ветки `2.3.0` и чеклист обкатки отслеживаются в **[PR #58](https://github.com/perkthefox/mqb_contitool/pull/58)**.
+>
+> **🇬🇧 Release Candidate `2.3.0-rc2` — preview build of the `2.3.0` branch, not the stable release.**
+> For daily `19 J533` gateway work, stay on stable **[`v2.2.1a`](https://github.com/perkthefox/mqb_contitool/releases/latest)**. Full `2.3.0` tracking and stabilization checklist live in **[PR #58](https://github.com/perkthefox/mqb_contitool/pull/58)**.
+
+### 🇷🇺 Что нового в `2.3.0-rc2` (поверх `2.3.0-rc1`)
+- **`17 Kombi VDD (V850E2)` — универсальный автопоиск `SL 7` в RAM на неизвестных версиях ПО (включая `6P0 920 740 A SW 1422`):**
+  - Если по адресам известных профилей (`0xFEDD5530` / `0xFEDD2480`) проверка `CRC-32` ключа `FD11 Supplier Level 7` не сходится, ContiTool автоматически сканирует `V850E2 RAM` (`0xFEDD0000..0xFEDFFFFF` / `0xFEDC0000..0xFEDD0000`) чанками по `500 Б` (с обходом защищённых областей по `128 Б`), находит смещённый буфер `NvM staging` и 20-байтную запись `SL 7` (`[16B ключ || 4B CRC-32]`), отличает ключ `L0..6` (`+0x14`) от `SL 7` (`+0x28`), и проверяет заголовок NvM-менеджера на `staging - 8`.
+  - После входа в `SL 7` запрашивается штатный **`DID 22 FE 30`** и из CodeFlash автоматически вычитывается актуальная таблица размеров блоков `EEL` (`n_blocks` и размер каждого блока) вместе с реальным адресом таблицы физических смещений в RAM.
+  - Парсеры `Dflash.bin` / `EelLogical.bin` (`kombi_eel_layout`, `unpack_kombi_logical_eel`, `is_kombi_dflash`, `detect_kombi_files`) поддерживают динамические `<H`-размеры записей; на непроверенных SW с автонайденным RAM чтение остаётся строго **read-only**.
+- **Автообновления:** добавлена поддержка буквенных хотфиксов у релиз-кандидатов (`-rc1a`, `-rc2a` и т. д.) с сохранением строгой изоляции каналов `stable` и `candidate`.
+
+### 🇬🇧 What's New in `2.3.0-rc2` (since `2.3.0-rc1`)
+- **`17 Kombi VDD (V850E2)` — universal RAM auto-discovery for `SL 7` on unverified SW revisions (including `6P0 920 740 A SW 1422`):**
+  - When the primary known profile address (`0xFEDD5530` / `0xFEDD2480`) fails `CRC-32` validation, ContiTool automatically checks the alternate known address and scans V850E2 RAM (`0xFEDD0000..0xFEDFFFFF` / `0xFEDC0000..0xFEDD0000`) in 500-byte chunks (with 128-byte fallback around protected holes), locating the shifted NvM staging buffer and 20-byte `SL 7` record (`[16B key || 4B LE CRC-32]`), disambiguating `L0..6` (`+0x14`) vs `SL 7` (`+0x28`), and validating the 8-byte NvM state header at `staging - 8`.
+  - Once at `SL 7`, ContiTool queries **`DID 22 FE 30`** and reads the live CodeFlash EEL descriptor table to auto-adapt `n_blocks`, per-block byte sizes, and the live RAM physical offset table address.
+  - `Dflash.bin` / `EelLogical.bin` parsers (`kombi_eel_layout`, `unpack_kombi_logical_eel`, `is_kombi_dflash`, `detect_kombi_files`) now handle dynamic self-describing `<H` record sizes; reads on unverified SW revisions stay strictly **read-only**.
+- **Updater:** added support for letter-suffixed RC hotfixes (`-rc1a`, `-rc2a`, etc.) while keeping `stable` and `candidate` channel isolation intact.
+
+---
+
 ## 2.3.0-rc1 — 2026-11-27
 
 > [!WARNING]

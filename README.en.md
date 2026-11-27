@@ -10,7 +10,7 @@
 
 [![Русский](https://img.shields.io/badge/%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9-README-2563EB?style=for-the-badge)](README.md)
 [![Stable v2.2.1a](https://img.shields.io/badge/Stable-v2.2.1a-16A34A?style=for-the-badge)](https://github.com/perkthefox/mqb_contitool/releases/latest)
-[![Next v2.3.0-rc1](https://img.shields.io/badge/Next%20RC-v2.3.0--rc1-D97706?style=for-the-badge)](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)
+[![Next v2.3.0-rc2](https://img.shields.io/badge/Next%20RC-v2.3.0--rc2-D97706?style=for-the-badge)](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc2)
 [![Platforms](https://img.shields.io/badge/GUI%20%2B%20CLI-Windows%20%7C%20macOS%20%7C%20Linux-0F172A?style=for-the-badge)](#quick-start)
 [![License](https://img.shields.io/badge/License-PolyForm%20NC-0284C7?style=for-the-badge)](#license)
 
@@ -25,11 +25,11 @@
 
 <br>
 
-| Stable Release · **`v2.2.1a`** *(main)* | Release Candidate · **`v2.3.0-rc1`** *(2.3 preview)* |
+| Stable Release · **`v2.2.1a`** *(main)* | Release Candidate · **`v2.3.0-rc2`** *(2.3 preview)* |
 | :--- | :--- |
 | Battle-tested release for everyday **`19 J533`** (`3Q0 907 530`) gateway work. | Massive 2.3 expansion covering **all six MQB ECUs**: `17 FPK_E / AID`, `17 Kombi VDD`, `09 BCM`, `13 ACC MRR`, `2B ELV`, CAN bus scanner, and the transparent `J533` RAM-Bridge. |
 | **Pick this one** for rock-solid daily `J533` servicing. Switch to the `candidate` update channel in **Settings** anytime. | **Unstable channel:** features may fail, misbehave, or be outright broken. Bench use with full backups only — please report bugs in [Issues](https://github.com/perkthefox/mqb_contitool/issues). |
-| 👉 **[Download stable v2.2.1a](https://github.com/perkthefox/mqb_contitool/releases/latest)** | 👉 **[Try v2.3.0-rc1](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)** |
+| 👉 **[Download stable v2.2.1a](https://github.com/perkthefox/mqb_contitool/releases/latest)** | 👉 **[Try v2.3.0-rc2](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc2)** |
 
 <p align="center">
   <img src="assets/screenshots/en_features.png" alt="ContiTool: an open ECU, SWaP feature activation with the gateway's own answer" width="100%">
@@ -118,11 +118,11 @@ Servicing VAG MQB control units normally means juggling expensive dongles, bench
 
 Grab a build from **[GitHub Releases](https://github.com/perkthefox/mqb_contitool/releases)**. Windows builds bundle verified D-PDU driver `27.2` (`dpdu/VW_PDUAPI_27.2`).
 
-| OS | Stable **`v2.2.1a`** *(main)* | Release Candidate **`v2.3.0-rc1`** *(unstable)* |
+| OS | Stable **`v2.2.1a`** *(main)* | Release Candidate **`v2.3.0-rc2`** *(unstable)* |
 | :--- | :--- | :--- |
-| **Windows x64** | `ContiTool-v2.2.1a-windows-amd64.zip` → `ContiTool.exe` | `ContiTool-v2.3.0-rc1-windows-amd64.zip` → `ContiTool.exe` |
-| **macOS Apple Silicon** | `ContiTool-v2.2.1a-macos-arm64.dmg` → `ContiTool.app` | `ContiTool-v2.3.0-rc1-macos-arm64.dmg` → `ContiTool.app` |
-| **Linux x86_64** | `ContiTool-v2.2.1a-linux-x86_64.tar.gz` → `ContiTool/ContiTool` | `ContiTool-v2.3.0-rc1-linux-x86_64.tar.gz` → `ContiTool/ContiTool` |
+| **Windows x64** | `ContiTool-v2.2.1a-windows-amd64.zip` → `ContiTool.exe` | `ContiTool-v2.3.0-rc2-windows-amd64.zip` → `ContiTool.exe` |
+| **macOS Apple Silicon** | `ContiTool-v2.2.1a-macos-arm64.dmg` → `ContiTool.app` | `ContiTool-v2.3.0-rc2-macos-arm64.dmg` → `ContiTool.app` |
+| **Linux x86_64** | `ContiTool-v2.2.1a-linux-x86_64.tar.gz` → `ContiTool/ContiTool` | `ContiTool-v2.3.0-rc2-linux-x86_64.tar.gz` → `ContiTool/ContiTool` |
 
 ### Run from Source (`Python 3.12+`)
 
@@ -238,8 +238,8 @@ python3 conti_cp_tool.py -l en elv status --port COM4
 
 ## FAQ
 
-**Should I install `v2.2.1a` or `v2.3.0-rc1`?**
-For stable daily **`19 J533`** gateway work, install **[`v2.2.1a`](https://github.com/perkthefox/mqb_contitool/releases/latest)** (you can pick the `stable` or `candidate` auto-update channel in **Settings**). If you want `FPK_E`, `Kombi VDD`, `BCM`, `MRR`, `ELV`, or the `J533` RAM-bridge, grab Release Candidate **[`v2.3.0-rc1`](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)** — just remember it is an early preview and full backups are mandatory.
+**Should I install `v2.2.1a` or `v2.3.0-rc2`?**
+For stable daily **`19 J533`** gateway work, install **[`v2.2.1a`](https://github.com/perkthefox/mqb_contitool/releases/latest)** (you can pick the `stable` or `candidate` auto-update channel in **Settings**). If you want `FPK_E`, `Kombi VDD`, `BCM`, `MRR`, `ELV`, or the `J533` RAM-bridge, grab Release Candidate **[`v2.3.0-rc2`](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc2)** — just remember it is an early preview and full backups are mandatory.
 
 **Can I flash a ContiTool `FPK_E / AID` `Dflash.bin` directly with VVDI / Multiprog / UPA?**
 Yes, starting in `2.3.0-rc1`. ContiTool runs hardware RV40F FACI Blank-Check (`0x71`) across all 64 KB and scrubs erased cells to deterministic `0xFF` (`fpke_report.json` → `dflash.blank_checked: true`). If Blank-Check had to be skipped on an unverified SW revision (`blank_checked: false`), ContiTool warns you explicitly — never write an unchecked raw dump via an external programmer (writing back via ContiTool over CAN remains safe).
