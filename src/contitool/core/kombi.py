@@ -34,7 +34,11 @@ from typing import Any
 import zlib
 
 from contitool.core.fpke import (
+    EEL_83A_IDS,
+    EEL_1703_IDS,
     EEL_MARK,
+    FPKE_DFLASH_FBL_RSAKEY_OFFSET,
+    FPKE_DFLASH_FBL_RSAKEY_SIZE,
     FPKE_DFLASH_SIZE,
     FPKE_IMMO_PARTNERS,
     _clean_ascii,
@@ -353,11 +357,17 @@ def is_kombi_ident(ident: list[dict[str, str]] | dict[str, Any] | None) -> bool:
     sys_name = vals.get("F197", "").upper()
     sw = "".join(vals.get("F189", "").split()).upper()
     pn = "".join((vals.get("F187") or vals.get("F191") or "").split()).upper()
-    if "FPK" in odx or "FPK" in sys_name:
+    if "FPK" in odx or "FPK" in sys_name or "AU27" in odx:
         return False
-    if "VDDMQB" in odx or "EV_DASHBOARDVDD" in odx:
-        return True
+    if pn.startswith("83A920700") or (
+        len(pn) >= 9 and pn[3:9] in ("920790", "920791", "920794", "920795", "920890", "920891")
+    ):
+        return False
     if pn in KOMBI_VERIFIED_PART_NUMBERS or pn.startswith(("5NA920740", "8V0920860", "6P0920740")):
+        return True
+    if "MQBA0" in odx:
+        return False
+    if "VDDMQBAB" in odx or "DASHBOARDVDDMQBAB" in odx:
         return True
     if len(pn) >= 9 and pn[3:6] == "920" and sw in KOMBI_VERIFIED_SW_VERSIONS:
         return True
@@ -440,6 +450,91 @@ def kombi_support_info(
 # ────────────────────────────── EEL Container Builders & Parsers ──────────────────────────────
 
 
+def _scan_eel_t01_drps(
+    dflash: bytes,
+    *,
+    vb_size: int = 0x800,
+    n_vb: int = 28,
+    base: int = 0,
+) -> dict[int, tuple[int, int, int | None]]:
+    """Scan all active EEL T01 virtual blocks without filtering by a fixed ID table.
+
+    Returns `{ident: (vb, top_addr, slot_padded)}` where `slot_padded` is the 4-byte-aligned
+    slot span to the next record inside the same VB (`top_j - top_{j+1}`), or `None` for the
+    last DRP in a VB.
+    """
+    if len(dflash) < base + n_vb * vb_size:
+        return {}
+
+    active_vbs: list[tuple[int, int]] = []
+    vb_entries: dict[int, list[tuple[int, int]]] = {}
+    for n in range(n_vb):
+        b = base + n * vb_size
+        w_i0, _w_p, w_a0, _w_a1, w_ec = struct.unpack_from("<5I", dflash, b)
+        w_i1 = struct.unpack_from("<I", dflash, b + vb_size - 4)[0]
+        if w_i0 == EEL_MARK and w_i1 == EEL_MARK:
+            continue
+        if w_a0 != EEL_MARK or w_ec == 0xFFFFFFFF or eel_cs24(w_ec) != w_ec:
+            continue
+        active_vbs.append((n, w_ec & 0xFFFFFF))
+        entries: list[tuple[int, int]] = []
+        a = b + 0x18
+        while a + 0x10 <= b + vb_size - 4:
+            m0, m1, m2, drp = struct.unpack_from("<4I", dflash, a)
+            if m0 != EEL_MARK or not (m2 == EEL_MARK or m1 == EEL_MARK):
+                break
+            ident = drp & 0xFFFF
+            widx = (drp >> 16) & 0x7FFF
+            if 1 <= ident <= 0x3FF and widx >= 0x18 and (widx & 3) == 0 and widx + 4 <= vb_size - 4:
+                entries.append((ident, b + widx))
+            a += 0x10
+        vb_entries[n] = entries
+
+    if not active_vbs:
+        return {}
+
+    active_nums = {n for n, _ec in active_vbs}
+    ring_start = 0
+    if 0 in active_nums and (n_vb - 1) in active_nums and len(active_nums) < n_vb:
+        ring_start = n_vb - 1
+        while ((ring_start - 1) % n_vb) in active_nums:
+            ring_start = (ring_start - 1) % n_vb
+
+    latest: dict[int, tuple[int, int, int | None]] = {}
+    for n, _ec in sorted(active_vbs, key=lambda item: (item[1], (item[0] - ring_start) % n_vb)):
+        entries = vb_entries.get(n, [])
+        for idx, (ident, top) in enumerate(entries):
+            slot_padded: int | None = None
+            if idx + 1 < len(entries):
+                delta = top - entries[idx + 1][1]
+                if delta > 0 and (delta & 3) == 0:
+                    slot_padded = delta
+            latest[ident] = (n, top, slot_padded)
+    return latest
+
+
+def _eel_ref_match_counts(
+    dflash: bytes,
+    raw_latest: dict[int, tuple[int, int, int | None]],
+) -> tuple[int, int, int]:
+    """Return `(ok_0310, ok_2220, ok_fpke)` comparing raw DRP record headers to fixed reference tables."""
+    ok_0310 = 0
+    ok_2220 = 0
+    ok_83a = 0
+    ok_1703 = 0
+    for ident, (_vb, top, _slot) in raw_latest.items():
+        hdr_sz = int.from_bytes(dflash[top : top + 2], "little")
+        if hdr_sz == EEL_KOMBI_0310_IDS.get(ident, -1):
+            ok_0310 += 1
+        if hdr_sz == EEL_KOMBI_2220_IDS.get(ident, -1):
+            ok_2220 += 1
+        if hdr_sz == EEL_83A_IDS.get(ident, -1):
+            ok_83a += 1
+        if hdr_sz == EEL_1703_IDS.get(ident, -1):
+            ok_1703 += 1
+    return ok_0310, ok_2220, max(ok_83a, ok_1703)
+
+
 def kombi_eel_layout(
     dflash: bytes | None = None,
     *,
@@ -448,37 +543,29 @@ def kombi_eel_layout(
     """Return the 28-VB EEL T01 container layout descriptor for Kombi V850E2 (`0310` 132-record, `2220` 130-record, or dynamic)."""
     chosen_ids = dict(ids) if ids is not None else None
     if chosen_ids is None and dflash is not None and len(dflash) == KOMBI_DFLASH_SYNTH_SIZE:
-        lay_0310 = {"vb": 0x800, "n_vb": 28, "base": 0, "threshold": 8, "ids": EEL_KOMBI_0310_IDS}
-        lay_2220 = {"vb": 0x800, "n_vb": 28, "base": 0, "threshold": 8, "ids": EEL_KOMBI_2220_IDS}
-        _, lat_0310 = eel_parse_pool(lay_0310, dflash)
-        _, lat_2220 = eel_parse_pool(lay_2220, dflash)
-        ok_0310 = sum(
-            1
-            for ident, (_vb, top, _ref) in lat_0310.items()
-            if int.from_bytes(dflash[top : top + 2], "little") == EEL_KOMBI_0310_IDS.get(ident, -1)
-        )
-        ok_2220 = sum(
-            1
-            for ident, (_vb, top, _ref) in lat_2220.items()
-            if int.from_bytes(dflash[top : top + 2], "little") == EEL_KOMBI_2220_IDS.get(ident, -1)
-        )
-        has_high_id = any(ident > 130 for ident in lat_0310)
-        if not has_high_id and lat_2220 and ok_2220 > ok_0310:
+        raw_latest = _scan_eel_t01_drps(dflash)
+        ok_0310, ok_2220, ok_fpke = _eel_ref_match_counts(dflash, raw_latest)
+        has_high_id = any(ident > 130 for ident in raw_latest)
+        if not has_high_id and raw_latest and ok_2220 > ok_0310:
             chosen_ids = dict(EEL_KOMBI_2220_IDS)
-            lat_win = lat_2220
         else:
             chosen_ids = dict(EEL_KOMBI_0310_IDS)
-            lat_win = lat_0310
-        # Adapt to self-describing `<H` record headers from other V850E2 SW revisions (e.g. 6P0 920 740 A SW 1422)
-        if max(ok_0310, ok_2220) >= 32 and lat_win:
-            for ident, (_vb, top, _ref) in lat_win.items():
-                if top + 2 <= len(dflash):
-                    hdr_sz = int.from_bytes(dflash[top : top + 2], "little")
-                    if 3 <= hdr_sz <= 512:
-                        chosen_ids[ident] = hdr_sz
-            max_present = max(lat_win)
-            for extra_id in [k for k in chosen_ids if k > max_present]:
-                del chosen_ids[extra_id]
+        # Adapt to self-describing `<H` record headers from other V850E2 SW revisions (e.g. 6P0 920 740 A SW 1422),
+        # while strictly refusing to reshape an RH850 FPK_E pool (`162`/`235` IDs, `ID 1 = 252 B`, `ok_fpke >= ok_kombi`).
+        ok_kombi = max(ok_0310, ok_2220)
+        id1_ok = 1 not in raw_latest or int.from_bytes(dflash[raw_latest[1][1] : raw_latest[1][1] + 2], "little") <= 64
+        if raw_latest and max(raw_latest) <= 155 and id1_ok and ok_kombi >= 32 and ok_kombi > ok_fpke:
+            adapted: dict[int, int] = {}
+            for ident, (_vb, top, slot_padded) in raw_latest.items():
+                hdr_sz = int.from_bytes(dflash[top : top + 2], "little")
+                if 3 <= hdr_sz <= 512 and (slot_padded is None or ((hdr_sz + 3) & ~3) == slot_padded):
+                    adapted[ident] = hdr_sz
+            if len(adapted) >= 80:
+                for ident, hdr_sz in adapted.items():
+                    chosen_ids[ident] = hdr_sz
+                max_present = max(raw_latest)
+                for extra_id in [k for k in chosen_ids if k > max_present]:
+                    del chosen_ids[extra_id]
     if chosen_ids is None:
         chosen_ids = dict(EEL_KOMBI_0310_IDS)
     return {
@@ -748,16 +835,23 @@ def is_kombi_dflash(data: bytes) -> bool:
         except Exception:
             return False
     if len(data) == KOMBI_DFLASH_SYNTH_SIZE and is_fpke_dflash(data):
-        lay = kombi_eel_layout(data)
-        _blocks, latest = eel_parse_pool(lay, data)
-        if not latest or any(ident > 200 for ident in latest):
+        rsa_end = FPKE_DFLASH_FBL_RSAKEY_OFFSET + FPKE_DFLASH_FBL_RSAKEY_SIZE
+        if data[FPKE_DFLASH_FBL_RSAKEY_OFFSET:rsa_end] != b"\xff" * FPKE_DFLASH_FBL_RSAKEY_SIZE:
             return False
-        ok_cnt = sum(
-            1
-            for ident, (_vb, top, _ref) in latest.items()
-            if int.from_bytes(data[top : top + 2], "little") == lay["ids"].get(ident, -1)
-        )
-        return ok_cnt >= 100
+        raw_latest = _scan_eel_t01_drps(data)
+        if not raw_latest or max(raw_latest) > 155:
+            return False
+        if 1 in raw_latest and int.from_bytes(data[raw_latest[1][1] : raw_latest[1][1] + 2], "little") > 64:
+            return False
+        ok_0310, ok_2220, ok_fpke = _eel_ref_match_counts(data, raw_latest)
+        if max(ok_0310, ok_2220) <= ok_fpke:
+            return False
+        hdr_slot_ok = 0
+        for _ident, (_vb, top, slot_padded) in raw_latest.items():
+            hdr_sz = int.from_bytes(data[top : top + 2], "little")
+            if 3 <= hdr_sz <= 512 and (slot_padded is None or ((hdr_sz + 3) & ~3) == slot_padded):
+                hdr_slot_ok += 1
+        return hdr_slot_ok >= 100
     if 4096 <= len(data) < KOMBI_DFLASH_POOL_SIZE:
         try:
             recs = unpack_kombi_logical_eel(data)

@@ -1304,6 +1304,103 @@ def test_kombi_ram_scanner_edge_cases_tail_l06_and_range2_scoring() -> None:
     assert found_crc == (zlib.crc32(sl7_key) & 0xFFFFFFFF)
 
 
+def test_is_kombi_ident_separates_fpke_mqba0_and_v850_mqbab_clusters() -> None:
+    """Issues #60, #61, #62: RH850 FPK_E (`EV_DashBoardVDDMQBA0` / `*920790*`) must never be routed to V850E2 Kombi."""
+    # Issue #60: SEAT Leon FPK_E (5F0920790A SW 1701, EV_DashBoardVDDMQBA0, F197=KOMBI)
+    ident_60 = [
+        {"did": "F187", "value": "5F0920790A"},
+        {"did": "F191", "value": "5F0920790A"},
+        {"did": "F189", "value": "1701"},
+        {"did": "F197", "value": "KOMBI"},
+        {"did": "F19E", "value": "EV_DashBoardVDDMQBA0"},
+    ]
+    assert is_kombi_ident(ident_60) is False
+    assert is_fpke_ident(ident_60) is True
+
+    # Issue #61: Skoda Kodiaq FPK_E (565920790C SW 4300, EV_DashBoardVDDMQBA0, F197=KOMBI)
+    ident_61 = [
+        {"did": "F187", "value": "565920790C"},
+        {"did": "F189", "value": "4300"},
+        {"did": "F197", "value": "KOMBI"},
+        {"did": "F19E", "value": "EV_DashBoardVDDMQBA0"},
+    ]
+    assert is_kombi_ident(ident_61) is False
+    assert is_fpke_ident(ident_61) is True
+
+    # Issue #62: SEAT Leon V850E2 Kombi (5F0920863 SW 6420, EV_DashBoardVDDMQBAB, even when F187 was missed)
+    ident_62 = [
+        {"did": "F189", "value": "6420"},
+        {"did": "F197", "value": "KOMBI"},
+        {"did": "F19E", "value": "EV_DashBoardVDDMQBAB"},
+    ]
+    assert is_kombi_ident(ident_62) is True
+    assert is_fpke_ident(ident_62) is False
+
+    # 5E0920790A (FPK_E) stays FPK_E even if ODX says EV_DashBoardVDDMQBAB or EV_DashBoardVDDMQBA0
+    for odx in ("EV_DashBoardVDDMQBA0", "EV_DashBoardVDDMQBAB", "EV_DashBoardFPKContinentMQBAB"):
+        ident_5e0 = [{"did": "F187", "value": "5E0920790A"}, {"did": "F189", "value": "1703"}, {"did": "F19E", "value": odx}]
+        assert is_kombi_ident(ident_5e0) is False
+        assert is_fpke_ident(ident_5e0) is True
+
+    # Audi Q3 FPK_E (83A920700E) stays FPK_E
+    ident_83a = [{"did": "F187", "value": "83A920700E"}, {"did": "F189", "value": "6181"}, {"did": "F19E", "value": "EV_DashBoardVDDMQBAU27"}]
+    assert is_kombi_ident(ident_83a) is False
+    assert is_fpke_ident(ident_83a) is True
+
+    # Missing F187 with EV_DashBoardVDDMQBA0 defaults to FPK_E, not Kombi
+    ident_mqba0_no_pn = [{"did": "F189", "value": "1701"}, {"did": "F197", "value": "KOMBI"}, {"did": "F19E", "value": "EV_DashBoardVDDMQBA0"}]
+    assert is_kombi_ident(ident_mqba0_no_pn) is False
+    assert is_fpke_ident(ident_mqba0_no_pn) is True
+
+    # 6P0920740A (V850E2 Kombi) stays Kombi regardless of F19E variant
+    for odx in ("EV_DashBoardVDDMQBAB", "EV_DashBoardVDDMQBA0", ""):
+        ident_6p0 = [{"did": "F187", "value": "6P0920740A"}, {"did": "F189", "value": "1422"}, {"did": "F19E", "value": odx}]
+        assert is_kombi_ident(ident_6p0) is True
+        assert is_fpke_ident(ident_6p0) is False
+
+    # Passat B8 analog V850E2 Kombi (EV_DashBoardVDDMQBAB)
+    ident_3g0 = [{"did": "F187", "value": "3G0920798A"}, {"did": "F189", "value": "0310"}, {"did": "F19E", "value": "EV_DashBoardVDDMQBAB"}]
+    assert is_kombi_ident(ident_3g0) is True
+    assert is_fpke_ident(ident_3g0) is False
+
+
+def test_is_kombi_dflash_rejects_fpke_83a_and_1703_and_accepts_dynamic_137_id_kombi() -> None:
+    """Ensure 64 KiB FPK_E dumps (83A 235-ID and 1703 162-ID) are never misclassified as Kombi, while dynamic Kombi (e.g. 137 IDs) works."""
+    from contitool.core.fpke import (
+        EEL_83A_IDS,
+        EEL_1703_IDS,
+        FPKE_DFLASH_FBL_RSAKEY_OFFSET,
+        eel_append_records,
+        is_fpke_dflash,
+    )
+    from contitool.core.kombi import _build_empty_eel_t01_pool, kombi_eel_layout
+
+    for id_map in (EEL_83A_IDS, EEL_1703_IDS):
+        lay = {"vb": 0x800, "n_vb": 28, "base": 0, "threshold": 8, "ids": dict(id_map)}
+        updates = {k: struct.pack("<H", sz) + (b"\xff" * (sz - 2)) for k, sz in sorted(id_map.items())}
+        fpke_df = eel_append_records(_build_empty_eel_t01_pool(updates[1]), updates, layout=lay)
+        assert is_fpke_dflash(fpke_df) is True
+        assert is_kombi_dflash(fpke_df) is False
+
+    # Dynamic 137-ID Kombi 64 KiB container (IDs 133..137 beyond 0310's 132) must be recognized & layout-recovered
+    recs_dyn = _build_synthetic_kombi_records()
+    dyn_ids = dict(EEL_KOMBI_0310_IDS)
+    for extra_id, extra_sz in ((133, 24), (134, 16), (135, 32), (136, 12), (137, 20)):
+        dyn_ids[extra_id] = extra_sz
+        recs_dyn[extra_id] = struct.pack("<H", extra_sz) + bytes((extra_id + i) & 0xFF for i in range(extra_sz - 2))
+    df_dyn = build_kombi_eel_dflash(recs_dyn, eel_ids=dyn_ids)
+    assert is_kombi_dflash(df_dyn) is True
+    lay_dyn = kombi_eel_layout(df_dyn)
+    assert len(lay_dyn["ids"]) == 137
+    assert lay_dyn["ids"][137] == 20
+
+    # A 64 KiB dump containing an FPK_E .FBL_RSAKEY at 0xED00 must never be classified as Kombi
+    df_with_rsa = bytearray(df_dyn)
+    df_with_rsa[FPKE_DFLASH_FBL_RSAKEY_OFFSET : FPKE_DFLASH_FBL_RSAKEY_OFFSET + 128] = b"\x01" + (b"\xaa" * 126) + b"\x80"
+    assert is_kombi_dflash(bytes(df_with_rsa)) is False
+
+
+
 
 
 
