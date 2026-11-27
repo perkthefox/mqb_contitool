@@ -219,9 +219,13 @@ class ConnectionDialog(Dialog):
         lay = QVBoxLayout(self.manual)
         lay.setContentsMargins(0, 0, 0, 0)
         self.cmb_iface = QComboBox()
+        self.cmb_iface.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_iface.setMinimumContentsLength(18)
+        self.cmb_iface.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         for code, en_name, ru_name in SUPPORTED_CAN_INTERFACES:
             self.cmb_iface.addItem(tr(ru_name, en_name), code)
         self.ed_port = QLineEdit()
+        self.ed_port.setMinimumWidth(140)
         self.ed_port.setPlaceholderText(tr("Порт: COM4, /dev/cu.usbmodem…, can0", "Port: COM4, /dev/cu.usbmodem…, can0"))
         self.ed_port.textChanged.connect(lambda *_a: self._picked())
         lay.addLayout(row(self.cmb_iface, self.ed_port, 0))

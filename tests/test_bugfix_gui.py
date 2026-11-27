@@ -1100,15 +1100,17 @@ def test_mrr_elv_ecu_start_problem_report_fixes(
     assert "EEL 130" in meta_eel["tags"]
 
     # ── ProblemReportDialog ──
+    from types import SimpleNamespace
     from PySide6.QtWidgets import QLabel
 
     pr_dlg = pr_mod.ProblemReportDialog(win, Failure("err", "tb"), win.conn, "log", {})
     all_pr_texts = " ".join(lbl.text() for lbl in pr_dlg.findChildren(QLabel))
     assert "stripped/masked" in all_pr_texts
     evil_dest = tmp_path / "<b>dir&1<x>.zip"
-    evil_dest.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
     monkeypatch.setattr(pr_mod, "build_report_zip", lambda dest, *_a, **_k: dest)
-    pr_dlg.create(dest=evil_dest, open_browser=False)
+    with monkeypatch.context() as mp:
+        mp.setattr(Path, "stat", lambda _self, *_a, **_k: SimpleNamespace(st_size=22))
+        pr_dlg.create(dest=evil_dest, open_browser=False)
     assert "&lt;b&gt;dir&amp;1&lt;x&gt;.zip" in pr_dlg.lbl_status.text()
     pr_dlg.close()
     win.close()

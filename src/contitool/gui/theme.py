@@ -696,7 +696,7 @@ def build_stylesheet() -> str:
         background-color: #1B273D; border-color: #3B6FD4; color: #90B8FF; font-weight: bold;
     }}
     QFrame#ProcDeck QPushButton {{
-        padding: 4px 11px;
+        padding: 4px 8px;
         min-height: 18px;
         font-size: 12px;
     }}

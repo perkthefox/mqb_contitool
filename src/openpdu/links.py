@@ -131,7 +131,10 @@ class Link:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise VciTimeout(f"{what} did not finish within {timeout:g} s")
-                    time.sleep(min(QUEUE_FULL_RETRY, remaining))
+                    if remaining <= QUEUE_FULL_RETRY:
+                        time.sleep(remaining)
+                        raise VciTimeout(f"{what} did not finish within {timeout:g} s")
+                    time.sleep(QUEUE_FULL_RETRY)
                     if time.monotonic() >= deadline:
                         raise VciTimeout(f"{what} did not finish within {timeout:g} s")
                     self.vci.unsubscribe(self.id, hcop)

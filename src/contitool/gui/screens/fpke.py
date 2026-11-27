@@ -2771,14 +2771,7 @@ class FpkeScreen(QWidget):
         sec_apply.body.setSpacing(4)
         sec_apply.set_text(
             tr("3. Что перенести в текущий дамп", "3. Data to transfer into current dump"),
-        )
-        sec_apply.head.addWidget(
-            status_readout(
-                tr("Калибровки и кодировка цели сохраняются", "Target calibration & coding preserved"),
-                "muted",
-            ),
-            0,
-            Qt.AlignmentFlag.AlignVCenter,
+            tr("Калибровки и кодировка цели сохраняются.", "Target calibration and coding are preserved."),
         )
 
         im_d = (donor_passport or {}).get("immo") or {}
@@ -4588,12 +4581,12 @@ class _FpkeCanControlPanel(QWidget):
         self.sld_speed.setSingleStep(5)
         self.sld_speed.setPageStep(20)
         self.sld_speed.setValue(0)
-        self.sld_speed.setMinimumWidth(48)
+        self.sld_speed.setMinimumWidth(36)
         self.sld_speed.sliderMoved.connect(self._on_manual_gauge_moved)
         self.sld_speed.valueChanged.connect(self._update_gauge_labels)
         self.lbl_spd_val = QLabel("0 " + tr("км/ч", "km/h"))
         self.lbl_spd_val.setFont(mono_font(12, bold=True))
-        self.lbl_spd_val.setFixedWidth(62)
+        self.lbl_spd_val.setFixedWidth(56)
         self.lbl_spd_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         sep2 = vdivider()
@@ -4605,12 +4598,12 @@ class _FpkeCanControlPanel(QWidget):
         self.sld_rpm.setSingleStep(100)
         self.sld_rpm.setPageStep(500)
         self.sld_rpm.setValue(800)
-        self.sld_rpm.setMinimumWidth(48)
+        self.sld_rpm.setMinimumWidth(36)
         self.sld_rpm.sliderMoved.connect(self._on_manual_gauge_moved)
         self.sld_rpm.valueChanged.connect(self._update_gauge_labels)
         self.lbl_rpm_val = QLabel("800 " + tr("об/м", "RPM"))
         self.lbl_rpm_val.setFont(mono_font(12, bold=True))
-        self.lbl_rpm_val.setFixedWidth(68)
+        self.lbl_rpm_val.setFixedWidth(62)
         self.lbl_rpm_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.btn_auto_sweep = button(tr("Автопрогон", "Auto sweep"), "Chip", slot=self._on_auto_sweep_clicked)
@@ -4781,7 +4774,7 @@ class _FpkeCanControlPanel(QWidget):
 
     def _build_mfl_pad(self) -> QWidget:
         sec = self._compact_section(Section())
-        sec.setFixedWidth(232)
+        sec.setFixedWidth(224)
         sec.set_text(tr("Кнопки руля", "Steering buttons"))
 
         def mfl_btn(label: str, code: int, ev: int, kind: str = "", tip: str = "") -> QWidget:
@@ -4848,13 +4841,13 @@ class _FpkeCanControlPanel(QWidget):
 
         self.ed_can_id = QLineEdit("3C0")
         self.ed_can_id.setFont(mono_font(12))
-        self.ed_can_id.setFixedWidth(74)
+        self.ed_can_id.setFixedWidth(66)
         self.ed_can_id.setPlaceholderText("ID")
         self.ed_can_id.returnPressed.connect(self._send_selected_packet)
 
         self.ed_can_data = QLineEdit("00 00 03 00")
         self.ed_can_data.setFont(mono_font(12))
-        self.ed_can_data.setMinimumWidth(84)
+        self.ed_can_data.setMinimumWidth(64)
         self.ed_can_data.setPlaceholderText("00 00 03 00")
         self.ed_can_data.returnPressed.connect(self._send_selected_packet)
 

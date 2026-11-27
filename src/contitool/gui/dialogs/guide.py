@@ -93,7 +93,8 @@ class GuideDialog(Dialog):
         (self.btn_tab_j533, self.btn_tab_kombi, self.btn_tab_elv)[tab_idx].setChecked(True)
         self.pinout_stack.setCurrentIndex(tab_idx)
 
-        self.body.addLayout(row(group_label(tr("СХЕМА ПОДКЛЮЧЕНИЯ НА СТЕНДЕ", "BENCH WIRING DIAGRAM")), 1, track))
+        self.body.addWidget(group_label(tr("СХЕМА ПОДКЛЮЧЕНИЯ НА СТЕНДЕ", "BENCH WIRING DIAGRAM")))
+        self.body.addLayout(row(track, 1))
         self.body.addWidget(self.pinout_stack)
 
         self.body.addWidget(group_label(tr("ЧТЕНИЕ ПРОГРАММАТОРОМ (ШЛЮЗ J533)", "PROGRAMMER READ (J533 GATEWAY)")))
