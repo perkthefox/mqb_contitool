@@ -1,21 +1,34 @@
 <div align="center">
 
-# ContiTool v2.1 — Continental VAG MQB Gateway J533 (`3Q0 907 530`)
-### Renesas RH850/F1L — Diagnosis CAN Studio, Component Protection (`KSCHUTZ`), Engineering Mode & `SWaP / RSA-1024`
+# ContiTool
 
-[![Russian README](https://img.shields.io/badge/lang-%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9-2563EB?style=for-the-badge)](README.md)
-[![GUI + CLI](https://img.shields.io/badge/Desktop%20GUI%20%2B%20CLI-Windows%20%7C%20macOS%20%7C%20Linux-0EA5E9?style=for-the-badge)](#quick-start)
-[![MCU RH850/F1L](https://img.shields.io/badge/MCU-Renesas%20RH850%2FF1L%20(64KB%20DFlash)-0284C7?style=for-the-badge)](#the-64-kb-dataflash-rule-for-bench-programmers)
-[![Free](https://img.shields.io/badge/Status-FREE-D97706?style=for-the-badge)](#intended-use--terms)
-[![License PolyForm NC](https://img.shields.io/badge/License-PolyForm%20Noncommercial-16A34A?style=for-the-badge)](#license)
+**Six VAG MQB ECUs straight over CAN. No opening. No desoldering. Zero paid tokens.**
+
+`19 J533 Gateway` · `17 FPK_E / AID` · `17 Kombi VDD` · `09 BCM` · `13 ACC MRR` · `2B ELV`
+
+<br>
+
+[![Русский](https://img.shields.io/badge/%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9-README-2563EB?style=for-the-badge)](README.md)
+[![Stable v2.2.1](https://img.shields.io/badge/Stable-v2.2.1-16A34A?style=for-the-badge)](https://github.com/perkthefox/mqb_contitool/releases/latest)
+[![Next v2.3.0-rc1](https://img.shields.io/badge/Next%20RC-v2.3.0--rc1-D97706?style=for-the-badge)](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)
+[![Platforms](https://img.shields.io/badge/GUI%20%2B%20CLI-Windows%20%7C%20macOS%20%7C%20Linux-0F172A?style=for-the-badge)](#quick-start)
+[![License](https://img.shields.io/badge/License-PolyForm%20NC-0284C7?style=for-the-badge)](#license)
 
 [![Website](https://img.shields.io/badge/Web-vwhacking.antonperk.com-181717?style=flat-square&logo=googlechrome&logoColor=00D8FF)](https://vwhacking.antonperk.com)
 [![Drive2](https://img.shields.io/badge/Drive2-PerkTheFox-E31E24?style=flat-square&logo=rss&logoColor=white)](https://www.drive2.ru/users/perkthefox/)
 [![Telegram](https://img.shields.io/badge/Telegram-%40perkthefox-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/perkthefox)
 
-**Made by PerkTheFox** • **[🇷🇺 Читать на русском (`README.md`)](README.md) | 🇬🇧 English** • **[📚 Deep Technical Docs (`docs/`)](docs/README.md)**
+**Made by PerkTheFox** · [🇷🇺 Читать на русском](README.md) · 🇬🇧 English · [📜 Changelog](CHANGELOG.md) · [📚 Deep Docs](docs/README.md)
 
 </div>
+
+<br>
+
+| Stable Release · **`v2.2.1`** *(main)* | Release Candidate · **`v2.3.0-rc1`** *(2.3 preview)* |
+| :--- | :--- |
+| Battle-tested release for everyday **`19 J533`** (`3Q0 907 530`) gateway work. | Massive 2.3 expansion covering **all six MQB ECUs**: `17 FPK_E / AID`, `17 Kombi VDD`, `09 BCM`, `13 ACC MRR`, `2B ELV`, CAN bus scanner, and the transparent `J533` RAM-Bridge. |
+| **Pick this one** for rock-solid daily `J533` servicing. | **Unstable channel:** features may fail, misbehave, or be outright broken. Bench use with full backups only — please report bugs in [Issues](https://github.com/perkthefox/mqb_contitool/issues). |
+| 👉 **[Download stable v2.2.1](https://github.com/perkthefox/mqb_contitool/releases/latest)** | 👉 **[Try v2.3.0-rc1](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)** |
 
 <p align="center">
   <img src="assets/screenshots/en_features.png" alt="ContiTool: an open ECU, SWaP feature activation with the gateway's own answer" width="100%">
@@ -23,47 +36,68 @@
 
 ---
 
-## Intended Use & Terms
+## Why ContiTool Exists
 
-- **Scope & Intended Use**: **ContiTool** is a cross-platform Desktop GUI (**Qt 6 / PySide6**) and command-line (**CLI**) bench utility for automotive electronics technicians, independent workshops, and **VAG MQB** owners servicing **Continental J533 Gateways (`3Q0 907 530 xx`, Renesas `RH850/F1L`)**: full flash backup over CAN, ECU repair/replacement, **Component Protection** module adaptation, and **SWaP / FeC** certificate management.
-- **Do NOT use this program** if you do not know why you “need” it, cannot work with ODIS or VCTool, or have any, even the slightest doubt that the adapter, the wiring or the power supply is sound. Cheap Chinese adapters are not considered safe, even if the program “gets along” with them.
-- **Do not connect it to a working car.** Work with the gateway removed, on a bench, with a regulated power supply. In a car the gateway connects all the modules: while it sits in its bootloader, or if a write fails, the modules stop seeing each other — the car may not start or drive. Besides, the car's voltage sags during a long write, and any dip or dropout during a write leads to a brick. If you connect to a car anyway, it is your risk: the author takes no responsibility for a damaged ECU. Do not message the author about it — open a [GitHub issue](https://github.com/perkthefox/mqb_contitool/issues) and wait for an answer.
-- **FREE COMMUNITY TOOL.** ContiTool is free and always available on [GitHub](https://github.com/perkthefox/mqb_contitool/releases); its [license](#license) forbids selling it. **If someone sold it to you, you were cheated.**
-- Provided **"AS IS"** without warranty of any kind and intended for authorized bench diagnostics, repair, and engineering research on owner-controlled hardware. The author (`PerkTheFox`) assumes zero liability for any direct or indirect damage. **Always save a verified full backup of all memory regions (`Cflash.bin` `1.5 MB`, `Uflash.bin` `32 KB`, `Dflash.bin` `64 KB`) before writing!**
+Servicing VAG MQB control units normally means juggling expensive dongles, bench programmers, hot air, and paid online tokens. **ContiTool** puts the whole stack into a single open **Qt 6 Desktop GUI + CLI** tool for **Windows, macOS, and Linux**:
+
+- **Zero opening, zero desoldering:** read and flash `CodeFlash`, `DataFlash`, `UFlash`, `Extra Area`, and `EEPROM` over CAN — with hardware `FACI Blank-Check`, so saved dumps are even safe to flash directly with external programmers (`VVDI`, `Multiprog`, `UPA`, `Orange5`).
+- **Immobilizer, keys, and CP on your own terms:** full **A→B** immo transfers (including `Kombi VDD` → `FPK_E`), **non-destructive additive key learning** via the stock LF coil without wiping existing keys, hybrid `Component Protection (#MoLaLi)` across all 12 gateway banks, `GFA`/`IKA`/`K_ffb` extraction, and `BCM` remote (`FFB`) / `ELV` adaptation.
+- **SWaP, datasets, and brick recovery:** built-in `RSA-1024` + `SWaP FSC v2` signer, `FPA`/`DCC`/`MKE`/`Start-Stop`/`BEM` editors, `MRR` radar CP defeat & `SWaP` activation, factory `FRF`/`ODX` flashing, and direct recovery of gateways stuck in `FBL`.
+- **One gateway = the whole bench bus:** plug into a `19 J533` Diagnosis CAN port — ContiTool discovers every slave ECU behind it and spins up a transparent `ch3 ↔ ch0/ch2` RAM-bridge whenever needed (including gateway-fired `BURST-GO` so `FPK_E` level 8 even works with `VAS 6154 / VNCI`).
 
 ---
 
-## Highlights
+## Read Before You Connect
 
-1. **One working screen built around a single ECU (`GUI`)**:
-   - The gateway is opened once — read over CAN or loaded from a folder of dumps — and the whole interface then describes that ECU: part number, checksum, `VIN`, `VCRN`, and one line per feature with its current state.
-   - On the left, the ECU's functions with their state; on the right, the selected function's page: what it does, step-by-step actions (e.g. for SWaP: your key → certificate → sending it to the ECU) and the list of enabled features by name.
-   - Edits are written to copies while original dumps stay untouched; all reads and writes are organized per gateway under `contitool_runs/<part>_<FAZIT>/` (`dumps/base_read` — the unit's first complete dump, `*_flashed` with `manifest.json` — what the ECU holds after a write, `writes/` — operation logs and pre-write backups). The bottom panel shows the state of every dump (`CodeFlash`, `DataFlash`, `Uflash`), exports changed files to any folder, and flashes **all** modified memory regions directly over **Diagnosis CAN** with a single **"Write to ECU"** click (100% replacing a bench programmer).
-   - Before writing `CodeFlash` over CAN, ContiTool automatically activates the engineering bootloader via `FACI` if the gateway is still on factory FBL, writes a zero tester serial in `F15A` (so subsequent reads never go silent), and writes modified `CodeFlash` boot blocks (`0x0000..0xBFFF`, e.g. custom `FBL RSA` key, `Block 4`) and `DataFlash` (`64 KB`) directly via RAM `FACI` drivers.
-   - **Write a backup back** (including when a gateway is **stuck in its `FBL` bootloader** after an interrupted flash) & **`F15B` fingerprint cure**: you pick the backup files, and ContiTool verifies `FAZIT` / `VCRN` over UDS and refuses a backup of another ECU before the first write command; if a gateway goes silent on Stage 1 due to an older non-zero `F15B` fingerprint, ContiTool automatically offers to cure it with one UDS reflash of its own `CodeFlash`. **Export backup** copies the dumps as read to any folder.
-   - **Guided CAN dataset upload & what the ECU itself accepted**: **"Write datasets over CAN"** checks live `SWaP` features (`22 3C 00`) and coding (`22 06 00`), optionally switches missing `SWaP` features on directly inside the gateway's `DataFlash`, uploads `ZDC` blocks over UDS, and aligns `0x0600` coding bits. The SWaP/FEC activation page reads `22 3C 00` — which features are active and which were rejected and why.
-   - Every operation shows its current step, progress (`%`), byte counter, transfer speed (`KB/s`), elapsed time and `ETA` in the status bar, and ContiTool quietly checks GitHub Releases for newer versions at startup. The log at the bottom is a short summary by default — the operation, its steps and the outcome; "Detailed" shows the full technical log with addresses, UDS and CAN.
-   - Live 1-click **Русский ⇄ English** language toggle in the header.
-2. **Full Bench-Programmer Replacement Over Diagnosis CAN (`500 kbit/s` — No ECU Opening Needed)**:
-   - Automatic adapter discovery for `CANable` / `SLCAN`, `SocketCAN`, `PCAN`, `Vector`, `Kvaser` and, on Windows, `J2534 PassThru` (Tactrix, Mongoose…) plus `VAS 6154` / `VNCI 6154A` through the ODIS D-PDU driver (using adapter-managed hardware `ISO-TP` for UDS flashing) with a one-click link check, automatic detection/rejection of unsupported `5Q0` and `Lear` (`PowerPC`) gateways, built-in **20-pin J533 `T20`** wiring diagram, and CAN termination confirmation (`VAS 6154` / `VNCI` and `J2534` adapters terminate the bus themselves). While an operation runs, no second link to the adapter is opened. On Windows, verified D-PDU driver `27.2` ships bundled in `dpdu/VW_PDUAPI_27.2` and runs out of the box; versions `30` and newer require an explicit confirmation (on connect the driver reflashes the VCI to its own version). Memory reads need a native USB adapter: serial SLCAN clones (CH340 etc.) lose frames.
-   - Full read-only CAN backup of **`Cflash.bin` (`1.5 MB` in `~61 s` via batched `FED_READER`)** + **`Uflash.bin` (`32 KB`)** + **`Dflash.bin` (`64 KB`, deterministic `FACI Blank Check` read)** + **`Eeprom.bin` (`8 KB`, external `ST M95640` SPI EEPROM, read-only)** + **`Opbt.bin` (`36 B`, `OPBT0..OPBT8`, `Extra Area IDCODE @ 0xFF300050`, and `CHIP ID @ 0xFFCD00E0`, read-only)** with `SHA-256` manifests, plus arbitrary physical address range reading (`can read-mem` — flash, `Local RAM`, MMIO registers).
-   - Direct differential CAN writing of **`DataFlash.bin` (`64 KB`, `0xFF200000..0xFF20FFFF`)** via a native RAM `FACI` driver (`FENTRYR = 0xAA80`, `64`-byte blocks, full 16-word programming of `ZDC < 0x3040` preventing `DTC 000401`, `R_FDL` hardware `ECC` preservation, `ICUSB 0xF800..0xFFFF` guard, automatic `0x0600` coding sync, and full `64 KB` readback verification).
-   - Atomic RAM `FACI` programming of the **`Uflash` (`32 KB`)** bootloader with automatic pre-backup, full `32 KB` readback verification, and live `RSA` status probe.
-   - Complete **`CodeFlash.bin` (`1.5 MB`)** programming: boot blocks `0x00000000..0x0000BFFF` (including `Sector 5` with `FBL RSA` modulus at `0x0000A2F7` and automatic preservation of the MCU's 128-bit `SELFID` at `0x0000AB00`) are written via `FACI`, and `FD_0DATA` is flashed via standard UDS (or pure `--raw-faci`) with full `1.5 MB` readback verification, Application health check (`10 03` / `3E 00`), and `DTC` reading/clearing.
-   - **CAN terminal**: send your own CAN frames (11/29-bit) or UDS requests over ISO-TP (replies are reassembled, `7F xx 78` is handled, negative response codes are decoded), with a live traffic table, ID filter, pause, copy, save to file, and command history.
-   - **Whole pipeline in one CLI command** (`can turnkey`): `Full Backup → Unlock Uflash → Write CP Keys to DataFlash → Patch & Flash CodeFlash → Health & Clear DTC`.
-   - **Trouble code descriptions**: codes from `19 02` are shown with their ODIS code (`U023500`, `B189CF0`, …) and a Russian or English description for the whole MQB gateway set (770 codes); active, stored and not-tested-since-clear codes are kept apart — the latter are not faults.
-3. **Hybrid Component Protection (`KSCHUTZ` `#MoLaLi`) Binding**:
-   - Full support for all **12 VAG Slave ECU Banks (`#1..#12`)** with per-bank status inspection and guardrails against `00..00` zeros or `SHE M1` (`00..00E5`) headers.
-   - Installs a 38-byte `RH850` **Hybrid `KSCHUTZ` Trampoline** in `CodeFlash`: all factory vehicle ECUs (`SHE M1..M3` and Master Key `GFA`) keep working natively while selected retrofitted ECUs authenticate using 16-byte plaintext `IKA` keys.
-   - Automatic external `ST M95640 SPI EEPROM` bitmask bypass when binding previously empty banks (`47`, `57`, `3C`, `CF`, `3D`, `A5`, `8C`, etc.) without desoldering the `95640` chip.
-4. **Engineering Mode & Stock Restore**:
-   - `CodeFlash`: unlocks `Feature 0x80/0x81/0x83`, removes `ASAM CCP v2.1` (`0x1BFC8600 / 0x1BFC8601`) memory blacklists, and enables `CAN RAM-Loader` entry (100% reversible to stock).
-   - `Uflash`: 4-byte `+0x342A` RSA-Free FBL patch accepting any valid-CRC `.odx` / firmware over UDS (100% reversible to stock).
-5. **`RSA-1024 (e = 3)`, SWaP `FSC` v2 & `ODX` Signing Studio**:
-   - Pure-Python `RSA-1024 (e = 3)` keypair generator exporting `.json` + OpenSSL `.private.pem` & `.public.pem`.
-   - Synchronized public modulus replacement in `CodeFlash.bin` and `DataFlash.bin` (`NvM 0x7C @ 0xDB04` with `CRC-32 @ 0xDCE4` update while preserving the original 5-byte `VCRN @ 0xDC0C`).
-   - 171-byte (`0xAB`) **VAG SWaP `FSC` v2** certificate signer (`RIPEMD-160 + RSA-1024`, including `FPA Driving Profile 10000100`, `MKE 10000300`, etc.) for OBD upload (`2E 3C 01` + `31 01 C0 01`) and `ODX` `<FW-SIGNATURE>` (`SHA-1 + RSA-1024`) signing.
+> [!CAUTION]
+> - **Do NOT use this program** if you don't know why you need it, have never used ODIS or VCTool, or have any doubt about your adapter, wiring, or power supply. Cheap Chinese clones are not considered safe even if they "work".
+> - **Bench use only.** Work with ECUs removed on a regulated `+12.5–13.8 V` supply. A voltage sag or link drop in a live car can immobilize the vehicle and permanently brick the module. Connecting to a car is strictly at your own risk.
+> - **Always save a verified full backup before writing.** ContiTool is free, open, and provided **"AS IS"** without warranty — selling it violates the [license](#license). **If someone sold it to you, you were cheated.**
+> - Bugs and questions — **[GitHub Issues](https://github.com/perkthefox/mqb_contitool/issues) only** (no direct messages).
+
+---
+
+## Supported VAG MQB ECUs
+
+| Addr | ECU | MCU / Platform | Verified Software | Adapters | Channel |
+| :---: | :--- | :--- | :--- | :--- | :---: |
+| **`19`** | **J533 Gateway**<br>`3Q0 907 530`, `8S0 907 468` | Renesas `RH850/F1L` | All Continental `3Q0`/`8S0` (`HW 517–527+`) | `CANable` / `SLCAN` / `candleLight`<br>`VAS 6154 / VNCI` · `J2534` | **`2.2.x` + `2.3`** |
+| **`17`** | **FPK_E / AID**<br>`83A`, `5E0`, `5NA`, `3G0` | Renesas `RH850/D1M2A` | `SW 83A (6181)`, `1701`, `1703`, `1711` | **Direct (`T18`):** `CANable` / `SLCAN` / `candleLight`¹<br>**Via `J533` bridge:** also `VAS 6154 / VNCI` | **`2.3 RC`** |
+| **`17`** | **Kombi VDD**<br>`EV_DashBoardVDDMQBAB` | Renesas `V850E2/Dx4` | `5NA 920 740 B (0310)`<br>`8V0 920 860 E (2220)` | `CANable` / `SLCAN` / `candleLight`<br>`VAS 6154 / VNCI` · `J2534` *(direct & via gateway)* | **`2.3 RC`** |
+| **`09`** | **BCM MQBAB**<br>Continental `5Q0 937 084 ...` | Renesas `RH850` | `SW 0173`, `0175`, `0212`, `0253` (`BL`/`BQ`/`CJ`/`CG`, etc.) | `CANable` / `SLCAN` / `candleLight`<br>`VAS 6154 / VNCI` *(full RawMode, direct & bridged)*² | **`2.3 RC`** |
+| **`13`** | **ACC Radar MRRevo14F**<br>`3QF` / `5Q0` | NXP `MPC5674K` / `MPC5675K` | Gen1 / Gen2 (`0130`, `0192`, `0196`, `0272`, `0780`, etc.) | `CANable` / `SLCAN` / `candleLight`<br>`VAS 6154 / VNCI` *(full RawMode, direct & bridged)*² | **`2.3 RC`** |
+| **`2B`** | **ELV / J764**<br>`5Q0` / `3Q0` | Renesas `RH850/F1L` | Bench-verified: UDS + `32 KB DataFlash` (`0x1BFD8A0B/0A`) | UDS: any; `32 KB DataFlash`: `CANable` / `SLCAN` / `candleLight` or `VAS 6154 / VNCI` *(RawMode)*² | **`2.3 RC`** |
+
+> ¹ **Why direct `17 FPK_E` needs `CANable / candleLight`:** keyless level 8 requires ~1,000 frames paced at **`0.35 ms/frame`** (~0.36 s). A `VAS 6154 / VNCI` takes 3–7 ms per TCP frame and physically misses the timing window. **Through a `19 J533` gateway**, `VNCI` works because the gateway itself blasts the stream from RAM at full 500 kbit/s (`BURST-GO`).
+>
+> ² **29-bit over `VAS 6154 / VNCI` (`BCM` / `MRR` / `ELV`):** 11-bit UDS (passport, status, DTCs, key/adaptation writes) works on every adapter; 29-bit RawMode TX (`TxFlag 0x100`) is implemented from DLL `27.2` RE and still awaits live VCI verification — if 29-bit XCP/WFS/ELV frames fail on your VNCI, use a native CAN adapter (`CANable / candleLight`).
+>
+> **`5Q0 907 530`** and **`Lear 3Q0 907 530`** gateways (PowerPC `MPC5607B` / `MPC5748G`) are **not supported** and are strictly refused before sending loader commands. Unverified `PN + SW` combinations on slave ECUs display a yellow warning banner.
+
+---
+
+## Capabilities by ECU
+
+### `19 J533` — Continental MQB Gateway (`2.2.x` + `2.3`)
+- **Full Diagnosis CAN read/write (`500 kbit/s`):** `Cflash` (`1.5 MB` in ~61 s via batched `FED_READER`), `Uflash` (`32 KB`), `Dflash` (`64 KB` with hardware `FACI Blank-Check`), `EEPROM 95640` (`8 KB`), `OPBT` + `IDCODE`/`CHIP ID`. Differential `DataFlash` flashing preserving `ECC` and `ICUSB`, `Uflash` unlock (including OTP-locked `OTPEUA`), **FBL brick recovery**, non-zero `F15B` cure, and factory `FRF`/`ODX` flashing.
+- **Hybrid Component Protection (`#MoLaLi`):** all **12 slave ECU banks (`#1..#12`)** — factory modules stay on native `SHE M1..M3` + Master `GFA` while retrofitted banks authenticate via plaintext 16-byte `IKA` keys, with automatic `95640` bitmask bypass and zero desoldering.
+- **Engineering Mode, `SWaP / RSA-1024`, `ZDC` & DTCs:** Engineering Mode + `ASAM CCP v2.1`, pure-Python `RSA-1024 (e = 3)` + 171-byte `SWaP FSC v2` signer (with live `22 3C 00` verification), **`FPA`** (`On/Off`, 15-step `DCC`), `MKE`, `Start-Stop`, `BEM` editors, guided `ZDC` upload with `0x0600` coding sync, and **770 ODIS DTC codes**.
+
+### `17 FPK_E / AID` — Continental Digital Clusters (`2.3 RC`)
+- **Keyless level 8 & full readout:** `SW 83A (6181)`, `1701`, `1703`, `1711` — reads `DataFlash 64 KB`, `Extra Area 256 B` + `IDAUTH`, `UFlash 32 KB`, `BFlash 96 KB`, and `CodeFlash 2 MB` via fast `0x6F1` streaming with `UDS 0x23` fallback.
+- **Programmer-safe `Dflash.bin` via hardware RV40F Blank-Check (`0x71`):** erased floating-gate cells are scrubbed to deterministic `0xFF`, making saved `Dflash.bin` images safe both for ContiTool CAN writes and for external programmers (`VVDI Prog`, `Multiprog`, `UPA`, `Orange5`).
+- **Smart CAN writer + `SWRESA`:** zero-erase `smart_eel_append`, `smart_tail_update`, `full_blank_checked_diff`, foreign `FD11` and `Kombi VDD` dump guard.
+- **A→B Immo transfer, LF coil key learning & `FBL RSA`:** `EEL T01` editor (`VIN`, odometer, coding, `PowerClass`, partners, `KESSY`, `K_c`, `IKA/CP`, `K_ffb`, transponders), cross-family `Kombi VDD` donor transfer, live RAM `S0/S1` extraction + **additive mode-5 key learning without wiping existing keys**, `.FBL_RSAKEY` / `BOLO` / ODX signing tools, and bench controls (KL15, gauges, MFL, DTC).
+
+### `17 Kombi VDD` — VDO/VDD Instrument Clusters (`2.3 RC`)
+- Dedicated workbench & CLI for `EV_DashBoardVDDMQBAB` (`SW 0310` and `SW 2220`, including the 75-byte `EEL 0x0068` layout).
+- `FD11 SL 7` via known key or `10 4F + SA1` with **built-in `7F 27 37` lockout timer reset (`+0x62EF`)**, pure 11-bit UDS EEL read/write (direct or behind any gateway), additive mode-5 LF coil key learning, and A→B transfer.
+
+### `09 BCM`, `13 ACC MRR`, `2B ELV` & `J533` RAM-Bridge (`2.3 RC`)
+- **`09 BCM` (Continental MQBAB):** `SW 0173 / 0175 / 0212 / 0253`, pre-bridge UDS profile verification, `GFA`/`IKA`/`K_ffb` readout with fail-closed `FFB` backup & restore, manual and automatic cluster-to-BCM remote (`FFB`) adaptation from `FPK_E` / `Kombi VDD`.
+- **`13 ACC MRR` (Bosch MRRevo14F):** XCP / fast SRAM `DFlash` (FEE) and `CFlash` read/write with sector checksums, `GFA`/`IKA` keys, CP counter reset, **CP deactivation**, **Gen1/Gen2 `SWaP` activation** with stock restore, and `FRF`/`ODX` flashing.
+- **`2B ELV` (J764):** passport/status/DTCs, 32 KB `DataFlash` readout, offline `EeeLib` editor, `2E 02E2` or cluster-dump adaptation, virginization, `IDAC` reset, and `31 01 02 03` + WFS5 bootloader check.
+- **Bus Scanner, CAN Terminal & Private Problem Reports:** unified bus topology, header ECU switcher, 11/29-bit raw CAN + ISO-TP UDS terminal, transparent `J533CanBridge` (`GAFL` filter + `BURST-GO`), and automatic key/`VIN`/`FAZIT` redaction in Problem Reports when dumps are unchecked.
 
 ---
 
@@ -77,80 +111,80 @@
 
 ---
 
-## How the Core Techniques Work & Prerequisites
-
-```mermaid
-flowchart LR
-    T20["J533 on Bench (T20: Pin 19/9 + 120 Ω)"] -->|"UDS 10 02 -> FCL Descriptor -> 0x0100120E"| RAM["Factory CAN RAM-Loader (0x6F0 / 0x6F1)"]
-    RAM -->|"4 KB chunked read / read-mem"| BKP["Full Backup: Cflash 1.5 MB + Uflash 32 KB + Dflash 64 KB"]
-    RAM -->|"RAM FACI Drivers (SELFID + WDTA)"| FACI["Direct Write: Uflash (32 KB), Dflash (64 KB) & Cflash Boot Blocks"]
-    FACI -->|"Standard ISO 14229 UDS (34/36/37/0202/FF01)"| CFL["Patched CodeFlash (Hybrid CP + 95640 Mask + Engineering Mode)"]
-```
-
-1. **Closed-Unit CAN Read & Write Without Opening the ECU or Using a Bench Programmer ([full breakdown in `docs/can-read-write.en.md`](docs/can-read-write.en.md))**:
-   - Although production `RH850/F1L` silicon is serial read-locked, entering `Uflash.bin` (`ProgrammingSession 10 02`) is supported on every stock gateway. Inside `Uflash`, ContiTool uses two calibrated multi-DID `0x22` passes to point the active `Renesas FCL` descriptor (`0xFEDE0C68`) at **`0x0100120E`** — Stage 2 of Continental's built-in **`CAN RAM-Loader` (`0x6F0 / 0x6F1`)**.
-   - From RAM, the watchdog-fed `FED_READER` streams `Cflash` (`1.5 MB` in `~61 s`) and `Uflash` (`32 KB`), while `DFLASH_READER_STUB` reads `DataFlash` (`64 KB`) deterministically via hardware `FACI Blank Check` without floating-gate noise on erased words.
-   - For flash programming, self-contained RH850 `FACI` RAM drivers service hardware watchdogs (`WDTA0` + `WDTA1`) and load the MCU's 128-bit `SELFID` directly from `Cflash + 0xAB00`:
-     - **`Uflash` (`32 KB`)** is reprogrammed atomically from RAM with the 4-byte `+0x342A` patch and verified by full readback;
-     - **`DataFlash` (`64 KB`, `0xFF200000..0xFF20FFFF`)** is reprogrammed differentially in 64-byte blocks (`FENTRYR = 0xAA80`) using 4-byte word writes that preserve valid `R_FDL` hardware `ECC` and guard the `ICUSB` system tail (`0xF800..0xFFFF`);
-     - **`CodeFlash` (`1.5 MB`)**: boot blocks `0x00000000..0x0000BFFF` (including `Sector 5` with the `FBL RSA` key) are written directly via `FACI` while preserving the live `SELFID`, and `FD_0DATA` is flashed over standard `ISO 14229 UDS` with `App CRC-16/MODBUS` (`0x0000C21C`) verification — or entirely via `--raw-faci`.
-2. **Hybrid Component Protection Selector ([full breakdown in `docs/component-protection.en.md`](docs/component-protection.en.md))**:
-   - Factory slave keys are 64-byte `SHE M1..M3` containers unwrapped by hardware `ICUS0` (`CMD_LOAD_KEY = 0x40`). ContiTool's 38-byte selector at `0x0016FF80` inspects the `M2/M3` tail in RAM: non-zero `SHE` records and Master Key `GFA` (`0xDA00`) use native `0x40`, whereas banks holding a 16-byte plaintext `IKA` key with a zero tail automatically switch to `CMD_LOAD_PLAIN_KEY = 0x10`.
-3. **Practical Notes for `CP` Module Binding**:
-   - **You must already have the Slave ECU's 16-byte `K3` (`IKA`) key**: plaintext `K3` never travels over CAN or `ODIS` logs — extract it beforehand from the memory dump of the target Slave ECU (`5F`, `17`, `13`, `47`, `A5`, etc.).
-   - **100% Diagnosis CAN Writing**: both the patched `CodeFlash.bin` and the updated `DataFlash.bin` (`64 KB` holding `IKA` keys or a custom `SWaP RSA` modulus) are written directly to the gateway over **Diagnosis CAN** via **"Write to ECU"** in the GUI or `can write-dflash` / `can write-cflash` / `can turnkey --set ...` in the CLI — no external bench programmer is required!
-
----
-
 ## Quick Start
 
-### Option 1 — Standalone Executables (Recommended)
+### Standalone Executables (No Python Required)
 
-Download from **GitHub Releases**:
-- **Windows**: extract `ContiTool-v2.2.1-windows-amd64.zip` and launch **`ContiTool.exe`**.
-- **macOS**: open `ContiTool-v2.2.1-macos-arm64.dmg` (or `.zip`) and launch **`ContiTool.app`**.
-- **Linux**: extract `ContiTool-v2.2.1-linux-x86_64.tar.gz` and run **`ContiTool/ContiTool`**.
+Grab a build from **[GitHub Releases](https://github.com/perkthefox/mqb_contitool/releases)**. Windows builds bundle verified D-PDU driver `27.2` (`dpdu/VW_PDUAPI_27.2`).
 
-### Option 2 — Run from Source (`Python 3.12+`)
+| OS | Stable **`v2.2.1`** *(main)* | Release Candidate **`v2.3.0-rc1`** *(unstable)* |
+| :--- | :--- | :--- |
+| **Windows x64** | `ContiTool-v2.2.1-windows-amd64.zip` → `ContiTool.exe` | `ContiTool-v2.3.0-rc1-windows-amd64.zip` → `ContiTool.exe` |
+| **macOS Apple Silicon** | `ContiTool-v2.2.1-macos-arm64.dmg` → `ContiTool.app` | `ContiTool-v2.3.0-rc1-macos-arm64.dmg` → `ContiTool.app` |
+| **Linux x86_64** | `ContiTool-v2.2.1-linux-x86_64.tar.gz` → `ContiTool/ContiTool` | `ContiTool-v2.3.0-rc1-linux-x86_64.tar.gz` → `ContiTool/ContiTool` |
+
+### Run from Source (`Python 3.12+`)
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# Launch Desktop GUI:
-python3 conti_cp_tool.py
+python3 conti_cp_tool.py         # no args -> Desktop GUI; subcommand -> CLI
 ```
 
-To build standalone `.exe` / `.app` packages locally: `pip install -r requirements-dev.txt && python3 scripts/build_release.py` (output in `dist/release/`).
+Build standalone packages locally: `pip install -r requirements-dev.txt && python3 scripts/build_release.py` (output in `dist/release/`).
 
 ---
 
-## Bench Wiring (`J533 T20` 20-Pin Connector)
+## Bench Wiring Reference
 
-Connect 5 wires to the gateway's 20-pin connector for **Diagnosis CAN (`500 kbit/s`)**:
+```mermaid
+flowchart LR
+    PC["ContiTool (GUI / CLI)<br/>CANable · VAS 6154 / VNCI · J2534"] -->|"Diag CAN 500 kbit/s (T20 Pin 19/9 + 120 Ω)"| GW["19 J533 Gateway (3Q0 907 530)<br/>RAM-Loader · FACI · RAM-Bridge"]
+    GW -->|"ch0 Komfort / ch1 Ext / ch2 Drive"| SLV["Slave ECUs (2.3):<br/>17 FPK_E · 17 Kombi · 09 BCM · 13 MRR · 2B ELV"]
+    PC -.->|"Direct bench wiring (+120 Ω)"| SLV
+```
 
-| J533 `T20` Pin | Signal | Description |
+### `19 J533` Gateway — `T20` Connector
+
+| `T20` Pin | Signal | Description |
 | :---: | :--- | :--- |
-| **Pin 1** | `KL30 (+12V)` | Permanent `+12V` bench power supply (`12.5–13.8 V`) |
-| **Pin 14** | `KL15 (+12V)` | Ignition `+12V` (bridge together with `Pin 1` on bench) |
-| **Pin 11** | `KL31 (GND)` | Common ground (PSU minus & CAN adapter `GND`) |
+| **Pin 1** | `KL30 (+12V)` | Permanent `+12 V` bench power (`12.5–13.8 V`) |
+| **Pin 14** | `KL15 (+12V)` | Ignition `+12 V` (bridge with `Pin 1` on bench) |
+| **Pin 11** | `KL31 (GND)` | Common ground (PSU minus & adapter `GND`) |
 | **Pin 19** | `Diag CAN-H` | Diagnosis `CAN High` (`500 kbit/s`) |
-| **Pin 9** | `Diag CAN-L` | Diagnosis `CAN Low` (`500 kbit/s`) |
+| **Pin 9** | `Diag CAN-L` | Diagnosis `CAN Low` (`500 kbit/s`) — **`120 Ω` terminator to Pin 19** |
+
+### `17 FPK_E / Kombi VDD` Cluster — `T18` Connector
+
+| `T18` Pin | Signal | Description |
+| :---: | :--- | :--- |
+| **Pin 1** | `KL30 (+12V)` | Permanent `+12 V` bench power (wakes via CAN) |
+| **Pin 10** | `KL31 (GND)` | Common ground (PSU minus & adapter `GND`) |
+| **Pin 8 / 9** | `D2 Coil 1 / 2` | Stock `125 kHz` immobilizer coil (non-polarized) |
+| **Pin 18** | `CAN-H` | Cluster `CAN High` (`500 kbit/s`) |
+| **Pin 17** | `CAN-L` | Cluster `CAN Low` (`500 kbit/s`) — **`120 Ω` terminator to Pin 18** |
+
+### `2B ELV (J764)` Steering Lock — `T4` (`T4dg` / `T4al`) Connector
+
+| `T4` Pin | Signal | Description |
+| :---: | :--- | :--- |
+| **Pin 1** | `CAN-H` | `Komfort CAN High` (`500 kbit/s`, to J533 `T20 Pin 15`) |
+| **Pin 2** | `CAN-L` | `Komfort CAN Low` (`500 kbit/s`) — **`120 Ω` terminator to Pin 1** |
+| **Pin 3** | `KL30 (+12V)` | Permanent `+12 V` bench power (wakes via CAN `0x1B000010`) |
+| **Pin 4** | `KL31 (GND)` | Common ground (PSU minus & adapter `GND`) |
 
 > [!IMPORTANT]
-> **Mandatory: Connect a `120 Ω` termination resistor between `Pin 19` (`CAN-H`) and `Pin 9` (`CAN-L`)** (or enable the `120 Ω` jumper on your CAN adapter)! `J533` has no internal termination on its diagnostic CAN pair.
+> Always ensure a **`120 Ω`** termination resistor sits across `CAN-H` / `CAN-L` on direct bench connections (`VAS 6154 / VNCI` and `J2534` usually terminate internally; enable the `120 Ω` jumper or add a resistor on `CANable / SLCAN`).
 
-### The `64 KB DataFlash` Rule for Bench Programmers
+<details>
+<summary><b>The 64 KB DataFlash Rule & All 12 Component Protection Banks (19 J533)</b></summary>
+
+<br>
 
 > [!WARNING]
-> Although `3Q0 907 530 xx` MCUs are marked `R7F7010343AFP`, the silicon inside is **`R7F7010543AFP / R7F7010563AFP` with a full `64 KB` DataFlash (`65,536` bytes)**, and **all 12 `CP` banks and `SWaP` keys reside in the upper half (`0xC000..0xFFFF`)**!
-> - **Never** select a `32 KB` `R7F7010343` profile — it truncates all keys.
-> - **Always** select the `3Q0907530` preset or **`R7F7010543` / `R7F7010563` (`64 KB Dflash`)** when importing/exporting dumps for third-party tools (ContiTool's Live CAN Read & Write handles all `64 KB` automatically with no external programmer needed).
-
----
-
-## Summary of All 12 Component Protection Banks (`DataFlash 64 KB`)
+> Although `3Q0 907 530 xx` MCUs are laser-marked `R7F7010343AFP`, the die inside is **`R7F7010543AFP / R7F7010563AFP` with a full `64 KB` DataFlash (`65,536` bytes)** — all 12 `CP` banks and `SWaP` keys live in the upper half (`0xC000..0xFFFF`). **Never select a 32 KB `R7F7010343` profile** in external programmers.
 
 | Bank | ECU | MQB Module | `Dflash` Offset | `NvM` | `95640` Mask | UDS ID | CP CAN TX / RX |
 | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -168,132 +202,104 @@ Connect 5 wires to the gateway's 20-pin connector for **Diagnosis CAN (`500 kbit
 | `#12` | **`8C`** | Hybrid / EV Battery Manager (`J840`) | `0xCB00` / `0xCB80` | `0x6B` | `0x0800` | `77B / 7E5` | `17FC017B / 17FE017B` |
 | `Mst` | **`19`** | Gateway Master Key `GFA` (`Master`) | `0xDA00` / `0xDA80` | `0x7B` | — | `710 / 77A` | *Keep untouched!* |
 
+</details>
+
 ---
 
 ## CLI Usage
 
-Running `python3 conti_cp_tool.py` without arguments opens the Desktop GUI; passing any subcommand runs in CLI mode (`-l en` / `-l ru`):
-
 ```bash
-# CLI help & read-only dump inspection:
-python3 conti_cp_tool.py -l en --help
+# Adapter discovery & full CAN bus scan:
+python3 conti_cp_tool.py -l en can ports
+python3 conti_cp_tool.py -l en can scan --port COM4
+
+# 19 J533 Gateway — backup, inspect, hybrid CP, SWaP, and 1-command turnkey:
+python3 conti_cp_tool.py -l en can backup --port COM4
 python3 conti_cp_tool.py -l en inspect --cflash Cflash.bin --dflash Dflash.bin --uflash Uflash.bin
-
-# Turnkey offline CP binding (hybrid trampoline + automatic 95640 mask bypass + IKA write):
-python3 conti_cp_tool.py -l en bind-cp \
-  --cflash-in Cflash.bin --dflash-in Dflash.bin \
-  --cflash-out Cflash_cp.bin --dflash-out Dflash_cp.bin \
-  --set 5F=A1B2C3D4E5F60718293A4B5C6D7E8F90
-
-# Enable Engineering Mode & sign a custom SWaP FSC certificate (FPA 10000100):
-python3 conti_cp_tool.py -l en patch-engineering --cflash-in Cflash.bin --cflash-out Cflash_eng.bin --uflash-in Uflash.bin --uflash-out Uflash_eng.bin
+python3 conti_cp_tool.py -l en can turnkey --port COM4 --set 5F=A1B2C3D4E5F60718293A4B5C6D7E8F90 --clear-dtc --yes
 python3 conti_cp_tool.py -l en set-rsa-key --generate-key swap_key.json --cflash-in Cflash.bin --cflash-out Cflash_swap.bin --dflash-in Dflash.bin --dflash-out Dflash_swap.bin --target swap
 python3 conti_cp_tool.py -l en sign-fsc --key swap_key.json --dflash Dflash_swap.bin --fec 10000100 -o fpa_10000100.fsc
 
-# Live Diagnosis CAN operations (port scan, full read/write of all flash regions, 1-command turnkey):
-python3 conti_cp_tool.py -l en can ports
-python3 conti_cp_tool.py -l en can backup --port COM4
-python3 conti_cp_tool.py -l en can write-dflash --port COM4 --dflash Dflash_cp.bin --yes
-python3 conti_cp_tool.py -l en can write-cflash --port COM4 --cflash Cflash_cp.bin --yes
-python3 conti_cp_tool.py -l en can read-mem --port COM4 --address 0xFF20C000 --length 0x1000 --out-file cp_banks.bin
-python3 conti_cp_tool.py -l en can turnkey --port COM4 --set 5F=A1B2C3D4E5F60718293A4B5C6D7E8F90 --clear-dtc --yes
+# 17 FPK_E / AID (2.3) — hardware Blank-Check read, inspect, and A->B transfer:
+python3 conti_cp_tool.py -l en fpke read --port COM4
+python3 conti_cp_tool.py -l en fpke read --interface dpdu --via-gateway --gateway-channel 0
+python3 conti_cp_tool.py -l en fpke inspect --dflash Dflash.bin --extra ExtraArea.bin
+python3 conti_cp_tool.py -l en fpke plan-transfer --donor-dflash donor/Dflash.bin --recipient-dflash target/Dflash.bin
+
+# 17 Kombi VDD · 09 BCM · 13 MRR · 2B ELV (2.3):
+python3 conti_cp_tool.py -l en kombi read --port COM4
+python3 conti_cp_tool.py -l en bcm read --port COM4 --via-gateway
+python3 conti_cp_tool.py -l en mrr status --port COM4
+python3 conti_cp_tool.py -l en elv status --port COM4
 ```
 
 ---
 
 ## FAQ
 
-**Why does ContiTool refuse `5Q0 907 530` gateways or `Lear` `3Q0 907 530` units?**
-Because they are built on completely different **NXP PowerPC (`MPC5607B` / `MPC5748G` VLE)** microcontrollers with no `Uflash`, `FACI`, or `ICUS0` — even when the part number is identical (`3Q0 907 530 AA` from Lear) or the unit identifies as `EV_GatewConti` (`5Q0` from Continental). ContiTool detects them during link check (`F191` / `F187` / `F1A3` / `F19E` / `F17C`) and stops before sending any loader commands. Only **Continental `3Q0 907 530 xx` gateways on Renesas `RH850/F1L`** are supported.
+**Should I install `v2.2.1` or `v2.3.0-rc1`?**
+For stable daily **`19 J533`** gateway work, install **[`v2.2.1`](https://github.com/perkthefox/mqb_contitool/releases/latest)**. If you want `FPK_E`, `Kombi VDD`, `BCM`, `MRR`, `ELV`, or the `J533` RAM-bridge, grab Release Candidate **[`v2.3.0-rc1`](https://github.com/perkthefox/mqb_contitool/releases/tag/v2.3.0-rc1)** — just remember it is an early preview and full backups are mandatory.
 
-**A gateway stopped answering on Stage 1 when reading after a flash. Does flashing it via ODIS cure this?**
-**Only if ODIS is set to a zero fingerprint — with its usual non-zero one ODIS triggers the exact same problem.** The last `F15B` copy in Stage 1's padding lands bytes `2..5` of the 6-byte tester serial onto FBL's suppress-response flag `0xFEDE0C62` ("do not answer"). Both `ContiTool <= v2.0.1d` (`01 02 03 04 05 06` → `0x03`) and `ODIS` (its own non-zero tester serial → e.g. `0xC8`) left a non-zero byte there, silencing Stage 1 on every subsequent entry. Since `v2.0.1e`, `ContiTool` writes a zero tester serial, and in `v2.0.2` it stops before sending `27 12` on a silent Stage 1 (avoiding `7F 27 37` lockout) and offers **the cure**: one UDS reflash of the gateway's own `CodeFlash` application with a zero serial.
+**Can I flash a ContiTool `FPK_E / AID` `Dflash.bin` directly with VVDI / Multiprog / UPA?**
+Yes, starting in `2.3.0-rc1`. ContiTool runs hardware RV40F FACI Blank-Check (`0x71`) across all 64 KB and scrubs erased cells to deterministic `0xFF` (`fpke_report.json` → `dflash.blank_checked: true`). If Blank-Check had to be skipped on an unverified SW revision (`blank_checked: false`), ContiTool warns you explicitly — never write an unchecked raw dump via an external programmer (writing back via ContiTool over CAN remains safe).
 
-**ContiTool asks for a backup to clear the fingerprint, but I have no backup of this gateway.**
-Flash the gateway's original firmware from its FRF instead: with VCTool or ODIS, or with ContiTool itself (“File → Flash an ODIS FRF / ODX…”, or the “FRF / ODX file…” button in the cure dialog; both `.frf` and a plain `.odx` work) — ContiTool always writes a zero fingerprint. If you flash with ODIS or VCTool on an original adapter, first check that their settings carry a zero fingerprint (importer, workshop and tester codes all 0): otherwise they write their own non-zero serial and the `RAM-Loader` entry stays closed.
+**Does `VAS 6154 / VNCI` work directly on slave ECUs without a gateway?**
+- **`17 Kombi VDD`:** yes, both direct and behind any gateway (pure 11-bit UDS).
+- **`09 BCM`, `13 ACC MRR`, `2B ELV`:** yes, both direct and via the `J533` bridge on any VNCI with full RawMode (11-bit UDS works on every VNCI; 29-bit RawMode TX awaits live VCI verification — switch to `CANable / candleLight` if 29-bit XCP/WFS/ELV frames fail).
+- **`17 FPK_E / AID`:** not directly on `T18` (level 8 requires `0.35 ms/frame`, while VNCI takes 3–7 ms per TCP frame). Connect `FPK_E` **through a `19 J533` gateway** (`BURST-GO`) and `VAS 6154 / VNCI` works too!
 
-**How do I recover a gateway stuck in its `FBL` bootloader after an interrupted write?**
-Click **"Write backup…"** on the start screen and select that unit's backup folder. ContiTool recognizes that the gateway is in `FBL`, verifies backup ownership via `22 F1 7C` (`FAZIT`) over UDS without entering `RAM-Loader`, and flashes the application directly. If `FBL` answers `7F 27 37` (security delay), cut `+12 V` for `10` seconds when prompted and ContiTool will resume automatically.
+**Do I need ODIS for a VAS 6154 / VNCI, and is adapter reflashing normal?**
+No ODIS required — verified D-PDU driver `27.2` ships in `dpdu/` next to ContiTool (you only need the adapter's USB driver). Automatic VCI firmware flashing on first connect (~30 s) is normal; keep ODIS and VCTool closed. Drivers `30+` require explicit opt-in because they can stall mid-UDS flash.
 
-**The VNCI does not connect although the driver is supported.**
-Reconnect the adapter or press “Check link” a few times. On connect the D-PDU driver itself reflashes the adapter to its own version (about 30 seconds), and ContiTool takes that for a CAN link error. If that does not help, restart the computer.
+**My `J533` gateway stopped answering Stage 1 or is stuck in `FBL` — how do I recover it?**
+A non-zero `F15B` fingerprint is detected automatically before sending `27 12`, offering a one-step UDS cure with a zero fingerprint. For a gateway stuck in `FBL`, click **"Write backup…"** on the Start screen — ContiTool verifies `FAZIT` over UDS without entering `RAM-Loader` and flashes the application directly.
 
-**My cheap Chinese adapter “works” — so I can use it?**
-No. Cheap Chinese adapters are not considered safe, even if the program “gets along” with them. A $2 adapter raises the chance of a brick by 99.9%.
-
-**The link dropped during the first read and the gateway no longer answers.**
-Switch the ignition off for a few seconds and back on; as a last resort disconnect the battery terminal. On the bench, cut the +12 V supply for a few seconds. And in general, better not play with this on a live car.
-
-**Do I need ODIS to use a VAS 6154 / VNCI?**
-No. D-PDU driver 27.2 comes with ContiTool (the `dpdu/` folder next to the program). The system only needs the adapter's own USB driver — the VAS 6154 add-on of the **VW D-PDU API** package; ODIS itself is not required.
-
-**Several D-PDU drivers are installed — which one does ContiTool use?**
-Every one it finds is its own row in the Connection window with its version. The driver 27.2 that comes with ContiTool is picked by default, but you can choose any other and the choice is remembered. On drivers 30 and newer work is unstable at the moment: the adapter hangs partway through a UDS flash, so those need a separate tick.
-
-**The driver reflashes the adapter — is that normal?**
-Yes. On connect the D-PDU driver itself writes firmware of its version into the VAS 6154 / VNCI (about 30 seconds) — let it finish and do not unplug the adapter. This is safe: ODIS writes its own version back into the adapter the next time it connects. ODIS and VCTool must stay closed while ContiTool is working.
-
-**What does "adapter provides no raw CAN channel" mean?**
-ContiTool reads memory through RawMode on pins 6/14. Some adapters do not provide it: other vendors' J2534 drivers, and some VAS 6154 / VNCI units — genuine ones included — where the refusal comes from the adapter itself on every driver. ContiTool then tries a fallback (ODIS-style links on fixed identifiers) and verifies it with one request. If that answers nothing, the adapter cannot be used; try another D-PDU driver, otherwise another adapter.
-
-**I need a driver of another version.**
-Copy the installed driver's folder into `dpdu/` next to ContiTool, beside the `VW_PDUAPI_27.2` that is there — it is found automatically. No registry entry and no administrator rights needed; it must be the 64-bit build.
-
-**How do I report a problem?**
-After an error ContiTool offers a report itself (or Help → Report a problem…): it collects an archive with the program, operation and D-PDU driver logs (`*.bin` memory dumps are excluded by default unless you tick the optional checkbox to attach them) and opens a new [GitHub issue](https://github.com/perkthefox/mqb_contitool/issues) with the text filled in — just drag the archive into it. Please do not message the author directly.
-
-## Deep Technical Documentation (`docs/`)
-
-Concrete, byte-accurate engineering documentation without noisy debug logs lives in **[`docs/`](docs/README.md)**:
-
-- **[`docs/can-read-write.en.md`](docs/can-read-write.en.md)** — exact `Uflash` `FCL` descriptor staging (`0xFEDE0548` → `0x0100120E`), `0x6F0 / 0x6F1` stream framing, `can backup` / `read-mem` reading, direct `FACI` RAM programming of `Uflash` (`32 KB`), `DataFlash` (`64 KB`), and `CodeFlash` boot blocks (`SELFID` auto-load + `WDTA` servicing), and `ISO 14229 UDS` `FD_0DATA` flashing.
-- **[`docs/component-protection.en.md`](docs/component-protection.en.md)** — `KSCHUTZ` & `ICUS0` internals, 38-byte hybrid trampoline disassembly, `ST M95640` mask bypass, full `64 KB` `DataFlash` map, runtime `80 01 / C0 01 / 80 02 / C0 02` `AES-128-ECB` handshake, and two-step Slave ECU UDS key adaptation (`2E 00 BE → 2E 00 BD`).
-- **[`docs/engineering-and-swap.en.md`](docs/engineering-and-swap.en.md)** — Engineering Mode opcodes, `ASAM CCP v2.1` (`0x1BFC8600`), stock `CRC-32` `ZDC` dataset upload, service `DID` / `RoutineControl` catalog, and `RSA-1024 (e = 3)` / `SWaP FSC v2` / `ODX` signing.
-
-> [!NOTE]
-> **Note When Using AI Coding Agents (Claude Code, etc.):**  
-> Because `docs/` contains low-level bootloader, `FACI` flash controller, and ECU cryptographic specifications, reading `docs/` through AI coding assistants may trigger false-positive automated safety safeguards. `CLAUDE.md` instructs agents not to open `docs/` automatically — **avoid asking AI agents to read `docs/` in full**, and point them only to a specific needed section if necessary.
+**How do I report a bug?**
+Click **"Create report…"** (or Help → Report a problem…) — ContiTool packs the logs (excluding dumps and automatically redacting cryptographic keys by default) and opens a pre-filled [GitHub Issue](https://github.com/perkthefox/mqb_contitool/issues).
 
 ---
 
-## Project Structure
+## Deep Technical Docs (`docs/`) & Project Layout
+
+Byte-accurate `J533` specifications live in **[`docs/`](docs/README.md)**:
+- **[`docs/can-read-write.en.md`](docs/can-read-write.en.md)** — `CAN RAM-Loader` (`0x0100120E`), memory streaming, `FACI` programming, and `FD_0DATA` UDS flashing.
+- **[`docs/component-protection.en.md`](docs/component-protection.en.md)** — `KSCHUTZ`, `ICUS0`, 38-byte hybrid trampoline, `95640` bypass, and `64 KB DataFlash` map.
+- **[`docs/engineering-and-swap.en.md`](docs/engineering-and-swap.en.md)** — Engineering Mode, `ASAM CCP v2.1`, `ZDC`, `RSA-1024 (e = 3)`, `SWaP FSC v2`, and `ODX` signing.
 
 ```text
-├── conti_cp_tool.py              # Entry point (opens Qt 6 GUI with no args, or runs CLI subcommands)
-├── CLAUDE.md                     # Developer & AI agent repository guide
-├── docs/                         # Concrete hardware, memory & protocol documentation (RU / EN)
-├── scripts/build_release.py      # Cross-platform PyInstaller release builder (.exe / .app / .dmg)
-├── src/contitool/
-│   ├── core/                     # Dump analyzers, CRC-16/32, CP/Engineering patchers & RSA/SWaP crypto
-│   ├── can/                      # ISO-TP / 0x6F0 RAM-Loader transport, port discovery & CAN workflows
-│   ├── cli/                      # Terminal tables, live progress bar & CLI subcommands
-│   └── gui/                      # PySide6 / Qt 6 Desktop GUI & built-in CAN terminal
-└── tests/                        # Unit, protocol & headless GUI smoke tests (pytest)
+├── conti_cp_tool.py              # Entry point (no args -> Qt 6 GUI, subcommand -> CLI)
+├── CHANGELOG.md                  # Full release history (RU / EN)
+├── docs/                         # Concrete hardware, memory & protocol docs (RU / EN)
+├── scripts/build_release.py      # Cross-platform PyInstaller builder (.exe / .app / .dmg / .tar.gz)
+├── src/
+│   ├── contitool/
+│   │   ├── core/                 # Analyzers, crypto & patchers (J533, FPK_E, Kombi, BCM, MRR, ELV, ZDC, FRF)
+│   │   ├── can/                  # ISO-TP / D-PDU / J2534, J533 RAM-Bridge, RH850/VLE applets & workflows
+│   │   ├── cli/                  # Terminal tables, progress bar & CLI subcommands
+│   │   └── gui/                  # PySide6 / Qt 6 Desktop GUI, Bus Scanner & CAN Terminal
+│   └── openpdu/                  # Experimental portable VAS 6154 TCP client (no vendor D-PDU driver)
+└── tests/                        # 640+ unit, protocol, emulator & headless GUI tests (pytest)
 ```
 
-## Contributing & Feedback
-
-- **A bug or a failed operation** — open an [issue](https://github.com/perkthefox/mqb_contitool/issues/new/choose) with the "Problem" form. Easiest from the program: after an error press **"Create report…"** — it saves an archive with the logs and opens the form already filled in.
-- **Questions** ("how to connect", "which adapter") — in [Discussions](https://github.com/perkthefox/mqb_contitool/discussions). Please do not use direct messages.
-- **Code changes** — see [`CONTRIBUTING.md`](CONTRIBUTING.md). A vulnerability in ContiTool itself — [`SECURITY.md`](SECURITY.md).
+---
 
 ## License
 
-ContiTool © 2026 PerkTheFox is licensed under the **[PolyForm Noncommercial 1.0.0 with Additional Terms](LICENSE)**. In short (only the text of `LICENSE` is legally binding):
+ContiTool © 2026 PerkTheFox is licensed under **[PolyForm Noncommercial 1.0.0 with Additional Terms](LICENSE)**. In short (only `LICENSE` is legally binding):
 
-- **the code is open** — read it, study it and change it;
-- **free** for personal and noncommercial use, and **for paid repair and diagnostics**: a workshop may use it on customers' cars;
-- **no selling** — not the program, not copies, not access to it, not as part of a paid bundle;
-- **changed versions** may only be distributed with their source open under the same terms and with the authorship line (`Required Notice`) kept.
+- **source-available** — read, study, and modify freely;
+- **free** for personal/noncommercial use and **for paid repair and diagnostics** (workshops may use it on customer vehicles);
+- **no selling** — not the app, not copies, not access, not bundled in paid toolkits;
+- **modified versions** must remain open-source under the same terms with the `Required Notice` intact.
 
-Third-party components of the release builds (Qt / PySide6 and python-can under the LGPL-3.0, and others) are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Third-party notices: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md). Security: [`SECURITY.md`](SECURITY.md).
 
 ---
 
 <div align="center">
 
 **Made by PerkTheFox**  
-[vwhacking.antonperk.com](https://vwhacking.antonperk.com) • [Drive2: perkthefox](https://www.drive2.ru/users/perkthefox/) • [Telegram: @perkthefox](https://t.me/perkthefox)  
+[vwhacking.antonperk.com](https://vwhacking.antonperk.com) · [Drive2: perkthefox](https://www.drive2.ru/users/perkthefox/) · [Telegram: @perkthefox](https://t.me/perkthefox)  
 *Free for the VAG research community. If someone sold it to you, you were cheated.*
 
 </div>

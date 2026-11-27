@@ -119,6 +119,7 @@ def build() -> None:
         f"--workpath={build_dir / 'pyi'}",
         f"--specpath={build_dir}",
         "--collect-submodules=can.interfaces",
+        "--collect-submodules=openpdu",
         "--hidden-import=serial.tools.list_ports",
     ]
     # inside the bundle, so they are part of what PyInstaller signs on macOS

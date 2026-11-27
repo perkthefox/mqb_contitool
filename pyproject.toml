@@ -6,8 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "contitool"
 # pip needs PEP 440; the version users see is contitool.__version__ ("2.0.4", "2.0.3b"). a/b/c only passed by
 # chance (pip reads them as alpha/beta/rc); "d", "e" have no such meaning, so the n-th 2.0.1 fix is post<n>.
-version = "2.2.1"
-description = "ContiTool — Desktop GUI Studio & CLI for Continental VAG MQB Gateway J533 (Renesas RH850/F1L)"
+version = "2.3.0rc1"
+description = "ContiTool — Desktop GUI Studio & CLI for VAG MQB ECUs (J533 Gateway, FPK_E / Kombi, BCM, MRR, ELV)"
 readme = "README.md"
 # PolyForm Noncommercial 1.0.0 plus the Additional Terms at the top of LICENSE, so not the bare SPDX id
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0-ContiTool"

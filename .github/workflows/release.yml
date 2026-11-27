@@ -96,6 +96,12 @@ jobs:
               out.write_text(out.read_text(encoding="utf-8") + "has_changelog=true\n" if out.exists() else "has_changelog=true\n", encoding="utf-8")
           else:
               out.write_text(out.read_text(encoding="utf-8") + "has_changelog=false\n" if out.exists() else "has_changelog=false\n", encoding="utf-8")
+          is_pre = "-" in ver
+          rel_name = f"{tag} — Release Candidate" if "-rc" in ver else (f"{tag} — Pre-release" if is_pre else tag)
+          with out.open("a", encoding="utf-8") as fh:
+              fh.write(f"is_prerelease={'true' if is_pre else 'false'}\n")
+              fh.write(f"make_latest={'false' if is_pre else 'true'}\n")
+              fh.write(f"release_name={rel_name}\n")
           PY
 
       - name: Download all platform release archives
@@ -107,6 +113,9 @@ jobs:
       - name: Create / Update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ steps.notes.outputs.release_name }}
+          prerelease: ${{ steps.notes.outputs.is_prerelease == 'true' }}
+          make_latest: ${{ steps.notes.outputs.make_latest }}
           body_path: ${{ steps.notes.outputs.has_changelog == 'true' && 'release_notes.md' || '' }}
           generate_release_notes: ${{ steps.notes.outputs.has_changelog != 'true' }}
           files: release-assets/*

@@ -19,12 +19,24 @@ class DisclaimerDialog(Dialog):
 
         risk = Callout("err")
         risk.label.setText(tr(
-            "<b>ContiTool читает и перезаписывает память шлюза J533 напрямую.</b> Ошибка, обрыв связи или просадка "
+            "<b>ContiTool читает и перезаписывает память ЭБУ MQB (J533, FPK_E / Kombi, BCM, MRR, ELV) напрямую.</b> Ошибка, обрыв связи или просадка "
             "питания во время записи могут необратимо вывести блок из строя («кирпич»).",
-            "<b>ContiTool reads and rewrites the memory of the J533 gateway directly.</b> A mistake, a dropped link or a "
+            "<b>ContiTool reads and rewrites VAG MQB ECU memory (J533, FPK_E / Kombi, BCM, MRR, ELV) directly.</b> A mistake, a dropped link or a "
             "power dip during a write can damage the ECU for good (a “brick”).",
         ))
         self.body.addWidget(risk)
+
+        if "-" in __version__:
+            testing = Callout("warn")
+            testing.label.setText(tr(
+                f"<b>Релиз-кандидат {__version__}:</b> это предварительная тестовая сборка, а не основной релиз. "
+                "Часть функций может не работать, вести себя криво или быть сломана — особенно на новых блоках "
+                "(FPK_E, Kombi VDD, BCM, MRR, ELV) и неподтверждённых версиях ПО. Обязательно сохраняйте полный бэкап до любых изменений!",
+                f"<b>Release Candidate {__version__}:</b> this is an early preview build, not the main stable release. "
+                "Features may not work, misbehave, or be broken — especially on newly added ECUs "
+                "(FPK_E, Kombi VDD, BCM, MRR, ELV) and unverified software versions. Always save a full backup before making any changes!",
+            ))
+            self.body.addWidget(testing)
 
         self.body.addWidget(self._text(tr(
             "<b>Не используйте программу, если:</b><br>"

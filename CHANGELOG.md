@@ -1,5 +1,136 @@
 # Changelog / История изменений
 
+## 2.3.0-rc1 — 2026-11-27
+
+> [!WARNING]
+> **🇷🇺 Релиз-кандидат `2.3.0-rc1` — тестовая сборка, не основной релиз.**
+>
+> ContiTool вырос из утилиты для одного шлюза `19 J533` в единый инструмент на **шесть ЭБУ VAG MQB** (`19 J533`, `17 FPK_E / AID`, `17 Kombi VDD`, `09 BCM`, `13 ACC MRR`, `2B ELV`). Обновление огромное, значительная часть механизмов собиралась по реверсу и ещё не обкатана на всех ревизиях железа и адаптеров.
+>
+> - **Что-то может не работать, вести себя криво, отваливаться на отдельных версиях ПО/адаптеров или вообще быть сломано.**
+> - **Только на столе со стабилизированным питанием — и всегда с полным бэкапом до любых записей.**
+> - Для спокойной повседневной работы со шлюзом `19 J533` оставайтесь на стабильном **[`v2.2.1`](https://github.com/perkthefox/mqb_contitool/releases/latest)**.
+> - Поймали баг? Откройте **[GitHub Issue](https://github.com/perkthefox/mqb_contitool/issues)** и приложите архив из кнопки **«Создать отчёт…»** — секретные ключи, `VIN` и `FAZIT` теперь вырезаются автоматически, если не отмечена галочка дампов.
+>
+> ---
+>
+> **🇬🇧 Release Candidate `2.3.0-rc1` — early preview build, not the stable release.**
+>
+> ContiTool has grown from a single-ECU `19 J533` tool into a unified bench workbench for **six VAG MQB ECUs** (`19 J533`, `17 FPK_E / AID`, `17 Kombi VDD`, `09 BCM`, `13 ACC MRR`, `2B ELV`). This is a massive leap with lots of fresh reverse-engineered code that has not seen every hardware/software revision yet.
+>
+> - **Things may fail, misbehave, choke on specific firmware/adapters, or be outright broken.**
+> - **Bench use on a regulated power supply only — always save a full backup before writing anything.**
+> - For rock-solid daily `19 J533` gateway work, stay on stable **[`v2.2.1`](https://github.com/perkthefox/mqb_contitool/releases/latest)**.
+> - Hit a bug? Open a **[GitHub Issue](https://github.com/perkthefox/mqb_contitool/issues)** with a **Problem Report** archive (keys, `VIN`, and `FAZIT` are automatically redacted whenever dumps are unchecked).
+
+### Что внутри `2.3.0-rc1` / ECU Matrix
+
+| Адрес | Блок / ECU | MCU | Подтверждённые ПО | Адаптеры (на столе и через `19 J533`) |
+| :---: | :--- | :--- | :--- | :--- |
+| **`19`** | **J533 Gateway** (`3Q0 907 530`, `8S0 907 468`) | Renesas `RH850/F1L` | Все Continental `3Q0`/`8S0` | `CANable` / `SLCAN` / `candleLight` · `VAS 6154 / VNCI` · `J2534` |
+| **`17`** | **FPK_E / AID** (`83A`, `5E0`, `5NA`, `3G0`) | Renesas `RH850/D1M2A` | `SW 83A (6181)`, `1701`, `1703`, `1711` | **Напрямую (`T18`):** `CANable` / `SLCAN` / `candleLight` *(поток level 8 = `0.35 мс/кадр`)*<br>**Через мост `19 J533`:** также `VAS 6154 / VNCI` *(шлюз шлёт burst сам — `BURST-GO`)* |
+| **`17`** | **Kombi VDD** (`EV_DashBoardVDDMQBAB`) | Renesas `V850E2/Dx4` | `5NA 920 740 B (0310)`, `8V0 920 860 E (2220)` | `CANable` / `SLCAN` / `candleLight` · `VAS 6154 / VNCI` · `J2534` *(напрямую и через любой шлюз)* |
+| **`09`** | **BCM MQBAB** (Continental) | Renesas `RH850` | `SW 0173`, `0175`, `0212`, `0253` (`5Q0 937 084 BL/BQ/CJ/CG` и др.) | `CANable` / `SLCAN` / `candleLight` · `VAS 6154 / VNCI` *(полный RawMode, прямо и через мост `J533`)*¹ |
+| **`13`** | **ACC Radar MRRevo14F** (`3QF` / `5Q0`) | NXP `MPC5674K` / `MPC5675K` | Gen1 / Gen2 (`0130`, `0192`, `0196`, `0272`, `0780` и др.) | `CANable` / `SLCAN` / `candleLight` · `VAS 6154 / VNCI` *(полный RawMode, прямо и через мост `J533`)*¹ |
+| **`2B`** | **ELV / J764** (`5Q0` / `3Q0`) | Renesas `RH850/F1L` | Стенд: UDS + `32 КБ DataFlash` (`0x1BFD8A0B/0A`) | UDS: любой; `32 КБ DataFlash`: `CANable` / `SLCAN` / `candleLight` · `VAS 6154 / VNCI` *(полный RawMode, прямо и через мост `J533`)*¹ |
+
+> ¹ *29-битный TX в D-PDU RawMode (`TxFlag 0x100`) собран по реверсу DLL `27.2` и ещё не подтверждён на живом VNCI. Обычный 11-битный UDS работает на любом адаптере; если ваш VNCI не пропустит 29-битные XCP/WFS/ELV-кадры — используйте `CANable / candleLight`.*
+
+---
+
+### 🇷🇺 Новое в `2.3.0-rc1`
+
+#### `17 FPK_E / AID` — Цифровые приборные панели (Continental RH850/D1M2A)
+- **Бесключевой доступ level 8 и полная вычитка по CAN:** `SW 83A (6181)`, `SW 1701 (5NA920790D)`, `SW 1703`, `SW 1711 (5E0920790A)`. Автоопределение профиля по `F187`/`F189` + стеку, чтение всех 5 областей (`DataFlash 64 КБ`, `Extra Area 256 Б` + проверка `IDAUTH`, включая незаблокированные `Extra Area`, `UFlash 32 КБ`, `BFlash 96 КБ`, `CodeFlash 2 МБ`), быстрый стрим `0x6F1` с откатом на `UDS 0x23` и переживанием фоновой записи `R_EEL_Handler`.
+- **Аппаратный RV40F FACI Blank-Check (`0x71`) при чтении `DataFlash`:** при чтении и контрольном readback ContiTool прогоняет аппаратный Blank-Check по всем 64 КБ (с контролем `VB_head` против фоновой активности `R_EEL_Handler`) и заменяет шум плавающего затвора в пустых ячейках на честный `0xFF`. Сохранённый `Dflash.bin` теперь безопасен не только для записи через ContiTool, но и для прямой заливки программатором (`VVDI Prog`, `Multiprog`, `UPA`, `Orange5`).
+- **Умная запись `DataFlash` по CAN + `SWRESA`:** безстирательное дописывание `smart_eel_append` (`0` стираний), `smart_tail_update`, `full_blank_checked_diff`, защита от случайной заливки чужого `FD11` или дампа `Kombi VDD` и безопасный порядок стирания на переиспользуемых виртуальных блоках.
+- **Офлайн-редактор `EEL T01` и перенос иммо A→B:** правка `VIN`, пробега (голосование + нормализация чётности), кодировки `0x0600`, `PowerClass`, маски партнёров, `KESSY`, ключей `K_c`, `IKA/CP`, `K_ffb`, транспондеров; перенос донора **A→B** (в том числе с аналоговой `17 Kombi VDD`).
+- **Обучение ключей через штатную катушку LF:** извлечение живых `S0/S1` из ОЗУ приборки при поднесении рабочего ключа, **добавление нового ключа без стирания старых (режим 5)** и классический цикл `2E 02F7` → `40 00` → `80 00` с автосохранением флага `KESSY`.
+- **Инженерный загрузчик `FBL RSA` и стендовое управление:** анализ `BOLO` / `.FBL_RSAKEY`, замена ключа RSA-1024 в `DataFlash`, офлайн-патч `BOLO`, подпись ODX, плюс стендовая панель (`KL15`, симуляция скорости/оборотов/температуры, кнопки MFL, DTC).
+
+#### `17 Kombi VDD` — Приборные панели VDO/VDD (V850E2/Dx4, `EV_DashBoardVDDMQBAB`)
+- **Отдельный рабочий стол и CLI (`contitool kombi ...`)**, полностью разведённые с RH850 `FPK_E` — никакой путаницы форматов.
+- **Подтверждённые платформы:** `5NA 920 740 B (SW 0310, 132 блока EEL)` и `8V0 920 860 E (SW 2220, 130 блоков EEL, подтверждённый 75-байтный EEL 0x0068)`.
+- **`FD11 SL 7` без лишней боли:** работа по известному/кэшированному ключу или извлечение через `10 4F + SA1` со **встроенным сбросом таймера задержки `7F 27 37`** (`+0x62EF` → `27 04 00 00 62 EF`). Работает по чистому 11-битному UDS как напрямую на столе (`CANable`, `VAS 6154 / VNCI`, `J2534`), так и через любой шлюз.
+- **Чтение/запись EEL, катушка LF и перенос A→B:** безопасное временное переключение `immo_mode = 0` с проверкой CRC-32 всех подблоков и гарантированным восстановлением, нативное извлечение `S0/S1` из ОЗУ, аддитивное обучение ключей в режиме 5 и перенос донора A→B.
+
+#### `09 BCM` — Бортовая сеть Continental MQBAB
+- **Рабочий стол и CLI (`contitool bcm ...`):** паспорт, статус, DTC и чтение ключей `GFA`, `IKA`, `K_ffb` для `SW 0173`, `0175`, `0212`, `0253` (`5Q0 937 084 BL / BQ / CJ / CG` и др.).
+- **Страховка при чтении ключей:** проверка профиля по штатному UDS **до запуска моста J533**, обязательный Fail-closed бэкап и восстановление пультов ДУ (`FFB` / `K_ffb`) во время чтения `GFA`, скрытие ключей в логах.
+- **Адаптация пультов ДУ (`FFB`):** ручная запись/очистка слотов (частота 315/433/434/868 МГц, счётчик) и **автоматический перенос данных ДУ из дампа или прямо с приборки `FPK_E` / `Kombi VDD`**.
+
+#### `13 ACC MRR` — Радар Bosch MRRevo14F (`3QF` / `5Q0`)
+- **Рабочий стол и CLI (`contitool mrr ...`):** паспорт, статус, DTC, чтение и запись `DFlash` (FEE) и `CFlash` по XCP / быстрым SRAM-драйверам с проверкой контрольных сумм секторов до и после записи.
+- **Защита компонентов и `SWaP`:** чтение/запись `GFA`/`IKA`, сброс счётчика CP, **отключение CP** и **активация `SWaP` (Gen1 / Gen2)** с возвратом в заводской сток.
+- **Прошивка `FRF` / `ODX`:** встроенный расшифровщик `FRF`, проверка совместимости и защищённая от прерывания секция стирания/записи.
+
+#### `2B ELV` — Блокиратор руля J764 (RH850/F1L)
+- **Рабочий стол и CLI (`contitool elv ...`):** паспорт, статус, DTC, чтение 32 КБ `DataFlash` (`0x1BFD8A0B/0A`), оффлайн-разбор и редактирование пула `EeeLib` (с проверкой тройных копий CRC).
+- **Привязка и обнуление:** адаптация по `2E 02E2` или прямо из дампа приборки (`FPK_E` / `Kombi`), обнуление (`virginize`), сброс `IDAC` и проверка загрузчика `31 01 02 03` + многофреймовый ISO-TP WFS5 с автовосстановлением `idac_state`.
+
+#### Сканер шины, прозрачный RAM-мост `19 J533` и `openpdu`
+- **Мультиблочный интерфейс и сканер шины:** новый стартовый экран `3×2` с режимом «Шина целиком», экран топологии **«Шина CAN»** с найденным шлюзом и ведомыми ЭБУ, переключение открытых блоков в шапке и автотаргетинг CAN-терминала.
+- **Прозрачный RAM-мост `J533CanBridge`:** проброс `ch3 Diag CAN ↔ ch0 Komfort / ch1 Ext / ch2 Drive` с аппаратным фильтром `RSCAN0 GAFL`, поддержкой **VAS 6154 / VNCI** (полный RawMode) и генератором **`BURST-GO`** на стороне шлюза для бесключевого level 8 на `FPK_E`.
+- **Прямой `VAS 6154 / VNCI` для ведомых блоков:** сняты лишние ограничения на прямое подключение через `VNCI / D-PDU` для `17 Kombi VDD`, `09 BCM`, `13 ACC MRR` и `2B ELV` (включая стендовое пробуждение по CAN).
+- **Экспериментальный пакет `openpdu`:** кроссплатформенный TCP-клиент протокола VAS 6154 (порт `4500`, без проприетарного драйвера D-PDU — работает на macOS и Linux; в GUI пока не подключён).
+
+#### Приватность, стабильность и аудит (640+ автотестов)
+- **Безопасный «Отчёт о проблеме»:** при снятой галочке «Приложить дампы» из логов и JSON автоматически вырезаются ключи (`IKA`, `GFA`, `K_ffb`, `K_c`, `K_5`, `S0`, `S1`, `IDCODE`), `VIN` и `FAZIT`, а файлы с ключами и трассами не попадают в архив.
+- **Ускорение J2534 и стабильность транспорта:** убрана задержка 250 мс на каждый UDS-кадр в `J2534Bus`, усилена проверка префиксов UDS, защищён аппаратный ISO-TP на `nonraw` D-PDU, усилены RH850-апплеты (`PSW.ID | PSW.NP`, раздельный вход/выход FACI P/E).
+- **Надёжность GUI:** защита всех фоновых коллбэков при переключении/закрытии экранов, подтверждения перед записью `BCM FFB` и `FPK_E 2E 02F7`, запрет случайного закрытия окна посреди CAN-операции.
+
+#### На что обратить внимание при тестировании `2.3.0-rc1`
+- Не все ревизии ПО/железа новых блоков ещё прошли живой стенд — для неподтверждённых пар `PN + SW` программа показывает жёлтое предупреждение.
+- Механизмы `BURST-GO` через `VAS 6154 / VNCI`, 29-битный TX в D-PDU RawMode (`BCM` / `MRR` / `ELV`), `openpdu` и часть веток `MRR` / `ELV` / `Kombi SW 2220` нуждаются в обкатке на реальных блоках и адаптерах.
+- **Прямое подключение к `17 FPK_E`** (без шлюза `19 J533`) физически требует нативный CAN (`CANable / SLCAN / candleLight`) из-за шага `0.35 мс/кадр` в потоке level 8. С `VAS 6154 / VNCI` работайте с `FPK_E` **через шлюз `19 J533`** (`BURST-GO`).
+
+---
+
+### 🇬🇧 What's New in `2.3.0-rc1`
+
+#### `17 FPK_E / AID` — Digital Instrument Clusters (Continental RH850/D1M2A)
+- **Keyless level-8 access & full CAN readout:** `SW 83A (6181)`, `SW 1701 (5NA920790D)`, `SW 1703`, and `SW 1711 (5E0920790A)` with `F187`/`F189` + stack refinement, reading all 5 regions (`DataFlash 64 KB`, `Extra Area 256 B` + `IDAUTH` check including unlocked `Extra Area`, `UFlash 32 KB`, `BFlash 96 KB`, `CodeFlash 2 MB`), fast `0x6F1` streaming with automatic `UDS 0x23` fallback, and retry handling across background `R_EEL_Handler` P/E windows.
+- **Hardware RV40F FACI Blank-Check (`0x71`) on `DataFlash` reads:** full reads, GUI/CLI `dflash` reads, and post-write readback run hardware Blank-Check across all 64 KB (with `VB_head` concurrency protection against `R_EEL_Handler`) and clean floating-gate noise in erased cells to deterministic `0xFF`. Saved `Dflash.bin` files are now safe for both ContiTool CAN writes and external programmers (`VVDI Prog`, `Multiprog`, `UPA`, `Orange5`).
+- **Smart CAN `DataFlash` writer + `SWRESA`:** zero-erase `smart_eel_append`, `smart_tail_update`, `full_blank_checked_diff`, foreign `FD11` / `Kombi VDD` dump guard, and power-fail-safe erase ordering.
+- **Offline `EEL T01` editor & A→B Immo transfer:** edit `VIN`, odometer (voting + even parity), `0x0600` coding, `PowerClass`, partner mask, `KESSY`, `K_c`, `IKA/CP`, `K_ffb`, and transponders; donor **A→B** transfer including cross-family `17 Kombi VDD` donors.
+- **Stock LF coil key learning wizard:** live `S0/S1` RAM extraction when a working key is held to the coil, **non-destructive additive learning (mode 5)** without wiping existing keys, and classic `2E 02F7` → `40 00` → `80 00` preserving `KESSY`.
+- **Engineering `FBL RSA` & bench panel:** `BOLO` / `.FBL_RSAKEY` analysis, `DataFlash` RSA-1024 replacement, offline `BOLO` patching, ODX signing, plus bench controls (`KL15`, speed/RPM/temp simulation, MFL buttons, DTC).
+
+#### `17 Kombi VDD` — VDO/VDD Instrument Clusters (V850E2/Dx4, `EV_DashBoardVDDMQBAB`)
+- **Dedicated workbench & CLI (`contitool kombi ...`)**, cleanly separated from RH850 `FPK_E`.
+- **Verified platforms:** `5NA 920 740 B (SW 0310, 132 EEL records)` and `8V0 920 860 E (SW 2220, 130 EEL records, hardware-verified 75-byte EEL 0x0068)`.
+- **`FD11 SL 7` + built-in `SA1` lockout reset:** known/cached `SL 7` key or `10 4F + SA1` extraction with automatic `+0x62EF` (`27 04 00 00 62 EF`) delay-timer reset on `7F 27 37`. Runs over standard 11-bit UDS directly on the bench (`CANable`, `VAS 6154 / VNCI`, `J2534`) or behind any gateway.
+- **EEL read/write, LF coil learning & A→B transfer:** CRC-32-verified temporary `immo_mode = 0` with guaranteed restore, native RAM `S0/S1` extraction, additive mode-5 key learning, and A→B transfer.
+
+#### `09 BCM` — Continental MQBAB Central Electrics
+- **Workbench & CLI (`contitool bcm ...`):** passport, status, DTCs, and `GFA`/`IKA`/`K_ffb` extraction for `SW 0173`, `0175`, `0212`, `0253` (`5Q0 937 084 BL / BQ / CJ / CG`, etc.).
+- **Fail-safe key workflows:** pre-bridge UDS profile verification before entering the J533 bridge, mandatory fail-closed remote (`FFB` / `K_ffb`) backup & restore during `GFA` reads, and masked secrets in logs.
+- **Remote (`FFB`) adaptation:** manual slot/frequency/counter management plus **direct FFB material transfer from `FPK_E` or `Kombi VDD` dumps (or live over CAN)**.
+
+#### `13 ACC MRR` — Bosch MRRevo14F Radar (`3QF` / `5Q0`)
+- **Workbench & CLI (`contitool mrr ...`):** passport, status, DTCs, XCP & fast SRAM-driver `DFlash` (FEE) and `CFlash` read/write with pre/post sector checksum verification.
+- **Component Protection & `SWaP`:** `GFA`/`IKA` read/write, CP counter reset, **CP deactivation**, and **Gen1/Gen2 `SWaP` activation** with stock rollback.
+- **`FRF` / `ODX` flashing:** built-in `FRF` decryptor, compatibility checks, and uninterruptible erase/program guards.
+
+#### `2B ELV` — J764 Steering Lock (RH850/F1L)
+- **Workbench & CLI (`contitool elv ...`):** passport, status, DTCs, 32 KB `DataFlash` readout (`0x1BFD8A0B/0A`), offline `EeeLib` triple-copy CRC parser/editor, `2E 02E2` or cluster-dump adaptation (`FPK_E` / `Kombi`), virginization, `IDAC` reset, and `31 01 02 03` + multi-frame ISO-TP WFS5 check with automatic `idac_state` recovery.
+
+#### Bus Scanner, Transparent `19 J533` RAM-Bridge & `openpdu`
+- **Multi-ECU workspace & CAN bus scanner:** redesigned `3×2` Start screen with full-bus scan, live **CAN Bus** topology screen, header ECU switcher, and auto-targeted CAN Terminal.
+- **Transparent `J533CanBridge`:** `ch3 Diag CAN ↔ ch0 Komfort / ch1 Ext / ch2 Drive` bridge with `RSCAN0 GAFL` hardware filter, **VAS 6154 / VNCI** support (full RawMode), and gateway-side **`BURST-GO`** level-8 frame generator for `FPK_E`.
+- **Direct `VAS 6154 / VNCI` for slave ECUs:** lifted unnecessary native-only restrictions on direct `VNCI / D-PDU` bench connections for `17 Kombi VDD`, `09 BCM`, `13 ACC MRR`, and `2B ELV` (including direct CAN wake bursts).
+- **Experimental `openpdu` package:** standalone pure-Python TCP client for the VAS 6154 protocol (port `4500`, runs on macOS/Linux without vendor D-PDU drivers; not wired into the GUI yet).
+
+#### Privacy, Transport & Hardening (640+ Automated Tests)
+- **Privacy-safe Problem Reports:** keys (`IKA`, `GFA`, `K_ffb`, `K_c`, `K_5`, `S0`, `S1`, `IDCODE`), `VIN`, and `FAZIT` are automatically redacted and secret-bearing files excluded whenever "Attach dumps" is unchecked.
+- **Transport & applet reliability:** eliminated 250 ms/frame batch stalls in `J2534Bus`, hardened UDS prefix validation and `nonraw` D-PDU ISO-TP sessions, and tightened RH850 applets (`PSW.ID | PSW.NP`, split FACI P/E transitions).
+- **GUI safety:** async callback lifecycle guards on screen close/switch, destructive confirmations for `BCM FFB` and `FPK_E 2E 02F7`, and close-block protection while a CAN task is active.
+
+#### Known Rough Edges in `2.3.0-rc1`
+- Not every hardware/software revision of the new ECUs has been bench-verified yet; unverified `PN + SW` pairs display a warning banner.
+- `BURST-GO` over `VAS 6154 / VNCI`, 29-bit D-PDU RawMode TX (`BCM` / `MRR` / `ELV`), `openpdu`, and several `MRR` / `ELV` / `Kombi SW 2220` paths need live community bench testing.
+- **Direct `17 FPK_E` bench access** (without a `19 J533` gateway) physically requires a native CAN adapter (`CANable / SLCAN / candleLight`) because the level-8 stream needs `0.35 ms/frame` pacing. With a `VAS 6154 / VNCI`, connect `FPK_E` **through a `19 J533` gateway** (`BURST-GO`).
+
 ## 2.2.1 — 2026-11-23
 
 ### 🇷🇺 Исправлено
