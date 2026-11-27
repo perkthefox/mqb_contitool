@@ -945,11 +945,11 @@ def test_j533_can_bridge_applet_gafl_whitelist_preserves_default_and_encodes_rul
     assert len(build_loader_packet(blob_mrr)) <= MAX_LOADER_PACKET_SIZE
     # GAFLCFG0 must encode ch2=3 rules, ch3=1 rule -> (3 << 8) | 1 = 0x00000301
     assert struct.pack("<I", 0x00000301) in blob_mrr
-    # Encoded GAFLID / GAFLM words for std 0x7C1, std 0x77E, ext 0x1BFEBA01
+    # Encoded GAFLID / GAFLM words for std 0x7C1, std 0x77E, ext 0x1BFEBA01 (stock 3Q0 907 530 RTRM=0)
     assert struct.pack("<I", 0x000007C1) in blob_mrr
-    assert struct.pack("<I", 0xC00007FF) in blob_mrr
+    assert struct.pack("<I", 0x800007FF) in blob_mrr
     assert struct.pack("<I", 0x1BFEBA01 | 0x80000000) in blob_mrr
-    assert struct.pack("<I", 0xDFFFFFFF) in blob_mrr
+    assert struct.pack("<I", 0x9FFFFFFF) in blob_mrr
 
     # ch4 > ch3: GAFLCFG0 has ch3=1 (0x00000001), GAFLCFG1 has ch4=2 (2 << 24)
     blob_ch4 = build_j533_can_bridge_applet(4, target_rx_filter=((0x773, False), (0x17FE015F, True)))

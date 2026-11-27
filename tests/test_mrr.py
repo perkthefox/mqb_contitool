@@ -3140,4 +3140,27 @@ def test_mrr_review_core_prefixes_fee_bounds_redundant_copy_vle_and_zipbomb() ->
         mrr_read_frf(bomb_frf, "bomb.frf")
 
 
+def test_mrr_read_passport_via_bridge_timeout_mentions_extended_can_ch2_pins() -> None:
+    """Issue #59: when the radar is silent behind the J533 ch3<->ch2 RAM bridge, hint at Extended CAN ch2 (T20 Pin 7/17)."""
+    from contitool.can.mrr import MrrCanLink
+
+    class SilentBus:
+        def send(self, msg: Any, timeout: float | None = None) -> None:  # noqa: ARG002
+            return None
+
+        def recv(self, timeout: float | None = None) -> None:  # noqa: ARG002
+            return None
+
+        def shutdown(self) -> None:
+            return None
+
+    for lang, expected_tok in (("en", "T20 Pin 7 CAN-L / Pin 17 CAN-H"), ("ru", "T20 Pin 7 CAN-L / Pin 17 CAN-H")):
+        set_lang(lang)
+        link = MrrCanLink("fake", bus=SilentBus(), via_bridge=True)
+        link.read_did = lambda did, *, timeout=1.5: (_ for _ in ()).throw(TimeoutError("no reply"))  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match=expected_tok):
+            link.read_passport()
+
+
+
 

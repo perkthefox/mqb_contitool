@@ -1457,13 +1457,13 @@ def build_j533_can_bridge_applet(
             if is_ext:
                 if not 0 <= cid <= 0x1FFFFFFF:
                     raise ValueError(f"Extended filter CAN ID out of range: 0x{cid:X}")
-                # GAFLID: IDE=1 (bit 31), RTR=0 (bit 30), LB=0 (bit 29); GAFLM: IDEM=1, RTRM=1, IDM=0x1FFFFFFF
-                encoded_tgt_rules.append((cid | 0x80000000, 0xDFFFFFFF))
+                # GAFLID: IDE=1 (bit 31), RTR=0 (bit 30), LB=0 (bit 29); GAFLM: IDEM=1, RTRM=0, IDM=0x1FFFFFFF (stock 3Q0 907 530)
+                encoded_tgt_rules.append((cid | 0x80000000, 0x9FFFFFFF))
             else:
                 if not 0 <= cid <= 0x7FF:
                     raise ValueError(f"Standard filter CAN ID out of range: 0x{cid:X}")
-                # GAFLID: IDE=0, RTR=0, LB=0; GAFLM: IDEM=1, RTRM=1, IDM=0x7FF
-                encoded_tgt_rules.append((cid, 0xC00007FF))
+                # GAFLID: IDE=0, RTR=0, LB=0; GAFLM: IDEM=1, RTRM=0, IDM=0x7FF (stock 3Q0 907 530)
+                encoded_tgt_rules.append((cid, 0x800007FF))
     burst_table = b""
     if burst_frames is not None:
         if not burst_frames:

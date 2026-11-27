@@ -161,6 +161,7 @@ class MrrCanLink(J533CanLink):
         log_path: Path | None = None,
         bus: Any | None = None,
         via_gateway: bool = False,
+        via_bridge: bool = False,
         sw_profile: str | None = None,
     ) -> None:
         super().__init__(
@@ -173,6 +174,7 @@ class MrrCanLink(J533CanLink):
             bus=bus,
         )
         self.via_gateway = bool(via_gateway)
+        self.via_bridge = bool(via_bridge)
         self.sw_profile = sw_profile.strip().upper() if sw_profile else None
         self._detected_sw: str | None = None
         self.xcp_tx_id = MRR_XCP_TX_ID
@@ -274,6 +276,19 @@ class MrrCanLink(J533CanLink):
                 else:
                     passport[field_name] = _clean_ascii(val)
         if not raw_dids:
+            if self.via_bridge:
+                raise RuntimeError(
+                    tr(
+                        "Радар 13 ACC (0x757 → 0x7C1) не ответил через RAM-мост J533 ch3 ↔ ch2 ни на один DID паспорта UDS. "
+                        "Проверьте, что радар подключён именно к шине Extended CAN ch2 шлюза J533 (T20 Pin 7 CAN-L / Pin 17 CAN-H), "
+                        "а не к Komfort (Pin 5 / 15) или Antrieb (Pin 6 / 16): в штатном режиме J533 рассылает UDS по всем шинам, "
+                        "но RAM-мост связывает строго ch2. Также проверьте питание +12 В, массу и терминатор 120 Ом.",
+                        "13 ACC Radar (0x757 → 0x7C1) did not answer any UDS passport DID over the J533 ch3 ↔ ch2 RAM bridge. "
+                        "Verify that the radar is wired specifically to J533 Extended CAN ch2 (T20 Pin 7 CAN-L / Pin 17 CAN-H), "
+                        "not Komfort (Pin 5 / 15) or Antrieb (Pin 6 / 16): in normal Application mode J533 broadcasts UDS to all sub-buses, "
+                        "whereas the RAM bridge links strictly ch2. Also check +12 V power, ground, and 120 Ω termination.",
+                    )
+                )
             raise RuntimeError(
                 tr(
                     "Радар 13 ACC (0x757 → 0x7C1) не ответил ни на один диагностический DID паспорта UDS. "
@@ -1535,6 +1550,7 @@ def _managed_mrr_session(
                 log_path=log_path,
                 bus=bridge.bus,
                 via_gateway=False,
+                via_bridge=True,
                 sw_profile=sw_profile,
             ) as link:
                 yield link, True
