@@ -10,5 +10,5 @@ FREE COMMUNITY RESEARCH TOOL — STRICTLY NOT FOR SALE! (БЕСПЛАТНО • 
 
 from __future__ import annotations
 
-__version__ = "2.3.0-rc2"
+__version__ = "2.3.0-rc3"
 __author__ = "PerkTheFox"

@@ -1,26 +1,38 @@
 # Changelog / История изменений
 
-## 2.3.0-rc2 — 2026-11-27
+## 2.3.0-rc3 — 2026-11-27
 
 > [!WARNING]
-> **🇷🇺 Релиз-кандидат `2.3.0-rc2` — тестовая сборка ветки `2.3.0`, не основной релиз.**
+> **🇷🇺 Релиз-кандидат `2.3.0-rc3` — тестовая сборка ветки `2.3.0`, не основной релиз.**
 > Для повседневной работы со шлюзом `19 J533` оставайтесь на стабильном **[`v2.2.1a`](https://github.com/perkthefox/mqb_contitool/releases/latest)**. Все изменения ветки `2.3.0` и чеклист обкатки отслеживаются в **[PR #58](https://github.com/perkthefox/mqb_contitool/pull/58)**.
 >
-> **🇬🇧 Release Candidate `2.3.0-rc2` — preview build of the `2.3.0` branch, not the stable release.**
+> **🇬🇧 Release Candidate `2.3.0-rc3` — preview build of the `2.3.0` branch, not the stable release.**
 > For daily `19 J533` gateway work, stay on stable **[`v2.2.1a`](https://github.com/perkthefox/mqb_contitool/releases/latest)**. Full `2.3.0` tracking and stabilization checklist live in **[PR #58](https://github.com/perkthefox/mqb_contitool/pull/58)**.
 
-### 🇷🇺 Что нового в `2.3.0-rc2` (поверх `2.3.0-rc1`)
-- **`17 Kombi VDD (V850E2)` — универсальный автопоиск `SL 7` в RAM на неизвестных версиях ПО (включая `6P0 920 740 A SW 1422`):**
+### 🇷🇺 Что нового в `2.3.0-rc3` (поверх `2.3.0-rc1`)
+- **`17 FPK_E` vs `17 Kombi VDD` — исправлена маршрутизация панелей `EV_DashBoardVDDMQBA0` ([#60](https://github.com/perkthefox/mqb_contitool/issues/60), [#61](https://github.com/perkthefox/mqb_contitool/issues/61)):**
+  - Цифровые приборные панели `RH850 FPK_E` с ODX `EV_DashBoardVDDMQBA0` и `F197 = KOMBI` (включая `5F0 920 790 A SW 1701` и `565 920 790 C SW 4300`, а также всё семейство `*920790*` / `83A920700*`) больше не перехватываются обработчиком `V850E2 Kombi VDD` (что приводило к `7F 23 33` по `0xFEDD5530`), а корректно открываются как `17 FPK_E`.
+  - Аналоговые `V850E2 Kombi VDD` (`EV_DashBoardVDDMQBAB`, `6P0 920 740 A`, `5F0 920 863` и др.) сохраняют маршрутизацию в `17 Kombi VDD` даже при пропущенном `F187`.
+- **`17 Kombi VDD (V850E2)` — универсальный автопоиск `SL 7` в RAM на неизвестных версиях ПО (`6P0 920 740 A SW 1422`, `5F0 920 863 SW 6420` [#62](https://github.com/perkthefox/mqb_contitool/issues/62)):**
   - Если по адресам известных профилей (`0xFEDD5530` / `0xFEDD2480`) проверка `CRC-32` ключа `FD11 Supplier Level 7` не сходится, ContiTool автоматически сканирует `V850E2 RAM` (`0xFEDD0000..0xFEDFFFFF` / `0xFEDC0000..0xFEDD0000`) чанками по `500 Б` (с обходом защищённых областей по `128 Б`), находит смещённый буфер `NvM staging` и 20-байтную запись `SL 7` (`[16B ключ || 4B CRC-32]`), отличает ключ `L0..6` (`+0x14`) от `SL 7` (`+0x28`), и проверяет заголовок NvM-менеджера на `staging - 8`.
   - После входа в `SL 7` запрашивается штатный **`DID 22 FE 30`** и из CodeFlash автоматически вычитывается актуальная таблица размеров блоков `EEL` (`n_blocks` и размер каждого блока) вместе с реальным адресом таблицы физических смещений в RAM.
-  - Парсеры `Dflash.bin` / `EelLogical.bin` (`kombi_eel_layout`, `unpack_kombi_logical_eel`, `is_kombi_dflash`, `detect_kombi_files`) поддерживают динамические `<H`-размеры записей; на непроверенных SW с автонайденным RAM чтение остаётся строго **read-only**.
+  - Парсеры `Dflash.bin` / `EelLogical.bin` (`kombi_eel_layout`, `unpack_kombi_logical_eel`, `is_kombi_dflash`, `detect_kombi_files`) переведены на прямое сканирование активных DRP-слотов EEL T01 с жёстким разделением 64 КБ дампов `FPK_E` (`162`/`235` ID, `ID 1 = 252 Б`, `.FBL_RSAKEY`) и динамических дампов `Kombi VDD` (до `155` ID); на непроверенных SW с автонайденным RAM чтение остаётся строго **read-only**.
+- **`19 J533` RAM-мост и `13 ACC MRR` ([#59](https://github.com/perkthefox/mqb_contitool/issues/59)):**
+  - Маски аппаратного фильтра `RSCAN0 GAFLM` в RAM-мосте выровнены под заводскую прошивку `3Q0 907 530` (`RTRM=0`: `0x800007FF` для 11-бит и `0x9FFFFFFF` для 29-бит); апплет по умолчанию без фильтра остался побайтно неизменным.
+  - Если радар `13 ACC` молчит за RAM-мостом `ch3 ↔ ch2`, ошибка теперь явно подсказывает проверить подключение к **Extended CAN `ch2` (J533 T20 Pin 7 CAN-L / Pin 17 CAN-H)**, а не к `Komfort (Pin 5 / 15)` или `Antrieb (Pin 6 / 16)`.
 - **Автообновления:** добавлена поддержка буквенных хотфиксов у релиз-кандидатов (`-rc1a`, `-rc2a` и т. д.) с сохранением строгой изоляции каналов `stable` и `candidate`.
 
-### 🇬🇧 What's New in `2.3.0-rc2` (since `2.3.0-rc1`)
-- **`17 Kombi VDD (V850E2)` — universal RAM auto-discovery for `SL 7` on unverified SW revisions (including `6P0 920 740 A SW 1422`):**
+### 🇬🇧 What's New in `2.3.0-rc3` (since `2.3.0-rc1`)
+- **`17 FPK_E` vs `17 Kombi VDD` — fixed `EV_DashBoardVDDMQBA0` cluster routing ([#60](https://github.com/perkthefox/mqb_contitool/issues/60), [#61](https://github.com/perkthefox/mqb_contitool/issues/61)):**
+  - RH850 `FPK_E` virtual clusters reporting `F19E = EV_DashBoardVDDMQBA0` and `F197 = KOMBI` (including `5F0 920 790 A SW 1701`, `565 920 790 C SW 4300`, and all `*920790*` / `83A920700*` part families) are no longer hijacked by the V850E2 `Kombi VDD` handler (which caused `7F 23 33` at `0xFEDD5530`) and now route cleanly to `17 FPK_E`.
+  - Analog V850E2 `Kombi VDD` clusters (`EV_DashBoardVDDMQBAB`, `6P0 920 740 A`, `5F0 920 863`, etc.) continue to route to `17 Kombi VDD`, even when `F187` is absent.
+- **`17 Kombi VDD (V850E2)` — universal RAM auto-discovery for `SL 7` on unverified SW revisions (`6P0 920 740 A SW 1422`, `5F0 920 863 SW 6420` [#62](https://github.com/perkthefox/mqb_contitool/issues/62)):**
   - When the primary known profile address (`0xFEDD5530` / `0xFEDD2480`) fails `CRC-32` validation, ContiTool automatically checks the alternate known address and scans V850E2 RAM (`0xFEDD0000..0xFEDFFFFF` / `0xFEDC0000..0xFEDD0000`) in 500-byte chunks (with 128-byte fallback around protected holes), locating the shifted NvM staging buffer and 20-byte `SL 7` record (`[16B key || 4B LE CRC-32]`), disambiguating `L0..6` (`+0x14`) vs `SL 7` (`+0x28`), and validating the 8-byte NvM state header at `staging - 8`.
   - Once at `SL 7`, ContiTool queries **`DID 22 FE 30`** and reads the live CodeFlash EEL descriptor table to auto-adapt `n_blocks`, per-block byte sizes, and the live RAM physical offset table address.
-  - `Dflash.bin` / `EelLogical.bin` parsers (`kombi_eel_layout`, `unpack_kombi_logical_eel`, `is_kombi_dflash`, `detect_kombi_files`) now handle dynamic self-describing `<H` record sizes; reads on unverified SW revisions stay strictly **read-only**.
+  - `Dflash.bin` / `EelLogical.bin` parsers (`kombi_eel_layout`, `unpack_kombi_logical_eel`, `is_kombi_dflash`, `detect_kombi_files`) now scan active EEL T01 DRPs directly with strict separation between 64 KiB `FPK_E` pools (`162`/`235` IDs, `ID 1 = 252 B`, `.FBL_RSAKEY`) and dynamic `Kombi VDD` pools (up to `155` IDs); reads on unverified SW revisions stay strictly **read-only**.
+- **`19 J533` RAM-bridge & `13 ACC MRR` ([#59](https://github.com/perkthefox/mqb_contitool/issues/59)):**
+  - Aligned J533 RAM-bridge `RSCAN0 GAFLM` filter masks with stock `3Q0 907 530` firmware (`RTRM=0`: `0x800007FF` std / `0x9FFFFFFF` ext), keeping default unfiltered bridge applets byte-identical.
+  - Added clear bench wiring guidance pointing to **Extended CAN `ch2` (J533 T20 Pin 7 CAN-L / Pin 17 CAN-H)** vs `Komfort (Pin 5 / 15)` and `Antrieb (Pin 6 / 16)` when `13 ACC MRR` does not reply behind the `ch3 ↔ ch2` RAM bridge.
 - **Updater:** added support for letter-suffixed RC hotfixes (`-rc1a`, `-rc2a`, etc.) while keeping `stable` and `candidate` channel isolation intact.
 
 ---
